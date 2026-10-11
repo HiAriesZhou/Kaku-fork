@@ -3,11 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>Kaku</title>
-<link rel="stylesheet" href="/assets/xterm.css">
+<link rel="stylesheet" href="assets/xterm.css">
 <style>
-  @font-face { font-family: "Kaku Mono"; src: url("/assets/font-regular.ttf") format("truetype"); font-weight: 400; }
-  @font-face { font-family: "Kaku Mono"; src: url("/assets/font-medium.ttf") format("truetype"); font-weight: 700; }
+  @font-face { font-family: "Kaku Mono"; src: url("assets/font-regular.ttf") format("truetype"); font-weight: 400; }
+  @font-face { font-family: "Kaku Mono"; src: url("assets/font-medium.ttf") format("truetype"); font-weight: 700; }
   :root { --bg: #16161a; --fg: #d4d4d8; --muted: #8b8b93; --line: rgba(255,255,255,0.08); }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); }
   body { display: flex; flex-direction: column; font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -34,28 +35,84 @@
   <div id="term"></div>
   <button id="history" type="button">Back to live</button>
 </div>
-<script src="/assets/xterm.js"></script>
+<script src="assets/xterm.js"></script>
 <script>
 (() => {
-  const token = new URLSearchParams(location.hash.slice(1)).get("t");
+  const params = new URLSearchParams(location.hash.slice(1));
+  // #t=<token>: this Mac or the LAN, plain WebSocket to Kaku.
+  // #k=<key>: through the relay, every message sealed with this key, which
+  // never leaves the browser because fragments are not sent to servers.
+  const token = params.get("t");
+  const keyText = params.get("k");
   const bar = document.getElementById("bar");
   const statusEl = document.getElementById("status");
   const stage = document.getElementById("stage");
   const termEl = document.getElementById("term");
   const historyBtn = document.getElementById("history");
 
-  if (!token) {
-    stage.innerHTML = '<div id="message">Open this page from the link Kaku gives you.<br>On the Mac running Kaku, visit /link on this server.</div>';
+  const showMessage = (text) => { stage.innerHTML = '<div id="message"></div>'; stage.firstChild.textContent = text; };
+  if (!token && !keyText) {
+    showMessage("Open this page from the link Kaku gives you.");
+    return;
+  }
+  if (keyText && !(window.crypto && crypto.subtle)) {
+    showMessage("This browser cannot open an encrypted Kaku link.");
     return;
   }
 
-  const q = "token=" + encodeURIComponent(token);
-  const wsBase = (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
+  // ── Transport ──────────────────────────────────────────────────────────
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const fromBase64Url = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  const keyPromise = keyText
+    ? crypto.subtle.importKey("raw", fromBase64Url(keyText), "AES-GCM", false, ["encrypt", "decrypt"])
+    : null;
+  const TO_HOST = enc.encode("kaku-web c2h");
+  const FROM_HOST = enc.encode("kaku-web h2c");
+
+  const wsUrl = () => {
+    const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+    if (keyText) {
+      const base = location.pathname.endsWith("/") ? location.pathname : location.pathname + "/";
+      return scheme + location.host + base + "ws";
+    }
+    return scheme + location.host + "/web/ws?token=" + encodeURIComponent(token);
+  };
+
   let ws = null;
+  // Sealing and opening are async; chain them so messages keep their order.
+  let sendChain = Promise.resolve();
+  let recvChain = Promise.resolve();
+  const send = (msg) => {
+    const socket = ws;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const json = JSON.stringify(msg);
+    if (!keyPromise) { socket.send(json); return; }
+    sendChain = sendChain.then(async () => {
+      const key = await keyPromise;
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: TO_HOST }, key, enc.encode(json)));
+      const out = new Uint8Array(12 + sealed.length);
+      out.set(iv);
+      out.set(sealed, 12);
+      if (socket.readyState === WebSocket.OPEN) socket.send(out);
+    }).catch(() => {});
+  };
+  const receive = (data, handle) => {
+    if (!keyPromise) { handle(JSON.parse(data)); return; }
+    recvChain = recvChain.then(async () => {
+      const key = await keyPromise;
+      const bytes = new Uint8Array(data);
+      const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12), additionalData: FROM_HOST }, key, bytes.slice(12));
+      handle(JSON.parse(dec.decode(plain)));
+    }).catch(() => setStatus("This link is no longer valid"));
+  };
+
+  // ── Terminal ───────────────────────────────────────────────────────────
   let paneId = null;
   let tabId = null;
-  // Kaku's own font size; the page only shrinks below it when the Mac
-  // pane's grid does not fit the browser window.
+  // Kaku's own font size; the page only shrinks below it until Kaku has
+  // resized the tab to this window.
   let baseFontSize = 15;
   let fontSize = baseFontSize;
   let size = { cols: 0, rows: 0 };
@@ -73,10 +130,6 @@
     allowTransparency: false,
   });
   term.open(termEl);
-
-  const send = (msg) => {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
-  };
 
   // Ask Kaku to size the tab to the grid this window holds at Kaku's font
   // size. The Mac takes the tab back on its next local input, and the page
@@ -188,47 +241,24 @@
   });
   stage.addEventListener("mousedown", () => term.focus());
 
-  const onFrame = (msg) => {
-    if (msg.cols !== size.cols || msg.rows !== size.rows) {
-      size = { cols: msg.cols, rows: msg.rows };
-      term.resize(msg.cols, msg.rows);
-      fit();
-    }
-    term.write(msg.data);
-    historyBtn.style.display = msg.scrolled ? "block" : "none";
-    document.title = msg.title ? msg.title + " - Kaku" : "Kaku";
-  };
-
-  const connect = (tab) => {
-    if (ws) { ws.onclose = null; ws.close(); }
-    const id = tab.pane_id;
-    paneId = id;
-    tabId = tab.tab_id;
-    claimed = "";
-    size = { cols: 0, rows: 0 };
-    try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
-    renderTabs();
-    setStatus("Connecting");
-    ws = new WebSocket(wsBase + "/web/ws/" + id + "?" + q);
-    ws.onopen = () => { retry = 0; setStatus(""); term.focus(); };
-    ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === "frame") onFrame(msg);
-      else if (msg.type === "closed") setStatus("Pane closed");
-    };
-    ws.onclose = () => {
-      setStatus("Disconnected, retrying");
-      const delay = Math.min(5000, 500 * 2 ** retry++);
-      setTimeout(() => { if (paneId === id) refreshPanes(true); }, delay);
-    };
-  };
-
+  // ── Tabs ───────────────────────────────────────────────────────────────
   let tabs = [];
   // After asking for a new tab, follow it once it shows up, the way Cmd+T
   // switches to the new tab on the Mac.
   let followNewTab = null;
   let followUntil = 0;
-  const refreshSoon = () => setTimeout(() => refreshPanes(false), 250);
+
+  const attach = (tab) => {
+    paneId = tab.pane_id;
+    tabId = tab.tab_id;
+    claimed = "";
+    size = { cols: 0, rows: 0 };
+    try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
+    send({ type: "attach", pane_id: paneId });
+    renderTabs();
+    term.focus();
+  };
+
   const renderTabs = () => {
     bar.querySelectorAll("button").forEach((b) => b.remove());
     for (const t of tabs) {
@@ -240,16 +270,15 @@
       label.textContent = t.title || "Tab";
       const close = document.createElement("span");
       close.className = "close";
-      close.textContent = "\u00d7";
+      close.textContent = "×";
       close.title = "Close Tab";
       close.addEventListener("click", (ev) => {
         ev.stopPropagation();
         if (t.confirm_close && !confirm("Close this tab?")) return;
         send({ type: "close_tab", tab_id: t.tab_id });
-        refreshSoon();
       });
       b.append(label, close);
-      b.addEventListener("click", () => { if (t.tab_id !== tabId) connect(t); else term.focus(); });
+      b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t); else term.focus(); });
       bar.insertBefore(b, statusEl);
     }
     const add = document.createElement("button");
@@ -261,51 +290,33 @@
       followNewTab = new Set(tabs.map((t) => t.tab_id));
       followUntil = Date.now() + 5000;
       send({ type: "new_tab" });
-      refreshSoon();
     });
     bar.insertBefore(add, statusEl);
   };
 
-  const refreshPanes = async (reconnect) => {
-    try {
-      const res = await fetch("/api/tabs?" + q);
-      if (res.status === 401) {
-        setStatus("Link expired, get a new one from Kaku");
-        return;
-      }
-      tabs = await res.json();
-    } catch (_) {
-      setStatus("Kaku is not reachable");
-      if (reconnect) setTimeout(() => refreshPanes(true), 3000);
-      return;
-    }
+  const onTabs = (list) => {
+    tabs = list;
     if (followNewTab) {
       const fresh = tabs.find((t) => !followNewTab.has(t.tab_id));
-      if (fresh) {
-        followNewTab = null;
-        connect(fresh);
-        return;
-      }
-      if (Date.now() < followUntil) refreshSoon();
-      else followNewTab = null;
+      if (fresh) { followNewTab = null; attach(fresh); return; }
+      if (Date.now() > followUntil) followNewTab = null;
     }
     const current = tabs.find((t) => t.tab_id === tabId);
     if (!current) {
       let saved = null;
       try { saved = Number(localStorage.getItem("kaku.tab")); } catch (_) {}
       const target = tabs.find((t) => t.tab_id === saved) || tabs.find((t) => t.active) || tabs[0];
-      if (target) connect(target);
-      else setStatus("No tabs");
-    } else if (reconnect || current.pane_id !== paneId) {
+      if (target) attach(target);
+      else { renderTabs(); setStatus("No tabs"); }
+    } else if (current.pane_id !== paneId) {
       // Follow the tab when focus moves to another split on the Mac.
-      connect(current);
+      attach(current);
     } else {
       renderTabs();
     }
   };
 
-  fetch("/api/config?" + q).then((r) => r.ok ? r.json() : null).then((cfg) => {
-    if (!cfg) return;
+  const onConfig = (cfg) => {
     const theme = {};
     if (cfg.background) { theme.background = cfg.background; document.documentElement.style.setProperty("--bg", cfg.background); }
     if (cfg.foreground) { theme.foreground = cfg.foreground; document.documentElement.style.setProperty("--fg", cfg.foreground); }
@@ -323,10 +334,58 @@
     // Measure cells only once the bundled font is in, or the grid is sized
     // against a fallback font.
     document.fonts.load('16px "Kaku Mono"').finally(fit);
-  }).catch(() => {});
+  };
 
-  refreshPanes(false);
-  setInterval(() => refreshPanes(false), 3000);
+  const onFrame = (msg) => {
+    if (msg.cols !== size.cols || msg.rows !== size.rows) {
+      size = { cols: msg.cols, rows: msg.rows };
+      term.resize(msg.cols, msg.rows);
+      fit();
+    }
+    term.write(msg.data);
+    historyBtn.style.display = msg.scrolled ? "block" : "none";
+    document.title = msg.title ? msg.title + " - Kaku" : "Kaku";
+  };
+
+  const handle = (msg) => {
+    if (msg.type === "config") onConfig(msg);
+    else if (msg.type === "tabs") onTabs(msg.tabs);
+    else if (msg.type === "frame") onFrame(msg);
+    else if (msg.type === "closed") {
+      const gone = paneId;
+      tabId = null;
+      paneId = null;
+      onTabs(tabs.filter((t) => t.pane_id !== gone));
+    }
+  };
+
+  const connect = () => {
+    setStatus("Connecting");
+    const socket = new WebSocket(wsUrl());
+    socket.binaryType = "arraybuffer";
+    ws = socket;
+    sendChain = Promise.resolve();
+    recvChain = Promise.resolve();
+    socket.onopen = () => {
+      retry = 0;
+      setStatus("");
+      // Through the relay, Kaku starts the session only after this first
+      // message opens with the key.
+      if (keyPromise) send({ type: "hello" });
+      // Re-attach after a reconnect; the server keeps no per-browser state.
+      if (paneId !== null) send({ type: "attach", pane_id: paneId });
+    };
+    socket.onmessage = (ev) => receive(ev.data, handle);
+    socket.onclose = (ev) => {
+      if (ws !== socket) return;
+      if (ev.code === 4404) setStatus("This Kaku is offline");
+      else setStatus("Disconnected, retrying");
+      claimed = "";
+      const delay = Math.min(5000, 500 * 2 ** retry++);
+      setTimeout(connect, delay);
+    };
+  };
+  connect();
 })();
 </script>
 </body>

@@ -24,7 +24,7 @@ use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
 use termwiz::color::ColorAttribute;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::{CursorShape, CursorVisibility};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use wezterm_term::TerminalSize;
 
 const INDEX_HTML: &str = include_str!("../assets/web/index.html");
@@ -104,45 +104,36 @@ pub(crate) fn pane_removed(dirty: &WebDirty, pane_id: usize) {
     dirty.lock().remove(&pane_id);
 }
 
-// ── Static routes ─────────────────────────────────────────────────────────────
+// ── Static assets ─────────────────────────────────────────────────────────────
 
-pub(crate) async fn route_index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+/// The page and its files, by path relative to the page. Served locally and,
+/// through the relay, from this Kaku, so the page always matches the build.
+pub(crate) fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
+    Some(match path {
+        "" | "index.html" => ("text/html; charset=utf-8", INDEX_HTML.as_bytes()),
+        "assets/xterm.js" => ("text/javascript; charset=utf-8", XTERM_JS.as_bytes()),
+        "assets/xterm.css" => ("text/css; charset=utf-8", XTERM_CSS.as_bytes()),
+        "assets/font-regular.ttf" => ("font/ttf", FONT_REGULAR),
+        "assets/font-medium.ttf" => ("font/ttf", FONT_MEDIUM),
+        _ => return None,
+    })
 }
 
-pub(crate) async fn route_xterm_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        XTERM_JS,
-    )
-        .into_response()
+fn asset_response(path: &str) -> Response {
+    match asset(path) {
+        Some((content_type, body)) => {
+            ([(header::CONTENT_TYPE, content_type)], body).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
-pub(crate) async fn route_xterm_css() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        XTERM_CSS,
-    )
-        .into_response()
+pub(crate) async fn route_index() -> Response {
+    asset_response("index.html")
 }
 
-fn font_response(bytes: &'static [u8]) -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "font/ttf"),
-            (header::CACHE_CONTROL, "max-age=86400"),
-        ],
-        bytes,
-    )
-        .into_response()
-}
-
-pub(crate) async fn route_font_regular() -> Response {
-    font_response(FONT_REGULAR)
-}
-
-pub(crate) async fn route_font_medium() -> Response {
-    font_response(FONT_MEDIUM)
+pub(crate) async fn route_asset(Path(name): Path<String>) -> Response {
+    asset_response(&format!("assets/{name}"))
 }
 
 /// Loopback-only page that hands the browser on this Mac a link carrying the
@@ -179,7 +170,7 @@ a{{color:#9ecbff;word-break:break-all}}p{{color:#999}}</style>
     Html(body).into_response()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 struct TabInfo {
     tab_id: usize,
     pane_id: usize,
@@ -190,19 +181,6 @@ struct TabInfo {
 }
 
 /// Tabs in tab bar order across windows, each pointing at its active pane.
-pub(crate) async fn route_tabs(
-    Query(query): Query<WsQuery>,
-    headers: axum::http::HeaderMap,
-) -> Response {
-    if !check_token(&query, &headers) {
-        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
-    }
-    // The busy check consults the Lua config, which only the GUI thread may
-    // touch, so the whole snapshot is taken there.
-    let tabs = promise::spawn::spawn_into_main_thread(async { collect_tabs() }).await;
-    axum::Json(tabs).into_response()
-}
-
 fn collect_tabs() -> Vec<TabInfo> {
     let Some(mux) = Mux::try_get() else {
         return Vec::new();
@@ -243,6 +221,12 @@ fn collect_tabs() -> Vec<TabInfo> {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WebClientMsg {
+    /// First message through the relay; proves the page holds the key.
+    Hello,
+    /// Start mirroring a pane; the rest of the messages act on it.
+    Attach {
+        pane_id: usize,
+    },
     /// Committed text: typed characters, IME output.
     Text {
         data: String,
@@ -279,9 +263,13 @@ enum WebClientMsg {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WebServerMsg<'a> {
+    Config(&'a crate::ConfigInfo),
+    Tabs {
+        tabs: &'a [TabInfo],
+    },
     Frame {
         cols: usize,
         rows: usize,
@@ -289,6 +277,7 @@ enum WebServerMsg<'a> {
         scrolled: bool,
         data: &'a str,
     },
+    /// The attached pane is gone; the page picks another tab.
     Closed,
 }
 
@@ -614,6 +603,7 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             }
             Ok(())
         }
+        WebClientMsg::Hello | WebClientMsg::Attach { .. } => Ok(()),
         WebClientMsg::Resize { cols, rows } => {
             let cols = cols.clamp(MIN_COLS, MAX_COLS);
             let rows = rows.clamp(MIN_ROWS, MAX_ROWS);
@@ -627,10 +617,131 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
     }
 }
 
-// ── WebSocket ─────────────────────────────────────────────────────────────────
+// ── Session ───────────────────────────────────────────────────────────────────
+
+fn lookup_pane(pane_id: usize) -> Option<Arc<dyn Pane>> {
+    Mux::try_get()?.get_pane(PaneId::from(pane_id))
+}
+
+fn subscribe(dirty: &WebDirty, pane_id: usize) -> broadcast::Receiver<()> {
+    dirty
+        .lock()
+        .entry(pane_id)
+        .or_insert_with(|| broadcast::channel(16).0)
+        .subscribe()
+}
+
+fn encode(msg: &WebServerMsg) -> Option<String> {
+    serde_json::to_string(msg).ok()
+}
+
+/// One browser, whatever carries its messages: the local WebSocket or the
+/// relay tunnel. `inbox` yields the page's JSON messages and `outbox` takes
+/// ours; the session ends when either side goes away.
+pub(crate) async fn run_session(
+    mut inbox: mpsc::Receiver<String>,
+    outbox: mpsc::Sender<String>,
+    dirty: WebDirty,
+) {
+    if let Some(json) = encode(&WebServerMsg::Config(&crate::config_info())) {
+        if outbox.send(json).await.is_err() {
+            return;
+        }
+    }
+
+    let mut attached: Option<usize> = None;
+    let mut updates: Option<broadcast::Receiver<()>> = None;
+    let mut view = View::default();
+    let mut last_frame = String::new();
+    let mut last_tabs: Option<Vec<TabInfo>> = None;
+    let mut dirty_frame = false;
+    let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
+    frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut idle = tokio::time::interval(IDLE_REFRESH);
+
+    loop {
+        let pane_update = async {
+            match updates.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            msg = inbox.recv() => {
+                let Some(text) = msg else { break };
+                let msg = match serde_json::from_str::<WebClientMsg>(&text) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        log::debug!("kaku-remote web: bad message: {e}");
+                        continue;
+                    }
+                };
+                if let WebClientMsg::Attach { pane_id } = msg {
+                    attached = Some(pane_id);
+                    updates = Some(subscribe(&dirty, pane_id));
+                    view.pinned_top = None;
+                    last_frame.clear();
+                    dirty_frame = true;
+                    continue;
+                }
+                let Some(pane) = attached.and_then(lookup_pane) else { continue };
+                handle_input(&pane, msg, &mut view);
+                dirty_frame = true;
+            }
+            update = pane_update => match update {
+                Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => dirty_frame = true,
+                Err(broadcast::error::RecvError::Closed) => updates = None,
+            },
+            _ = idle.tick() => {
+                dirty_frame = attached.is_some();
+                // Tab state lives on the GUI thread; the close-confirmation
+                // check reads the Lua config, which only that thread may touch.
+                let tabs = promise::spawn::spawn_into_main_thread(async { collect_tabs() }).await;
+                if last_tabs.as_ref() != Some(&tabs) {
+                    let Some(json) = encode(&WebServerMsg::Tabs { tabs: &tabs }) else { continue };
+                    if outbox.send(json).await.is_err() {
+                        break;
+                    }
+                    last_tabs = Some(tabs);
+                }
+            }
+            _ = frame_tick.tick(), if dirty_frame => {
+                dirty_frame = false;
+                let Some(pane_id) = attached else { continue };
+                let Some(pane) = lookup_pane(pane_id) else {
+                    attached = None;
+                    updates = None;
+                    let Some(json) = encode(&WebServerMsg::Closed) else { continue };
+                    if outbox.send(json).await.is_err() {
+                        break;
+                    }
+                    continue;
+                };
+                let frame = render_frame(&pane, &mut view);
+                let msg = WebServerMsg::Frame {
+                    cols: frame.cols,
+                    rows: frame.rows,
+                    title: &frame.title,
+                    scrolled: frame.scrolled,
+                    data: &frame.data,
+                };
+                let Some(json) = encode(&msg) else { continue };
+                // Idle refreshes usually change nothing; skip those.
+                if json == last_frame {
+                    continue;
+                }
+                if outbox.send(json.clone()).await.is_err() {
+                    break;
+                }
+                last_frame = json;
+            }
+        }
+    }
+}
+
+// ── Local WebSocket ───────────────────────────────────────────────────────────
 
 pub(crate) async fn route_ws(
-    Path(pane_id): Path<usize>,
     Query(query): Query<WsQuery>,
     State(dirty): State<WebDirty>,
     headers: axum::http::HeaderMap,
@@ -639,79 +750,35 @@ pub(crate) async fn route_ws(
     if !check_token(&query, &headers) {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
-    let rx = dirty
-        .lock()
-        .entry(pane_id)
-        .or_insert_with(|| broadcast::channel(16).0)
-        .subscribe();
-    upgrade.on_upgrade(move |socket| handle_ws(socket, pane_id, rx))
+    upgrade.on_upgrade(move |socket| handle_local_ws(socket, dirty))
 }
 
-fn lookup_pane(pane_id: usize) -> Option<Arc<dyn Pane>> {
-    Mux::try_get()?.get_pane(PaneId::from(pane_id))
-}
-
-async fn handle_ws(socket: ws::WebSocket, pane_id: usize, mut rx: broadcast::Receiver<()>) {
-    let (mut tx, mut ws_rx) = socket.split();
-    let mut view = View::default();
-    let mut last_sent = String::new();
-    let mut dirty = true;
-    let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
-    frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut idle = tokio::time::interval(IDLE_REFRESH);
-
-    loop {
-        tokio::select! {
-            msg = ws_rx.next() => {
-                let Some(Ok(msg)) = msg else { break };
-                let text = match msg {
-                    ws::Message::Text(t) => t,
-                    ws::Message::Close(_) => break,
-                    _ => continue,
-                };
-                let Some(pane) = lookup_pane(pane_id) else { break };
-                match serde_json::from_str::<WebClientMsg>(text.as_str()) {
-                    Ok(msg) => {
-                        handle_input(&pane, msg, &mut view);
-                        dirty = true;
-                    }
-                    Err(e) => log::debug!("kaku-remote web: bad message: {e}"),
-                }
-            }
-            recv = rx.recv() => match recv {
-                Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => dirty = true,
-                Err(broadcast::error::RecvError::Closed) => break,
-            },
-            _ = idle.tick() => dirty = true,
-            _ = frame_tick.tick(), if dirty => {
-                dirty = false;
-                let Some(pane) = lookup_pane(pane_id) else { break };
-                let frame = render_frame(&pane, &mut view);
-                // Skip identical idle refreshes; the title and size live in
-                // the message, so include them in the comparison.
-                let key = format!("{}x{}|{}|{}|{}", frame.cols, frame.rows, frame.scrolled, frame.title, frame.data);
-                if key == last_sent {
-                    continue;
-                }
-                let msg = WebServerMsg::Frame {
-                    cols: frame.cols,
-                    rows: frame.rows,
-                    title: &frame.title,
-                    scrolled: frame.scrolled,
-                    data: &frame.data,
-                };
-                let Ok(json) = serde_json::to_string(&msg) else { continue };
-                if tx.send(ws::Message::Text(json.into())).await.is_err() {
-                    return;
-                }
-                last_sent = key;
+async fn handle_local_ws(socket: ws::WebSocket, dirty: WebDirty) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (in_tx, in_rx) = mpsc::channel::<String>(64);
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
+    let session = tokio::spawn(run_session(in_rx, out_tx, dirty));
+    let writer = tokio::spawn(async move {
+        while let Some(text) = out_rx.recv().await {
+            if ws_tx.send(ws::Message::Text(text.into())).await.is_err() {
+                break;
             }
         }
+    });
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        match msg {
+            ws::Message::Text(text) => {
+                if in_tx.send(text.to_string()).await.is_err() {
+                    break;
+                }
+            }
+            ws::Message::Close(_) => break,
+            _ => {}
+        }
     }
-
-    if let Ok(json) = serde_json::to_string(&WebServerMsg::Closed) {
-        let _ = tx.send(ws::Message::Text(json.into())).await;
-    }
+    drop(in_tx);
+    let _ = session.await;
+    writer.abort();
 }
 
 #[cfg(test)]

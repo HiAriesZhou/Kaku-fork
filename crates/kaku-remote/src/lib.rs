@@ -204,7 +204,7 @@ struct PaneInfo {
     cwd: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ConfigInfo {
     background: Option<String>,
     foreground: Option<String>,
@@ -376,6 +376,17 @@ async fn route_config(Query(query): Query<WsQuery>, headers: axum::http::HeaderM
     if !check_token(&query, &headers) {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
+    let info = config_info();
+    match serde_json::to_value(&info) {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => {
+            log::error!("kaku-remote: failed to serialize config: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "serialization error").into_response()
+        }
+    }
+}
+
+fn config_info() -> ConfigInfo {
     let cfg = configuration();
     let palette = &cfg.resolved_palette;
 
@@ -401,7 +412,7 @@ async fn route_config(Query(query): Query<WsQuery>, headers: axum::http::HeaderM
         features.push("ai_chat".to_string());
     }
 
-    let info = ConfigInfo {
+    ConfigInfo {
         background: opt_hex(palette.background.as_ref()),
         foreground: opt_hex(palette.foreground.as_ref()),
         cursor_fg: opt_hex(palette.cursor_fg.as_ref()),
@@ -412,14 +423,6 @@ async fn route_config(Query(query): Query<WsQuery>, headers: axum::http::HeaderM
         font_size: cfg.font_size,
         line_height: cfg.line_height,
         features,
-    };
-
-    match serde_json::to_value(&info) {
-        Ok(v) => axum::Json(v).into_response(),
-        Err(e) => {
-            log::error!("kaku-remote: failed to serialize config: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "serialization error").into_response()
-        }
     }
 }
 
@@ -1045,12 +1048,8 @@ pub fn start() {
                 let web_routes = Router::new()
                     .route("/", get(web::route_index))
                     .route("/link", get(web::route_link))
-                    .route("/api/tabs", get(web::route_tabs))
-                    .route("/assets/xterm.js", get(web::route_xterm_js))
-                    .route("/assets/xterm.css", get(web::route_xterm_css))
-                    .route("/assets/font-regular.ttf", get(web::route_font_regular))
-                    .route("/assets/font-medium.ttf", get(web::route_font_medium))
-                    .route("/web/ws/{pane_id}", get(web::route_ws))
+                    .route("/assets/{name}", get(web::route_asset))
+                    .route("/web/ws", get(web::route_ws))
                     .with_state(web_dirty);
 
                 let app = Router::new()
