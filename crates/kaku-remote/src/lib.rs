@@ -21,6 +21,8 @@ use tokio::sync::{broadcast, mpsc};
 
 mod web;
 
+pub use web::publish_tab_title;
+
 // ── Token ─────────────────────────────────────────────────────────────────────
 
 static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -212,6 +214,7 @@ struct ConfigInfo {
     brights: Vec<String>,
     font_family: String,
     font_size: f64,
+    line_height: f64,
     /// Capability flags for the iOS client. Currently emits "ai_chat" when an
     /// AI handler is registered at boot.
     features: Vec<String>,
@@ -407,6 +410,7 @@ async fn route_config(Query(query): Query<WsQuery>, headers: axum::http::HeaderM
         brights: bright_colors,
         font_family,
         font_size: cfg.font_size,
+        line_height: cfg.line_height,
         features,
     };
 
@@ -1041,8 +1045,11 @@ pub fn start() {
                 let web_routes = Router::new()
                     .route("/", get(web::route_index))
                     .route("/link", get(web::route_link))
+                    .route("/api/tabs", get(web::route_tabs))
                     .route("/assets/xterm.js", get(web::route_xterm_js))
                     .route("/assets/xterm.css", get(web::route_xterm_css))
+                    .route("/assets/font-regular.ttf", get(web::route_font_regular))
+                    .route("/assets/font-medium.ttf", get(web::route_font_medium))
                     .route("/web/ws/{pane_id}", get(web::route_ws))
                     .with_state(web_dirty);
 

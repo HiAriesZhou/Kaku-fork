@@ -6,6 +6,8 @@
 <title>Kaku</title>
 <link rel="stylesheet" href="/assets/xterm.css">
 <style>
+  @font-face { font-family: "Kaku Mono"; src: url("/assets/font-regular.ttf") format("truetype"); font-weight: 400; }
+  @font-face { font-family: "Kaku Mono"; src: url("/assets/font-medium.ttf") format("truetype"); font-weight: 700; }
   :root { --bg: #16161a; --fg: #d4d4d8; --muted: #8b8b93; --line: rgba(255,255,255,0.08); }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); }
   body { display: flex; flex-direction: column; font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -45,16 +47,22 @@
   const wsBase = (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
   let ws = null;
   let paneId = null;
-  let fontSize = 14;
+  let tabId = null;
+  // Kaku's own font size; the page only shrinks below it when the Mac
+  // pane's grid does not fit the browser window.
+  let baseFontSize = 15;
+  let fontSize = baseFontSize;
   let size = { cols: 0, rows: 0 };
   let retry = 0;
 
   const setStatus = (text) => { statusEl.textContent = text; };
 
+  const FONT_STACK = '"Kaku Mono", "PingFang SC", Menlo, monospace';
   const term = new Terminal({
     fontSize,
-    fontFamily: 'Menlo, "SF Mono", Monaco, Consolas, monospace',
+    fontFamily: FONT_STACK,
     cursorBlink: true,
+    cursorInactiveStyle: "bar",
     scrollback: 0,
     allowTransparency: false,
   });
@@ -74,7 +82,7 @@
     const rect = screen.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
     const scale = Math.min((stage.clientWidth - 16) / rect.width, (stage.clientHeight - 16) / rect.height);
-    const next = Math.max(6, Math.min(28, Math.floor(fontSize * scale * 10) / 10));
+    const next = Math.max(6, Math.min(baseFontSize, Math.floor(fontSize * scale * 10) / 10));
     if (Math.abs(next - fontSize) < 0.1 || ++fitSteps > 6) return;
     fontSize = next;
     term.options.fontSize = fontSize;
@@ -158,10 +166,12 @@
     document.title = msg.title ? msg.title + " - Kaku" : "Kaku";
   };
 
-  const connect = (id) => {
+  const connect = (tab) => {
     if (ws) { ws.onclose = null; ws.close(); }
+    const id = tab.pane_id;
     paneId = id;
-    try { localStorage.setItem("kaku.pane", String(id)); } catch (_) {}
+    tabId = tab.tab_id;
+    try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     renderTabs();
     setStatus("Connecting");
     ws = new WebSocket(wsBase + "/web/ws/" + id + "?" + q);
@@ -178,42 +188,42 @@
     };
   };
 
-  let panes = [];
+  let tabs = [];
   const renderTabs = () => {
     bar.querySelectorAll("button").forEach((b) => b.remove());
-    for (const p of panes) {
+    for (const t of tabs) {
       const b = document.createElement("button");
       b.type = "button";
-      b.textContent = p.title || ("Pane " + p.id);
-      b.title = p.cwd || "";
-      b.setAttribute("aria-current", String(p.id === paneId));
-      b.addEventListener("click", () => { if (p.id !== paneId) connect(p.id); else term.focus(); });
+      b.textContent = t.title || "Tab";
+      b.setAttribute("aria-current", String(t.tab_id === tabId));
+      b.addEventListener("click", () => { if (t.tab_id !== tabId) connect(t); else term.focus(); });
       bar.insertBefore(b, statusEl);
     }
   };
 
   const refreshPanes = async (reconnect) => {
     try {
-      const res = await fetch("/api/panes?" + q);
+      const res = await fetch("/api/tabs?" + q);
       if (res.status === 401) {
         setStatus("Link expired, get a new one from Kaku");
         return;
       }
-      panes = await res.json();
+      tabs = await res.json();
     } catch (_) {
       setStatus("Kaku is not reachable");
       if (reconnect) setTimeout(() => refreshPanes(true), 3000);
       return;
     }
-    const ids = panes.map((p) => p.id);
-    if (paneId === null || !ids.includes(paneId)) {
+    const current = tabs.find((t) => t.tab_id === tabId);
+    if (!current) {
       let saved = null;
-      try { saved = Number(localStorage.getItem("kaku.pane")); } catch (_) {}
-      const target = ids.includes(saved) ? saved : ids[0];
-      if (target !== undefined) connect(target);
-      else setStatus("No panes");
-    } else if (reconnect) {
-      connect(paneId);
+      try { saved = Number(localStorage.getItem("kaku.tab")); } catch (_) {}
+      const target = tabs.find((t) => t.tab_id === saved) || tabs.find((t) => t.active) || tabs[0];
+      if (target) connect(target);
+      else setStatus("No tabs");
+    } else if (reconnect || current.pane_id !== paneId) {
+      // Follow the tab when focus moves to another split on the Mac.
+      connect(current);
     } else {
       renderTabs();
     }
@@ -230,8 +240,14 @@
     (cfg.ansi || []).forEach((c, i) => { if (names[i]) theme[names[i]] = c; });
     (cfg.brights || []).forEach((c, i) => { if (names[i]) theme["bright" + names[i][0].toUpperCase() + names[i].slice(1)] = c; });
     term.options.theme = theme;
-    if (cfg.font_family) term.options.fontFamily = '"' + cfg.font_family + '", Menlo, "SF Mono", Monaco, monospace';
-    fit();
+    if (cfg.font_family && cfg.font_family !== "JetBrains Mono") {
+      term.options.fontFamily = '"' + cfg.font_family + '", ' + FONT_STACK;
+    }
+    if (cfg.line_height) term.options.lineHeight = cfg.line_height;
+    if (cfg.font_size) { baseFontSize = cfg.font_size; fontSize = baseFontSize; term.options.fontSize = fontSize; }
+    // Measure cells only once the bundled font is in, or the grid is sized
+    // against a fallback font.
+    document.fonts.load('16px "Kaku Mono"').finally(fit);
   }).catch(() => {});
 
   refreshPanes(false);

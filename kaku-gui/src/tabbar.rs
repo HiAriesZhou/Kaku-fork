@@ -46,6 +46,19 @@ struct TitleText {
     items: Vec<FormatItem>,
 }
 
+/// The visible text of a tab title, without colors or attributes.
+#[cfg(feature = "remote")]
+fn title_plain_text(title: &TitleText) -> String {
+    title
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 struct BatchTabTitles {
     callback_present: bool,
@@ -1097,6 +1110,11 @@ impl TabBarState {
 
             let mut tab_title =
                 compute_tab_title_from_precomputed(&tab_info[tab_idx], config, precomputed.clone());
+            #[cfg(feature = "remote")]
+            kaku_remote::publish_tab_title(
+                tab_info[tab_idx].tab_id.into(),
+                &title_plain_text(&tab_title),
+            );
             let mut cell_attrs = if active {
                 &active_cell_attrs
             } else {

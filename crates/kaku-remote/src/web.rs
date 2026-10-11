@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
 use termwiz::color::ColorAttribute;
@@ -29,6 +29,10 @@ use tokio::sync::broadcast;
 const INDEX_HTML: &str = include_str!("../assets/web/index.html");
 const XTERM_JS: &str = include_str!("../assets/web/xterm.js");
 const XTERM_CSS: &str = include_str!("../assets/web/xterm.css");
+// Kaku's bundled terminal font: Regular for text, Medium for bold, matching
+// the dark-theme weights in the bundled kaku.lua.
+const FONT_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
+const FONT_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Medium.ttf");
 
 /// Frames are coalesced to this interval; the trailing edge always flushes,
 /// so the last output of a burst is never dropped.
@@ -40,6 +44,21 @@ const MAX_INPUT_LEN: usize = 65_536;
 
 /// Per-pane "something changed" signal fed by the mux subscriber.
 pub(crate) type WebDirty = Arc<Mutex<HashMap<usize, broadcast::Sender<()>>>>;
+
+/// Tab titles exactly as the GUI tab bar last drew them, keyed by tab id.
+/// The tab bar runs the user's `format-tab-title`, which only the GUI can
+/// evaluate, so the page reuses its output instead of re-deriving a title.
+static TAB_TITLES: LazyLock<Mutex<HashMap<usize, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Called by the GUI whenever it lays out the tab bar.
+pub fn publish_tab_title(tab_id: usize, title: &str) {
+    let title = title.trim();
+    let mut titles = TAB_TITLES.lock();
+    if titles.get(&tab_id).map(String::as_str) != Some(title) {
+        titles.insert(tab_id, title.to_string());
+    }
+}
 
 pub(crate) fn notify_output(dirty: &WebDirty, pane_id: usize) {
     if let Some(tx) = dirty.lock().get(&pane_id) {
@@ -71,6 +90,25 @@ pub(crate) async fn route_xterm_css() -> Response {
         XTERM_CSS,
     )
         .into_response()
+}
+
+fn font_response(bytes: &'static [u8]) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "font/ttf"),
+            (header::CACHE_CONTROL, "max-age=86400"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+pub(crate) async fn route_font_regular() -> Response {
+    font_response(FONT_REGULAR)
+}
+
+pub(crate) async fn route_font_medium() -> Response {
+    font_response(FONT_MEDIUM)
 }
 
 /// Loopback-only page that hands the browser on this Mac a link carrying the
@@ -105,6 +143,53 @@ a{{color:#9ecbff;word-break:break-all}}p{{color:#999}}</style>
     }
     body.push_str("<p>The link stops working when Kaku restarts.</p>");
     Html(body).into_response()
+}
+
+#[derive(Serialize)]
+struct TabInfo {
+    tab_id: usize,
+    pane_id: usize,
+    title: String,
+    active: bool,
+}
+
+/// Tabs in tab bar order across windows, each pointing at its active pane.
+pub(crate) async fn route_tabs(
+    Query(query): Query<WsQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !check_token(&query, &headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+    }
+    let Some(mux) = Mux::try_get() else {
+        return axum::Json(Vec::<TabInfo>::new()).into_response();
+    };
+    let titles = TAB_TITLES.lock().clone();
+    let mut tabs = Vec::new();
+    for window_id in mux.iter_windows() {
+        let Some(window) = mux.get_window(window_id) else {
+            continue;
+        };
+        let active_idx = window.get_active_idx();
+        for (idx, tab) in window.iter().enumerate() {
+            let Some(pane) = tab.get_active_pane() else {
+                continue;
+            };
+            let tab_id: usize = tab.tab_id().into();
+            let title = titles
+                .get(&tab_id)
+                .filter(|t| !t.is_empty())
+                .cloned()
+                .unwrap_or_else(|| pane.get_title());
+            tabs.push(TabInfo {
+                tab_id,
+                pane_id: pane.pane_id().into(),
+                title,
+                active: idx == active_idx,
+            });
+        }
+    }
+    axum::Json(tabs).into_response()
 }
 
 // ── Wire protocol ─────────────────────────────────────────────────────────────
@@ -236,7 +321,15 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
 
 fn cursor_shape_param(shape: CursorShape) -> u8 {
     match shape {
-        CursorShape::Default => 0,
+        // The app did not pick a shape, so Kaku draws its configured default.
+        CursorShape::Default => match config::configuration().default_cursor_style {
+            config::DefaultCursorStyle::BlinkingBlock => 1,
+            config::DefaultCursorStyle::SteadyBlock => 2,
+            config::DefaultCursorStyle::BlinkingUnderline => 3,
+            config::DefaultCursorStyle::SteadyUnderline => 4,
+            config::DefaultCursorStyle::BlinkingBar => 5,
+            config::DefaultCursorStyle::SteadyBar => 6,
+        },
         CursorShape::BlinkingBlock => 1,
         CursorShape::SteadyBlock => 2,
         CursorShape::BlinkingUnderline => 3,
@@ -520,6 +613,15 @@ mod tests {
         let mut out = String::new();
         Sgr::from_attrs(&CellAttributes::default()).write(&mut out);
         assert_eq!(out, "\x1b[0m");
+    }
+
+    #[test]
+    fn published_tab_titles_are_trimmed() {
+        publish_tab_title(usize::MAX, "  Users/tw93  ");
+        assert_eq!(
+            TAB_TITLES.lock().get(&usize::MAX).map(String::as_str),
+            Some("Users/tw93")
+        );
     }
 
     #[test]
