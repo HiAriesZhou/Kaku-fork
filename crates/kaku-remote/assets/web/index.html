@@ -23,8 +23,8 @@
   #bar .close:hover { opacity: 1; background: var(--line); }
   #bar .add { width: 26px; padding: 0; font-size: 16px; }
   #status { margin-left: auto; padding-left: 12px; color: var(--muted); white-space: nowrap; }
-  #stage { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
-  #term { padding: 8px; }
+  #stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+  #term { position: absolute; top: 8px; left: 8px; }
   #history { position: absolute; right: 16px; bottom: 16px; display: none; height: 28px; padding: 0 12px; border: 0; border-radius: 14px; background: var(--line); color: var(--fg); font: inherit; cursor: pointer; }
   #message { color: var(--muted); padding: 24px; text-align: center; line-height: 1.6; }
 </style>
@@ -131,50 +131,60 @@
   });
   term.open(termEl);
 
+  // The terminal sits at the top left with an 8px margin. Cell size comes
+  // from xterm.js, which re-measures synchronously when the font changes,
+  // so sizing needs no waiting for a frame and no guessing from a scaled font.
+  const MARGIN = 8;
+  const cellSize = () => {
+    const cell = term._core && term._core._renderService && term._core._renderService.dimensions.css.cell;
+    if (cell && cell.width && cell.height) return cell;
+    const screen = termEl.querySelector(".xterm-screen");
+    if (!screen || !term.cols) return null;
+    const rect = screen.getBoundingClientRect();
+    return { width: rect.width / term.cols, height: rect.height / term.rows };
+  };
+  const setFont = (px) => {
+    if (Math.abs(px - fontSize) < 0.05) return;
+    fontSize = px;
+    term.options.fontSize = px;
+  };
+
   // Ask Kaku to size the tab to the grid this window holds at Kaku's font
   // size. The Mac takes the tab back on its next local input, and the page
   // claims it again on its own next input.
   let claimed = "";
-  const claimGrid = () => {
-    const screen = termEl.querySelector(".xterm-screen");
-    if (!screen || !size.cols || !ws || ws.readyState !== WebSocket.OPEN) return;
-    const rect = screen.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const k = baseFontSize / fontSize;
-    const cols = Math.floor((stage.clientWidth - 16) / (rect.width / size.cols * k));
-    const rows = Math.floor((stage.clientHeight - 16) / (rect.height / size.rows * k));
-    if (cols < 20 || rows < 5) return;
-    const key = cols + "x" + rows;
-    if (key === claimed) return;
-    claimed = key;
-    send({ type: "resize", cols, rows });
-  };
-
-  // Until Kaku applies that size, shrink the font so the current grid still
-  // fits. xterm.js re-measures cells on the next frame, so step once per
-  // frame until the size settles instead of measuring a stale layout.
-  let fitSteps = 0;
-  const fitStep = () => {
-    const screen = termEl.querySelector(".xterm-screen");
-    if (!screen || !size.cols) return;
-    const rect = screen.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const scale = Math.min((stage.clientWidth - 16) / rect.width, (stage.clientHeight - 16) / rect.height);
-    const next = Math.max(6, Math.min(baseFontSize, Math.floor(fontSize * scale * 10) / 10));
-    if (Math.abs(next - fontSize) < 0.1 || ++fitSteps > 6) {
-      claimGrid();
-      return;
+  const fit = () => {
+    const availW = stage.clientWidth - MARGIN * 2;
+    const availH = stage.clientHeight - MARGIN * 2;
+    if (availW <= 0 || availH <= 0) return;
+    setFont(baseFontSize);
+    const base = cellSize();
+    if (!base) return;
+    if (ws && ws.readyState === WebSocket.OPEN && paneId !== null) {
+      const cols = Math.floor(availW / base.width);
+      const rows = Math.floor(availH / base.height);
+      const key = cols + "x" + rows;
+      if (cols >= 20 && rows >= 5 && key !== claimed) {
+        claimed = key;
+        send({ type: "resize", cols, rows });
+      }
     }
-    fontSize = next;
-    term.options.fontSize = fontSize;
-    requestAnimationFrame(fitStep);
+    // Until Kaku applies that size, the current grid may be larger than the
+    // window; shrink the font just enough for it to fit.
+    if (!size.cols) return;
+    let px = baseFontSize;
+    for (let i = 0; i < 40; i++) {
+      const cell = cellSize();
+      if (!cell || (size.cols * cell.width <= availW && size.rows * cell.height <= availH) || px <= 6) break;
+      const scale = Math.min(availW / (size.cols * cell.width), availH / (size.rows * cell.height));
+      px = Math.max(6, Math.min(px - 0.25, Math.floor(px * scale * 4) / 4));
+      setFont(px);
+    }
   };
-  const fit = () => { fitSteps = 0; requestAnimationFrame(fitStep); };
   let resizeTimer = 0;
   new ResizeObserver(() => {
-    fit();
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(fit, 150);
+    resizeTimer = setTimeout(fit, 100);
   }).observe(stage);
 
   // Keys that are not plain text go to Kaku, which encodes them for the
@@ -331,9 +341,13 @@
     }
     if (cfg.line_height) term.options.lineHeight = cfg.line_height;
     if (cfg.font_size) { baseFontSize = cfg.font_size; fontSize = baseFontSize; term.options.fontSize = fontSize; }
-    // Measure cells only once the bundled font is in, or the grid is sized
-    // against a fallback font.
-    document.fonts.load('16px "Kaku Mono"').finally(fit);
+    // xterm.js measures cells only when a font option changes, so once the
+    // bundled font is in, nudge the size to measure it instead of the
+    // fallback face it saw first; fit() then sets Kaku's size back.
+    document.fonts.load('16px "Kaku Mono"').finally(() => {
+      setFont(baseFontSize + 1);
+      fit();
+    });
   };
 
   const onFrame = (msg) => {
