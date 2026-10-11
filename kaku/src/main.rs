@@ -181,8 +181,15 @@ enum SubCommand {
     SetCwd(SetCwdCommand),
 
     #[cfg(feature = "remote")]
-    #[command(name = "remote", about = "Show QR code to connect Kaku iOS app")]
-    Remote,
+    #[command(
+        name = "remote",
+        about = "Show this Kaku's web link, to open its terminals from another device"
+    )]
+    Remote {
+        /// Replace the link; the old one stops working within seconds
+        #[arg(long)]
+        reset: bool,
+    },
 
     /// Generate shell completion information
     #[command(name = "shell-completion", hide = true)]
@@ -348,15 +355,23 @@ fn run() -> anyhow::Result<()> {
             cli::run_cli(&opts, cli)
         }
         #[cfg(feature = "remote")]
-        SubCommand::Remote => {
-            let state = kaku_remote::read_state()?;
-            let output = if let Some(relay) = &state.tunnel_relay {
-                kaku_remote::render_relay_qr_terminal(relay, &state.token)
+        SubCommand::Remote { reset } => {
+            let identity = if reset {
+                kaku_remote::reset_identity()?
             } else {
-                let host = lan_ip().unwrap_or_else(|| "127.0.0.1".to_string());
-                kaku_remote::render_qr_terminal(&host, state.port, &state.token)
+                kaku_remote::load_or_create_identity()?
             };
-            println!("{output}");
+            let state = kaku_remote::read_state()?;
+            let url = match &state.tunnel_relay {
+                Some(relay) => identity.link(relay),
+                // Without the relay the page is only reachable on this Mac,
+                // and its token changes with every Kaku launch.
+                None => format!("http://127.0.0.1:{}/#t={}", state.port, state.token),
+            };
+            println!("{}", kaku_remote::render_qr_terminal(&url));
+            if reset {
+                println!("The previous link stops working within a few seconds.");
+            }
             Ok(())
         }
         SubCommand::SetCwd(cmd) => cmd.run(),
@@ -664,12 +679,4 @@ fn resolve_gui_executable(exe_name: &str) -> anyhow::Result<PathBuf> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("unable to resolve GUI executable path"))
-}
-
-#[cfg(feature = "remote")]
-fn lan_ip() -> Option<String> {
-    use std::net::UdpSocket;
-    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:80").ok()?;
-    Some(sock.local_addr().ok()?.ip().to_string())
 }

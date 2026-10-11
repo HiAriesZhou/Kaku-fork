@@ -19,8 +19,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
+mod share;
 mod web;
 
+pub use share::{load_or_create_identity, reset_identity, ShareIdentity};
 pub use web::{publish_tab_title, set_tab_action_handler, TabAction, TabActionHandler};
 
 // ── Token ─────────────────────────────────────────────────────────────────────
@@ -129,8 +131,7 @@ fn dispatch_ai(req: AiRequest) {
     }
 }
 
-/// Session-shared state used by both the local WebSocket handler and the
-/// outbound relay tunnel to route AI messages without duplicating logic.
+/// Per-session state the iOS WebSocket handler uses to route AI messages.
 type CancelMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
 /// Start an AI chat for this session. Enforces MAX_INFLIGHT_AI per session.
@@ -229,7 +230,9 @@ struct WsQuery {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
     Input {
+        /// Sent by the iOS client; a LAN socket is bound to one pane.
         #[serde(default)]
+        #[allow(dead_code)]
         pane_id: Option<usize>,
         text: String,
     },
@@ -759,8 +762,8 @@ pub fn read_state() -> anyhow::Result<RemoteState> {
     serde_json::from_str(&data).context("invalid state file")
 }
 
-pub fn render_qr_terminal(host: &str, port: u16, token: &str) -> String {
-    let url = format!("kakuremote://{}:{}?token={}", host, port, token);
+/// A QR code for `url`, drawn with block characters, followed by the url.
+pub fn render_qr_terminal(url: &str) -> String {
     let qr = match QrCode::new(url.as_bytes()) {
         Ok(q) => q,
         Err(_) => return "Failed to generate QR code".to_string(),
@@ -772,211 +775,6 @@ pub fn render_qr_terminal(host: &str, port: u16, token: &str) -> String {
         .quiet_zone(false)
         .build();
     format!("{}\n{}", rendered.trim_end(), url)
-}
-
-// ── Relay tunnel ──────────────────────────────────────────────────────────────
-
-/// Render a TUI QR code for the relay connection URL.
-/// URL scheme: `kakuremote://relay?server=<host>&token=<token>`
-pub fn render_relay_qr_terminal(relay_server: &str, token: &str) -> String {
-    let host = relay_server
-        .trim_start_matches("wss://")
-        .trim_start_matches("ws://");
-    let url = format!("kakuremote://relay?server={}&token={}", host, token);
-    let qr = match QrCode::new(url.as_bytes()) {
-        Ok(q) => q,
-        Err(_) => return "Failed to generate QR code".to_string(),
-    };
-    let rendered = qr
-        .render::<qrcode::render::unicode::Dense1x2>()
-        .dark_color(qrcode::render::unicode::Dense1x2::Dark)
-        .light_color(qrcode::render::unicode::Dense1x2::Light)
-        .quiet_zone(false)
-        .build();
-    format!("{}\n{}", rendered.trim_end(), url)
-}
-
-/// Start the outbound relay tunnel. Spawns a dedicated thread with its own
-/// tokio runtime that maintains a persistent WSS connection to the relay host
-/// endpoint, forwarding pane screen updates and routing client input back.
-pub fn start_tunnel(tunnel_url: String) {
-    let token = get_or_init_token().to_string();
-
-    // One broadcast channel for all pane updates; tunnel subscribes per session.
-    let (tx, _) = broadcast::channel::<ScreenUpdate>(128);
-    let tx = Arc::new(tx);
-    let tx_for_sub = tx.clone();
-
-    if let Some(mux) = Mux::try_get() {
-        // Throttle tunnel captures to CAPTURE_INTERVAL (16ms) per pane,
-        // matching the local WebSocket path, to avoid capturing on every
-        // PaneOutput event under high-throughput output.
-        let tunnel_throttle: PaneThrottle = Arc::new(Mutex::new(HashMap::new()));
-        mux.subscribe(move |notification| {
-            if let MuxNotification::PaneOutput(pane_id) = notification {
-                let pid: usize = (*pane_id).into();
-                if tx_for_sub.receiver_count() > 0 {
-                    {
-                        let mut times = tunnel_throttle.lock();
-                        let now = Instant::now();
-                        if let Some(last) = times.get(&pid) {
-                            if now.duration_since(*last) < CAPTURE_INTERVAL {
-                                return true;
-                            }
-                        }
-                        times.insert(pid, now);
-                    }
-                    if let Some(update) = capture_pane(pid) {
-                        if let Err(e) = tx_for_sub.send(update) {
-                            log::debug!("kaku-tunnel: failed to send update: {:?}", e);
-                        }
-                    }
-                }
-            }
-            true
-        });
-    }
-
-    std::thread::Builder::new()
-        .name("kaku-tunnel".to_string())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("kaku-tunnel tokio runtime");
-            rt.block_on(async move {
-                let host_url = format!("{}/h/{}", tunnel_url, token);
-                loop {
-                    let rx = tx.subscribe();
-                    log::info!("kaku-tunnel: connecting to {}", host_url);
-                    match run_tunnel_session(&host_url, rx).await {
-                        Ok(()) => log::info!("kaku-tunnel: session ended, reconnecting..."),
-                        Err(e) => {
-                            log::warn!("kaku-tunnel: error: {}, reconnecting in 5s", e)
-                        }
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                }
-            });
-        })
-        .expect("spawn kaku-tunnel thread");
-}
-
-async fn run_tunnel_session(
-    url: &str,
-    mut rx: broadcast::Receiver<ScreenUpdate>,
-) -> anyhow::Result<()> {
-    use tokio_tungstenite::connect_async;
-    use tokio_tungstenite::tungstenite::Message;
-
-    let (ws_stream, _) = connect_async(url).await.context("tunnel connect")?;
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
-
-    let (ai_tx, mut ai_rx) = mpsc::unbounded_channel::<AiEvent>();
-    let cancel_handles: CancelMap = Arc::new(Mutex::new(HashMap::new()));
-    let in_flight = Arc::new(AtomicUsize::new(0));
-
-    if let Some(mux) = Mux::try_get() {
-        for pane in mux.iter_panes() {
-            let pid: usize = pane.pane_id().into();
-            if let Some(update) = capture_pane(pid) {
-                let msg = ServerMsg::Screen(update);
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    ws_tx.send(Message::Text(json.into())).await?;
-                }
-            }
-        }
-    }
-
-    let cancel_handles_fwd = cancel_handles.clone();
-    let fwd = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                ai = ai_rx.recv() => {
-                    let Some(event) = ai else { break };
-                    if let AiEvent::AiDone { conversation_id }
-                        | AiEvent::AiError { conversation_id, .. } = &event
-                    {
-                        finish_ai_conversation(conversation_id, &cancel_handles_fwd);
-                    }
-                    let msg: ServerMsg = event.into();
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                recv = rx.recv() => {
-                    match recv {
-                        Ok(update) => {
-                            let msg = ServerMsg::Screen(update);
-                            if let Ok(json) = serde_json::to_string(&msg) {
-                                if ws_tx.send(Message::Text(json.into())).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            }
-        }
-    });
-
-    while let Some(msg) = ws_rx.next().await {
-        match msg? {
-            Message::Text(text) => match serde_json::from_str::<ClientMsg>(text.as_str()) {
-                Ok(ClientMsg::Input {
-                    pane_id,
-                    text: input,
-                }) => {
-                    if input.len() > MAX_INPUT_LEN {
-                        log::warn!(
-                            "kaku-tunnel: input too large ({} bytes), dropping",
-                            input.len()
-                        );
-                        continue;
-                    }
-                    if let Some(mux) = Mux::try_get() {
-                        let target = pane_id
-                            .and_then(|id| mux.get_pane(mux::pane::PaneId::from(id)))
-                            .or_else(|| mux.iter_panes().into_iter().next());
-                        if let Some(pane) = target {
-                            if let Err(e) = pane.writer().write_all(input.as_bytes()) {
-                                log::debug!("kaku-remote: failed to write to pane: {}", e);
-                            }
-                        }
-                    }
-                }
-                Ok(ClientMsg::Scroll { .. }) => {}
-                Ok(ClientMsg::AiChat {
-                    conversation_id,
-                    content,
-                    attach_pane,
-                }) => {
-                    dispatch_ai_chat(
-                        conversation_id,
-                        content,
-                        attach_pane,
-                        &ai_tx,
-                        &cancel_handles,
-                        &in_flight,
-                    );
-                }
-                Ok(ClientMsg::AiCancel { conversation_id }) => {
-                    cancel_ai_conversation(&conversation_id, &cancel_handles);
-                }
-                Err(e) => log::debug!("kaku-tunnel: unknown message: {}", e),
-            },
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-
-    fwd.abort();
-    Ok(())
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -996,7 +794,7 @@ pub fn start() {
     let tunnel_url = cfg.remote.tunnel_url.clone();
     let token = get_or_init_token();
 
-    log::info!("kaku-remote: starting on {}:{} token={}", bind, port, token);
+    log::info!("kaku-remote: starting on {}:{}", bind, port);
 
     let pane_senders: PaneSenders = Arc::new(Mutex::new(HashMap::new()));
     let senders_for_sub = pane_senders.clone();
@@ -1028,10 +826,6 @@ pub fn start() {
         });
     }
 
-    if tunnel {
-        start_tunnel(tunnel_url.clone());
-    }
-
     let tunnel_relay_opt: Option<String> = if tunnel { Some(tunnel_url) } else { None };
     std::thread::Builder::new()
         .name("kaku-remote".to_string())
@@ -1044,6 +838,9 @@ pub fn start() {
 
             rt.block_on(async move {
                 let state = AppState { pane_senders };
+                if let Some(relay_url) = tunnel_relay_opt.clone() {
+                    tokio::spawn(share::run(relay_url, web_dirty.clone()));
+                }
 
                 let web_routes = Router::new()
                     .route("/", get(web::route_index))

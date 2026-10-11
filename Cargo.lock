@@ -3035,6 +3035,7 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "config",
  "fastrand",
  "futures-util",
@@ -3044,6 +3045,7 @@ dependencies = [
  "parking_lot",
  "promise",
  "qrcode",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
