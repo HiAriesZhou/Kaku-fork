@@ -767,11 +767,7 @@ async fn handle_local_ws(socket: ws::WebSocket, dirty: WebDirty) {
     });
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
-            ws::Message::Text(text) => {
-                if in_tx.send(text.to_string()).await.is_err() {
-                    break;
-                }
-            }
+            ws::Message::Text(text) if in_tx.send(text.to_string()).await.is_err() => break,
             ws::Message::Close(_) => break,
             _ => {}
         }
