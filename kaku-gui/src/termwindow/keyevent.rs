@@ -526,6 +526,10 @@ impl super::TermWindow {
     }
 
     pub fn raw_key_event_impl(&mut self, key: RawKeyEvent, context: &dyn WindowOps) {
+        #[cfg(feature = "remote")]
+        if key.key_is_down {
+            self.reclaim_active_tab_size();
+        }
         // The leader key is a kind of modal modifier key.
         // It is allowed to be active for up to the leader timeout duration,
         // after which it auto-deactivates.

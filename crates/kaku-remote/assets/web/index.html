@@ -72,9 +72,28 @@
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   };
 
-  // Scale the font so the Mac pane's exact grid fits the browser window.
-  // xterm.js re-measures cells on the next frame, so step once per frame
-  // until the size settles instead of measuring a stale layout.
+  // Ask Kaku to size the tab to the grid this window holds at Kaku's font
+  // size. The Mac takes the tab back on its next local input, and the page
+  // claims it again on its own next input.
+  let claimed = "";
+  const claimGrid = () => {
+    const screen = termEl.querySelector(".xterm-screen");
+    if (!screen || !size.cols || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const rect = screen.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const k = baseFontSize / fontSize;
+    const cols = Math.floor((stage.clientWidth - 16) / (rect.width / size.cols * k));
+    const rows = Math.floor((stage.clientHeight - 16) / (rect.height / size.rows * k));
+    if (cols < 20 || rows < 5) return;
+    const key = cols + "x" + rows;
+    if (key === claimed) return;
+    claimed = key;
+    send({ type: "resize", cols, rows });
+  };
+
+  // Until Kaku applies that size, shrink the font so the current grid still
+  // fits. xterm.js re-measures cells on the next frame, so step once per
+  // frame until the size settles instead of measuring a stale layout.
   let fitSteps = 0;
   const fitStep = () => {
     const screen = termEl.querySelector(".xterm-screen");
@@ -83,13 +102,21 @@
     if (!rect.width || !rect.height) return;
     const scale = Math.min((stage.clientWidth - 16) / rect.width, (stage.clientHeight - 16) / rect.height);
     const next = Math.max(6, Math.min(baseFontSize, Math.floor(fontSize * scale * 10) / 10));
-    if (Math.abs(next - fontSize) < 0.1 || ++fitSteps > 6) return;
+    if (Math.abs(next - fontSize) < 0.1 || ++fitSteps > 6) {
+      claimGrid();
+      return;
+    }
     fontSize = next;
     term.options.fontSize = fontSize;
     requestAnimationFrame(fitStep);
   };
   const fit = () => { fitSteps = 0; requestAnimationFrame(fitStep); };
-  new ResizeObserver(fit).observe(stage);
+  let resizeTimer = 0;
+  new ResizeObserver(() => {
+    fit();
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(fit, 150);
+  }).observe(stage);
 
   // Keys that are not plain text go to Kaku, which encodes them for the
   // pane's current modes. Plain characters and IME text arrive via onData.
@@ -171,6 +198,8 @@
     const id = tab.pane_id;
     paneId = id;
     tabId = tab.tab_id;
+    claimed = "";
+    size = { cols: 0, rows: 0 };
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     renderTabs();
     setStatus("Connecting");

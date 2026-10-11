@@ -25,6 +25,7 @@ use termwiz::color::ColorAttribute;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::{CursorShape, CursorVisibility};
 use tokio::sync::broadcast;
+use wezterm_term::TerminalSize;
 
 const INDEX_HTML: &str = include_str!("../assets/web/index.html");
 const XTERM_JS: &str = include_str!("../assets/web/xterm.js");
@@ -41,6 +42,10 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// title changes and resizes that do not produce `PaneOutput`.
 const IDLE_REFRESH: Duration = Duration::from_secs(1);
 const MAX_INPUT_LEN: usize = 65_536;
+const MIN_COLS: usize = 20;
+const MAX_COLS: usize = 500;
+const MIN_ROWS: usize = 5;
+const MAX_ROWS: usize = 300;
 
 /// Per-pane "something changed" signal fed by the mux subscriber.
 pub(crate) type WebDirty = Arc<Mutex<HashMap<usize, broadcast::Sender<()>>>>;
@@ -218,6 +223,13 @@ enum WebClientMsg {
     Scroll {
         lines: isize,
     },
+    /// The grid the browser can show at Kaku's font size. While the page is
+    /// driving the pane, its tab takes this size; local input on the Mac
+    /// takes it back.
+    Resize {
+        cols: usize,
+        rows: usize,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -240,6 +252,39 @@ enum WebServerMsg<'a> {
 #[derive(Clone, Copy, Default)]
 struct View {
     pinned_top: Option<isize>,
+    /// Grid size this browser asked for, re-applied on its next input in
+    /// case the Mac took the tab back meanwhile.
+    claimed: Option<(usize, usize)>,
+}
+
+/// Size the tab holding `pane_id` to the browser's grid. Runs on the GUI
+/// thread, where the window's own resizes happen.
+fn claim_tab_size(pane_id: usize, cols: usize, rows: usize) {
+    promise::spawn::spawn_into_main_thread(async move {
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        let Some((_, _, tab_id)) = mux.resolve_pane_id(PaneId::from(pane_id)) else {
+            return;
+        };
+        let Some(tab) = mux.get_tab(tab_id) else {
+            return;
+        };
+        let current = tab.get_size();
+        if current.cols == cols && current.rows == rows {
+            return;
+        }
+        let cell_width = current.pixel_width / current.cols.max(1);
+        let cell_height = current.pixel_height / current.rows.max(1);
+        tab.resize(TerminalSize {
+            rows,
+            cols,
+            pixel_width: cell_width * cols,
+            pixel_height: cell_height * rows,
+            dpi: current.dpi,
+        });
+    })
+    .detach();
 }
 
 struct Frame {
@@ -450,6 +495,15 @@ fn key_code(name: &str) -> Option<KeyCode> {
 }
 
 fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
+    let interactive = matches!(
+        msg,
+        WebClientMsg::Text { .. } | WebClientMsg::Key { .. } | WebClientMsg::Paste { .. }
+    );
+    if interactive {
+        if let Some((cols, rows)) = view.claimed {
+            claim_tab_size(pane.pane_id().into(), cols, rows);
+        }
+    }
     let result = match msg {
         WebClientMsg::Text { data } => {
             view.pinned_top = None;
@@ -494,6 +548,13 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             let current = view.pinned_top.unwrap_or(dims.physical_top);
             let top = (current - lines).clamp(dims.scrollback_top, dims.physical_top);
             view.pinned_top = (top < dims.physical_top).then_some(top);
+            Ok(())
+        }
+        WebClientMsg::Resize { cols, rows } => {
+            let cols = cols.clamp(MIN_COLS, MAX_COLS);
+            let rows = rows.clamp(MIN_ROWS, MAX_ROWS);
+            view.claimed = Some((cols, rows));
+            claim_tab_size(pane.pane_id().into(), cols, rows);
             Ok(())
         }
     };

@@ -778,6 +778,10 @@ impl super::TermWindow {
                 event.platform_click_count
             );
         }
+        #[cfg(feature = "remote")]
+        if matches!(event.kind, WMEK::Press(_)) {
+            self.reclaim_active_tab_size();
+        }
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,

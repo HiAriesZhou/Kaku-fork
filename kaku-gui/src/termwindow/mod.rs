@@ -1278,6 +1278,8 @@ impl TermWindow {
             // otherwise the exit-time session save skips it forever and the stale
             // last_session.json resurrects tabs the user already closed.
             crate::session_restore::forget_logically_closed(self.mux_window_id);
+            #[cfg(feature = "remote")]
+            self.reclaim_active_tab_size();
         }
         if !self.config.tab_bar_at_bottom && self.layout_is_effective_fullscreen() {
             self.arm_layout_sticky_fullscreen();
@@ -1419,6 +1421,20 @@ impl TermWindow {
 }
 
 impl TermWindow {
+    /// The web terminal sizes a tab to the browser while it is driving it.
+    /// Local input takes the tab back, so whichever side interacted last
+    /// decides the size.
+    #[cfg(feature = "remote")]
+    pub(crate) fn reclaim_active_tab_size(&mut self) {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        let size = tab.get_size();
+        if size.rows != self.terminal_size.rows || size.cols != self.terminal_size.cols {
+            tab.resize(self.terminal_size);
+        }
+    }
+
     fn arm_layout_sticky_fullscreen(&mut self) {
         if self.config.tab_bar_at_bottom {
             return;
