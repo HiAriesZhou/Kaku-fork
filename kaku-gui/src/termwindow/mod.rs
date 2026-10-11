@@ -681,6 +681,13 @@ pub enum MouseCapture {
 /// context of the window-specific event loop
 pub enum TermWindowNotif {
     InvalidateShapeCache,
+    /// Close one tab in place without switching to it. Sent by the web
+    /// terminal after the browser already asked per tab_close_confirmation,
+    /// since a prompt drawn here would only be visible on the Mac.
+    #[cfg(feature = "remote")]
+    CloseConfirmedTab {
+        tab_id: TabId,
+    },
     PerformAssignment {
         pane_id: PaneId,
         assignment: KeyAssignment,
@@ -2333,6 +2340,21 @@ impl TermWindow {
                 self.box_text_shape_cache.borrow_mut().clear();
                 self.invalidate_modal();
                 window.invalidate();
+            }
+            #[cfg(feature = "remote")]
+            TermWindowNotif::CloseConfirmedTab { tab_id } => {
+                let mux = Mux::get();
+                let in_this_window = mux
+                    .get_window(self.mux_window_id)
+                    .and_then(|w| w.idx_by_id(tab_id))
+                    .is_some();
+                if let (true, Some(tab)) = (in_this_window, mux.get_tab(tab_id)) {
+                    // Same bookkeeping as close_specific_tab, so Cmd+Shift+T
+                    // can reopen a tab closed from the browser.
+                    self.record_closed_tab_cwd(&tab);
+                    mux.remove_tab(tab_id);
+                    window.invalidate();
+                }
             }
             TermWindowNotif::PerformAssignment {
                 pane_id,

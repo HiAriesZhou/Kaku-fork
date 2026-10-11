@@ -11,14 +11,14 @@ use axum::extract::{ws, ConnectInfo, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
-use mux::pane::{Pane, PaneId};
+use mux::pane::{CloseReason, Pane, PaneId};
 use mux::Mux;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
 use termwiz::color::ColorAttribute;
@@ -55,6 +55,35 @@ pub(crate) type WebDirty = Arc<Mutex<HashMap<usize, broadcast::Sender<()>>>>;
 /// evaluate, so the page reuses its output instead of re-deriving a title.
 static TAB_TITLES: LazyLock<Mutex<HashMap<usize, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Tab changes the page asks for. The GUI performs them through the same
+/// key assignments as its own Cmd+T and Close Tab, so cwd inheritance and
+/// the closed-tab history behave as they do on the Mac.
+#[derive(Debug, Clone, Copy)]
+pub enum TabAction {
+    /// Open a tab in the window holding this pane.
+    New { pane_id: usize },
+    /// Close the tab holding this pane. The page has already asked per
+    /// tab_close_confirmation, so the Mac must not prompt again: its prompt
+    /// would only be visible on the Mac.
+    Close { pane_id: usize },
+}
+
+pub type TabActionHandler = Arc<dyn Fn(TabAction) + Send + Sync + 'static>;
+
+static TAB_ACTION_HANDLER: OnceLock<TabActionHandler> = OnceLock::new();
+
+/// Register the GUI's tab action handler. First registration wins.
+pub fn set_tab_action_handler(handler: TabActionHandler) {
+    let _ = TAB_ACTION_HANDLER.set(handler);
+}
+
+fn dispatch_tab_action(action: TabAction) {
+    match TAB_ACTION_HANDLER.get() {
+        Some(handler) => handler(action),
+        None => log::debug!("kaku-remote web: no tab action handler for {action:?}"),
+    }
+}
 
 /// Called by the GUI whenever it lays out the tab bar.
 pub fn publish_tab_title(tab_id: usize, title: &str) {
@@ -156,6 +185,8 @@ struct TabInfo {
     pane_id: usize,
     title: String,
     active: bool,
+    /// Whether closing should ask first, per tab_close_confirmation.
+    confirm_close: bool,
 }
 
 /// Tabs in tab bar order across windows, each pointing at its active pane.
@@ -166,10 +197,18 @@ pub(crate) async fn route_tabs(
     if !check_token(&query, &headers) {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
+    // The busy check consults the Lua config, which only the GUI thread may
+    // touch, so the whole snapshot is taken there.
+    let tabs = promise::spawn::spawn_into_main_thread(async { collect_tabs() }).await;
+    axum::Json(tabs).into_response()
+}
+
+fn collect_tabs() -> Vec<TabInfo> {
     let Some(mux) = Mux::try_get() else {
-        return axum::Json(Vec::<TabInfo>::new()).into_response();
+        return Vec::new();
     };
     let titles = TAB_TITLES.lock().clone();
+    let policy = config::configuration().tab_close_confirmation;
     let mut tabs = Vec::new();
     for window_id in mux.iter_windows() {
         let Some(window) = mux.get_window(window_id) else {
@@ -191,10 +230,12 @@ pub(crate) async fn route_tabs(
                 pane_id: pane.pane_id().into(),
                 title,
                 active: idx == active_idx,
+                confirm_close: policy
+                    .should_prompt(true, || tab.can_close_without_prompting(CloseReason::Tab)),
             });
         }
     }
-    axum::Json(tabs).into_response()
+    tabs
 }
 
 // ── Wire protocol ─────────────────────────────────────────────────────────────
@@ -229,6 +270,12 @@ enum WebClientMsg {
     Resize {
         cols: usize,
         rows: usize,
+    },
+    /// Open a tab next to the one being viewed.
+    NewTab,
+    /// Close a tab; the page has already confirmed with the user.
+    CloseTab {
+        tab_id: usize,
     },
 }
 
@@ -548,6 +595,23 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             let current = view.pinned_top.unwrap_or(dims.physical_top);
             let top = (current - lines).clamp(dims.scrollback_top, dims.physical_top);
             view.pinned_top = (top < dims.physical_top).then_some(top);
+            Ok(())
+        }
+        WebClientMsg::NewTab => {
+            dispatch_tab_action(TabAction::New {
+                pane_id: pane.pane_id().into(),
+            });
+            Ok(())
+        }
+        WebClientMsg::CloseTab { tab_id } => {
+            let target = Mux::try_get()
+                .and_then(|mux| mux.get_tab(mux::tab::TabId::from(tab_id)))
+                .and_then(|tab| tab.get_active_pane());
+            if let Some(target) = target {
+                dispatch_tab_action(TabAction::Close {
+                    pane_id: target.pane_id().into(),
+                });
+            }
             Ok(())
         }
         WebClientMsg::Resize { cols, rows } => {

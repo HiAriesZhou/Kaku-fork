@@ -15,6 +15,12 @@
   #bar button { flex: none; max-width: 220px; height: 26px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font: inherit; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
   #bar button:hover { background: var(--line); }
   #bar button[aria-current="true"] { background: var(--line); color: var(--fg); }
+  #bar .tab { display: flex; align-items: center; gap: 6px; padding-right: 6px; }
+  #bar .tab span:first-child { overflow: hidden; text-overflow: ellipsis; }
+  #bar .close { flex: none; width: 16px; height: 16px; line-height: 16px; border-radius: 4px; text-align: center; opacity: 0; }
+  #bar .tab:hover .close, #bar .tab[aria-current="true"] .close { opacity: 0.6; }
+  #bar .close:hover { opacity: 1; background: var(--line); }
+  #bar .add { width: 26px; padding: 0; font-size: 16px; }
   #status { margin-left: auto; padding-left: 12px; color: var(--muted); white-space: nowrap; }
   #stage { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
   #term { padding: 8px; }
@@ -218,16 +224,46 @@
   };
 
   let tabs = [];
+  // After asking for a new tab, follow it once it shows up, the way Cmd+T
+  // switches to the new tab on the Mac.
+  let followNewTab = null;
+  let followUntil = 0;
+  const refreshSoon = () => setTimeout(() => refreshPanes(false), 250);
   const renderTabs = () => {
     bar.querySelectorAll("button").forEach((b) => b.remove());
     for (const t of tabs) {
       const b = document.createElement("button");
       b.type = "button";
-      b.textContent = t.title || "Tab";
+      b.className = "tab";
       b.setAttribute("aria-current", String(t.tab_id === tabId));
+      const label = document.createElement("span");
+      label.textContent = t.title || "Tab";
+      const close = document.createElement("span");
+      close.className = "close";
+      close.textContent = "\u00d7";
+      close.title = "Close Tab";
+      close.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (t.confirm_close && !confirm("Close this tab?")) return;
+        send({ type: "close_tab", tab_id: t.tab_id });
+        refreshSoon();
+      });
+      b.append(label, close);
       b.addEventListener("click", () => { if (t.tab_id !== tabId) connect(t); else term.focus(); });
       bar.insertBefore(b, statusEl);
     }
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "add";
+    add.textContent = "+";
+    add.title = "New Tab";
+    add.addEventListener("click", () => {
+      followNewTab = new Set(tabs.map((t) => t.tab_id));
+      followUntil = Date.now() + 5000;
+      send({ type: "new_tab" });
+      refreshSoon();
+    });
+    bar.insertBefore(add, statusEl);
   };
 
   const refreshPanes = async (reconnect) => {
@@ -242,6 +278,16 @@
       setStatus("Kaku is not reachable");
       if (reconnect) setTimeout(() => refreshPanes(true), 3000);
       return;
+    }
+    if (followNewTab) {
+      const fresh = tabs.find((t) => !followNewTab.has(t.tab_id));
+      if (fresh) {
+        followNewTab = null;
+        connect(fresh);
+        return;
+      }
+      if (Date.now() < followUntil) refreshSoon();
+      else followNewTab = null;
     }
     const current = tabs.find((t) => t.tab_id === tabId);
     if (!current) {

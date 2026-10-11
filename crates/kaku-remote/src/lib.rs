@@ -21,7 +21,7 @@ use tokio::sync::{broadcast, mpsc};
 
 mod web;
 
-pub use web::publish_tab_title;
+pub use web::{publish_tab_title, set_tab_action_handler, TabAction, TabActionHandler};
 
 // ── Token ─────────────────────────────────────────────────────────────────────
 
