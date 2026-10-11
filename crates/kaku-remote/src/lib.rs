@@ -19,6 +19,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
+mod web;
+
 // ── Token ─────────────────────────────────────────────────────────────────────
 
 static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -993,11 +995,14 @@ pub fn start() {
     let senders_for_sub = pane_senders.clone();
     let pane_throttle: PaneThrottle = Arc::new(Mutex::new(HashMap::new()));
     let throttle_for_sub = pane_throttle.clone();
+    let web_dirty: web::WebDirty = Arc::new(Mutex::new(HashMap::new()));
+    let web_dirty_for_sub = web_dirty.clone();
 
     if let Some(mux) = Mux::try_get() {
         mux.subscribe(move |notification| {
             match notification {
                 MuxNotification::PaneOutput(pane_id) => {
+                    web::notify_output(&web_dirty_for_sub, (*pane_id).into());
                     on_pane_output(
                         (*pane_id).into(),
                         senders_for_sub.clone(),
@@ -1008,6 +1013,7 @@ pub fn start() {
                     let id: usize = (*pane_id).into();
                     senders_for_sub.lock().remove(&id);
                     throttle_for_sub.lock().remove(&id);
+                    web::pane_removed(&web_dirty_for_sub, id);
                 }
                 _ => {}
             }
@@ -1032,12 +1038,21 @@ pub fn start() {
             rt.block_on(async move {
                 let state = AppState { pane_senders };
 
+                let web_routes = Router::new()
+                    .route("/", get(web::route_index))
+                    .route("/link", get(web::route_link))
+                    .route("/assets/xterm.js", get(web::route_xterm_js))
+                    .route("/assets/xterm.css", get(web::route_xterm_css))
+                    .route("/web/ws/{pane_id}", get(web::route_ws))
+                    .with_state(web_dirty);
+
                 let app = Router::new()
                     .route("/api/config", get(route_config))
                     .route("/api/panes", get(route_panes))
                     .route("/qr", get(route_qr))
                     .route("/ws/{pane_id}", get(route_ws))
-                    .with_state(state);
+                    .with_state(state)
+                    .merge(web_routes);
 
                 let addr: SocketAddr = match format!("{}:{}", bind, port).parse() {
                     Ok(a) => a,

@@ -17,6 +17,7 @@ mux.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+termwiz.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
 tokio-tungstenite.workspace = true
 rustls.workspace = true

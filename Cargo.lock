@@ -3046,6 +3046,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "termwiz",
  "tokio",
  "tokio-tungstenite 0.26.2",
 ]
