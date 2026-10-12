@@ -857,11 +857,13 @@ pub fn start() {
                     .with_state(state)
                     .merge(web_routes);
 
+                // The relay link does not depend on the local listener, so a
+                // busy port must not take it down with this task.
                 let addr: SocketAddr = match format!("{}:{}", bind, port).parse() {
                     Ok(a) => a,
                     Err(e) => {
                         log::error!("kaku-remote: invalid bind address: {e}");
-                        return;
+                        return std::future::pending().await;
                     }
                 };
 
@@ -872,7 +874,7 @@ pub fn start() {
                     Ok(l) => l,
                     Err(e) => {
                         log::error!("kaku-remote: failed to bind {addr}: {e}");
-                        return;
+                        return std::future::pending().await;
                     }
                 };
                 if let Err(e) = axum::serve(

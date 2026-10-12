@@ -27,6 +27,12 @@ const FROM_HOST: &[u8] = b"kaku-web h2c";
 const KIND_DATA: u8 = 0;
 const KIND_ASSET: u8 = 1;
 const IDENTITY_CHECK: Duration = Duration::from_secs(3);
+/// Pings keep NATs and proxies from dropping an idle link, and their pongs
+/// prove the relay is still there.
+const KEEPALIVE: Duration = Duration::from_secs(20);
+/// With pings every 20s, this long without hearing from the relay means the
+/// link died without a close (sleep, network change); reconnect.
+const SILENCE_LIMIT: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 // ── Identity ──────────────────────────────────────────────────────────────────
@@ -236,7 +242,8 @@ async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> a
         "x-kaku-secret",
         identity.secret.parse().context("secret header")?,
     );
-    let (socket, _) = tokio_tungstenite::connect_async(request)
+    // Keystrokes and echoes are tiny frames; Nagle would hold them back.
+    let (socket, _) = tokio_tungstenite::connect_async_with_config(request, None, true)
         .await
         .context("connect to relay")?;
     log::info!("kaku-share: registered with relay as {id}");
@@ -256,6 +263,9 @@ async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> a
     let mut browsers: HashMap<u32, Browser> = HashMap::new();
     let mut identity_check = tokio::time::interval(IDENTITY_CHECK);
     identity_check.tick().await;
+    let mut keepalive = tokio::time::interval(KEEPALIVE);
+    keepalive.tick().await;
+    let mut last_heard = tokio::time::Instant::now();
 
     let result = loop {
         tokio::select! {
@@ -265,6 +275,7 @@ async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> a
                     Some(Err(e)) => break Err(anyhow::Error::from(e)),
                     None => break Ok(()),
                 };
+                last_heard = tokio::time::Instant::now();
                 match msg {
                     Message::Text(text) => match serde_json::from_str::<RelayMsg>(text.as_str()) {
                         Ok(RelayMsg::Open { c }) => {
@@ -305,6 +316,14 @@ async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> a
                     }
                     Message::Close(_) => break Ok(()),
                     _ => {}
+                }
+            }
+            _ = keepalive.tick() => {
+                if last_heard.elapsed() > SILENCE_LIMIT {
+                    break Err(anyhow::anyhow!("relay went silent"));
+                }
+                if to_relay.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break Ok(());
                 }
             }
             _ = identity_check.tick() => {
