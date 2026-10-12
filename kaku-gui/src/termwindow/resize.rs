@@ -11,7 +11,12 @@ use std::time::{Duration, SystemTime};
 use wezterm_font::FontConfiguration;
 use wezterm_term::TerminalSize;
 
-const FONT_SCALE_PTY_RESIZE_DEBOUNCE: Duration = Duration::from_millis(750);
+/// Like tmux's pane resize timer: during a font zoom the PTY hears the first
+/// step at once, then at most one (latest) size per window, so a burst of
+/// Cmd+= steps does not flood the app with SIGWINCH. The window is Ghostty's
+/// 25ms resize coalesce rather than tmux's 250ms: until the app is told, it
+/// keeps drawing frames for the old size into the already reflowed grid.
+const FONT_SCALE_PTY_RESIZE_THROTTLE: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowsAndCols {
@@ -19,17 +24,12 @@ pub struct RowsAndCols {
     pub cols: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Present while a font zoom is in progress for a window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DeferredFontScalePtyResize {
-    epoch: u64,
-    last_cells: RowsAndCols,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeferredFontScalePtyResizeAction {
-    Stale,
-    Remove,
-    Keep(DeferredFontScalePtyResize),
+    timer_running: bool,
+    /// A step reflowed the grid after the PTY was last told.
+    pending: bool,
 }
 
 static DEFERRED_FONT_SCALE_PTY_RESIZES: OnceLock<
@@ -40,18 +40,12 @@ fn deferred_font_scale_pty_resizes() -> &'static Mutex<HashMap<usize, DeferredFo
     DEFERRED_FONT_SCALE_PTY_RESIZES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn mark_deferred_font_scale_pty_resize(
-    window_id: usize,
-    current_cells: RowsAndCols,
-) -> DeferredFontScalePtyResize {
-    let mut deferred = deferred_font_scale_pty_resizes().lock().unwrap();
-    let prior = deferred.get(&window_id).copied();
-    let state = DeferredFontScalePtyResize {
-        epoch: prior.map(|state| state.epoch.wrapping_add(1)).unwrap_or(1),
-        last_cells: current_cells,
-    };
-    deferred.insert(window_id, state);
-    state
+fn mark_deferred_font_scale_pty_resize(window_id: usize) {
+    deferred_font_scale_pty_resizes()
+        .lock()
+        .unwrap()
+        .entry(window_id)
+        .or_default();
 }
 
 fn has_deferred_font_scale_pty_resize(window_id: usize) -> bool {
@@ -61,27 +55,34 @@ fn has_deferred_font_scale_pty_resize(window_id: usize) -> bool {
         .contains_key(&window_id)
 }
 
-fn finish_deferred_font_scale_pty_resize(
-    window_id: usize,
-    epoch: u64,
-    current_cells: RowsAndCols,
-) -> DeferredFontScalePtyResizeAction {
+/// Records a zoom step. Returns true when the PTY should be told now and the
+/// throttle timer started; otherwise the step waits for the timer.
+fn note_deferred_font_scale_pty_resize(window_id: usize) -> bool {
     let mut deferred = deferred_font_scale_pty_resizes().lock().unwrap();
-    match deferred.get(&window_id).copied() {
-        Some(state) if state.epoch == epoch => {
-            if state.last_cells != current_cells {
-                let next = DeferredFontScalePtyResize {
-                    epoch: state.epoch.wrapping_add(1),
-                    last_cells: current_cells,
-                };
-                deferred.insert(window_id, next);
-                DeferredFontScalePtyResizeAction::Keep(next)
-            } else {
-                deferred.remove(&window_id);
-                DeferredFontScalePtyResizeAction::Remove
-            }
+    let state = deferred.entry(window_id).or_default();
+    if state.timer_running {
+        state.pending = true;
+        false
+    } else {
+        state.timer_running = true;
+        true
+    }
+}
+
+/// Called when the throttle timer fires. Returns true when a step is waiting:
+/// the PTY should be told now and the timer restarted. Otherwise the zoom is
+/// over and the window leaves the deferred path.
+fn finish_deferred_font_scale_pty_resize(window_id: usize) -> bool {
+    let mut deferred = deferred_font_scale_pty_resizes().lock().unwrap();
+    match deferred.get_mut(&window_id) {
+        Some(state) if state.pending => {
+            state.pending = false;
+            true
         }
-        _ => DeferredFontScalePtyResizeAction::Stale,
+        _ => {
+            deferred.remove(&window_id);
+            false
+        }
     }
 }
 
@@ -92,12 +93,12 @@ pub(super) fn clear_deferred_font_scale_pty_resize(window_id: usize) {
         .remove(&window_id);
 }
 
-fn schedule_deferred_font_scale_pty_resize_epoch(window: &Window, epoch: u64) {
+fn schedule_deferred_font_scale_pty_resize_timer(window: &Window) {
     let window = window.clone();
     promise::spawn::spawn_into_main_thread(async move {
-        smol::Timer::after(FONT_SCALE_PTY_RESIZE_DEBOUNCE).await;
+        smol::Timer::after(FONT_SCALE_PTY_RESIZE_THROTTLE).await;
         window.notify(super::TermWindowNotif::Apply(Box::new(move |tw| {
-            tw.flush_deferred_font_scale_pty_resize(epoch);
+            tw.flush_deferred_font_scale_pty_resize();
         })));
     })
     .detach();
@@ -407,32 +408,20 @@ impl super::TermWindow {
     }
 
     fn schedule_deferred_font_scale_pty_resize(&mut self, window: &Window) {
-        let state =
-            mark_deferred_font_scale_pty_resize(self.mux_window_id, self.current_cell_dimensions());
-        schedule_deferred_font_scale_pty_resize_epoch(window, state.epoch);
+        if note_deferred_font_scale_pty_resize(self.mux_window_id) {
+            self.flush_all_pane_pty_sizes();
+            schedule_deferred_font_scale_pty_resize_timer(window);
+        }
     }
 
-    fn flush_deferred_font_scale_pty_resize(&mut self, epoch: u64) {
-        match finish_deferred_font_scale_pty_resize(
-            self.mux_window_id,
-            epoch,
-            self.current_cell_dimensions(),
-        ) {
-            DeferredFontScalePtyResizeAction::Keep(next) => {
-                if let Some(window) = self.window.as_ref() {
-                    schedule_deferred_font_scale_pty_resize_epoch(window, next.epoch);
-                }
+    fn flush_deferred_font_scale_pty_resize(&mut self) {
+        // The deferred path reflowed the grids via resize_visual, so the PTY
+        // has not seen the latest size yet.
+        if finish_deferred_font_scale_pty_resize(self.mux_window_id) {
+            self.flush_all_pane_pty_sizes();
+            if let Some(window) = self.window.as_ref() {
+                schedule_deferred_font_scale_pty_resize_timer(window);
             }
-            DeferredFontScalePtyResizeAction::Remove => {
-                // Cells have stabilized after the font-scale debounce. The defer
-                // path only updated split-tree geometry via resize_visual, so the
-                // PTY never saw the post-scale size. Emit one final SIGWINCH now,
-                // mirroring the live-resize flush, so the shell learns the new
-                // pixel geometry (and the row/col count when the window was
-                // clamped at the screen edge or the WM is tiling).
-                self.flush_all_pane_pty_sizes();
-            }
-            DeferredFontScalePtyResizeAction::Stale => {}
         }
     }
 
@@ -754,6 +743,20 @@ impl super::TermWindow {
                 } else {
                     tab.resize(size);
                 }
+                if defer_font_scale_pty_resize {
+                    // Unlike a live drag, zoom steps are discrete, so reflow each
+                    // pane's grid now or the old rows/cols render at the new cell
+                    // size until the PTY is told, which is throttled below.
+                    for pos in tab.iter_panes() {
+                        let _ = pos.pane.resize_visual(TerminalSize {
+                            rows: pos.height,
+                            cols: pos.width,
+                            pixel_width: pos.pixel_width,
+                            pixel_height: pos.pixel_height,
+                            dpi: size.dpi,
+                        });
+                    }
+                }
             }
             for tab in window.iter() {
                 for pos in tab.iter_panes_ignoring_zoom() {
@@ -919,7 +922,7 @@ impl super::TermWindow {
     /// the `adjust_window_size_when_changing_font_size` configuration and
     /// revises the scaling/resize change accordingly
     pub fn adjust_font_scale(&mut self, font_scale: f64, window: &Window) {
-        mark_deferred_font_scale_pty_resize(self.mux_window_id, self.current_cell_dimensions());
+        mark_deferred_font_scale_pty_resize(self.mux_window_id);
 
         let adjust_window_size_when_changing_font_size =
             match self.config.adjust_window_size_when_changing_font_size {
@@ -1343,11 +1346,10 @@ mod tests {
         clear_deferred_font_scale_pty_resize, effective_top_padding,
         effective_vertical_padding_with_policy, finish_deferred_font_scale_pty_resize,
         has_deferred_font_scale_pty_resize, mark_deferred_font_scale_pty_resize,
-        rebalance_top_padding_for_bottom_gap, should_defer_screen_change_scale_update,
-        should_normalize_fullscreen_state_on_resize,
+        note_deferred_font_scale_pty_resize, rebalance_top_padding_for_bottom_gap,
+        should_defer_screen_change_scale_update, should_normalize_fullscreen_state_on_resize,
         should_preserve_terminal_cells_on_scale_change,
         should_rebalance_top_tab_visible_bottom_gap, user_custom_window_padding_config_path,
-        DeferredFontScalePtyResizeAction, RowsAndCols,
     };
     use config::{Config, ConfigHandle, DimensionContext};
     use std::path::PathBuf;
@@ -1368,77 +1370,42 @@ mod tests {
     }
 
     #[test]
-    fn deferred_font_scale_resize_keeps_visual_only_until_cells_stabilize() {
+    fn deferred_font_scale_resize_throttles_pty_like_tmux() {
         let window_id = usize::MAX - 407;
         clear_deferred_font_scale_pty_resize(window_id);
 
-        let first = mark_deferred_font_scale_pty_resize(
-            window_id,
-            RowsAndCols {
-                rows: 39,
-                cols: 177,
-            },
-        );
-        let second = mark_deferred_font_scale_pty_resize(
-            window_id,
-            RowsAndCols {
-                rows: 35,
-                cols: 168,
-            },
-        );
-
-        assert!(has_deferred_font_scale_pty_resize(window_id));
-        assert_eq!(second.epoch, first.epoch + 1);
-        assert_eq!(
-            second.last_cells,
-            RowsAndCols {
-                rows: 35,
-                cols: 168
-            }
-        );
-
-        assert_eq!(
-            finish_deferred_font_scale_pty_resize(
-                window_id,
-                first.epoch,
-                RowsAndCols {
-                    rows: 35,
-                    cols: 168,
-                },
-            ),
-            DeferredFontScalePtyResizeAction::Stale
-        );
-        assert_eq!(
-            finish_deferred_font_scale_pty_resize(
-                window_id,
-                second.epoch,
-                RowsAndCols {
-                    rows: 30,
-                    cols: 135,
-                },
-            ),
-            DeferredFontScalePtyResizeAction::Keep(super::DeferredFontScalePtyResize {
-                epoch: second.epoch + 1,
-                last_cells: RowsAndCols {
-                    rows: 30,
-                    cols: 135
-                }
-            })
-        );
+        mark_deferred_font_scale_pty_resize(window_id);
         assert!(has_deferred_font_scale_pty_resize(window_id));
 
-        assert_eq!(
-            finish_deferred_font_scale_pty_resize(
-                window_id,
-                second.epoch + 1,
-                RowsAndCols {
-                    rows: 30,
-                    cols: 135,
-                },
-            ),
-            DeferredFontScalePtyResizeAction::Remove
-        );
+        // First step reaches the PTY at once; steps inside the window coalesce.
+        assert!(note_deferred_font_scale_pty_resize(window_id));
+        assert!(!note_deferred_font_scale_pty_resize(window_id));
+        assert!(!note_deferred_font_scale_pty_resize(window_id));
+
+        // Timer: the waiting step is sent and the window stays open.
+        assert!(finish_deferred_font_scale_pty_resize(window_id));
+        assert!(has_deferred_font_scale_pty_resize(window_id));
+
+        // Timer with nothing new: the zoom is over.
+        assert!(!finish_deferred_font_scale_pty_resize(window_id));
         assert!(!has_deferred_font_scale_pty_resize(window_id));
+    }
+
+    #[test]
+    fn deferred_font_scale_resize_reflows_pane_grids_without_pty() {
+        // Each Cmd+/- step must resize every pane's terminal state, or the old
+        // grid renders at the new cell size until the debounce flush.
+        let source = include_str!("resize.rs");
+        let body = source.split("pub fn apply_dimensions(").nth(1).unwrap();
+        let body = body.split("\n    }\n").next().unwrap();
+        let branch = body
+            .split("if defer_font_scale_pty_resize {")
+            .nth(1)
+            .unwrap();
+        let branch = branch.split("for tab in window.iter()").next().unwrap();
+        assert!(branch.contains("tab.iter_panes()"));
+        assert!(branch.contains("pos.pane.resize_visual("));
+        assert!(!branch.contains("pos.pane.resize("));
     }
 
     fn effective_vertical_padding(
