@@ -443,8 +443,31 @@ impl Shown {
             || self.scrolled != frame.scrolled;
         let mut data = String::from("\x1b[?25l");
         let mut changed = false;
+        // Scrolling, and output that pushes rows up, move most of the screen
+        // without changing it. Let the browser move what it already has and
+        // send only the rows that are new, instead of every row again.
+        let moved = if full {
+            0
+        } else {
+            row_shift(&self.lines, &frame.lines)
+        };
+        if moved != 0 {
+            let _ = write!(
+                data,
+                "\x1b[0m\x1b[{}{}",
+                moved.unsigned_abs(),
+                if moved > 0 { 'S' } else { 'T' }
+            );
+            changed = true;
+        }
         for (idx, line) in frame.lines.iter().enumerate() {
-            if full || self.lines.get(idx) != Some(line) {
+            let before = if full {
+                None
+            } else {
+                idx.checked_add_signed(moved)
+                    .and_then(|i| self.lines.get(i))
+            };
+            if before.map(|old| row_body(old)) != Some(row_body(line)) {
                 data.push_str(line);
                 changed = true;
             }
@@ -459,6 +482,49 @@ impl Shown {
         self.cursor.clone_from(&frame.cursor);
         self.lines.clone_from(&frame.lines);
         Some((frame, data))
+    }
+}
+
+/// A row without its leading cursor position, so a row that moved compares
+/// equal to where it was.
+fn row_body(line: &str) -> &str {
+    line.strip_prefix("\x1b[")
+        .and_then(|rest| rest.find('H').map(|i| &rest[i + 1..]))
+        .unwrap_or(line)
+}
+
+/// How many rows the screen content moved: positive when it moved up (new
+/// output, or scrolling toward the bottom), negative when it moved down.
+/// Zero unless the move reuses more rows than leaving everything in place.
+fn row_shift(old: &[String], new: &[String]) -> isize {
+    let rows = new.len();
+    if old.len() != rows || rows < 4 {
+        return 0;
+    }
+    let reused = |shift: isize| {
+        (0..rows)
+            .filter(|&i| {
+                i.checked_add_signed(shift)
+                    .and_then(|j| old.get(j))
+                    .is_some_and(|o| row_body(o) == row_body(&new[i]))
+            })
+            .count()
+    };
+    let in_place = reused(0);
+    let mut best = (0, in_place);
+    for k in 1..=(rows / 2) as isize {
+        for shift in [k, -k] {
+            let n = reused(shift);
+            if n > best.1 {
+                best = (shift, n);
+            }
+        }
+    }
+    // A move costs one short sequence; worth it once it saves a few rows.
+    if best.1 >= in_place + 2 {
+        best.0
+    } else {
+        0
     }
 }
 
@@ -963,6 +1029,100 @@ mod tests {
 
         let (_, resized) = shown.update(frame(12, &["A", "X", "C"], "@2")).unwrap();
         assert_eq!(resized, "\x1b[?25lAXC@2", "a resize redraws everything");
+    }
+
+    /// Rows as render_frame writes them: each carries its own position.
+    fn rows(texts: &[&str]) -> Vec<String> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("\x1b[{};1H{t}", i + 1))
+            .collect()
+    }
+
+    /// Applies what Shown sends to a model of the browser screen: row
+    /// positions, scroll up (S) and scroll down (T) with blank rows coming in.
+    fn apply(screen: &mut [String], data: &str) {
+        let mut rest = data;
+        while let Some(at) = rest.find("\x1b[") {
+            rest = &rest[at + 2..];
+            let end = rest.find(|c: char| c.is_ascii_alphabetic()).unwrap();
+            let (params, cmd) = (&rest[..end], &rest[end..=end]);
+            rest = &rest[end + 1..];
+            let n: usize = params.split(';').next().unwrap().parse().unwrap_or(1);
+            match cmd {
+                "S" => {
+                    screen.rotate_left(n);
+                    let len = screen.len();
+                    screen[len - n..].iter_mut().for_each(String::clear);
+                }
+                "T" => {
+                    screen.rotate_right(n);
+                    screen[..n].iter_mut().for_each(String::clear);
+                }
+                "H" if params.ends_with(";1") => {
+                    let text = rest.split("\x1b[").next().unwrap();
+                    screen[n - 1] = text.to_string();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn moved_rows_are_scrolled_not_resent() {
+        let texts = ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"];
+        let mut shown = Shown::default();
+        let mut screen = vec![String::new(); 8];
+        let (_, first) = shown
+            .update(Frame {
+                lines: rows(&texts),
+                ..frame(10, &[], "")
+            })
+            .unwrap();
+        apply(&mut screen, &first);
+
+        // Two new lines of output push everything up.
+        let up = ["l3", "l4", "l5", "l6", "l7", "l8", "n1", "n2"];
+        let (_, data) = shown
+            .update(Frame {
+                lines: rows(&up),
+                ..frame(10, &[], "")
+            })
+            .unwrap();
+        assert!(data.contains("\x1b[2S"), "scrolls up by two: {data:?}");
+        assert_eq!(data.matches(";1H").count(), 2, "sends only the new rows");
+        apply(&mut screen, &data);
+        assert_eq!(screen, up);
+
+        // Scrolling back into history moves it down again, with a row edited.
+        let down = ["l1", "l2", "l3", "l4", "X5", "l6", "l7", "l8"];
+        let (_, data) = shown
+            .update(Frame {
+                lines: rows(&down),
+                ..frame(10, &[], "")
+            })
+            .unwrap();
+        assert!(data.contains("\x1b[2T"), "scrolls down by two: {data:?}");
+        assert_eq!(data.matches(";1H").count(), 3);
+        apply(&mut screen, &data);
+        assert_eq!(screen, down);
+    }
+
+    #[test]
+    fn unrelated_screens_are_not_treated_as_moved() {
+        let mut shown = Shown::default();
+        shown.update(Frame {
+            lines: rows(&["a", "b", "c", "d", "e", "f"]),
+            ..frame(10, &[], "")
+        });
+        let (_, data) = shown
+            .update(Frame {
+                lines: rows(&["u", "v", "w", "x", "y", "z"]),
+                ..frame(10, &[], "")
+            })
+            .unwrap();
+        assert!(!data.contains('S') && !data.contains('T'), "{data:?}");
     }
 
     #[test]

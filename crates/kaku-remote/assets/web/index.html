@@ -292,7 +292,17 @@
     if (data) send({ type: "paste", data });
   }, true);
 
+  // A trackpad fires about 60 wheel events a second. Sum them and send at
+  // most one scroll per animation frame, so a fling is a few messages rather
+  // than a queue the remote Mac keeps answering after the fingers stop.
   let wheelRemainder = 0;
+  let wheelPending = 0;
+  let wheelFrame = 0;
+  const flushWheel = () => {
+    wheelFrame = 0;
+    if (wheelPending !== 0) send({ type: "scroll", lines: wheelPending });
+    wheelPending = 0;
+  };
   stage.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
@@ -302,7 +312,8 @@
     const lines = Math.trunc(wheelRemainder);
     if (lines !== 0) {
       wheelRemainder -= lines;
-      send({ type: "scroll", lines });
+      wheelPending += lines;
+      if (!wheelFrame) wheelFrame = requestAnimationFrame(flushWheel);
     }
   }, { passive: false, capture: true });
 

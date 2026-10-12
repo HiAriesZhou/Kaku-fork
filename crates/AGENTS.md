@@ -31,6 +31,7 @@ Key groups:
 - Anything that reads the Lua config (for example `can_close_without_prompting`) must run on the GUI thread via `promise::spawn::spawn_into_main_thread`; calling it from the server's tokio threads panics.
 - Relay ids are the first 128 bits of SHA-256 of a secret that never leaves the Mac, so a link holder cannot register as that Mac. Messages are AES-256-GCM sealed with the key from the link fragment, with direction labels so a frame cannot be reflected. The relay forwards bytes it cannot read and fetches the page's files from the Mac, so the page always matches the Kaku build.
 - Each web session holds `awake::Awake`, a latency-critical `NSProcessInfo` activity. Without it, App Nap throttles the backgrounded GUI's main thread, which turns PTY output into the pane change the session renders from, and every echo waited 100-200 ms. Measure remote input latency with the Kaku window hidden, not focused.
+- `Shown::update` turns a screen whose rows moved into `CSI n S` / `CSI n T` plus the new rows. That relies on each row starting with its own `CSI row;1H` and on the page never setting a scroll region; keep both, or the browser's copy drifts from Kaku's.
 - One link per Kaku, persisted at `DATA_DIR/remote-share.json` (0600). `kaku remote --reset` rotates it; the running bridge notices within seconds and re-registers, which retires the old link.
 
 ## Cross-References
