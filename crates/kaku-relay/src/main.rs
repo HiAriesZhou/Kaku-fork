@@ -71,6 +71,17 @@ fn owns(id: &str, secret: &str) -> bool {
     expected == id
 }
 
+/// The fly edge that accepted the connection, so latency can be reasoned
+/// about from logs: a Mac and its browsers entering far apart cost a long
+/// hop per keystroke. Only the region code is recorded.
+fn edge(headers: &HeaderMap) -> String {
+    headers
+        .get("fly-region")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string()
+}
+
 fn valid_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -95,10 +106,10 @@ async fn host_ws(
     }
     upgrade
         .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| serve_host(socket, id, state))
+        .on_upgrade(move |socket| serve_host(socket, id, edge(&headers), state))
 }
 
-async fn serve_host(socket: ws::WebSocket, id: String, state: AppState) {
+async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppState) {
     let (mut sink, mut stream) = socket.split();
     let (to_host, mut outgoing) = mpsc::channel::<ws::Message>(QUEUE);
     let host = Arc::new(Host {
@@ -112,7 +123,7 @@ async fn serve_host(socket: ws::WebSocket, id: String, state: AppState) {
     if let Some(old) = state.hosts.lock().insert(id.clone(), host.clone()) {
         old.browsers.lock().clear();
     }
-    info!("host {} registered", short(&id));
+    info!("host {} registered via edge {}", short(&id), edge);
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = outgoing.recv().await {
@@ -280,6 +291,7 @@ async fn page_asset(
 async fn browser_ws(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     upgrade: ws::WebSocketUpgrade,
 ) -> Response {
     let Some(host) = state.host(&id) else {
@@ -290,7 +302,14 @@ async fn browser_ws(
     }
     upgrade
         .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| serve_browser(socket, host))
+        .on_upgrade(move |socket| async move {
+            info!(
+                "browser joined host {} via edge {}",
+                short(&id),
+                edge(&headers)
+            );
+            serve_browser(socket, host).await
+        })
 }
 
 async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>) {
