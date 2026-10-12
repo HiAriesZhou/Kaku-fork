@@ -219,9 +219,21 @@ struct ConfigInfo {
     line_height: f64,
     /// Where Kaku draws its tab bar, so the page puts its tabs there too.
     tab_bar_at_bottom: bool,
+    /// Kaku's tab bar colors, so the page's tabs look like the window's.
+    tab_bar: Option<TabBarInfo>,
     /// Capability flags for the iOS client. Currently emits "ai_chat" when an
     /// AI handler is registered at boot.
     features: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TabBarInfo {
+    background: Option<String>,
+    active_bg: Option<String>,
+    active_fg: Option<String>,
+    inactive_fg: Option<String>,
+    hover_bg: Option<String>,
+    hover_fg: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -429,6 +441,20 @@ fn config_info() -> ConfigInfo {
         font_size: cfg.font_size,
         line_height: cfg.line_height,
         tab_bar_at_bottom: cfg.tab_bar_at_bottom,
+        tab_bar: palette.tab_bar.as_ref().map(|bar| TabBarInfo {
+            background: opt_hex(bar.background.as_ref()),
+            active_bg: bar.active_tab.as_ref().map(|t| rgba_to_hex(&t.bg_color)),
+            active_fg: bar.active_tab.as_ref().map(|t| rgba_to_hex(&t.fg_color)),
+            inactive_fg: bar.inactive_tab.as_ref().map(|t| rgba_to_hex(&t.fg_color)),
+            hover_bg: bar
+                .inactive_tab_hover
+                .as_ref()
+                .map(|t| rgba_to_hex(&t.bg_color)),
+            hover_fg: bar
+                .inactive_tab_hover
+                .as_ref()
+                .map(|t| rgba_to_hex(&t.fg_color)),
+        }),
         features,
     }
 }

@@ -34,6 +34,7 @@ const XTERM_CSS: &str = include_str!("../assets/web/xterm.css");
 // the dark-theme weights in the bundled kaku.lua.
 const FONT_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
 const FONT_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Medium.ttf");
+const ICON_PNG: &[u8] = include_bytes!("../assets/web/icon.png");
 
 /// Frames are coalesced to this interval; the trailing edge always flushes,
 /// so the last output of a burst is never dropped.
@@ -117,6 +118,7 @@ pub(crate) fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
         "assets/xterm.css" => ("text/css; charset=utf-8", XTERM_CSS.as_bytes()),
         "assets/font-regular.ttf" => ("font/ttf", FONT_REGULAR),
         "assets/font-medium.ttf" => ("font/ttf", FONT_MEDIUM),
+        "assets/icon.png" => ("image/png", ICON_PNG),
         _ => return None,
     })
 }

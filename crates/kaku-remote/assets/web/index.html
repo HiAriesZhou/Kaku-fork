@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="referrer" content="no-referrer">
 <title>Kaku</title>
+<link rel="icon" type="image/png" href="assets/icon.png">
+<link rel="apple-touch-icon" href="assets/icon.png">
 <link rel="stylesheet" href="assets/xterm.css">
 <style>
   @font-face { font-family: "Kaku Mono"; src: url("assets/font-regular.ttf") format("truetype"); font-weight: 400; }
@@ -16,18 +18,22 @@
      against Kaku's own window that drew about 35% more ink than Kaku does.
      Grayscale antialiasing lands within a few percent of it. */
   body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
-  body.tabs-bottom #bar { order: 2; border-bottom: 0; border-top: 1px solid var(--line); }
-  #bar { display: flex; align-items: center; gap: 2px; height: 34px; padding: 0 10px; border-bottom: 1px solid var(--line); flex: none; overflow-x: auto; }
-  #bar button { flex: none; max-width: 220px; height: 26px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font: inherit; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
-  #bar button:hover { background: var(--line); }
-  #bar button[aria-current="true"] { background: var(--line); color: var(--fg); }
-  #bar .tab { display: flex; align-items: center; gap: 6px; padding-right: 6px; }
+  /* The tab bar follows Kaku's own: monospace titles, the active tab as a
+     filled block in Kaku's tab colors, no rule between it and the terminal. */
+  :root { --mono: "Kaku Mono", monospace; --bar-bg: var(--bg); --tab-fg: var(--muted); --tab-active-bg: rgba(255,255,255,0.08); --tab-active-fg: var(--fg); --tab-hover-bg: rgba(255,255,255,0.05); --tab-hover-fg: var(--fg); }
+  body.tabs-bottom #bar { order: 2; }
+  #bar { display: flex; align-items: stretch; height: 30px; padding: 0; background: var(--bar-bg); flex: none; overflow-x: auto; scrollbar-width: none; font: 13px var(--mono); }
+  #bar::-webkit-scrollbar { display: none; }
+  #bar button { flex: none; max-width: 240px; height: auto; padding: 0 12px; border: 0; border-radius: 0; background: transparent; color: var(--tab-fg); font: inherit; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; outline: none; }
+  #bar button:hover { background: var(--tab-hover-bg); color: var(--tab-hover-fg); }
+  #bar button[aria-current="true"] { background: var(--tab-active-bg); color: var(--tab-active-fg); font-weight: 700; }
+  #bar button:focus-visible { box-shadow: inset 0 0 0 1px var(--tab-fg); }
+  #bar .tab { display: flex; align-items: center; gap: 8px; padding-right: 6px; }
   #bar .tab span:first-child { overflow: hidden; text-overflow: ellipsis; }
-  #bar .close { flex: none; width: 16px; height: 16px; line-height: 16px; border-radius: 4px; text-align: center; opacity: 0; }
-  #bar .tab:hover .close, #bar .tab[aria-current="true"] .close { opacity: 0.6; }
-  #bar .close:hover { opacity: 1; background: var(--line); }
-  #bar .add { width: 26px; padding: 0; font-size: 16px; }
-  #status { margin-left: auto; padding-left: 12px; color: var(--muted); white-space: nowrap; }
+  #bar .close { flex: none; width: 18px; height: 18px; line-height: 18px; border-radius: 4px; text-align: center; font-weight: 400; opacity: 0; }
+  #bar .tab:hover .close, #bar .tab[aria-current="true"] .close { opacity: 0.55; }
+  #bar .close:hover { opacity: 1; background: var(--tab-hover-bg); }
+  #bar .add { width: 32px; padding: 0; font-size: 15px; }
   #stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
   /* Chrome squeezes runs of CJK punctuation by default. xterm.js measures a
      glyph as 32 copies in a row, so it read "，" as half width while rows draw
@@ -36,15 +42,32 @@
      both places. */
   .xterm, .xterm * { text-spacing-trim: space-all; }
   #term { position: absolute; top: 8px; left: 8px; }
-  #history { position: absolute; right: 16px; bottom: 16px; display: none; height: 28px; padding: 0 12px; border: 0; border-radius: 14px; background: var(--line); color: var(--fg); font: inherit; cursor: pointer; }
+  #history { position: absolute; right: 16px; bottom: 16px; display: none; height: 28px; padding: 0 12px; border: 0; border-radius: 14px; background: var(--tab-active-bg); color: var(--tab-active-fg); font: inherit; cursor: pointer; }
   #message { color: var(--muted); padding: 24px; text-align: center; line-height: 1.6; }
+  /* Connection state, over the terminal: dimmed while the screen is stale. */
+  #notice { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 24px; text-align: center; pointer-events: none; }
+  #notice.show { display: flex; }
+  #notice .title { color: var(--fg); font-size: 15px; }
+  #notice .detail { color: var(--muted); font-size: 13px; }
+  #term { transition: opacity 0.2s; }
+  body.stale #term { opacity: 0.3; }
+  /* In-page confirmation instead of the browser's own dialog. */
+  #dialog { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.45); z-index: 10; }
+  #dialog.show { display: flex; }
+  #dialog .card { width: min(320px, calc(100vw - 32px)); padding: 20px; border-radius: 12px; background: var(--bg); box-shadow: 0 0 0 1px var(--line), 0 12px 40px rgba(0,0,0,0.4); }
+  #dialog .title { font-size: 15px; color: var(--fg); }
+  #dialog .detail { margin-top: 6px; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+  #dialog button { height: 30px; padding: 0 14px; border: 0; border-radius: 6px; font: inherit; cursor: pointer; background: var(--line); color: var(--fg); }
+  #dialog button.primary { background: var(--tab-active-bg); color: var(--tab-active-fg); font-weight: 600; }
+  #dialog button:focus-visible { box-shadow: 0 0 0 2px var(--muted); outline: none; }
   /* Phones and tablets: a key row for what touch keyboards lack, finger-size
      targets, room for the home indicator, and a 16px input so iOS does not
      zoom the page when the keyboard opens. */
   #keys { display: none; }
   body.touch { box-sizing: border-box; padding-bottom: env(safe-area-inset-bottom); }
   body.touch #bar { height: 44px; }
-  body.touch #bar button { height: 36px; }
+  body.touch #dialog button { height: 40px; }
   body.touch #bar .close { width: 28px; height: 28px; line-height: 28px; opacity: 0.6; }
   body.touch #bar .add { width: 36px; }
   body.touch #keys { display: flex; order: 3; flex: none; gap: 6px; padding: 6px 8px; overflow-x: auto; border-top: 1px solid var(--line); }
@@ -64,7 +87,9 @@
 <div id="stage">
   <div id="term"></div>
   <button id="history" type="button">Back to live</button>
+  <div id="notice"><div class="title"></div><div class="detail"></div></div>
 </div>
+<div id="dialog" role="dialog" aria-modal="true"><div class="card"><div class="title">Close this tab?</div><div class="detail"></div><div class="actions"><button type="button" data-act="cancel">Cancel</button><button type="button" class="primary" data-act="ok">Close Tab</button></div></div></div>
 <div id="keys"></div>
 <script src="assets/xterm.js"></script>
 <script>
@@ -147,7 +172,7 @@
       const bytes = new Uint8Array(data);
       const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12), additionalData: FROM_HOST }, key, bytes.slice(12));
       handle(JSON.parse(dec.decode(plain)));
-    }).catch(() => setStatus("This link is no longer valid"));
+    }).catch(() => setNotice("This link no longer works", "Get the current link from Kaku on the Mac.", { stale: true }));
   };
 
   // ── Terminal ───────────────────────────────────────────────────────────
@@ -162,7 +187,23 @@
   let size = { cols: 0, rows: 0 };
   let retry = 0;
 
-  const setStatus = (text) => { statusEl.textContent = text; };
+  // What the page tells the user about the link, over the terminal. A stale
+  // screen dims so it does not pass for a live one.
+  const noticeEl = document.getElementById("notice");
+  let noticeTimer = 0;
+  let everConnected = false;
+  const setNotice = (title, detail = "", { stale = false, delay = 0 } = {}) => {
+    clearTimeout(noticeTimer);
+    const apply = () => {
+      noticeEl.querySelector(".title").textContent = title;
+      noticeEl.querySelector(".detail").textContent = detail;
+      noticeEl.classList.toggle("show", !!title);
+      document.body.classList.toggle("stale", !!title && stale);
+    };
+    if (delay && title) noticeTimer = setTimeout(apply, delay);
+    else apply();
+  };
+  const clearNotice = () => setNotice("");
 
   // Kaku's own fallback order (JetBrains Mono, PingFang SC, Apple Symbols,
   // Apple Color Emoji), then the Windows equivalents for CJK and emoji.
@@ -555,6 +596,34 @@
     term.focus();
   };
 
+  // Close confirmation in the page's own style: Enter closes, Esc cancels.
+  const dialogEl = document.getElementById("dialog");
+  let dialogDone = null;
+  const askClose = (title) => new Promise((resolve) => {
+    if (dialogDone) dialogDone(false);
+    dialogEl.querySelector(".detail").textContent = title;
+    dialogEl.classList.add("show");
+    dialogDone = (ok) => {
+      dialogDone = null;
+      dialogEl.classList.remove("show");
+      term.focus();
+      resolve(ok);
+    };
+    dialogEl.querySelector('[data-act="ok"]').focus();
+  });
+  dialogEl.addEventListener("click", (ev) => {
+    if (!dialogDone) return;
+    const act = ev.target.closest("[data-act]");
+    if (act) dialogDone(act.dataset.act === "ok");
+    else if (ev.target === dialogEl) dialogDone(false);
+  });
+  dialogEl.addEventListener("keydown", (ev) => {
+    if (!dialogDone) return;
+    if (ev.key === "Escape") { ev.preventDefault(); dialogDone(false); }
+    else if (ev.key === "Enter") { ev.preventDefault(); dialogDone(ev.target.dataset.act !== "cancel"); }
+    ev.stopPropagation();
+  }, true);
+
   const renderTabs = () => {
     bar.querySelectorAll("button").forEach((b) => b.remove());
     for (const t of tabs) {
@@ -570,8 +639,9 @@
       close.title = "Close Tab";
       close.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        if (t.confirm_close && !confirm("Close this tab?")) return;
-        send({ type: "close_tab", tab_id: t.tab_id });
+        const go = () => send({ type: "close_tab", tab_id: t.tab_id });
+        if (t.confirm_close) askClose(t.title || "Tab").then((ok) => { if (ok) go(); });
+        else go();
       });
       b.append(label, close);
       b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t); else term.focus(); });
@@ -603,7 +673,7 @@
       try { saved = Number(localStorage.getItem("kaku.tab")); } catch (_) {}
       const target = tabs.find((t) => t.tab_id === saved) || tabs.find((t) => t.active) || tabs[0];
       if (target) attach(target);
-      else { renderTabs(); setStatus("No tabs"); }
+      else { renderTabs(); setNotice("No tabs open", "Open one with the + button."); }
     } else if (current.pane_id !== paneId) {
       // Follow the tab when focus moves to another split on the Mac.
       attach(current);
@@ -627,6 +697,13 @@
     }
     if (cfg.line_height) term.options.lineHeight = cfg.line_height;
     document.body.classList.toggle("tabs-bottom", !!cfg.tab_bar_at_bottom);
+    const root = document.documentElement.style;
+    root.setProperty("--mono", term.options.fontFamily);
+    const bar = cfg.tab_bar || {};
+    for (const [name, value] of [["--bar-bg", bar.background], ["--tab-active-bg", bar.active_bg], ["--tab-active-fg", bar.active_fg],
+      ["--tab-fg", bar.inactive_fg], ["--tab-hover-bg", bar.hover_bg], ["--tab-hover-fg", bar.hover_fg]]) {
+      if (value) root.setProperty(name, value);
+    }
     // One pixel under Kaku's size reads closer to the native window.
     if (cfg.font_size) { baseFontSize = Math.max(8, cfg.font_size - 1); fontSize = baseFontSize; term.options.fontSize = fontSize; }
     // xterm.js measures cells only when a font option changes, so once the
@@ -682,10 +759,25 @@
     send({ type: "ping" });
   }, 20000);
 
+  // Through the relay the page's own address answers 404 while the Mac's
+  // Kaku is not connected, and fails outright without a network.
+  const explainOffline = () => {
+    if (!keyPromise) {
+      setNotice("Kaku is not running", "This page reconnects when it is back.", { stale: true });
+      return;
+    }
+    fetch(location.pathname, { method: "HEAD", cache: "no-store" }).then((res) => {
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+      if (res.status === 404) setNotice("Kaku on the Mac is offline", "This page reconnects when it is back.", { stale: true });
+    }).catch(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+      setNotice("No connection", "Check this device's network. Retrying.", { stale: true });
+    });
+  };
   let reconnectTimer = 0;
   const connect = () => {
     clearTimeout(reconnectTimer);
-    setStatus("Connecting");
+    if (!everConnected) setNotice("Connecting to Kaku", "", { delay: 400 });
     const socket = new WebSocket(wsUrl());
     socket.binaryType = "arraybuffer";
     ws = socket;
@@ -695,7 +787,8 @@
     recvChain = Promise.resolve();
     socket.onopen = () => {
       retry = 0;
-      setStatus("");
+      everConnected = true;
+      clearNotice();
       // Through the relay, Kaku starts the session only after this first
       // message opens with the key.
       if (keyPromise) send({ type: "hello" });
@@ -705,8 +798,10 @@
     socket.onmessage = (ev) => { lastHeard = Date.now(); receive(ev.data, handle); };
     socket.onclose = (ev) => {
       if (ws !== socket) return;
-      if (ev.code === 4404) setStatus("This Kaku is offline");
-      else setStatus("Disconnected, retrying");
+      // A quick blip reconnects before anyone notices; say something only if
+      // it lasts, and after a few failures say why when the page can tell.
+      setNotice("Reconnecting", "", { stale: true, delay: retry ? 0 : 800 });
+      if (retry >= 2) explainOffline();
       claimed = "";
       const delay = Math.min(5000, 500 * 2 ** retry++);
       reconnectTimer = setTimeout(connect, delay);
