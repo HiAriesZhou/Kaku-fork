@@ -70,6 +70,10 @@ pub enum TabAction {
     /// tab_close_confirmation, so the Mac must not prompt again: its prompt
     /// would only be visible on the Mac.
     Close { pane_id: usize },
+    /// The browser is looking at this pane: clear its unread bell, which the
+    /// Mac only clears when its own window takes focus, and so never while
+    /// the Mac sits unattended.
+    Seen { pane_id: usize },
 }
 
 pub type TabActionHandler = Arc<dyn Fn(TabAction) + Send + Sync + 'static>;
@@ -255,6 +259,13 @@ enum WebClientMsg {
     Scroll {
         lines: isize,
     },
+    /// A left click on a cell of the visible screen. Only a program that
+    /// asked for the mouse (Claude Code's "Jump to bottom", Codex) gets it;
+    /// otherwise a click is the browser's, for selecting text.
+    Click {
+        x: usize,
+        y: usize,
+    },
     /// The grid the browser can show at Kaku's font size. While the page is
     /// driving the pane, its tab takes this size; local input on the Mac
     /// takes it back.
@@ -306,6 +317,21 @@ struct View {
     /// Grid size this browser asked for, re-applied on its next input in
     /// case the Mac took the tab back meanwhile.
     claimed: Option<(usize, usize)>,
+    /// When the pane was last reported as seen, to report at most once a
+    /// second while typing.
+    seen_at: Option<std::time::Instant>,
+}
+
+fn mark_seen(pane_id: usize, view: &mut View) {
+    let now = std::time::Instant::now();
+    if view
+        .seen_at
+        .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+    {
+        return;
+    }
+    view.seen_at = Some(now);
+    dispatch_tab_action(TabAction::Seen { pane_id });
 }
 
 /// Size the tab holding `pane_id` to the browser's grid. Runs on the GUI
@@ -666,12 +692,16 @@ fn key_code(name: &str) -> Option<KeyCode> {
 fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
     let interactive = matches!(
         msg,
-        WebClientMsg::Text { .. } | WebClientMsg::Key { .. } | WebClientMsg::Paste { .. }
+        WebClientMsg::Text { .. }
+            | WebClientMsg::Key { .. }
+            | WebClientMsg::Paste { .. }
+            | WebClientMsg::Click { .. }
     );
     if interactive {
         if let Some((cols, rows)) = view.claimed {
             claim_tab_size(pane.pane_id().into(), cols, rows);
         }
+        mark_seen(pane.pane_id().into(), view);
     }
     let result = match msg {
         WebClientMsg::Text { data } => {
@@ -732,6 +762,28 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
                     x_pixel_offset: 0,
                     y_pixel_offset: 0,
                     button,
+                    modifiers: Modifiers::NONE,
+                });
+                if result.is_err() {
+                    break;
+                }
+            }
+            result
+        }
+        WebClientMsg::Click { x, y } => {
+            if !pane.is_mouse_grabbed() {
+                return;
+            }
+            let dims = pane.get_dimensions();
+            let mut result = Ok(());
+            for kind in [MouseEventKind::Press, MouseEventKind::Release] {
+                result = pane.mouse_event(MouseEvent {
+                    kind,
+                    x: x.min(dims.cols.saturating_sub(1)),
+                    y: y.min(dims.viewport_rows.saturating_sub(1)) as i64,
+                    x_pixel_offset: 0,
+                    y_pixel_offset: 0,
+                    button: MouseButton::Left,
                     modifiers: Modifiers::NONE,
                 });
                 if result.is_err() {
@@ -864,6 +916,8 @@ pub(crate) async fn run_session(
                     attached = Some(pane_id);
                     updates = Some(subscribe(&dirty, pane_id));
                     view.pinned_top = None;
+                    view.seen_at = None;
+                    mark_seen(pane_id, &mut view);
                     shown = Shown::default();
                     dirty_frame = true;
                     continue;

@@ -1431,6 +1431,25 @@ impl TermWindow {
     /// The web terminal sizes a tab to the browser while it is driving it.
     /// Local input takes the tab back, so whichever side interacted last
     /// decides the size.
+    /// The web terminal is showing this pane: clear its unread bell as
+    /// window focus does, so the tab's dot and the Dock count go away even
+    /// though this window never takes focus while the Mac is unattended.
+    #[cfg(feature = "remote")]
+    pub(crate) fn mark_pane_seen(&mut self, pane_id: PaneId) {
+        let mut state = self.pane_state(pane_id);
+        state.has_unread_notification = false;
+        if !state.has_unread_bell {
+            return;
+        }
+        state.has_unread_bell = false;
+        drop(state);
+        front_end().adjust_unread_bell_count(-1);
+        self.update_title();
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
     #[cfg(feature = "remote")]
     pub(crate) fn reclaim_active_tab_size(&mut self) {
         let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
@@ -2513,6 +2532,11 @@ impl TermWindow {
                     // Update global Dock badge count
                     if should_mark_unread {
                         front_end().adjust_unread_bell_count(1);
+                        // The web terminal reads tab titles from the title
+                        // pass, which a repaint alone does not run, so the
+                        // bell dot would only show there on some later event.
+                        #[cfg(feature = "remote")]
+                        self.update_title();
                     }
 
                     // Show macOS system notification when window is not focused
