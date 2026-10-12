@@ -28,16 +28,19 @@
      or the close mark while the pointer is over the tab, as Kaku's own tab
      bar uses its trailing cell. The mark never covers the title, never sits
      on the edge, and the dot leaving does not resize the tab. */
-  #bar .tab { position: relative; display: flex; align-items: center; padding: 0 var(--tab-pad, 18px); }
+  #bar .tab { position: relative; display: flex; align-items: center; padding: 0 var(--tab-pad, 14px); }
   #bar .tab span:first-child { overflow: hidden; text-overflow: ellipsis; }
-  #bar .slot { position: absolute; top: 0; right: 0; bottom: 0; width: var(--tab-pad, 18px); }
+  #bar .slot { position: absolute; top: 0; right: 0; bottom: 0; width: var(--tab-pad, 14px); }
   #bar .dot, #bar .close { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; transition: opacity 0.15s; }
   #bar .dot::after { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--dot, #daae76); }
   #bar .dot.in { animation: dot-in 0.25s ease-out; }
   #bar .dot.out { animation: dot-out 0.3s ease-in forwards; }
   @keyframes dot-in { from { opacity: 0; transform: scale(0.4); } }
   @keyframes dot-out { to { opacity: 0; transform: scale(0.4); } }
-  #bar .close { inset: 50% auto auto 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 4px; font-size: 13px; line-height: 1; font-weight: 400; opacity: 0; pointer-events: none; }
+  /* Drawn, not a font glyph: a glyph sits on the text baseline and reads
+     off-center; the icon is centered in its box exactly. */
+  #bar .close { inset: 50% auto auto 50%; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 3px; opacity: 0; pointer-events: none; }
+  #bar .close svg { width: 8px; height: 8px; }
   #bar .tab:hover .dot { opacity: 0; }
   #bar .tab:hover .close { opacity: 0.7; pointer-events: auto; }
   #bar .close:hover { opacity: 1; background: var(--tab-hover-bg); }
@@ -81,7 +84,8 @@
   body.touch #bar { height: 44px; }
   body.touch #dialog button { height: 40px; }
   body.touch #bar { --tab-pad: 24px; }
-  body.touch #bar .close { width: 22px; height: 22px; margin: -11px 0 0 -12px; font-size: 16px; }
+  body.touch #bar .close { width: 20px; height: 20px; margin: -10px 0 0 -11px; }
+  body.touch #bar .close svg { width: 10px; height: 10px; }
   body.touch #bar .tab[aria-current="true"] .dot { opacity: 0; }
   body.touch #bar .tab[aria-current="true"] .close { opacity: 0.7; pointer-events: auto; }
   body.touch #bar .add { width: 36px; }
@@ -329,6 +333,9 @@
   // in case the Mac took it back meanwhile.
   const reclaim = () => { claimed = ""; fit(); };
   window.addEventListener("focus", reclaim);
+  // A press anywhere on the page means this side is in use, as a click in
+  // the Mac window is for the Mac.
+  document.addEventListener("pointerdown", reclaim, true);
 
   // Keys that are not plain text go to Kaku, which encodes them for the
   // pane's current modes. Plain characters and IME text arrive via onData.
@@ -653,6 +660,15 @@
 
   // What each tab last looked like, so switching back draws it at once and
   // the Mac's fresh frame, a network round trip later, only corrects it.
+  // Resize, then reset. Growing xterm.js's rows with no scrollback leaves its
+  // buffer one line short of the viewport (baseY 1 over rows+0 lines), so
+  // the last row took no writes and kept stale text: the ghost rows seen
+  // while scrolling on a phone. A reset clears that; what follows a size
+  // change is always a full frame (or a snapshot), so nothing is lost.
+  const resizeTerm = (cols, rows) => {
+    term.resize(cols, rows);
+    term.reset();
+  };
   const snapshots = new Map();
   const NO_WRAP = "\x1b[?7l";
   const sgrColor = (cell, fg) => {
@@ -708,7 +724,7 @@
     const saved = snapshots.get(paneId);
     if (saved) {
       size = { cols: saved.cols, rows: saved.rows };
-      term.resize(saved.cols, saved.rows);
+      resizeTerm(saved.cols, saved.rows);
       fit();
       term.write(NO_WRAP + "\x1b[?25l\x1b[0m\x1b[2J" + saved.data);
     }
@@ -802,7 +818,7 @@
       label.textContent = attention ? title.slice(0, -1).trimEnd() : title;
       const close = document.createElement("span");
       close.className = "close";
-      close.textContent = "×";
+      close.innerHTML = '<svg viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M1 1l6 6M7 1L1 7"/></svg>';
       close.title = "Close Tab";
       close.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -900,7 +916,7 @@
     document.body.classList.add("drawn");
     if (msg.cols !== size.cols || msg.rows !== size.rows) {
       size = { cols: msg.cols, rows: msg.rows };
-      term.resize(msg.cols, msg.rows);
+      resizeTerm(msg.cols, msg.rows);
       fit();
     }
     // Autowrap off first: each row is placed by position, so a row that
