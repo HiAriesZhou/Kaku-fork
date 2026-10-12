@@ -51,13 +51,43 @@ struct Host {
 
 #[derive(Clone, Default)]
 struct AppState {
-    hosts: Arc<Mutex<HashMap<String, Arc<Host>>>>,
+    /// Every connected registration per id; the last one serves browsers.
+    /// Two Kakus can share an identity (a second instance on the same Mac):
+    /// when the newer one leaves, the older one, still connected, takes over
+    /// instead of the link reading offline while a Kaku is running.
+    hosts: Arc<Mutex<HashMap<String, Vec<Arc<Host>>>>>,
     generation: Arc<AtomicU64>,
 }
 
 impl AppState {
     fn host(&self, id: &str) -> Option<Arc<Host>> {
-        self.hosts.lock().get(id).cloned()
+        self.hosts
+            .lock()
+            .get(id)
+            .and_then(|all| all.last().cloned())
+    }
+
+    /// Make `host` the one serving `id`; returns the one it displaced.
+    fn register(&self, id: &str, host: Arc<Host>) -> Option<Arc<Host>> {
+        let mut hosts = self.hosts.lock();
+        let all = hosts.entry(id.to_string()).or_default();
+        let displaced = all.last().cloned();
+        all.push(host);
+        displaced
+    }
+
+    /// Drop this registration; returns how many remain for `id`.
+    fn unregister(&self, id: &str, generation: u64) -> usize {
+        let mut hosts = self.hosts.lock();
+        let Some(all) = hosts.get_mut(id) else {
+            return 0;
+        };
+        all.retain(|h| h.generation != generation);
+        let left = all.len();
+        if left == 0 {
+            hosts.remove(id);
+        }
+        left
     }
 }
 
@@ -173,8 +203,9 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
         assets: Mutex::new(HashMap::new()),
         next_id: AtomicU32::new(1),
     });
-    // The newest registration wins; the old one's browsers are dropped.
-    if let Some(old) = state.hosts.lock().insert(id.clone(), host.clone()) {
+    // The newest registration serves; the previous one stays connected as a
+    // standby, and its browsers reconnect to this one.
+    if let Some(old) = state.register(&id, host.clone()) {
         old.browsers.lock().clear();
     }
     info!("host {} registered via edge {}", short(&id), edge);
@@ -229,16 +260,16 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
     }
 
     writer.abort();
-    let mut hosts = state.hosts.lock();
-    if hosts
-        .get(&id)
-        .is_some_and(|current| current.generation == host.generation)
-    {
-        hosts.remove(&id);
-    }
-    drop(hosts);
+    let left = state.unregister(&id, host.generation);
     host.browsers.lock().clear();
-    info!("host {} gone", short(&id));
+    if left > 0 {
+        info!(
+            "host {} gone, an earlier registration takes over",
+            short(&id)
+        );
+    } else {
+        info!("host {} gone", short(&id));
+    }
 }
 
 fn parse_asset(payload: Bytes) -> Option<Asset> {
@@ -495,6 +526,37 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_host(state: &AppState) -> Arc<Host> {
+        let (to_host, _rx) = mpsc::channel(1);
+        Arc::new(Host {
+            generation: state.generation.fetch_add(1, Ordering::Relaxed),
+            to_host,
+            browsers: Mutex::new(HashMap::new()),
+            assets: Mutex::new(HashMap::new()),
+            next_id: AtomicU32::new(1),
+        })
+    }
+
+    #[test]
+    fn an_earlier_host_takes_over_when_the_newer_one_leaves() {
+        let state = AppState::default();
+        let first = test_host(&state);
+        let second = test_host(&state);
+        assert!(state.register("id", first.clone()).is_none());
+        let displaced = state
+            .register("id", second.clone())
+            .expect("first displaced");
+        assert_eq!(displaced.generation, first.generation);
+        assert_eq!(state.host("id").unwrap().generation, second.generation);
+
+        // The newer Kaku quits: the first, still connected, serves again.
+        assert_eq!(state.unregister("id", second.generation), 1);
+        assert_eq!(state.host("id").unwrap().generation, first.generation);
+
+        assert_eq!(state.unregister("id", first.generation), 0);
+        assert!(state.host("id").is_none());
+    }
 
     #[test]
     fn device_names_browser_and_os_only() {
