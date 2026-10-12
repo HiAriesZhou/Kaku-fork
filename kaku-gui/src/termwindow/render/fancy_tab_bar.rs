@@ -115,12 +115,7 @@ impl crate::TermWindow {
             let active_tab = colors.active_tab();
 
             match item.item {
-                // The retro bar draws the close control; the fancy bar builds its
-                // own via make_x_button, so this entry never reaches here.
-                TabBarItem::RightStatus
-                | TabBarItem::LeftStatus
-                | TabBarItem::None
-                | TabBarItem::CloseTabButton { .. } => element
+                TabBarItem::RightStatus | TabBarItem::LeftStatus | TabBarItem::None => element
                     .item_type(UIItemType::TabBar(TabBarItem::None))
                     .line_height(Some(1.75))
                     .margin(BoxDimension {

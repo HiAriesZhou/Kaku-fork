@@ -1545,10 +1545,6 @@ impl super::TermWindow {
                         }
                         self.start_tab_drag(tab_idx, event.clone());
                     }
-                    TabBarItem::CloseTabButton { tab_idx } => {
-                        self.tab_drag_state = None;
-                        self.close_specific_tab(tab_idx, true);
-                    }
                     TabBarItem::NewTabButton { .. } => {
                         self.tab_drag_state = None;
                         self.do_new_tab_button_click(MousePress::Left);
@@ -1610,10 +1606,6 @@ impl super::TermWindow {
                     self.tab_drag_state = None;
                     self.close_specific_tab(tab_idx, true);
                 }
-                TabBarItem::CloseTabButton { tab_idx } => {
-                    self.tab_drag_state = None;
-                    self.close_specific_tab(tab_idx, true);
-                }
                 TabBarItem::NewTabButton { .. } => {
                     self.tab_drag_state = None;
                     self.do_new_tab_button_click(MousePress::Middle);
@@ -1624,7 +1616,7 @@ impl super::TermWindow {
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Press(MousePress::Right) => match item {
-                TabBarItem::Tab { tab_idx, .. } | TabBarItem::CloseTabButton { tab_idx } => {
+                TabBarItem::Tab { tab_idx, .. } => {
                     self.tab_drag_state = None;
                     self.show_tab_context_menu(tab_idx, &event, context);
                 }
@@ -1654,7 +1646,6 @@ impl super::TermWindow {
                 }
                 TabBarItem::WindowButton(_)
                 | TabBarItem::Tab { .. }
-                | TabBarItem::CloseTabButton { .. }
                 | TabBarItem::NewTabButton { .. } => {}
             },
             WMEK::VertWheel(n) => {
@@ -1669,7 +1660,6 @@ impl super::TermWindow {
         }
         let cursor = match item {
             TabBarItem::Tab { .. }
-            | TabBarItem::CloseTabButton { .. }
             | TabBarItem::NewTabButton { .. }
             | TabBarItem::WindowButton(_) => MouseCursor::Hand,
             _ => MouseCursor::Arrow,

@@ -3288,11 +3288,8 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, effective_config, hove
     end
 
     local total_limit = math.max(1, max_width or 32)
-    -- Two cells of padding on each side: the left ones here, on the right a
-    -- gap and the status cell, where the attention dot or, on hover, the
-    -- close mark sits apart from the title.
-    local leading = total_limit >= 6 and '  ' or (total_limit >= 2 and ' ' or '')
-    local title_limit = math.max(0, total_limit - wezterm.column_width(leading) - 2)
+    local leading = total_limit >= 2 and ' ' or ''
+    local title_limit = math.max(0, total_limit - wezterm.column_width(leading) - 1)
 
     -- This branch draws the tab index as well, and the index is charged
     -- against the same title budget the single-pane path truncates to.
@@ -3392,9 +3389,7 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, effective_config, hove
       end
     end
 
-    -- A gap, then one stable trailing cell: attention wins over running,
-    -- idle stays blank.
-    items[#items + 1] = { Text = ' ' }
+    -- One stable trailing cell: attention wins over running, idle stays blank.
     items[#items + 1] = { Foreground = { Color = status_dot and status_dot_color or fg_active } }
     items[#items + 1] = { Text = status_dot and '\u{2022}' or ' ' }
 
@@ -3416,8 +3411,8 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, effective_config, hove
   -- Truncate on our terms with an ellipsis; the renderer would otherwise
   -- hard-clip mid-word and swallow the trailing bell slot.
   local total_limit = math.max(1, max_width or 32)
-  local leading = total_limit >= 6 and '  ' or (total_limit >= 2 and ' ' or '')
-  local title_limit = math.max(0, total_limit - wezterm.column_width(leading) - 2)
+  local leading = total_limit >= 2 and ' ' or ''
+  local title_limit = math.max(0, total_limit - wezterm.column_width(leading) - 1)
   if wezterm.column_width(text) > title_limit then
     if title_limit == 0 then
       text = ''
@@ -3430,12 +3425,11 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, effective_config, hove
 
   local intensity = tab.is_active and 'Bold' or 'Normal'
 
-  -- A gap, then the status cell: the dot, or the close mark while the pointer
-  -- is on the tab, never touches the title, and the tab keeps its width.
+  -- The status dot replaces the trailing space without changing tab width.
   return {
     { Attribute = { Intensity = intensity } },
     { Foreground = { Color = fg_active } },
-    { Text = leading .. text .. ' ' },
+    { Text = leading .. text },
     { Foreground = { Color = status_dot and status_dot_color or fg_active } },
     { Text = status_dot and '\u{2022}' or ' ' },
   }
