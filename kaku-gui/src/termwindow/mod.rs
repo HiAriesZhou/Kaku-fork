@@ -474,13 +474,32 @@ struct RenderMetricsCacheKey {
 /// name resolves) into the key means a `font` change invalidates instead of
 /// serving stale cell geometry. The app version is included because shaping
 /// or metrics behavior can change between releases.
-fn font_config_fingerprint(config: &ConfigHandle) -> u64 {
+fn font_config_fingerprint(config: &config::Config) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     env!("CARGO_PKG_VERSION").hash(&mut hasher);
     format!("{:?}", config.font).hash(&mut hasher);
     format!("{:?}", config.font_dirs).hash(&mut hasher);
     hasher.finish()
+}
+
+/// The config inputs that size the cell grid. `underline_*` and
+/// `strikethrough_position` also feed `RenderMetrics` but are not in the key.
+/// Also recorded on each window so `apply_scale_change` can tell whether its
+/// current metrics are stale.
+fn render_metrics_key(
+    config: &config::Config,
+    dpi: usize,
+    font_scale: f64,
+) -> RenderMetricsCacheKey {
+    RenderMetricsCacheKey {
+        dpi,
+        font_scale_bits: font_scale.to_bits(),
+        font_size_bits: config.font_size.to_bits(),
+        line_height_bits: config.line_height.to_bits(),
+        cell_width_bits: config.cell_width.to_bits(),
+        font_fingerprint: font_config_fingerprint(config),
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -626,14 +645,7 @@ fn render_metrics_from_cache_or_compute(
     dpi: usize,
     font_scale: f64,
 ) -> anyhow::Result<(RenderMetrics, bool)> {
-    let key = RenderMetricsCacheKey {
-        dpi,
-        font_scale_bits: font_scale.to_bits(),
-        font_size_bits: config.font_size.to_bits(),
-        line_height_bits: config.line_height.to_bits(),
-        cell_width_bits: config.cell_width.to_bits(),
-        font_fingerprint: font_config_fingerprint(config),
-    };
+    let key = render_metrics_key(config, dpi, font_scale);
 
     {
         let mut cache = RENDER_METRICS_CACHE.lock().unwrap();
@@ -1027,6 +1039,8 @@ pub struct TermWindow {
     pub mux_window_id: MuxWindowId,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     pub render_metrics: RenderMetrics,
+    /// The `render_metrics_key` that `render_metrics` was computed for.
+    render_metrics_key: RenderMetricsCacheKey,
     render_state: Option<RenderState>,
     /// All keyboard-input state (input map, key tables, leader, dead keys).
     /// Bundled so the flat `TermWindow` field list stays smaller; see
@@ -1722,6 +1736,11 @@ impl TermWindow {
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
             fonts: Rc::clone(&fontconfig),
             render_metrics,
+            render_metrics_key: render_metrics_key(
+                &config,
+                dpi,
+                persisted_font_scale.unwrap_or(1.0),
+            ),
             dimensions,
             window_state: WindowState::default(),
             resize_state: ResizeLifecycleState::default(),
@@ -7056,5 +7075,34 @@ mod tests {
             bell_notification_message(None, None, "\u{273B}", None),
             "Background task complete"
         );
+    }
+
+    #[test]
+    fn config_reload_recomputes_cell_geometry_only_for_typography() {
+        // apply_scale_change keeps a window's cell geometry while this key is
+        // unchanged. A config reload keeps scale and dpi, so the Settings
+        // typography fields must be in the key or open windows never pick
+        // them up, while a theme flip must stay on the #401 fast path.
+        let key = |config: &config::Config| super::render_metrics_key(config, 144, 1.0);
+        let base = config::Config::default_config();
+
+        let mut line_height = base.clone();
+        line_height.line_height += 0.1;
+        let mut font_size = base.clone();
+        font_size.font_size += 1.0;
+        let mut cell_width = base.clone();
+        cell_width.cell_width += 0.1;
+        for changed in [&line_height, &font_size, &cell_width] {
+            assert_ne!(key(&base), key(changed));
+        }
+
+        let mut theme = base.clone();
+        theme.color_scheme = Some("Kaku Light".into());
+        assert_eq!(key(&base), key(&theme));
+
+        let source = include_str!("resize.rs");
+        let body = source.split("pub fn apply_scale_change(").nth(1).unwrap();
+        let guard = body.split("change_scaling(").next().unwrap();
+        assert!(guard.contains("key == self.render_metrics_key"));
     }
 }
