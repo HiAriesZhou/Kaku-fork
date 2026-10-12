@@ -216,6 +216,8 @@ struct ConfigInfo {
     font_family: String,
     font_size: f64,
     line_height: f64,
+    /// Where Kaku draws its tab bar, so the page puts its tabs there too.
+    tab_bar_at_bottom: bool,
     /// Capability flags for the iOS client. Currently emits "ai_chat" when an
     /// AI handler is registered at boot.
     features: Vec<String>,
@@ -425,6 +427,7 @@ fn config_info() -> ConfigInfo {
         font_family,
         font_size: cfg.font_size,
         line_height: cfg.line_height,
+        tab_bar_at_bottom: cfg.tab_bar_at_bottom,
         features,
     }
 }

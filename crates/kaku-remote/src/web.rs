@@ -25,7 +25,7 @@ use termwiz::color::ColorAttribute;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::{CursorShape, CursorVisibility};
 use tokio::sync::{broadcast, mpsc};
-use wezterm_term::TerminalSize;
+use wezterm_term::{MouseButton, MouseEvent, MouseEventKind, TerminalSize};
 
 const INDEX_HTML: &str = include_str!("../assets/web/index.html");
 const XTERM_JS: &str = include_str!("../assets/web/xterm.js");
@@ -42,6 +42,8 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// title changes and resizes that do not produce `PaneOutput`.
 const IDLE_REFRESH: Duration = Duration::from_secs(1);
 const MAX_INPUT_LEN: usize = 65_536;
+/// Cap on wheel notches forwarded to an app from one browser wheel event.
+const MAX_WHEEL_STEPS: usize = 10;
 const MIN_COLS: usize = 20;
 const MAX_COLS: usize = 500;
 const MIN_ROWS: usize = 5;
@@ -371,12 +373,20 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
                     current = Some(sgr);
                 }
                 let text = cell.str();
+                let width = cell.width().max(1);
                 if text.is_empty() {
                     out.push(' ');
                 } else {
                     out.push_str(text);
                 }
-                col += cell.width().max(1);
+                col += width;
+                // xterm.js has its own width table (Unicode 6 by default), so
+                // for symbols and emoji it can disagree with Kaku about how
+                // many columns a glyph takes and shift the rest of the row.
+                // Pin the next column to Kaku's answer.
+                if !text.is_ascii() && col < dims.cols {
+                    let _ = write!(out, "\x1b[{}G", col + 1);
+                }
             }
         }
         // Clear the rest of the row with the default background.
@@ -626,6 +636,49 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
                 mods |= Modifiers::SHIFT;
             }
             pane.key_down(code, mods)
+        }
+        // Same routing as Kaku's own wheel: an app that asked for the mouse
+        // (Claude Code, vim with mouse on) gets wheel events and scrolls
+        // itself; a full-screen app without the mouse gets arrow keys; a
+        // plain shell scrolls Kaku's history.
+        WebClientMsg::Scroll { lines } if pane.is_mouse_grabbed() => {
+            let dims = pane.get_dimensions();
+            let button = if lines > 0 {
+                MouseButton::WheelUp(1)
+            } else {
+                MouseButton::WheelDown(1)
+            };
+            let mut result = Ok(());
+            for _ in 0..lines.unsigned_abs().min(MAX_WHEEL_STEPS) {
+                result = pane.mouse_event(MouseEvent {
+                    kind: MouseEventKind::Press,
+                    x: dims.cols / 2,
+                    y: (dims.viewport_rows / 2) as i64,
+                    x_pixel_offset: 0,
+                    y_pixel_offset: 0,
+                    button,
+                    modifiers: Modifiers::NONE,
+                });
+                if result.is_err() {
+                    break;
+                }
+            }
+            result
+        }
+        WebClientMsg::Scroll { lines } if pane.is_alt_screen_active() => {
+            let key = if lines > 0 {
+                KeyCode::UpArrow
+            } else {
+                KeyCode::DownArrow
+            };
+            let mut result = Ok(());
+            for _ in 0..lines.unsigned_abs().min(MAX_WHEEL_STEPS) {
+                result = pane.key_down(key, Modifiers::NONE);
+                if result.is_err() {
+                    break;
+                }
+            }
+            result
         }
         WebClientMsg::Scroll { lines } => {
             let dims = pane.get_dimensions();

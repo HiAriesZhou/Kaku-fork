@@ -11,7 +11,8 @@
   @font-face { font-family: "Kaku Mono"; src: url("assets/font-medium.ttf") format("truetype"); font-weight: 700; }
   :root { --bg: #16161a; --fg: #d4d4d8; --muted: #8b8b93; --line: rgba(255,255,255,0.08); }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); }
-  body { display: flex; flex-direction: column; font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body { display: flex; flex-direction: column; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body.tabs-bottom #bar { order: 2; border-bottom: 0; border-top: 1px solid var(--line); }
   #bar { display: flex; align-items: center; gap: 2px; height: 34px; padding: 0 10px; border-bottom: 1px solid var(--line); flex: none; overflow-x: auto; }
   #bar button { flex: none; max-width: 220px; height: 26px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font: inherit; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
   #bar button:hover { background: var(--line); }
@@ -131,7 +132,9 @@
 
   const setStatus = (text) => { statusEl.textContent = text; };
 
-  const FONT_STACK = '"Kaku Mono", "PingFang SC", Menlo, monospace';
+  // Kaku's own fallback order (JetBrains Mono, PingFang SC, Apple Symbols,
+  // Apple Color Emoji), then the Windows equivalents for CJK and emoji.
+  const FONT_STACK = '"Kaku Mono", "PingFang SC", "Apple Symbols", "Apple Color Emoji", "Microsoft YaHei", "Segoe UI Emoji", "Segoe UI Symbol", monospace';
   const term = new Terminal({
     fontSize,
     fontFamily: FONT_STACK,
@@ -360,7 +363,9 @@
       term.options.fontFamily = '"' + cfg.font_family + '", ' + FONT_STACK;
     }
     if (cfg.line_height) term.options.lineHeight = cfg.line_height;
-    if (cfg.font_size) { baseFontSize = cfg.font_size; fontSize = baseFontSize; term.options.fontSize = fontSize; }
+    document.body.classList.toggle("tabs-bottom", !!cfg.tab_bar_at_bottom);
+    // One pixel under Kaku's size reads closer to the native window.
+    if (cfg.font_size) { baseFontSize = Math.max(8, cfg.font_size - 1); fontSize = baseFontSize; term.options.fontSize = fontSize; }
     // xterm.js measures cells only when a font option changes, so once the
     // bundled font is in, nudge the size to measure it instead of the
     // fallback face it saw first; fit() then sets Kaku's size back.
