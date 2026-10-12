@@ -437,11 +437,18 @@
   };
 
   // Heartbeat: a link that died without closing (sleep, a network switch, a
-  // proxy's idle timeout) shows up as silence; reconnect instead of waiting.
+  // proxy's idle timeout) shows up as an unanswered ping; reconnect instead
+  // of waiting. Judge by the ping, not by time since the last message:
+  // background tabs run timers about once a minute, and measuring silence
+  // across that gap closed a healthy link every minute.
   let lastHeard = Date.now();
+  let pingSentAt = 0;
+  const PONG_WAIT = 15000;
   setInterval(() => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    if (Date.now() - lastHeard > 50000) { ws.close(); return; }
+    if (pingSentAt > lastHeard && Date.now() - pingSentAt > PONG_WAIT) { ws.close(); return; }
+    if (pingSentAt > lastHeard) return;
+    pingSentAt = Date.now();
     send({ type: "ping" });
   }, 20000);
 
@@ -451,6 +458,7 @@
     socket.binaryType = "arraybuffer";
     ws = socket;
     lastHeard = Date.now();
+    pingSentAt = 0;
     sendChain = Promise.resolve();
     recvChain = Promise.resolve();
     socket.onopen = () => {
