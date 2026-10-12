@@ -49,6 +49,10 @@ if grep -Fq "local: can only be used in a function" "$output_log" "$error_log"; 
 fi
 
 [[ -f "$tmp_home/.config/starship.toml" ]] || fail "starship.toml was not initialized"
+if grep -En '^(success_symbol|error_symbol|symbol|conflicted|staged|modified|stashed) = " *"$' \
+  "$tmp_home/.config/starship.toml"; then
+  fail "starship.toml ships a blank Nerd Font icon"
+fi
 [[ -f "$tmp_home/.config/kaku/zsh/kaku.zsh" ]] || fail "kaku.zsh was not generated"
 [[ -f "$tmp_home/.zshrc" ]] || fail ".zshrc was not patched"
 
