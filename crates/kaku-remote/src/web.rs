@@ -223,6 +223,9 @@ fn collect_tabs() -> Vec<TabInfo> {
 enum WebClientMsg {
     /// First message through the relay; proves the page holds the key.
     Hello,
+    /// Heartbeat; answered with `pong` so the page can tell a dead link
+    /// from a quiet terminal, and so idle-timeout proxies see traffic.
+    Ping,
     /// Start mirroring a pane; the rest of the messages act on it.
     Attach {
         pane_id: usize,
@@ -279,6 +282,7 @@ enum WebServerMsg<'a> {
     },
     /// The attached pane is gone; the page picks another tab.
     Closed,
+    Pong,
 }
 
 // ── Frame rendering ───────────────────────────────────────────────────────────
@@ -328,7 +332,11 @@ struct Frame {
     rows: usize,
     title: String,
     scrolled: bool,
-    data: String,
+    /// One self-contained string per row: it positions itself and starts
+    /// from reset attributes, so any subset of rows can be sent alone.
+    lines: Vec<String>,
+    /// Cursor position, shape and visibility, applied after the rows.
+    cursor: String,
 }
 
 fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
@@ -346,11 +354,11 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
 
     let (_, lines) = pane.get_lines(top..top + rows as isize);
 
-    let mut out = String::with_capacity(rows * (dims.cols + 16));
-    out.push_str("\x1b[?25l");
-    let mut current: Option<Sgr> = None;
+    let mut rendered = Vec::with_capacity(rows);
     for row in 0..rows {
+        let mut out = String::with_capacity(dims.cols + 16);
         let _ = write!(out, "\x1b[{};1H", row + 1);
+        let mut current: Option<Sgr> = None;
         if let Some(line) = lines.get(row) {
             let mut col = 0;
             for cell in line.visible_cells() {
@@ -373,21 +381,22 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
         }
         // Clear the rest of the row with the default background.
         out.push_str("\x1b[0m\x1b[K");
-        current = None;
+        rendered.push(out);
     }
 
+    let mut cursor_out = String::new();
     let cursor = pane.get_cursor_position();
     let cursor_row = cursor.y - top;
     if view.pinned_top.is_none() && cursor_row >= 0 && (cursor_row as usize) < rows {
         let _ = write!(
-            out,
+            cursor_out,
             "\x1b[{};{}H\x1b[{} q",
             cursor_row + 1,
             cursor.x + 1,
             cursor_shape_param(cursor.shape)
         );
         if cursor.visibility == CursorVisibility::Visible {
-            out.push_str("\x1b[?25h");
+            cursor_out.push_str("\x1b[?25h");
         }
     }
 
@@ -396,7 +405,46 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
         rows,
         title: pane.get_title(),
         scrolled: view.pinned_top.is_some(),
-        data: out,
+        lines: rendered,
+        cursor: cursor_out,
+    }
+}
+
+/// What the browser already shows, so the next frame only carries changes.
+#[derive(Default)]
+struct Shown {
+    cols: usize,
+    title: String,
+    scrolled: bool,
+    lines: Vec<String>,
+    cursor: String,
+}
+
+impl Shown {
+    /// The bytes that bring the browser from what it shows to `frame`, or
+    /// None when nothing changed.
+    fn update(&mut self, frame: Frame) -> Option<(Frame, String)> {
+        let full = self.cols != frame.cols
+            || self.lines.len() != frame.lines.len()
+            || self.scrolled != frame.scrolled;
+        let mut data = String::from("\x1b[?25l");
+        let mut changed = false;
+        for (idx, line) in frame.lines.iter().enumerate() {
+            if full || self.lines.get(idx) != Some(line) {
+                data.push_str(line);
+                changed = true;
+            }
+        }
+        if !changed && self.cursor == frame.cursor && self.title == frame.title {
+            return None;
+        }
+        data.push_str(&frame.cursor);
+        self.cols = frame.cols;
+        self.title.clone_from(&frame.title);
+        self.scrolled = frame.scrolled;
+        self.cursor.clone_from(&frame.cursor);
+        self.lines.clone_from(&frame.lines);
+        Some((frame, data))
     }
 }
 
@@ -603,7 +651,7 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             }
             Ok(())
         }
-        WebClientMsg::Hello | WebClientMsg::Attach { .. } => Ok(()),
+        WebClientMsg::Hello | WebClientMsg::Ping | WebClientMsg::Attach { .. } => Ok(()),
         WebClientMsg::Resize { cols, rows } => {
             let cols = cols.clamp(MIN_COLS, MAX_COLS);
             let rows = rows.clamp(MIN_ROWS, MAX_ROWS);
@@ -652,7 +700,7 @@ pub(crate) async fn run_session(
     let mut attached: Option<usize> = None;
     let mut updates: Option<broadcast::Receiver<()>> = None;
     let mut view = View::default();
-    let mut last_frame = String::new();
+    let mut shown = Shown::default();
     let mut last_tabs: Option<Vec<TabInfo>> = None;
     let mut dirty_frame = false;
     let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
@@ -676,11 +724,18 @@ pub(crate) async fn run_session(
                         continue;
                     }
                 };
+                if matches!(msg, WebClientMsg::Ping) {
+                    let Some(json) = encode(&WebServerMsg::Pong) else { continue };
+                    if outbox.send(json).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 if let WebClientMsg::Attach { pane_id } = msg {
                     attached = Some(pane_id);
                     updates = Some(subscribe(&dirty, pane_id));
                     view.pinned_top = None;
-                    last_frame.clear();
+                    shown = Shown::default();
                     dirty_frame = true;
                     continue;
                 }
@@ -717,23 +772,22 @@ pub(crate) async fn run_session(
                     }
                     continue;
                 };
-                let frame = render_frame(&pane, &mut view);
+                // Only rows that changed since the last frame are sent; idle
+                // refreshes usually change nothing and send nothing.
+                let Some((frame, data)) = shown.update(render_frame(&pane, &mut view)) else {
+                    continue;
+                };
                 let msg = WebServerMsg::Frame {
                     cols: frame.cols,
                     rows: frame.rows,
                     title: &frame.title,
                     scrolled: frame.scrolled,
-                    data: &frame.data,
+                    data: &data,
                 };
                 let Some(json) = encode(&msg) else { continue };
-                // Idle refreshes usually change nothing; skip those.
-                if json == last_frame {
-                    continue;
-                }
-                if outbox.send(json.clone()).await.is_err() {
+                if outbox.send(json).await.is_err() {
                     break;
                 }
-                last_frame = json;
             }
         }
     }
@@ -810,6 +864,38 @@ mod tests {
             TAB_TITLES.lock().get(&usize::MAX).map(String::as_str),
             Some("Users/tw93")
         );
+    }
+
+    fn frame(cols: usize, lines: &[&str], cursor: &str) -> Frame {
+        Frame {
+            cols,
+            rows: lines.len(),
+            title: "t".into(),
+            scrolled: false,
+            lines: lines.iter().map(|l| l.to_string()).collect(),
+            cursor: cursor.into(),
+        }
+    }
+
+    #[test]
+    fn frames_send_only_changed_rows() {
+        let mut shown = Shown::default();
+        let (_, first) = shown.update(frame(10, &["A", "B", "C"], "@1")).unwrap();
+        assert_eq!(first, "\x1b[?25lABC@1", "first frame is complete");
+
+        let (_, second) = shown.update(frame(10, &["A", "X", "C"], "@1")).unwrap();
+        assert_eq!(second, "\x1b[?25lX@1", "only the changed row");
+
+        assert!(
+            shown.update(frame(10, &["A", "X", "C"], "@1")).is_none(),
+            "nothing changed, nothing sent"
+        );
+
+        let (_, cursor_only) = shown.update(frame(10, &["A", "X", "C"], "@2")).unwrap();
+        assert_eq!(cursor_only, "\x1b[?25l@2");
+
+        let (_, resized) = shown.update(frame(12, &["A", "X", "C"], "@2")).unwrap();
+        assert_eq!(resized, "\x1b[?25lAXC@2", "a resize redraws everything");
     }
 
     #[test]

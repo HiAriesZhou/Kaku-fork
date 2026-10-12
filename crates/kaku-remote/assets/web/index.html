@@ -42,8 +42,19 @@
   // #t=<token>: this Mac or the LAN, plain WebSocket to Kaku.
   // #k=<key>: through the relay, every message sealed with this key, which
   // never leaves the browser because fragments are not sent to servers.
-  const token = params.get("t");
-  const keyText = params.get("k");
+  // Either one moves to this tab's session storage and out of the address
+  // bar, so it does not linger in history on a borrowed computer; a reload
+  // in the same tab still finds it.
+  const SECRET_SLOT = "kaku.link:" + location.pathname;
+  let stored = null;
+  try { stored = JSON.parse(sessionStorage.getItem(SECRET_SLOT) || "null"); } catch (_) {}
+  const token = params.get("t") || (stored && stored.t) || null;
+  const keyText = params.get("k") || (stored && stored.k) || null;
+  if (params.get("t") || params.get("k")) {
+    try { sessionStorage.setItem(SECRET_SLOT, JSON.stringify({ t: token, k: keyText })); } catch (_) {}
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+  const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
   const bar = document.getElementById("bar");
   const statusEl = document.getElementById("status");
   const stage = document.getElementById("stage");
@@ -193,6 +204,15 @@
     "PageUp", "PageDown", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]);
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.isComposing || ev.keyCode === 229) return true;
+    // Off the Mac, Ctrl+V pastes, and Ctrl+C copies when text is selected
+    // (Ctrl+Shift+C/V always do), as in other browser terminals. Returning
+    // false leaves the key to the browser, whose copy and paste events
+    // reach xterm.js and the paste handler below.
+    if (!IS_MAC && ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+      const k = ev.key.toLowerCase();
+      if (k === "v") return false;
+      if (k === "c" && (ev.shiftKey || term.hasSelection())) return false;
+    }
     if (ev.metaKey) {
       // Kaku binds Cmd+Enter to a newline without executing.
       if (ev.key === "Enter") {
@@ -373,11 +393,21 @@
     }
   };
 
+  // Heartbeat: a link that died without closing (sleep, a network switch, a
+  // proxy's idle timeout) shows up as silence; reconnect instead of waiting.
+  let lastHeard = Date.now();
+  setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (Date.now() - lastHeard > 50000) { ws.close(); return; }
+    send({ type: "ping" });
+  }, 20000);
+
   const connect = () => {
     setStatus("Connecting");
     const socket = new WebSocket(wsUrl());
     socket.binaryType = "arraybuffer";
     ws = socket;
+    lastHeard = Date.now();
     sendChain = Promise.resolve();
     recvChain = Promise.resolve();
     socket.onopen = () => {
@@ -389,7 +419,7 @@
       // Re-attach after a reconnect; the server keeps no per-browser state.
       if (paneId !== null) send({ type: "attach", pane_id: paneId });
     };
-    socket.onmessage = (ev) => receive(ev.data, handle);
+    socket.onmessage = (ev) => { lastHeard = Date.now(); receive(ev.data, handle); };
     socket.onclose = (ev) => {
       if (ws !== socket) return;
       if (ev.code === 4404) setStatus("This Kaku is offline");
