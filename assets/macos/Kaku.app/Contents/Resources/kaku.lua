@@ -3425,7 +3425,8 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, effective_config, hove
 
   local intensity = tab.is_active and 'Bold' or 'Normal'
 
-  -- The status dot replaces the trailing space without changing tab width.
+  -- The status dot replaces the trailing space without changing tab width,
+  -- and the close mark takes the same cell while the pointer is on the tab.
   return {
     { Attribute = { Intensity = intensity } },
     { Foreground = { Color = fg_active } },

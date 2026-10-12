@@ -65,15 +65,10 @@ impl crate::TermWindow {
 
         let palette = self.palette().clone();
 
-        let tab_metrics = if self.config.tab_bar_at_bottom {
-            // Bottom tabs have no rounded titlebar mask above them, so keep the
-            // compact natural height used by earlier releases.
-            RenderMetrics::with_font_metrics(&self.fonts.default_font()?.metrics())
-        } else {
-            // Top tabs sit under the macOS titlebar mask; honor line_height so
-            // tall fonts don't clip against the top edge.
-            self.render_metrics
-        };
+        // A terminal row with line_height, top or bottom: titles sit centered
+        // with room around them, and top tabs don't clip against the macOS
+        // titlebar mask. The rename field sizes itself from this row (#382).
+        let tab_metrics = self.render_metrics;
 
         self.ui_items.append(&mut self.tab_bar.compute_ui_items(
             tab_bar_y as usize,
@@ -179,9 +174,9 @@ impl crate::TermWindow {
         if config.use_fancy_tab_bar {
             let font = fontconfig.title_font()?;
             Ok((font.metrics().cell_height.get() as f32 * 1.75).ceil())
-        } else if config.tab_bar_at_bottom {
-            Ok(render_metrics.natural_cell_height as f32)
         } else {
+            // One terminal row, line_height included, at the top or bottom:
+            // the compact natural height read as cramped at the bottom.
             Ok(render_metrics.cell_size.height as f32)
         }
     }
@@ -200,8 +195,6 @@ impl crate::TermWindow {
             // the terminal cell height as a stand-in for the title font cell
             // height. The two differ by ~1-2 pixels in typical configs.
             (render_metrics.cell_size.height as f32 * 1.75).ceil()
-        } else if config.tab_bar_at_bottom {
-            render_metrics.natural_cell_height as f32
         } else {
             render_metrics.cell_size.height as f32
         }
