@@ -15,7 +15,7 @@ use mux::pane::{CloseReason, Pane, PaneId};
 use mux::Mux;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -59,6 +59,21 @@ pub(crate) type WebDirty = Arc<Mutex<HashMap<usize, broadcast::Sender<()>>>>;
 static TAB_TITLES: LazyLock<Mutex<HashMap<usize, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Tabs whose size a browser set. That size can be larger than the Mac
+/// window, which then draws the rows that fit rather than over its tab bar.
+static WEB_SIZED_TABS: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Whether a browser set this tab's size, so it may not fit the Mac window.
+pub fn tab_is_web_sized(tab_id: usize) -> bool {
+    WEB_SIZED_TABS.lock().contains(&tab_id)
+}
+
+/// The Mac took the tab back to its window's size.
+pub fn release_web_size(tab_id: usize) {
+    WEB_SIZED_TABS.lock().remove(&tab_id);
+}
+
 /// Tab changes the page asks for. The GUI performs them through the same
 /// key assignments as its own Cmd+T and Close Tab, so cwd inheritance and
 /// the closed-tab history behave as they do on the Mac.
@@ -74,6 +89,8 @@ pub enum TabAction {
     /// Mac only clears when its own window takes focus, and so never while
     /// the Mac sits unattended.
     Seen { pane_id: usize },
+    /// Make the tab holding this pane the active tab in its Mac window.
+    Activate { pane_id: usize },
 }
 
 pub type TabActionHandler = Arc<dyn Fn(TabAction) + Send + Sync + 'static>;
@@ -237,6 +254,10 @@ enum WebClientMsg {
     /// Start mirroring a pane; the rest of the messages act on it.
     Attach {
         pane_id: usize,
+        /// The user picked this tab in the page (a click, Cmd+digit): make it
+        /// the Mac's active tab too. Reconnects and follows leave it alone.
+        #[serde(default)]
+        focus: bool,
     },
     /// Committed text: typed characters, IME output.
     Text {
@@ -278,6 +299,14 @@ enum WebClientMsg {
     /// Close a tab; the page has already confirmed with the user.
     CloseTab {
         tab_id: usize,
+    },
+    /// The text of every row the page shows, once it has applied `frames`
+    /// frames. Kaku compares it with what it believes the page shows; a
+    /// mismatch is logged with enough context to find its cause, then healed
+    /// with a full frame.
+    Verify {
+        frames: u64,
+        rows: Vec<String>,
     },
 }
 
@@ -351,6 +380,7 @@ fn claim_tab_size(pane_id: usize, cols: usize, rows: usize) {
         if current.cols == cols && current.rows == rows {
             return;
         }
+        WEB_SIZED_TABS.lock().insert(tab_id.into());
         let cell_width = current.pixel_width / current.cols.max(1);
         let cell_height = current.pixel_height / current.rows.max(1);
         tab.resize(TerminalSize {
@@ -463,6 +493,9 @@ struct Shown {
     scrolled: bool,
     lines: Vec<String>,
     cursor: String,
+    /// For drift reports: the last row move sent, and frames since a full one.
+    last_move: isize,
+    since_full: usize,
 }
 
 impl Shown {
@@ -482,6 +515,14 @@ impl Shown {
         } else {
             row_shift(&self.lines, &frame.lines)
         };
+        if full {
+            self.since_full = 0;
+        } else {
+            self.since_full += 1;
+        }
+        if moved != 0 {
+            self.last_move = moved;
+        }
         if moved != 0 {
             let _ = write!(
                 data,
@@ -557,6 +598,45 @@ fn row_shift(old: &[String], new: &[String]) -> isize {
     } else {
         0
     }
+}
+
+/// The visible text of a row, escape sequences and whitespace removed, so
+/// Kaku's row and xterm.js's copy compare equal however each spaced it.
+fn row_text(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if !c.is_whitespace() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Rows where the page's text differs from what Kaku believes it shows.
+fn drifted_rows(shown: &[String], page: &[String]) -> Vec<usize> {
+    let rows = shown.len().max(page.len());
+    (0..rows)
+        .filter(|&i| {
+            let kaku = shown.get(i).map(|l| row_text(l)).unwrap_or_default();
+            let seen: String = page
+                .get(i)
+                .map(|l| l.chars().filter(|c| !c.is_whitespace()).collect())
+                .unwrap_or_default();
+            kaku != seen
+        })
+        .collect()
 }
 
 fn cursor_shape_param(shape: CursorShape) -> u8 {
@@ -831,7 +911,10 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             }
             Ok(())
         }
-        WebClientMsg::Hello | WebClientMsg::Ping | WebClientMsg::Attach { .. } => Ok(()),
+        WebClientMsg::Hello
+        | WebClientMsg::Ping
+        | WebClientMsg::Attach { .. }
+        | WebClientMsg::Verify { .. } => Ok(()),
         WebClientMsg::Resize { cols, rows } => {
             let cols = cols.clamp(MIN_COLS, MAX_COLS);
             let rows = rows.clamp(MIN_ROWS, MAX_ROWS);
@@ -884,6 +967,9 @@ pub(crate) async fn run_session(
     let mut shown = Shown::default();
     let mut last_tabs: Option<Vec<TabInfo>> = None;
     let mut dirty_frame = false;
+    // Frames sent this session; a page's verify only counts once it has
+    // applied the same number, so frames in flight never read as drift.
+    let mut frames_sent: u64 = 0;
     let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle = tokio::time::interval(IDLE_REFRESH);
@@ -912,7 +998,41 @@ pub(crate) async fn run_session(
                     }
                     continue;
                 }
-                if let WebClientMsg::Attach { pane_id } = msg {
+                if let WebClientMsg::Verify { frames, rows } = &msg {
+                    if *frames == frames_sent && attached.is_some() {
+                        let drift = drifted_rows(&shown.lines, rows);
+                        if !drift.is_empty() {
+                            let pane = attached.and_then(lookup_pane);
+                            let sample: Vec<String> = drift
+                                .iter()
+                                .take(4)
+                                .map(|&i| {
+                                    let kaku: String = shown.lines.get(i).map(|l| row_text(l)).unwrap_or_default().chars().take(40).collect();
+                                    let page: String = rows.get(i).map(|l| l.trim().chars().take(40).collect()).unwrap_or_default();
+                                    format!("row {i}: page {page:?} kaku {kaku:?}")
+                                })
+                                .collect();
+                            log::warn!(
+                                "kaku-remote web: screen drift in {} of {} rows (last move {}, {} frames since full, scrolled {}, alt screen {}, mouse grabbed {}); redrawing. {}",
+                                drift.len(),
+                                shown.lines.len(),
+                                shown.last_move,
+                                shown.since_full,
+                                shown.scrolled,
+                                pane.as_ref().is_some_and(|p| p.is_alt_screen_active()),
+                                pane.as_ref().is_some_and(|p| p.is_mouse_grabbed()),
+                                sample.join("; ")
+                            );
+                            shown = Shown::default();
+                            dirty_frame = true;
+                        }
+                    }
+                    continue;
+                }
+                if let WebClientMsg::Attach { pane_id, focus } = msg {
+                    if focus {
+                        dispatch_tab_action(TabAction::Activate { pane_id });
+                    }
                     attached = Some(pane_id);
                     updates = Some(subscribe(&dirty, pane_id));
                     view.pinned_top = None;
@@ -973,6 +1093,7 @@ pub(crate) async fn run_session(
                 if outbox.send(json).await.is_err() {
                     break;
                 }
+                frames_sent += 1;
             }
         }
     }
@@ -1183,6 +1304,21 @@ mod tests {
             })
             .unwrap();
         assert!(!data.contains('S') && !data.contains('T'), "{data:?}");
+    }
+
+    #[test]
+    fn drift_compares_text_not_spacing() {
+        let shown = rows(&["\x1b[0;31m中文 abc", "same", "kaku row"]);
+        let page = vec![
+            "中文  abc".to_string(),
+            " same ".to_string(),
+            "stale row".to_string(),
+        ];
+        assert_eq!(drifted_rows(&shown, &page), vec![2]);
+        assert_eq!(
+            row_text("\x1b[3;1H\x1b[0m⏺ hi\x1b[5G!\x1b[0m\x1b[K"),
+            "⏺hi!"
+        );
     }
 
     #[test]

@@ -1459,6 +1459,7 @@ impl TermWindow {
         if size.rows != self.terminal_size.rows || size.cols != self.terminal_size.cols {
             tab.resize(self.terminal_size);
         }
+        kaku_remote::release_web_size(tab.tab_id().into());
     }
 
     fn arm_layout_sticky_fullscreen(&mut self) {

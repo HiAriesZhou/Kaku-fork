@@ -19,9 +19,10 @@ pub fn register() {
 
 fn perform(action: TabAction) {
     let pane_id = match action {
-        TabAction::New { pane_id } | TabAction::Close { pane_id } | TabAction::Seen { pane_id } => {
-            PaneId::from(pane_id)
-        }
+        TabAction::New { pane_id }
+        | TabAction::Close { pane_id }
+        | TabAction::Seen { pane_id }
+        | TabAction::Activate { pane_id } => PaneId::from(pane_id),
     };
     let mux = Mux::get();
     let Some((_, window_id, tab_id)) = mux.resolve_pane_id(pane_id) else {
@@ -48,6 +49,16 @@ fn perform(action: TabAction) {
         TabAction::Close { .. } => {
             gui.window
                 .notify(TermWindowNotif::CloseConfirmedTab { tab_id });
+        }
+        TabAction::Activate { .. } => {
+            let Some(idx) = mux.get_window(window_id).and_then(|w| w.idx_by_id(tab_id)) else {
+                return;
+            };
+            gui.window.notify(TermWindowNotif::PerformAssignment {
+                pane_id,
+                assignment: KeyAssignment::ActivateTab(idx as isize),
+                tx: None,
+            });
         }
         TabAction::Seen { .. } => {
             gui.window
