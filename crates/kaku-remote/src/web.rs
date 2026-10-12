@@ -748,6 +748,7 @@ pub(crate) async fn run_session(
     outbox: mpsc::Sender<String>,
     dirty: WebDirty,
 ) {
+    let _awake = crate::awake::Awake::hold();
     if let Some(json) = encode(&WebServerMsg::Config(&crate::config_info())) {
         if outbox.send(json).await.is_err() {
             return;

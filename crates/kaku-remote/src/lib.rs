@@ -19,6 +19,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
+mod awake;
 mod share;
 mod web;
 
