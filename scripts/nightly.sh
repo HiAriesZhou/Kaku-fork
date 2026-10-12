@@ -48,6 +48,13 @@ for arg in "$@"; do
     esac
 done
 
+# The web terminal is not launched yet; Nightly is public, so it must not
+# carry it. Build it locally with CARGO_FEATURES=remote ./scripts/build.sh.
+if [[ ",$FEATURES," == *",remote,"* ]]; then
+    echo "The remote feature stays out of public builds until it launches." >&2
+    exit 1
+fi
+
 case "$PROFILE" in
     release | release-opt) ;;
     *) echo "PROFILE must be release or release-opt for a notarizable nightly, got: $PROFILE" >&2; exit 1 ;;

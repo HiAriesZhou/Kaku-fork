@@ -26,6 +26,7 @@ Key groups:
 
 `kaku-remote` serves a browser terminal (`src/web.rs`, page in `assets/web/`) and `kaku-relay` lets it be reached from outside the LAN (`src/share.rs` on the Mac side). Both ship only with the `remote` cargo feature. Invariants:
 
+- Not launched: the maintainer uses it privately until deciding to open it up. Release and Nightly builds leave the `remote` feature off (`scripts/nightly.sh` refuses it), `kaku remote` is hidden from `--help`, and no doc, README, menu, setting, release note or issue reply mentions it. Build it locally with `CARGO_FEATURES=remote ./scripts/build.sh`.
 - One session per browser, carried either by the local WebSocket (`#t=<token>` link) or by the relay (`#k=<key>` link). `run_session` only sees two string channels; keep transport logic out of it.
 - The page mirrors Kaku's own terminal model as ANSI frames rather than replaying the PTY stream, so terminal queries are answered once, by Kaku. Keys go through `Pane::key_down`, pastes through `send_paste`.
 - Anything that reads the Lua config (for example `can_close_without_prompting`) must run on the GUI thread via `promise::spawn::spawn_into_main_thread`; calling it from the server's tokio threads panics.
