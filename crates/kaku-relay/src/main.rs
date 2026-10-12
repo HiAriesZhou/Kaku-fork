@@ -260,11 +260,26 @@ fn parse_asset(payload: Bytes) -> Option<Asset> {
 
 // ── Browser side ──────────────────────────────────────────────────────────────
 
-const OFFLINE_PAGE: &str = "<!doctype html><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Kaku</title><body style=\"font:15px -apple-system,sans-serif;background:#16161a;\
-color:#999;display:flex;align-items:center;justify-content:center;height:100vh;margin:0\">\
-This Kaku is offline. Open Kaku on the Mac and reload.</body>";
+/// Shown while the Mac's Kaku is not connected. It looks like the terminal
+/// page's own notice and opens the terminal by itself once the Mac is back;
+/// the link's key is still in the address bar, so the reload keeps it.
+const OFFLINE_PAGE: &str = r#"<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kaku</title>
+<style>
+html,body{height:100%;margin:0;background:#15141a;color:#d4d4d8}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:24px;box-sizing:border-box;text-align:center;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+.title{font-size:15px}.detail{font-size:13px;color:#8b8b93}
+</style>
+<div class="title">Kaku on the Mac is offline</div>
+<div class="detail">This page opens the terminal by itself when it is back.</div>
+<script>
+setInterval(function () {
+  fetch(location.pathname, { method: "HEAD", cache: "no-store" })
+    .then(function (r) { if (r.ok) location.reload(); })
+    .catch(function () {});
+}, 3000);
+</script>"#;
 
 async fn fetch_asset(state: &AppState, id: &str, path: &str) -> Response {
     let Some(host) = state.host(id) else {
