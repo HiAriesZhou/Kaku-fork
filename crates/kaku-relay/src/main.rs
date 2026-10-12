@@ -82,6 +82,60 @@ fn edge(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+/// Browser and OS family from the User-Agent, enough to tell a laptop from
+/// a phone in the logs without recording anything that identifies a person.
+fn device(headers: &HeaderMap) -> &'static str {
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let os = if ua.contains("iPhone") {
+        "iPhone"
+    } else if ua.contains("iPad") {
+        "iPad"
+    } else if ua.contains("Android") {
+        "Android"
+    } else if ua.contains("Windows") {
+        "Windows"
+    } else if ua.contains("Mac OS X") || ua.contains("Macintosh") {
+        "macOS"
+    } else if ua.contains("Linux") {
+        "Linux"
+    } else {
+        "other"
+    };
+    let browser = if ua.contains("Edg/") {
+        "Edge"
+    } else if ua.contains("Chrome/") || ua.contains("CriOS/") {
+        "Chrome"
+    } else if ua.contains("Firefox/") || ua.contains("FxiOS/") {
+        "Firefox"
+    } else if ua.contains("Safari/") {
+        "Safari"
+    } else {
+        "other"
+    };
+    match (browser, os) {
+        ("Chrome", "Windows") => "Chrome Windows",
+        ("Chrome", "macOS") => "Chrome macOS",
+        ("Chrome", "Android") => "Chrome Android",
+        ("Chrome", "iPhone") => "Chrome iPhone",
+        ("Edge", "Windows") => "Edge Windows",
+        ("Edge", "macOS") => "Edge macOS",
+        ("Safari", "macOS") => "Safari macOS",
+        ("Safari", "iPhone") => "Safari iPhone",
+        ("Safari", "iPad") => "Safari iPad",
+        ("Firefox", "Windows") => "Firefox Windows",
+        ("Firefox", "macOS") => "Firefox macOS",
+        (_, "iPhone") => "iPhone",
+        (_, "iPad") => "iPad",
+        (_, "Android") => "Android",
+        (_, "Windows") => "Windows",
+        (_, "macOS") => "macOS",
+        _ => "other",
+    }
+}
+
 fn valid_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -304,9 +358,10 @@ async fn browser_ws(
         .max_message_size(MAX_MESSAGE)
         .on_upgrade(move |socket| async move {
             info!(
-                "browser joined host {} via edge {}",
+                "browser joined host {} via edge {} from {}",
                 short(&id),
-                edge(&headers)
+                edge(&headers),
+                device(&headers)
             );
             serve_browser(socket, host).await
         })
@@ -425,6 +480,19 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_names_browser_and_os_only() {
+        let ua = |s: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(axum::http::header::USER_AGENT, s.parse().unwrap());
+            device(&h)
+        };
+        assert_eq!(ua("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"), "Chrome macOS");
+        assert_eq!(ua("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"), "Safari iPhone");
+        assert_eq!(ua("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0"), "Edge Windows");
+        assert_eq!(device(&HeaderMap::new()), "other");
+    }
 
     #[test]
     fn only_the_secret_owner_matches_an_id() {
