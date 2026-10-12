@@ -282,8 +282,12 @@ enum WebServerMsg<'a> {
         scrolled: bool,
         data: &'a str,
     },
-    /// The attached pane is gone; the page picks another tab.
-    Closed,
+    /// The attached pane is gone; the page picks another tab. It names the
+    /// pane because the page may already have moved on after a tabs update,
+    /// and must not drop the tab it moved to.
+    Closed {
+        pane_id: usize,
+    },
     Pong,
 }
 
@@ -819,7 +823,8 @@ pub(crate) async fn run_session(
                 let Some(pane) = lookup_pane(pane_id) else {
                     attached = None;
                     updates = None;
-                    let Some(json) = encode(&WebServerMsg::Closed) else { continue };
+                    let msg = WebServerMsg::Closed { pane_id };
+                    let Some(json) = encode(&msg) else { continue };
                     if outbox.send(json).await.is_err() {
                         break;
                     }
@@ -901,6 +906,14 @@ mod tests {
         let mut out = String::new();
         Sgr::from_attrs(&attrs).write(&mut out);
         assert_eq!(out, "\x1b[0;1;7;38;5;2;48;2;255;0;127m");
+    }
+
+    #[test]
+    fn closed_names_the_pane_it_reports() {
+        // The page ignores a closed notice for a pane it already left; without
+        // the id it dropped the tab it had just switched to.
+        let json = encode(&WebServerMsg::Closed { pane_id: 7 }).unwrap();
+        assert_eq!(json, r#"{"type":"closed","pane_id":7}"#);
     }
 
     #[test]

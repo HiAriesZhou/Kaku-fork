@@ -429,6 +429,9 @@
     else if (msg.type === "tabs") onTabs(msg.tabs);
     else if (msg.type === "frame") onFrame(msg);
     else if (msg.type === "closed") {
+      // A tabs update may already have moved the page to another tab; the
+      // late notice for the old pane must not drop the tab it moved to.
+      if (msg.pane_id !== paneId) return;
       const gone = paneId;
       tabId = null;
       paneId = null;
