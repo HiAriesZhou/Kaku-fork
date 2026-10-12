@@ -34,6 +34,8 @@
   #bar .tab:hover .close, #bar .tab[aria-current="true"] .close { opacity: 0.55; }
   #bar .close:hover { opacity: 1; background: var(--tab-hover-bg); }
   #bar .add { width: 32px; padding: 0; font-size: 15px; }
+  #bar .fs { display: flex; align-items: center; justify-content: center; width: 34px; padding: 0; margin-left: auto; }
+  #bar .fs svg { width: 13px; height: 13px; }
   #stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
   /* Chrome squeezes runs of CJK punctuation by default. xterm.js measures a
      glyph as 32 copies in a row, so it read "，" as half width while rows draw
@@ -319,8 +321,40 @@
     return (IS_MAC ? MAC_SHORTCUTS : OTHER_SHORTCUTS)[mod + "+" + name] || null;
   };
 
+  // Kaku's tab keys: Cmd+1-9, Cmd+Shift+[ and ], Cmd+W, Cmd+T. Browsers keep
+  // most of these for their own tabs; in full screen the page asks for them
+  // with the Keyboard Lock API, and wherever they do arrive they act here.
+  const tabKey = (ev) => {
+    if (!IS_MAC || !ev.metaKey || ev.ctrlKey || ev.altKey) return null;
+    if (!ev.shiftKey && /^Digit[1-9]$/.test(ev.code)) return { go: Number(ev.code.slice(5)) - 1 };
+    if (ev.shiftKey && ev.code === "BracketLeft") return { step: -1 };
+    if (ev.shiftKey && ev.code === "BracketRight") return { step: 1 };
+    if (!ev.shiftKey && ev.code === "KeyW") return { close: true };
+    if (!ev.shiftKey && ev.code === "KeyT") return { add: true };
+    return null;
+  };
+  const runTabKey = (k) => {
+    const at = tabs.findIndex((t) => t.tab_id === tabId);
+    if (k.close) { if (at >= 0) closeTab(tabs[at]); return; }
+    if (k.add) { newTab(); return; }
+    const next = k.step ? tabs[(at + k.step + tabs.length) % tabs.length] : tabs[k.go];
+    if (next && next.tab_id !== tabId) attach(next);
+  };
+  window.addEventListener("keydown", (ev) => {
+    // Outside the terminal (the tab bar, the page) the same keys still work.
+    if (termEl.contains(ev.target) || dialogEl.contains(ev.target)) return;
+    const k = tabKey(ev);
+    if (k) { ev.preventDefault(); runTabKey(k); }
+  });
+
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.isComposing || ev.keyCode === 229) return true;
+    const tk = tabKey(ev);
+    if (tk) {
+      if (ev.type === "keydown") runTabKey(tk);
+      ev.preventDefault();
+      return false;
+    }
     const shortcut = shortcutFor(ev);
     if (shortcut) {
       if (ev.type === "keydown") send({ type: "key", ctrl: false, alt: false, shift: false, ...shortcut });
@@ -624,8 +658,48 @@
     ev.stopPropagation();
   }, true);
 
+  // Full screen is where Kaku's tab keys reach the page: the Keyboard Lock
+  // API (Chrome, Edge) hands them over instead of the browser acting on them.
+  // Esc goes to the terminal too; holding it leaves full screen.
+  const LOCKED_KEYS = ["Escape", "KeyW", "KeyT", "BracketLeft", "BracketRight",
+    "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9"];
+  if (document.fullscreenEnabled && !TOUCH) {
+    const fs = document.createElement("button");
+    fs.type = "button";
+    fs.className = "fs";
+    const icon = (inFs) => inFs
+      ? '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 1v5H1M10 1v5h5M6 15v-5H1M10 15v-5h5"/></svg>'
+      : '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 6V1h5M15 6V1h-5M1 10v5h5M15 10v5h-5"/></svg>';
+    const sync = () => {
+      const inFs = !!document.fullscreenElement;
+      fs.innerHTML = icon(inFs);
+      fs.title = inFs ? "Exit Full Screen" : "Full Screen, so Cmd+1-9, Cmd+W and Cmd+T work as in Kaku";
+      if (!inFs && navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+    };
+    fs.addEventListener("click", () => {
+      if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
+      document.documentElement.requestFullscreen().then(() => {
+        if (navigator.keyboard && navigator.keyboard.lock) return navigator.keyboard.lock(LOCKED_KEYS);
+      }).catch(() => {}).finally(() => term.focus());
+    });
+    document.addEventListener("fullscreenchange", sync);
+    sync();
+    bar.append(fs);
+  }
+
+  const closeTab = (t) => {
+    const go = () => send({ type: "close_tab", tab_id: t.tab_id });
+    if (t.confirm_close) askClose(t.title || "Tab").then((ok) => { if (ok) go(); });
+    else go();
+  };
+  const newTab = () => {
+    followNewTab = new Set(tabs.map((t) => t.tab_id));
+    followUntil = Date.now() + 5000;
+    send({ type: "new_tab" });
+  };
+
   const renderTabs = () => {
-    bar.querySelectorAll("button").forEach((b) => b.remove());
+    bar.querySelectorAll(".tab, .add").forEach((b) => b.remove());
     for (const t of tabs) {
       const b = document.createElement("button");
       b.type = "button";
@@ -639,9 +713,7 @@
       close.title = "Close Tab";
       close.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        const go = () => send({ type: "close_tab", tab_id: t.tab_id });
-        if (t.confirm_close) askClose(t.title || "Tab").then((ok) => { if (ok) go(); });
-        else go();
+        closeTab(t);
       });
       b.append(label, close);
       b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t); else term.focus(); });
@@ -652,11 +724,7 @@
     add.className = "add";
     add.textContent = "+";
     add.title = "New Tab";
-    add.addEventListener("click", () => {
-      followNewTab = new Set(tabs.map((t) => t.tab_id));
-      followUntil = Date.now() + 5000;
-      send({ type: "new_tab" });
-    });
+    add.addEventListener("click", newTab);
     bar.insertBefore(add, statusEl);
   };
 
