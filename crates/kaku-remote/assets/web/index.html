@@ -205,8 +205,40 @@
   // pane's current modes. Plain characters and IME text arrive via onData.
   const NAMED = new Set(["Enter", "Tab", "Escape", "Backspace", "Delete", "Insert", "Home", "End",
     "PageUp", "PageDown", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]);
+  // Kaku's editing shortcuts (bundled kaku.lua), sent as the keys Kaku
+  // turns them into. Cmd+R stays the browser's reload.
+  const MAC_SHORTCUTS = {
+    "meta+Backspace": { key: "u", ctrl: true },        // delete to line start
+    "alt+Backspace": { key: "w", ctrl: true },         // delete previous word
+    "meta+Delete": { key: "k", ctrl: true },           // delete to line end
+    "alt+Delete": { key: "d", alt: true },             // delete next word
+    "meta+ArrowLeft": { key: "a", ctrl: true },        // line start
+    "meta+ArrowRight": { key: "e", ctrl: true },       // line end
+    "alt+ArrowLeft": { key: "b", alt: true },          // previous word
+    "alt+ArrowRight": { key: "f", alt: true },         // next word
+    "meta+k": { key: "l", ctrl: true },                // clear
+  };
+  const OTHER_SHORTCUTS = {
+    "ctrl+Backspace": { key: "w", ctrl: true },
+    "ctrl+Delete": { key: "d", alt: true },
+    "ctrl+ArrowLeft": { key: "b", alt: true },
+    "ctrl+ArrowRight": { key: "f", alt: true },
+  };
+  const shortcutFor = (ev) => {
+    const mod = ev.metaKey ? "meta" : ev.altKey ? "alt" : ev.ctrlKey ? "ctrl" : null;
+    if (!mod || ev.shiftKey || (ev.metaKey && (ev.altKey || ev.ctrlKey))) return null;
+    const name = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+    return (IS_MAC ? MAC_SHORTCUTS : OTHER_SHORTCUTS)[mod + "+" + name] || null;
+  };
+
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.isComposing || ev.keyCode === 229) return true;
+    const shortcut = shortcutFor(ev);
+    if (shortcut) {
+      if (ev.type === "keydown") send({ type: "key", ctrl: false, alt: false, shift: false, ...shortcut });
+      ev.preventDefault();
+      return false;
+    }
     // Off the Mac, Ctrl+V pastes, and Ctrl+C copies when text is selected
     // (Ctrl+Shift+C/V always do), as in other browser terminals. Returning
     // false leaves the key to the browser, whose copy and paste events
