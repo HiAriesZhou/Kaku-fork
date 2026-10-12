@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="referrer" content="no-referrer">
 <title>Kaku</title>
 <link rel="stylesheet" href="assets/xterm.css">
@@ -34,6 +34,25 @@
   #term { position: absolute; top: 8px; left: 8px; }
   #history { position: absolute; right: 16px; bottom: 16px; display: none; height: 28px; padding: 0 12px; border: 0; border-radius: 14px; background: var(--line); color: var(--fg); font: inherit; cursor: pointer; }
   #message { color: var(--muted); padding: 24px; text-align: center; line-height: 1.6; }
+  /* Phones and tablets: a key row for what touch keyboards lack, finger-size
+     targets, room for the home indicator, and a 16px input so iOS does not
+     zoom the page when the keyboard opens. */
+  #keys { display: none; }
+  body.touch { box-sizing: border-box; padding-bottom: env(safe-area-inset-bottom); }
+  body.touch #bar { height: 44px; }
+  body.touch #bar button { height: 36px; }
+  body.touch #bar .close { width: 28px; height: 28px; line-height: 28px; opacity: 0.6; }
+  body.touch #bar .add { width: 36px; }
+  body.touch #keys { display: flex; order: 3; flex: none; gap: 6px; padding: 6px 8px; overflow-x: auto; border-top: 1px solid var(--line); }
+  body.touch #keys button { flex: none; min-width: 40px; height: 36px; padding: 0 10px; border: 0; border-radius: 6px; background: var(--line); color: var(--fg); font: inherit; -webkit-user-select: none; user-select: none; }
+  body.touch #keys button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+  body.touch .xterm-helper-textarea { font-size: 16px !important; }
+  /* Dragging scrolls the terminal, so the browser must not take the gesture.
+     Touches also land on the stable screen element rather than a row: xterm
+     replaces row elements as frames arrive, and a touch whose target left
+     the page stops reaching any listener mid-drag. */
+  body.touch #stage { touch-action: none; }
+  body.touch .xterm-rows { pointer-events: none; }
 </style>
 </head>
 <body>
@@ -42,6 +61,7 @@
   <div id="term"></div>
   <button id="history" type="button">Back to live</button>
 </div>
+<div id="keys"></div>
 <script src="assets/xterm.js"></script>
 <script>
 (() => {
@@ -132,6 +152,8 @@
   // Kaku's own font size; the page only shrinks below it until Kaku has
   // resized the tab to this window.
   let baseFontSize = 15;
+  const TOUCH = matchMedia("(pointer: coarse)").matches;
+  if (TOUCH) document.body.classList.add("touch");
   let fontSize = baseFontSize;
   let size = { cols: 0, rows: 0 };
   let retry = 0;
@@ -173,11 +195,26 @@
   // size. The Mac takes the tab back on its next local input, and the page
   // claims it again on its own next input.
   let claimed = "";
+  // On a phone, Kaku's own size leaves about 38 columns on a portrait screen,
+  // and the tab on the Mac narrows to match. Size the font for about 50
+  // columns across the screen's shorter side, so landscape gets more. The
+  // screen, not the window, so the keyboard opening does not change it.
+  const PHONE_COLS = 50;
+  const claimFont = () => {
+    if (!TOUCH) return baseFontSize;
+    setFont(baseFontSize);
+    const cell = cellSize();
+    if (!cell) return baseFontSize;
+    const across = Math.min(screen.width, screen.height) - MARGIN * 2;
+    const px = Math.floor((baseFontSize * across) / (PHONE_COLS * cell.width) * 4) / 4;
+    return Math.max(9, Math.min(baseFontSize, px));
+  };
   const fit = () => {
     const availW = stage.clientWidth - MARGIN * 2;
     const availH = stage.clientHeight - MARGIN * 2;
     if (availW <= 0 || availH <= 0) return;
-    setFont(baseFontSize);
+    const want = claimFont();
+    setFont(want);
     const base = cellSize();
     if (!base) return;
     if (ws && ws.readyState === WebSocket.OPEN && paneId !== null) {
@@ -192,7 +229,7 @@
     // Until Kaku applies that size, the current grid may be larger than the
     // window; shrink the font just enough for it to fit.
     if (!size.cols) return;
-    let px = baseFontSize;
+    let px = want;
     for (let i = 0; i < 40; i++) {
       const cell = cellSize();
       if (!cell || (size.cols * cell.width <= availW && size.rows * cell.height <= availH) || px <= 6) break;
@@ -283,7 +320,75 @@
     ev.preventDefault();
     return false;
   });
-  term.onData((data) => send({ type: "text", data }));
+  // Key row for touch keyboards, which have no Esc, Tab, Ctrl or arrows.
+  // Ctrl stays down for the next key, typed or tapped. Buttons act on
+  // pointerdown and never take focus, so the keyboard stays open.
+  let ctrlDown = false;
+  let ctrlButton = null;
+  const setCtrl = (on) => {
+    ctrlDown = on;
+    if (ctrlButton) ctrlButton.setAttribute("aria-pressed", String(on));
+  };
+  term.onData((data) => {
+    if (ctrlDown && data.length === 1) {
+      setCtrl(false);
+      send({ type: "key", key: data.toLowerCase(), ctrl: true, alt: false, shift: false });
+      return;
+    }
+    send({ type: "text", data });
+  });
+  if (TOUCH) {
+    const keysEl = document.getElementById("keys");
+    const KEY_ROW = [
+      ["Esc", { key: "Escape" }],
+      ["Tab", { key: "Tab" }],
+      ["⇧Tab", { key: "Tab", shift: true }],
+      ["Ctrl", "ctrl"],
+      ["←", { key: "ArrowLeft" }],
+      ["↑", { key: "ArrowUp" }],
+      ["↓", { key: "ArrowDown" }],
+      ["→", { key: "ArrowRight" }],
+      ["^C", { key: "c", ctrl: true }],
+      ["/", "/"],
+      ["|", "|"],
+      ["~", "~"],
+      ["-", "-"],
+    ];
+    for (const [label, action] of KEY_ROW) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.tabIndex = -1;
+      b.textContent = label;
+      if (action === "ctrl") { ctrlButton = b; b.setAttribute("aria-pressed", "false"); }
+      b.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        if (action === "ctrl") { setCtrl(!ctrlDown); return; }
+        if (typeof action === "string") {
+          if (ctrlDown) { setCtrl(false); send({ type: "key", key: action, ctrl: true, alt: false, shift: false }); }
+          else send({ type: "text", data: action });
+          return;
+        }
+        const ctrl = action.ctrl || ctrlDown;
+        setCtrl(false);
+        send({ type: "key", alt: false, shift: false, ...action, ctrl });
+      });
+      // Keep the tap from moving focus off the terminal or becoming a click.
+      b.addEventListener("touchstart", (ev) => ev.preventDefault(), { passive: false });
+      keysEl.append(b);
+    }
+    // When the keyboard opens, iOS shrinks only the visual viewport: size the
+    // page to it so the prompt and the key row stay above the keyboard.
+    if (window.visualViewport) {
+      const vv = window.visualViewport;
+      const sync = () => {
+        document.body.style.height = vv.height + "px";
+        window.scrollTo(0, 0);
+      };
+      vv.addEventListener("resize", sync);
+      vv.addEventListener("scroll", sync);
+      sync();
+    }
+  }
 
   termEl.addEventListener("paste", (ev) => {
     ev.preventDefault();
@@ -303,18 +408,68 @@
     if (wheelPending !== 0) send({ type: "scroll", lines: wheelPending });
     wheelPending = 0;
   };
+  // Positive lines move toward history.
+  const queueScroll = (lines) => {
+    wheelRemainder += lines;
+    const whole = Math.trunc(wheelRemainder);
+    if (whole !== 0) {
+      wheelRemainder -= whole;
+      wheelPending += whole;
+      if (!wheelFrame) wheelFrame = requestAnimationFrame(flushWheel);
+    }
+  };
   stage.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
     const lineHeight = Math.max(1, fontSize * 1.2);
     const px = ev.deltaMode === 1 ? ev.deltaY * lineHeight : ev.deltaY;
-    wheelRemainder += -px / lineHeight;
-    const lines = Math.trunc(wheelRemainder);
-    if (lines !== 0) {
-      wheelRemainder -= lines;
-      wheelPending += lines;
-      if (!wheelFrame) wheelFrame = requestAnimationFrame(flushWheel);
-    }
+    queueScroll(-px / lineHeight);
+  }, { passive: false, capture: true });
+
+  // Touch: drag to scroll a row per row height, and keep going briefly after
+  // a flick. A tap without movement still reaches xterm.js and focuses it.
+  let touchY = null;
+  let touchMoved = false;
+  let touchVel = 0;
+  let touchAt = 0;
+  let flingFrame = 0;
+  const rowHeight = () => { const c = cellSize(); return c ? c.height : Math.max(1, fontSize * 1.2); };
+  stage.addEventListener("touchstart", (ev) => {
+    cancelAnimationFrame(flingFrame);
+    if (ev.touches.length !== 1) { touchY = null; return; }
+    touchY = ev.touches[0].clientY;
+    touchMoved = false;
+    touchVel = 0;
+    touchAt = performance.now();
+  }, { passive: true, capture: true });
+  stage.addEventListener("touchmove", (ev) => {
+    if (touchY === null || ev.touches.length !== 1) return;
+    const y = ev.touches[0].clientY;
+    const dy = y - touchY;
+    if (!touchMoved && Math.abs(dy) < 8) return;
+    touchMoved = true;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const now = performance.now();
+    touchVel = dy / Math.max(1, now - touchAt);
+    touchAt = now;
+    touchY = y;
+    queueScroll(dy / rowHeight());
+  }, { passive: false, capture: true });
+  stage.addEventListener("touchend", (ev) => {
+    if (touchY === null) return;
+    touchY = null;
+    if (!touchMoved) return;
+    ev.preventDefault();
+    let v = touchVel;
+    let last = performance.now();
+    const step = (now) => {
+      v *= Math.pow(0.95, (now - last) / 16);
+      queueScroll((v * (now - last)) / rowHeight());
+      last = now;
+      if (Math.abs(v) > 0.05) flingFrame = requestAnimationFrame(step);
+    };
+    if (Math.abs(v) > 0.3) flingFrame = requestAnimationFrame(step);
   }, { passive: false, capture: true });
 
   historyBtn.addEventListener("click", () => {
@@ -523,7 +678,9 @@
     send({ type: "ping" });
   }, 20000);
 
+  let reconnectTimer = 0;
   const connect = () => {
+    clearTimeout(reconnectTimer);
     setStatus("Connecting");
     const socket = new WebSocket(wsUrl());
     socket.binaryType = "arraybuffer";
@@ -548,10 +705,29 @@
       else setStatus("Disconnected, retrying");
       claimed = "";
       const delay = Math.min(5000, 500 * 2 ** retry++);
-      setTimeout(connect, delay);
+      reconnectTimer = setTimeout(connect, delay);
     };
   };
   connect();
+
+  // Phones suspend a page in the background and its socket often dies
+  // there. On return, reconnect at once, or check the link with a ping
+  // instead of waiting out the heartbeat.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      retry = 0;
+      connect();
+      return;
+    }
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const socket = ws;
+    pingSentAt = Date.now();
+    send({ type: "ping" });
+    setTimeout(() => {
+      if (ws === socket && pingSentAt > lastHeard) socket.close();
+    }, 3000);
+  });
 })();
 </script>
 </body>
