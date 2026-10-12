@@ -25,6 +25,12 @@
   #bar .add { width: 26px; padding: 0; font-size: 16px; }
   #status { margin-left: auto; padding-left: 12px; color: var(--muted); white-space: nowrap; }
   #stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+  /* Chrome squeezes runs of CJK punctuation by default. xterm.js measures a
+     glyph as 32 copies in a row, so it read "，" as half width while rows draw
+     it full width, then padded it with extra letter-spacing: a wide gap after
+     every Chinese punctuation mark. Keep punctuation at its full width in
+     both places. */
+  .xterm, .xterm * { text-spacing-trim: space-all; }
   #term { position: absolute; top: 8px; left: 8px; }
   #history { position: absolute; right: 16px; bottom: 16px; display: none; height: 28px; padding: 0 12px; border: 0; border-radius: 14px; background: var(--line); color: var(--fg); font: inherit; cursor: pointer; }
   #message { color: var(--muted); padding: 24px; text-align: center; line-height: 1.6; }
