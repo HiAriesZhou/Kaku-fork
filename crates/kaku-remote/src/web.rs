@@ -276,6 +276,9 @@ enum WebServerMsg<'a> {
         tabs: &'a [TabInfo],
     },
     Frame {
+        /// The pane this frame draws; the page drops frames still in flight
+        /// from the tab it just left.
+        pane_id: usize,
         cols: usize,
         rows: usize,
         title: &'a str,
@@ -903,6 +906,7 @@ pub(crate) async fn run_session(
                     continue;
                 };
                 let msg = WebServerMsg::Frame {
+                    pane_id,
                     cols: frame.cols,
                     rows: frame.rows,
                     title: &frame.title,

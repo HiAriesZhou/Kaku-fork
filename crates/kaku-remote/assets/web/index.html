@@ -330,11 +330,66 @@
   let followNewTab = null;
   let followUntil = 0;
 
+  // What each tab last looked like, so switching back draws it at once and
+  // the Mac's fresh frame, a network round trip later, only corrects it.
+  const snapshots = new Map();
+  const sgrColor = (cell, fg) => {
+    const base = fg ? 30 : 40;
+    if (fg ? cell.isFgDefault() : cell.isBgDefault()) return [base + 9];
+    const c = fg ? cell.getFgColor() : cell.getBgColor();
+    if (fg ? cell.isFgRGB() : cell.isBgRGB()) return [base + 8, 2, (c >> 16) & 255, (c >> 8) & 255, c & 255];
+    return [base + 8, 5, c];
+  };
+  const snapshot = () => {
+    const buf = term.buffer.active;
+    let out = "";
+    let cell = buf.getNullCell();
+    for (let y = 0; y < term.rows; y++) {
+      const line = buf.getLine(buf.viewportY + y);
+      if (!line) continue;
+      out += `\x1b[${y + 1};1H`;
+      // Stop after the last cell that shows anything; erase the rest, as
+      // Kaku's own frames do.
+      let end = 0;
+      for (let x = 0; x < term.cols; x++) {
+        cell = line.getCell(x, cell);
+        if (cell && (cell.getChars() || !cell.isBgDefault() || cell.isInverse())) end = x + 1;
+      }
+      let last = "";
+      for (let x = 0; x < end; x++) {
+        cell = line.getCell(x, cell);
+        if (!cell || cell.getWidth() === 0) continue;
+        const sgr = [0];
+        if (cell.isBold()) sgr.push(1);
+        if (cell.isDim()) sgr.push(2);
+        if (cell.isItalic()) sgr.push(3);
+        if (cell.isUnderline()) sgr.push(4);
+        if (cell.isInverse()) sgr.push(7);
+        if (cell.isInvisible()) sgr.push(8);
+        if (cell.isStrikethrough()) sgr.push(9);
+        sgr.push(...sgrColor(cell, true), ...sgrColor(cell, false));
+        const code = `\x1b[${sgr.join(";")}m`;
+        if (code !== last) { out += code; last = code; }
+        out += cell.getChars() || " ";
+      }
+      out += "\x1b[0m\x1b[K";
+    }
+    return { cols: term.cols, rows: term.rows, data: out };
+  };
+
   const attach = (tab) => {
+    if (paneId !== null && size.cols) snapshots.set(paneId, snapshot());
     paneId = tab.pane_id;
     tabId = tab.tab_id;
     claimed = "";
     size = { cols: 0, rows: 0 };
+    const saved = snapshots.get(paneId);
+    if (saved) {
+      size = { cols: saved.cols, rows: saved.rows };
+      term.resize(saved.cols, saved.rows);
+      fit();
+      term.write("\x1b[?25l\x1b[0m\x1b[2J" + saved.data);
+    }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     send({ type: "attach", pane_id: paneId });
     renderTabs();
@@ -425,6 +480,7 @@
   };
 
   const onFrame = (msg) => {
+    if (msg.pane_id !== paneId) return;
     if (msg.cols !== size.cols || msg.rows !== size.rows) {
       size = { cols: msg.cols, rows: msg.rows };
       term.resize(msg.cols, msg.rows);
@@ -444,6 +500,7 @@
       // late notice for the old pane must not drop the tab it moved to.
       if (msg.pane_id !== paneId) return;
       const gone = paneId;
+      snapshots.delete(gone);
       tabId = null;
       paneId = null;
       onTabs(tabs.filter((t) => t.pane_id !== gone));
