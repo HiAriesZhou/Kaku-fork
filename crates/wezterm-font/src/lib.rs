@@ -78,9 +78,11 @@ lazy_static::lazy_static! {
 }
 
 pub struct LoadedFont {
-    rasterizers: RefCell<HashMap<FallbackIdx, Box<dyn FontRasterizer>>>,
-    handles: RefCell<Vec<ParsedFont>>,
-    shaper: RefCell<Box<dyn FontShaper>>,
+    // Shaping and rasterizing take the size per call, so these are shared
+    // with the same style's font at the next zoom level (see `rescaled`).
+    rasterizers: Rc<RefCell<HashMap<FallbackIdx, Box<dyn FontRasterizer>>>>,
+    handles: Rc<RefCell<Vec<ParsedFont>>>,
+    shaper: Rc<RefCell<Box<dyn FontShaper>>>,
     metrics: FontMetrics,
     pixel_geometry: DisplayPixelGeometry,
     font_size: f64,
@@ -91,7 +93,7 @@ pub struct LoadedFont {
     id: LoadedFontId,
     /// Glyphs for which no font was found and for which we should
     /// stop searching
-    tried_glyphs: RefCell<HashSet<char>>,
+    tried_glyphs: Rc<RefCell<HashSet<char>>>,
 }
 
 impl std::fmt::Debug for LoadedFont {
@@ -503,6 +505,9 @@ enum Entity {
 
 struct FontConfigInner {
     fonts: RefCell<HashMap<TextStyle, Rc<LoadedFont>>>,
+    /// Fonts from before the last `change_scaling`, reused by `resolve_font`
+    /// so a zoom step does not reload every fallback face on the next paint.
+    rescaled: RefCell<HashMap<TextStyle, Rc<LoadedFont>>>,
     metrics: RefCell<Option<FontMetrics>>,
     dpi: RefCell<usize>,
     font_scale: RefCell<f64>,
@@ -529,6 +534,7 @@ impl FontConfigInner {
         let locator = new_locator(config.font_locator);
         Ok(Self {
             fonts: RefCell::new(HashMap::new()),
+            rescaled: RefCell::new(HashMap::new()),
             locator,
             metrics: RefCell::new(None),
             title_font: RefCell::new(None),
@@ -549,6 +555,7 @@ impl FontConfigInner {
         *self.config.borrow_mut() = config.clone();
         // Config was reloaded, invalidate our caches
         fonts.clear();
+        self.rescaled.borrow_mut().clear();
         self.title_font.borrow_mut().take();
         self.pane_select_font.borrow_mut().take();
         self.char_select_font.borrow_mut().take();
@@ -677,9 +684,9 @@ impl FontConfigInner {
         })?;
 
         let loaded = Rc::new(LoadedFont {
-            rasterizers: RefCell::new(HashMap::new()),
-            handles: RefCell::new(handles),
-            shaper: RefCell::new(shaper),
+            rasterizers: Default::default(),
+            handles: Rc::new(RefCell::new(handles)),
+            shaper: Rc::new(RefCell::new(shaper)),
             metrics,
             font_size,
             dpi,
@@ -687,7 +694,7 @@ impl FontConfigInner {
             pending_fallback: Arc::new(Mutex::new(vec![])),
             text_style: text_style.clone(),
             id: alloc_font_id(),
-            tried_glyphs: RefCell::new(HashSet::new()),
+            tried_glyphs: Default::default(),
             pixel_geometry: config.display_pixel_geometry,
         });
 
@@ -920,9 +927,33 @@ impl FontConfigInner {
         let dpi = *self.dpi.borrow() as u32;
         let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
 
-        let (mut shaper, mut handles) = self.resolve_font_helper(style, &config, pixel_size)?;
+        // A zoom step changes only the size: keep the shaper, the fallback
+        // faces it has loaded and the rasterizers of this style's font at the
+        // previous zoom level instead of resolving and loading them again.
+        // Not across a DPI change, which fixes the faces' HarfBuzz load flags,
+        // nor for a bitmap font, whose file is picked per pixel size.
+        // ponytail: only the primary face is checked; a bitmap fallback font
+        // shipped as one file per size keeps its first file while zooming.
+        let rescaled = self.rescaled.borrow_mut().remove(style).filter(|old| {
+            old.dpi == dpi
+                && old
+                    .handles
+                    .borrow()
+                    .first()
+                    .is_none_or(|primary| primary.pixel_sizes.is_empty())
+        });
+        let (mut shaper, mut handles) = match &rescaled {
+            Some(old) => (Rc::clone(&old.shaper), Rc::clone(&old.handles)),
+            None => {
+                let (shaper, handles) = self.resolve_font_helper(style, &config, pixel_size)?;
+                (
+                    Rc::new(RefCell::new(shaper)),
+                    Rc::new(RefCell::new(handles)),
+                )
+            }
+        };
 
-        let mut metrics = shaper.metrics(font_size, dpi).with_context(|| {
+        let mut metrics = shaper.borrow().metrics(font_size, dpi).with_context(|| {
             format!(
                 "obtaining metrics for font_size={} @ dpi {}",
                 font_size, dpi
@@ -948,17 +979,22 @@ impl FontConfigInner {
                             scaled_font_size,
                             metrics,
                         );
-                        let (alt_shaper, alt_handles) =
-                            self.resolve_font_helper(style, &config, scaled_pixel_size)?;
-                        shaper = alt_shaper;
-                        handles = alt_handles;
+                        if rescaled.is_none() {
+                            let (alt_shaper, alt_handles) =
+                                self.resolve_font_helper(style, &config, scaled_pixel_size)?;
+                            shaper = Rc::new(RefCell::new(alt_shaper));
+                            handles = Rc::new(RefCell::new(alt_handles));
+                        }
 
-                        metrics = shaper.metrics(scaled_font_size, dpi).with_context(|| {
-                            format!(
+                        metrics = shaper
+                            .borrow()
+                            .metrics(scaled_font_size, dpi)
+                            .with_context(|| {
+                                format!(
                                 "obtaining cap-height adjusted metrics for font_size={} @ dpi {}",
                                 scaled_font_size, dpi
                             )
-                        })?;
+                            })?;
 
                         font_size = scaled_font_size;
                     }
@@ -968,17 +1004,26 @@ impl FontConfigInner {
         }
 
         let loaded = Rc::new(LoadedFont {
-            rasterizers: RefCell::new(HashMap::new()),
-            handles: RefCell::new(handles),
-            shaper: RefCell::new(shaper),
+            rasterizers: rescaled
+                .as_ref()
+                .map(|old| Rc::clone(&old.rasterizers))
+                .unwrap_or_default(),
+            handles,
+            shaper,
             metrics,
             font_size,
             dpi,
             font_config: Rc::downgrade(myself),
-            pending_fallback: Arc::new(Mutex::new(vec![])),
+            pending_fallback: rescaled
+                .as_ref()
+                .map(|old| Arc::clone(&old.pending_fallback))
+                .unwrap_or_default(),
             text_style: style.clone(),
             id: alloc_font_id(),
-            tried_glyphs: RefCell::new(HashSet::new()),
+            tried_glyphs: rescaled
+                .as_ref()
+                .map(|old| Rc::clone(&old.tried_glyphs))
+                .unwrap_or_default(),
             pixel_geometry: config.display_pixel_geometry,
         });
 
@@ -993,7 +1038,9 @@ impl FontConfigInner {
 
         *self.dpi.borrow_mut() = dpi;
         *self.font_scale.borrow_mut() = font_scale;
-        self.fonts.borrow_mut().clear();
+        self.rescaled
+            .borrow_mut()
+            .extend(self.fonts.borrow_mut().drain());
         self.metrics.borrow_mut().take();
         self.title_font.borrow_mut().take();
 
@@ -1200,5 +1247,60 @@ mod macos_tests {
                 "fallback job left an autoreleased object pending"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_step_reuses_loaded_shaper_until_config_changes() {
+        config::use_test_configuration();
+        let fonts = FontConfiguration::new(None, 72).unwrap();
+        let before = fonts.default_font().unwrap();
+
+        fonts.change_scaling(1.5, 72);
+        let after = fonts.default_font().unwrap();
+        assert_ne!(before.id(), after.id(), "caches keyed by font id must miss");
+        assert!(after.metrics().cell_height.get() > before.metrics().cell_height.get());
+        // the lazily computed width must follow the face's new size too
+        assert!(after.metrics().cell_width.get() > before.metrics().cell_width.get());
+        assert!(Rc::ptr_eq(&before.shaper, &after.shaper));
+        assert!(Rc::ptr_eq(&before.handles, &after.handles));
+
+        fonts.config_changed(&config::configuration()).unwrap();
+        let reloaded = fonts.default_font().unwrap();
+        assert!(!Rc::ptr_eq(&after.shaper, &reloaded.shaper));
+    }
+
+    #[test]
+    fn shared_shaper_keeps_each_font_at_its_own_size() {
+        config::use_test_configuration();
+        let fonts = FontConfiguration::new(None, 72).unwrap();
+        let before = fonts.default_font().unwrap();
+        let advances = |font: &LoadedFont, text: &str| -> Vec<f64> {
+            font.blocking_shape(text, None, Direction::LeftToRight, None, None)
+                .unwrap()
+                .iter()
+                .map(|glyph| glyph.x_advance.get())
+                .collect()
+        };
+        let first = advances(&before, "A");
+
+        // Resolving the next zoom level sizes the shared face for it.
+        fonts.change_scaling(1.5, 72);
+        fonts.default_font().unwrap();
+        assert_eq!(advances(&before, "AB"), vec![first[0]; 2]);
+    }
+
+    #[test]
+    fn dpi_change_does_not_reuse_the_shaper() {
+        config::use_test_configuration();
+        let fonts = FontConfiguration::new(None, 72).unwrap();
+        let before = fonts.default_font().unwrap();
+        fonts.change_scaling(1.0, 144);
+        let after = fonts.default_font().unwrap();
+        assert!(!Rc::ptr_eq(&before.shaper, &after.shaper));
     }
 }

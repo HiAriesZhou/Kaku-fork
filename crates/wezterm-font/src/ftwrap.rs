@@ -114,7 +114,9 @@ impl Drop for Face {
 struct FaceSize {
     size: f64,
     dpi: u32,
-    cell_width: f64,
+    /// Computed on first use: it loads every ASCII glyph, and most
+    /// fallback faces only ever need the height (shaping, metrics probing).
+    cell_width: Option<f64>,
     cell_height: f64,
     cap_height: Option<f64>,
     cap_height_to_height_ratio: Option<f64>,
@@ -129,7 +131,6 @@ struct ComputedCellMetrics {
 
 #[derive(Debug)]
 pub struct SelectedFontSize {
-    pub width: f64,
     pub height: f64,
     pub cap_height: Option<f64>,
     pub cap_height_to_height_ratio: Option<f64>,
@@ -451,7 +452,6 @@ impl Face {
         if let Some(face_size) = self.size.as_ref() {
             if face_size.size == point_size && face_size.dpi == dpi {
                 return Ok(SelectedFontSize {
-                    width: face_size.cell_width,
                     height: face_size.cell_height,
                     is_scaled: face_size.is_scaled,
                     cap_height: face_size.cap_height,
@@ -472,18 +472,16 @@ impl Face {
         // the fallback code for set_pixel_sizes below.
         let size = FT_F26Dot6::from_num(point_size);
 
-        let selected_size = match self.set_char_size(size, size, dpi, dpi) {
-            Ok(_) => {
-                // Compute metrics for the nominal monospace cell
-                let ComputedCellMetrics { width, height } = self.cell_metrics();
+        let (selected_size, cell_width) = match self.set_char_size(size, size, dpi, dpi) {
+            Ok(_) => (
                 SelectedFontSize {
-                    width,
-                    height,
+                    height: self.cell_height(),
                     cap_height: None,
                     cap_height_to_height_ratio: None,
                     is_scaled: true,
-                }
-            }
+                },
+                None,
+            ),
             Err(err) => {
                 log::debug!("set_char_size: {:?}, will inspect strikes", err);
 
@@ -537,20 +535,22 @@ impl Face {
                 // <https://github.com/wezterm/wezterm/issues/1165>
                 let m = self.cell_metrics();
                 let height = f64::from(best.height).max(m.height);
-                SelectedFontSize {
-                    width: f64::from(best.width).max(m.width),
-                    height,
-                    is_scaled: false,
-                    cap_height: None,
-                    cap_height_to_height_ratio: None,
-                }
+                (
+                    SelectedFontSize {
+                        height,
+                        is_scaled: false,
+                        cap_height: None,
+                        cap_height_to_height_ratio: None,
+                    },
+                    Some(f64::from(best.width).max(m.width)),
+                )
             }
         };
 
         self.size.replace(FaceSize {
             size: point_size,
             dpi,
-            cell_width: selected_size.width,
+            cell_width,
             cap_height: None,
             cap_height_to_height_ratio: None,
             cell_height: selected_size.height,
@@ -564,7 +564,7 @@ impl Face {
             self.size.replace(FaceSize {
                 size: point_size,
                 dpi,
-                cell_width: selected_size.width,
+                cell_width,
                 cap_height: Some(cap_height),
                 cap_height_to_height_ratio: Some(cap_height_to_height_ratio),
                 cell_height: selected_size.height,
@@ -1085,11 +1085,28 @@ impl Face {
         }
     }
 
-    fn cell_metrics(&mut self) -> ComputedCellMetrics {
+    /// Width of the nominal monospace cell at the current size.
+    pub fn cell_width(&mut self) -> f64 {
+        if let Some(width) = self.size.as_ref().and_then(|s| s.cell_width) {
+            return width;
+        }
+        let width = self.cell_metrics().width;
+        if let Some(size) = self.size.as_mut() {
+            size.cell_width = Some(width);
+        }
+        width
+    }
+
+    fn cell_height(&self) -> f64 {
         unsafe {
             let metrics = &(*(*self.face).size).metrics;
-            let height = metrics.y_scale.to_num::<f64>() * f64::from((*self.face).height) / 64.0;
+            metrics.y_scale.to_num::<f64>() * f64::from((*self.face).height) / 64.0
+        }
+    }
 
+    fn cell_metrics(&mut self) -> ComputedCellMetrics {
+        let height = self.cell_height();
+        unsafe {
             let mut width = 0.0;
             let mut num_examined = 0;
             for i in 32..128 {

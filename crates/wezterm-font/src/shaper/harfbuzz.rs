@@ -600,10 +600,13 @@ impl FontShaper for HarfbuzzShaper {
         let scale = self.handles[font_idx].scale.unwrap_or(1.);
 
         let selected_size = pair.face.set_font_size(size * scale, dpi)?;
+        // Fonts of other sizes share this shaper, so make do_shape resync
+        // HarfBuzz with the face size this call just set.
+        pair.last_size_and_dpi.borrow_mut().take();
         let y_scale = unsafe { (*(*pair.face.face).size).metrics.y_scale.to_num::<f64>() };
         let mut metrics = FontMetrics {
             cell_height: PixelLength::new(selected_size.height),
-            cell_width: PixelLength::new(selected_size.width),
+            cell_width: PixelLength::new(pair.face.cell_width()),
             // Note: face.face.descender is useless, we have to go through
             // face.face.size.metrics to get to the real descender!
             descender: PixelLength::new(unsafe {
@@ -668,6 +671,7 @@ impl FontShaper for HarfbuzzShaper {
             let selected_size = pair
                 .face
                 .set_font_size(size * self.handles[metrics_idx].scale.unwrap_or(1.), dpi)?;
+            pair.last_size_and_dpi.borrow_mut().take();
             let diff = (theoretical_height - selected_size.height).abs();
             let factor = diff / theoretical_height;
             if factor < 2.0 {
