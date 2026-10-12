@@ -226,7 +226,17 @@ async fn fetch_asset(state: &AppState, id: &str, path: &str) -> Response {
         Ok(Ok(asset)) if asset.status == 200 => (
             [
                 (header::CONTENT_TYPE, asset.content_type),
-                (header::CACHE_CONTROL, "no-cache".to_string()),
+                // The page always comes fresh from the Mac; xterm.js and the
+                // fonts are ~1 MB that rarely change, so a reload skips them.
+                (
+                    header::CACHE_CONTROL,
+                    if path == "index.html" {
+                        "no-cache"
+                    } else {
+                        "max-age=3600"
+                    }
+                    .to_string(),
+                ),
                 (header::REFERRER_POLICY, "no-referrer".to_string()),
             ],
             asset.body,
@@ -381,6 +391,12 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Keystrokes and echoes are tiny frames; Nagle would hold them back.
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::warn!("set_nodelay failed: {e}");
+        }
+    });
     if let Err(e) = axum::serve(listener, app(AppState::default())).await {
         eprintln!("kaku-relay: server error: {}", e);
         std::process::exit(1);
