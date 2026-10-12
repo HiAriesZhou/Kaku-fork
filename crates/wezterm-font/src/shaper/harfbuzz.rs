@@ -66,7 +66,6 @@ fn make_glyphinfo(text: &str, num_cells: u8, font_idx: usize, info: &Info) -> Gl
 struct FontPair {
     face: ftwrap::Face,
     font: RefCell<harfbuzz::Font>,
-    shaped_any: bool,
     presentation: Presentation,
     features: Vec<harfbuzz::hb_feature_t>,
     last_size_and_dpi: RefCell<Option<(f64, u32)>>,
@@ -184,7 +183,6 @@ impl HarfbuzzShaper {
                     *opt_pair = Some(FontPair {
                         face,
                         font: RefCell::new(font),
-                        shaped_any: false,
                         presentation: if handle.assume_emoji_presentation {
                             Presentation::Emoji
                         } else {
@@ -232,8 +230,6 @@ impl HarfbuzzShaper {
         buf.set_cluster_level(
             harfbuzz::hb_buffer_cluster_level_t::HB_BUFFER_CLUSTER_LEVEL_MONOTONE_GRAPHEMES,
         );
-
-        let shaped_any;
 
         // We set this to true when we've run out of fallback fonts to try.
         // In that case, we accept shaper info with codepoint==0 and
@@ -287,7 +283,6 @@ impl HarfbuzzShaper {
                     }
 
                     let mut font = pair.font.borrow_mut();
-                    shaped_any = pair.shaped_any;
                     font.shape(&mut buf, pair.features.as_slice());
                     log::trace!(
                         "shaped font_idx={} {:?} presentation={presentation:?} as: {}",
@@ -458,8 +453,6 @@ impl HarfbuzzShaper {
         //  log::error!("do_shape: font_idx={} {:?} {:#?}", font_idx, &s[range.clone()], info_clusters);
         log::debug!("font_idx={font_idx} info_clusters: {:#?}", info_clusters);
 
-        let mut direct_clusters = 0;
-
         for infos in &info_clusters {
             let cluster_info = cluster_resolver
                 .get(infos[0].cluster)
@@ -536,29 +529,12 @@ impl HarfbuzzShaper {
                 let glyph = make_glyphinfo(substr, weighted_cell_width, font_idx, info);
 
                 cluster.push(glyph);
-                direct_clusters += 1;
             }
         }
 
-        if !shaped_any {
-            if let Some(opt_pair) = self.fonts.get(font_idx) {
-                if direct_clusters == 0 {
-                    // If we've never shaped anything from this font, and we didn't
-                    // shape it just now, then we're probably a fallback font from
-                    // the system and unlikely to be useful to keep around, so we
-                    // unload it.
-                    log::trace!(
-                        "Shaper didn't resolve glyphs from {:?}, so unload it",
-                        self.handles[font_idx]
-                    );
-                    opt_pair.borrow_mut().take();
-                } else if let Some(pair) = &mut *opt_pair.borrow_mut() {
-                    // We shaped something: mark this pair up so that it sticks around
-                    pair.shaped_any = true;
-                }
-            }
-        }
-
+        // A fallback that resolved nothing stays loaded: unloading it made
+        // every later shape of a glyph missing from the chain reopen each
+        // fallback face, which cost ~0.5s per paint after a zoom step.
         Ok(cluster)
     }
 }
@@ -838,6 +814,38 @@ mod test {
     use super::*;
     use crate::FontDatabase;
     use config::FontAttributes;
+
+    #[test]
+    fn fallback_that_resolves_nothing_stays_loaded() {
+        let db = FontDatabase::with_built_in().unwrap();
+        let resolve = |family: &str| {
+            db.resolve(&FontAttributes::new(family), 14)
+                .unwrap()
+                .clone()
+        };
+        let handles = [resolve("JetBrains Mono"), resolve("Symbols Nerd Font Mono")];
+        let shaper = HarfbuzzShaper::new(&config::configuration(), &handles).unwrap();
+
+        // U+10FFFD is in neither font, so shaping walks the whole chain.
+        let mut no_glyphs = vec![];
+        shaper
+            .shape(
+                "\u{10FFFD}",
+                10.,
+                72,
+                &mut no_glyphs,
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(no_glyphs, vec!['\u{10FFFD}']);
+        assert!(
+            shaper.fonts[1].borrow().is_some(),
+            "reopening it on every shape made zoom repaints slow"
+        );
+    }
 
     #[test]
     fn ligatures() {
