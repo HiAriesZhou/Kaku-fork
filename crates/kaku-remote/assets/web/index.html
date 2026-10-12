@@ -22,16 +22,24 @@
   #bar::-webkit-scrollbar { display: none; }
   #bar button { flex: none; max-width: 240px; height: auto; padding: 0 12px; border: 0; border-radius: 0; background: transparent; color: var(--tab-fg); font: inherit; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; outline: none; }
   #bar button:hover { background: var(--tab-hover-bg); color: var(--tab-hover-fg); }
-  #bar button[aria-current="true"] { background: var(--tab-active-bg); color: var(--tab-active-fg); font-weight: 700; }
+  #bar button[aria-current="true"] { background: var(--tab-active-bg); color: var(--tab-active-fg); }
   #bar button:focus-visible { box-shadow: inset 0 0 0 1px var(--tab-fg); }
-  /* The close mark floats over the end of the title on hover instead of
-     reserving room, so a tab is only as wide as its title, as in Kaku. */
-  #bar .tab { position: relative; display: flex; align-items: center; }
+  /* Even padding on both sides; the right padding holds the attention dot,
+     or the close mark while the pointer is over the tab, as Kaku's own tab
+     bar uses its trailing cell. The mark never covers the title, never sits
+     on the edge, and the dot leaving does not resize the tab. */
+  #bar .tab { position: relative; display: flex; align-items: center; padding: 0 var(--tab-pad, 18px); }
   #bar .tab span:first-child { overflow: hidden; text-overflow: ellipsis; }
-  #bar .tab .dot { flex: none; width: 7px; height: 7px; margin-left: 8px; border-radius: 50%; background: var(--dot, #daae76); }
-  #bar .close { position: absolute; right: 4px; top: 50%; width: 22px; height: 22px; margin-top: -11px; line-height: 22px; border-radius: 5px; text-align: center; font-size: 17px; font-weight: 400; opacity: 0; pointer-events: none; }
+  #bar .slot { position: absolute; top: 0; right: 0; bottom: 0; width: var(--tab-pad, 18px); }
+  #bar .dot, #bar .close { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; transition: opacity 0.15s; }
+  #bar .dot::after { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--dot, #daae76); }
+  #bar .dot.in { animation: dot-in 0.25s ease-out; }
+  #bar .dot.out { animation: dot-out 0.3s ease-in forwards; }
+  @keyframes dot-in { from { opacity: 0; transform: scale(0.4); } }
+  @keyframes dot-out { to { opacity: 0; transform: scale(0.4); } }
+  #bar .close { inset: 50% auto auto 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 4px; font-size: 13px; line-height: 1; font-weight: 400; opacity: 0; pointer-events: none; }
+  #bar .tab:hover .dot { opacity: 0; }
   #bar .tab:hover .close { opacity: 0.7; pointer-events: auto; }
-  #bar .tab:hover span:first-child { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 30px), transparent calc(100% - 12px)); mask-image: linear-gradient(to right, #000 calc(100% - 30px), transparent calc(100% - 12px)); }
   #bar .close:hover { opacity: 1; background: var(--tab-hover-bg); }
   #bar .add { width: 38px; padding: 0; font-size: 19px; }
   #bar .fs { display: flex; align-items: center; justify-content: center; width: 40px; padding: 0; margin-left: auto; }
@@ -72,8 +80,10 @@
   body.touch { box-sizing: border-box; padding-bottom: env(safe-area-inset-bottom); }
   body.touch #bar { height: 44px; }
   body.touch #dialog button { height: 40px; }
-  body.touch #bar .tab[aria-current="true"] { padding-right: 36px; }
-  body.touch #bar .tab[aria-current="true"] .close { width: 28px; height: 28px; margin-top: -14px; line-height: 28px; opacity: 0.7; pointer-events: auto; }
+  body.touch #bar { --tab-pad: 24px; }
+  body.touch #bar .close { width: 22px; height: 22px; margin: -11px 0 0 -12px; font-size: 16px; }
+  body.touch #bar .tab[aria-current="true"] .dot { opacity: 0; }
+  body.touch #bar .tab[aria-current="true"] .close { opacity: 0.7; pointer-events: auto; }
   body.touch #bar .add { width: 36px; }
   body.touch #keys { display: flex; order: 3; flex: none; gap: 6px; padding: 6px 8px; overflow-x: auto; border-top: 1px solid var(--line); }
   body.touch #keys button { flex: none; min-width: 40px; height: 36px; padding: 0 10px; border: 0; border-radius: 6px; background: var(--line); color: var(--fg); font: inherit; -webkit-user-select: none; user-select: none; }
@@ -220,6 +230,9 @@
     cursorInactiveStyle: "bar",
     scrollback: 0,
     allowTransparency: false,
+    // Bold text draws at the regular weight: heavier glyphs read as smeared
+    // in the browser.
+    fontWeightBold: "normal",
     theme: { background: getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#16161a" },
   });
   term.open(termEl);
@@ -294,6 +307,28 @@
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(fit, 100);
   }).observe(stage);
+  // Moving to a display with another pixel density changes the cell size
+  // without resizing the page, which left a gap at the right and bottom until
+  // the next input. Re-fit when the density changes.
+  // The media query fires in browsers that report the change; the poll
+  // covers the ones that only update devicePixelRatio.
+  let density = window.devicePixelRatio;
+  const densityChanged = () => {
+    if (window.devicePixelRatio === density) return;
+    density = window.devicePixelRatio;
+    document.body.dataset.dpr = String(density);
+    fit();
+  };
+  const watchDensity = () => {
+    const mq = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    mq.addEventListener("change", () => { densityChanged(); watchDensity(); }, { once: true });
+  };
+  watchDensity();
+  setInterval(densityChanged, 2000);
+  // Coming back to the page means using it here: claim the tab's size again,
+  // in case the Mac took it back meanwhile.
+  const reclaim = () => { claimed = ""; fit(); };
+  window.addEventListener("focus", reclaim);
 
   // Keys that are not plain text go to Kaku, which encodes them for the
   // pane's current modes. Plain characters and IME text arrive via onData.
@@ -342,7 +377,7 @@
     if (k.close) { if (at >= 0) closeTab(tabs[at]); return; }
     if (k.add) { newTab(); return; }
     const next = k.step ? tabs[(at + k.step + tabs.length) % tabs.length] : tabs[k.go];
-    if (next && next.tab_id !== tabId) attach(next);
+    if (next && next.tab_id !== tabId) attach(next, true);
   };
   window.addEventListener("keydown", (ev) => {
     // Outside the terminal (the tab bar, the page) the same keys still work.
@@ -488,9 +523,34 @@
   let wheelFrame = 0;
   const flushWheel = () => {
     wheelFrame = 0;
-    if (wheelPending !== 0) send({ type: "scroll", lines: wheelPending });
+    if (wheelPending !== 0) {
+      send({ type: "scroll", lines: wheelPending });
+      verifySoon();
+    }
     wheelPending = 0;
   };
+  // Tell Kaku what this page shows, once the frames it has sent are drawn;
+  // Kaku logs and redraws if that differs from what it sent. Run after a
+  // scroll settles, where stale rows have shown up, and every 10 seconds.
+  let framesSeen = 0;
+  let verifyTimer = 0;
+  const verify = () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN || paneId === null || !size.cols) return;
+    term.write("", () => {
+      const buf = term.buffer.active;
+      const rows = [];
+      for (let y = 0; y < term.rows; y++) {
+        const line = buf.getLine(buf.viewportY + y);
+        rows.push(line ? line.translateToString(true) : "");
+      }
+      send({ type: "verify", frames: framesSeen, rows });
+    });
+  };
+  const verifySoon = () => {
+    clearTimeout(verifyTimer);
+    verifyTimer = setTimeout(verify, 1000);
+  };
+  setInterval(verify, 10000);
   // Positive lines move toward history.
   const queueScroll = (lines) => {
     wheelRemainder += lines;
@@ -639,7 +699,7 @@
     return { cols: term.cols, rows: term.rows, data: out };
   };
 
-  const attach = (tab) => {
+  const attach = (tab, focus = false) => {
     if (paneId !== null && size.cols) snapshots.set(paneId, snapshot());
     paneId = tab.pane_id;
     tabId = tab.tab_id;
@@ -653,7 +713,7 @@
       term.write(NO_WRAP + "\x1b[?25l\x1b[0m\x1b[2J" + saved.data);
     }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
-    send({ type: "attach", pane_id: paneId });
+    send({ type: "attach", pane_id: paneId, focus });
     renderTabs();
     term.focus();
   };
@@ -726,6 +786,7 @@
     send({ type: "new_tab" });
   };
 
+  const dotted = new Set();
   const renderTabs = () => {
     bar.querySelectorAll(".tab, .add").forEach((b) => b.remove());
     for (const t of tabs) {
@@ -747,14 +808,21 @@
         ev.stopPropagation();
         closeTab(t);
       });
-      b.append(label);
-      if (attention) {
+      const slot = document.createElement("span");
+      slot.className = "slot";
+      // The dot fades in when it appears and out when it goes, in place.
+      const had = dotted.has(t.tab_id);
+      if (attention || had) {
         const dot = document.createElement("i");
-        dot.className = "dot";
-        b.append(dot);
+        dot.className = "dot" + (attention ? (had ? "" : " in") : " out");
+        if (!attention) dot.addEventListener("animationend", () => dot.remove());
+        slot.append(dot);
       }
-      b.append(close);
-      b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t); else term.focus(); });
+      if (attention) dotted.add(t.tab_id);
+      else dotted.delete(t.tab_id);
+      slot.append(close);
+      b.append(label, slot);
+      b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t, true); else term.focus(); });
       bar.insertBefore(b, statusEl);
     }
     const add = document.createElement("button");
@@ -848,7 +916,7 @@
   const handle = (msg) => {
     if (msg.type === "config") onConfig(msg);
     else if (msg.type === "tabs") onTabs(msg.tabs);
-    else if (msg.type === "frame") onFrame(msg);
+    else if (msg.type === "frame") { framesSeen++; onFrame(msg); }
     else if (msg.type === "closed") {
       // A tabs update may already have moved the page to another tab; the
       // late notice for the old pane must not drop the tab it moved to.
@@ -901,6 +969,7 @@
     ws = socket;
     lastHeard = Date.now();
     pingSentAt = 0;
+    framesSeen = 0;
     sendChain = Promise.resolve();
     recvChain = Promise.resolve();
     socket.onopen = () => {
@@ -932,6 +1001,7 @@
   // instead of waiting out the heartbeat.
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
+    reclaim();
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       retry = 0;
       connect();
