@@ -4,7 +4,7 @@
 #
 
 app = 'kaku-relay'
-primary_region = 'iad'
+primary_region = 'nrt'
 
 [build]
 
