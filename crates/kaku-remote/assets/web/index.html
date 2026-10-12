@@ -14,28 +14,28 @@
   :root { --bg: #16161a; --fg: #d4d4d8; --muted: #8b8b93; --line: rgba(255,255,255,0.08); }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); }
   body { display: flex; flex-direction: column; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  /* On macOS, browsers thicken light text on dark backgrounds; measured
-     against Kaku's own window that drew about 35% more ink than Kaku does.
-     Grayscale antialiasing lands within a few percent of it. */
-  body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
   /* The tab bar follows Kaku's own: monospace titles, the active tab as a
      filled block in Kaku's tab colors, no rule between it and the terminal. */
   :root { --mono: "Kaku Mono", monospace; --bar-bg: var(--bg); --tab-fg: var(--muted); --tab-active-bg: rgba(255,255,255,0.08); --tab-active-fg: var(--fg); --tab-hover-bg: rgba(255,255,255,0.05); --tab-hover-fg: var(--fg); }
   body.tabs-bottom #bar { order: 2; }
-  #bar { display: flex; align-items: stretch; height: 30px; padding: 0; background: var(--bar-bg); flex: none; overflow-x: auto; scrollbar-width: none; font: 13px var(--mono); }
+  #bar { display: flex; align-items: stretch; height: 32px; padding: 0; background: var(--bar-bg); flex: none; overflow-x: auto; scrollbar-width: none; font: var(--bar-font, 15px) var(--mono); }
   #bar::-webkit-scrollbar { display: none; }
   #bar button { flex: none; max-width: 240px; height: auto; padding: 0 12px; border: 0; border-radius: 0; background: transparent; color: var(--tab-fg); font: inherit; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; outline: none; }
   #bar button:hover { background: var(--tab-hover-bg); color: var(--tab-hover-fg); }
   #bar button[aria-current="true"] { background: var(--tab-active-bg); color: var(--tab-active-fg); font-weight: 700; }
   #bar button:focus-visible { box-shadow: inset 0 0 0 1px var(--tab-fg); }
-  #bar .tab { display: flex; align-items: center; gap: 8px; padding-right: 6px; }
+  /* The close mark floats over the end of the title on hover instead of
+     reserving room, so a tab is only as wide as its title, as in Kaku. */
+  #bar .tab { position: relative; display: flex; align-items: center; }
   #bar .tab span:first-child { overflow: hidden; text-overflow: ellipsis; }
-  #bar .close { flex: none; width: 18px; height: 18px; line-height: 18px; border-radius: 4px; text-align: center; font-weight: 400; opacity: 0; }
-  #bar .tab:hover .close, #bar .tab[aria-current="true"] .close { opacity: 0.55; }
+  #bar .tab .dot { flex: none; width: 7px; height: 7px; margin-left: 8px; border-radius: 50%; background: var(--dot, #daae76); }
+  #bar .close { position: absolute; right: 4px; top: 50%; width: 22px; height: 22px; margin-top: -11px; line-height: 22px; border-radius: 5px; text-align: center; font-size: 17px; font-weight: 400; opacity: 0; pointer-events: none; }
+  #bar .tab:hover .close { opacity: 0.7; pointer-events: auto; }
+  #bar .tab:hover span:first-child { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 30px), transparent calc(100% - 12px)); mask-image: linear-gradient(to right, #000 calc(100% - 30px), transparent calc(100% - 12px)); }
   #bar .close:hover { opacity: 1; background: var(--tab-hover-bg); }
-  #bar .add { width: 32px; padding: 0; font-size: 15px; }
-  #bar .fs { display: flex; align-items: center; justify-content: center; width: 34px; padding: 0; margin-left: auto; }
-  #bar .fs svg { width: 13px; height: 13px; }
+  #bar .add { width: 38px; padding: 0; font-size: 19px; }
+  #bar .fs { display: flex; align-items: center; justify-content: center; width: 40px; padding: 0; margin-left: auto; }
+  #bar .fs svg { width: 15px; height: 15px; }
   #stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
   /* Chrome squeezes runs of CJK punctuation by default. xterm.js measures a
      glyph as 32 copies in a row, so it read "，" as half width while rows draw
@@ -43,7 +43,10 @@
      every Chinese punctuation mark. Keep punctuation at its full width in
      both places. */
   .xterm, .xterm * { text-spacing-trim: space-all; }
-  #term { position: absolute; top: 8px; left: 8px; }
+  /* Hidden until Kaku's first frame, so xterm's default black canvas never
+     shows before the theme and the screen arrive. */
+  #term { position: absolute; top: 8px; left: 8px; visibility: hidden; }
+  body.drawn #term { visibility: visible; }
   #history { position: absolute; right: 16px; bottom: 16px; display: none; height: 28px; padding: 0 12px; border: 0; border-radius: 14px; background: var(--tab-active-bg); color: var(--tab-active-fg); font: inherit; cursor: pointer; }
   #message { color: var(--muted); padding: 24px; text-align: center; line-height: 1.6; }
   /* Connection state, over the terminal: dimmed while the screen is stale. */
@@ -54,15 +57,14 @@
   #term { transition: opacity 0.2s; }
   body.stale #term { opacity: 0.3; }
   /* In-page confirmation instead of the browser's own dialog. */
-  #dialog { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.45); z-index: 10; }
+  #dialog { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.25); z-index: 10; }
   #dialog.show { display: flex; }
-  #dialog .card { width: min(320px, calc(100vw - 32px)); padding: 20px; border-radius: 12px; background: var(--bg); box-shadow: 0 0 0 1px var(--line), 0 12px 40px rgba(0,0,0,0.4); }
-  #dialog .title { font-size: 15px; color: var(--fg); }
-  #dialog .detail { margin-top: 6px; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
-  #dialog button { height: 30px; padding: 0 14px; border: 0; border-radius: 6px; font: inherit; cursor: pointer; background: var(--line); color: var(--fg); }
-  #dialog button.primary { background: var(--tab-active-bg); color: var(--tab-active-fg); font-weight: 600; }
-  #dialog button:focus-visible { box-shadow: 0 0 0 2px var(--muted); outline: none; }
+  #dialog .card { width: min(300px, calc(100vw - 32px)); padding: 16px; border-radius: 10px; background: var(--bar-bg); border: 1px solid var(--line); }
+  #dialog .title { font-size: 14px; color: var(--fg); }
+  #dialog .detail { margin-top: 4px; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  #dialog button { height: 28px; padding: 0 12px; border: 0; border-radius: 6px; font: 13px inherit; font-family: inherit; cursor: pointer; background: var(--line); color: var(--fg); }
+  #dialog button:hover, #dialog button:focus-visible { background: var(--tab-active-bg); outline: none; }
   /* Phones and tablets: a key row for what touch keyboards lack, finger-size
      targets, room for the home indicator, and a 16px input so iOS does not
      zoom the page when the keyboard opens. */
@@ -70,7 +72,8 @@
   body.touch { box-sizing: border-box; padding-bottom: env(safe-area-inset-bottom); }
   body.touch #bar { height: 44px; }
   body.touch #dialog button { height: 40px; }
-  body.touch #bar .close { width: 28px; height: 28px; line-height: 28px; opacity: 0.6; }
+  body.touch #bar .tab[aria-current="true"] { padding-right: 36px; }
+  body.touch #bar .tab[aria-current="true"] .close { width: 28px; height: 28px; margin-top: -14px; line-height: 28px; opacity: 0.7; pointer-events: auto; }
   body.touch #bar .add { width: 36px; }
   body.touch #keys { display: flex; order: 3; flex: none; gap: 6px; padding: 6px 8px; overflow-x: auto; border-top: 1px solid var(--line); }
   body.touch #keys button { flex: none; min-width: 40px; height: 36px; padding: 0 10px; border: 0; border-radius: 6px; background: var(--line); color: var(--fg); font: inherit; -webkit-user-select: none; user-select: none; }
@@ -91,7 +94,7 @@
   <button id="history" type="button">Back to live</button>
   <div id="notice"><div class="title"></div><div class="detail"></div></div>
 </div>
-<div id="dialog" role="dialog" aria-modal="true"><div class="card"><div class="title">Close this tab?</div><div class="detail"></div><div class="actions"><button type="button" data-act="cancel">Cancel</button><button type="button" class="primary" data-act="ok">Close Tab</button></div></div></div>
+<div id="dialog" role="dialog" aria-modal="true"><div class="card"><div class="title">Close this tab?</div><div class="detail"></div><div class="actions"><button type="button" data-act="cancel">Cancel</button><button type="button" data-act="ok">Close</button></div></div></div>
 <div id="keys"></div>
 <script src="assets/xterm.js"></script>
 <script>
@@ -217,6 +220,7 @@
     cursorInactiveStyle: "bar",
     scrollback: 0,
     allowTransparency: false,
+    theme: { background: getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#16161a" },
   });
   term.open(termEl);
 
@@ -505,6 +509,29 @@
     queueScroll(-px / lineHeight);
   }, { passive: false, capture: true });
 
+  // A click without a drag goes to the cell under it, for TUIs that asked
+  // for the mouse; Kaku drops it otherwise, so selecting text still works.
+  let clickFrom = null;
+  const cellAt = (cx, cy) => {
+    const screenEl = termEl.querySelector(".xterm-screen");
+    const cell = cellSize();
+    if (!screenEl || !cell) return null;
+    const rect = screenEl.getBoundingClientRect();
+    const x = Math.floor((cx - rect.left) / cell.width);
+    const y = Math.floor((cy - rect.top) / cell.height);
+    if (x < 0 || y < 0 || x >= term.cols || y >= term.rows) return null;
+    return { x, y };
+  };
+  stage.addEventListener("mousedown", (ev) => { clickFrom = ev.button === 0 ? [ev.clientX, ev.clientY] : null; }, true);
+  stage.addEventListener("mouseup", (ev) => {
+    const from = clickFrom;
+    clickFrom = null;
+    if (!from || ev.button !== 0) return;
+    if (Math.abs(ev.clientX - from[0]) + Math.abs(ev.clientY - from[1]) > 4) return;
+    const at = cellAt(ev.clientX, ev.clientY);
+    if (at) send({ type: "click", x: at.x, y: at.y });
+  }, true);
+
   // Touch: drag to scroll a row per row height, and keep going briefly after
   // a flick. A tap without movement still reaches xterm.js and focuses it.
   let touchY = null;
@@ -567,6 +594,7 @@
   // What each tab last looked like, so switching back draws it at once and
   // the Mac's fresh frame, a network round trip later, only corrects it.
   const snapshots = new Map();
+  const NO_WRAP = "\x1b[?7l";
   const sgrColor = (cell, fg) => {
     const base = fg ? 30 : 40;
     if (fg ? cell.isFgDefault() : cell.isBgDefault()) return [base + 9];
@@ -622,7 +650,7 @@
       size = { cols: saved.cols, rows: saved.rows };
       term.resize(saved.cols, saved.rows);
       fit();
-      term.write("\x1b[?25l\x1b[0m\x1b[2J" + saved.data);
+      term.write(NO_WRAP + "\x1b[?25l\x1b[0m\x1b[2J" + saved.data);
     }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     send({ type: "attach", pane_id: paneId });
@@ -705,8 +733,12 @@
       b.type = "button";
       b.className = "tab";
       b.setAttribute("aria-current", String(t.tab_id === tabId));
+      // Kaku marks a tab that wants attention (an unread bell, a paused or
+      // failed task) with a trailing dot in its title; draw it as a dot.
+      const title = t.title || "Tab";
+      const attention = title.endsWith("\u2022");
       const label = document.createElement("span");
-      label.textContent = t.title || "Tab";
+      label.textContent = attention ? title.slice(0, -1).trimEnd() : title;
       const close = document.createElement("span");
       close.className = "close";
       close.textContent = "×";
@@ -715,7 +747,13 @@
         ev.stopPropagation();
         closeTab(t);
       });
-      b.append(label, close);
+      b.append(label);
+      if (attention) {
+        const dot = document.createElement("i");
+        dot.className = "dot";
+        b.append(dot);
+      }
+      b.append(close);
       b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t); else term.focus(); });
       bar.insertBefore(b, statusEl);
     }
@@ -767,7 +805,13 @@
     document.body.classList.toggle("tabs-bottom", !!cfg.tab_bar_at_bottom);
     const root = document.documentElement.style;
     root.setProperty("--mono", term.options.fontFamily);
+    // Kaku's retro tab bar draws titles in the terminal font at its size,
+    // so the page's tabs use the same size as its terminal text.
+    if (cfg.font_size) root.setProperty("--bar-font", Math.max(12, cfg.font_size - 1) + "px");
     const bar = cfg.tab_bar || {};
+    // Kaku's attention dot: gold on the dark theme, darker on the light one.
+    const light = /^#fffcf0$/i.test(bar.background || "");
+    root.setProperty("--dot", light ? "#AD8301" : "#daae76");
     for (const [name, value] of [["--bar-bg", bar.background], ["--tab-active-bg", bar.active_bg], ["--tab-active-fg", bar.active_fg],
       ["--tab-fg", bar.inactive_fg], ["--tab-hover-bg", bar.hover_bg], ["--tab-hover-fg", bar.hover_fg]]) {
       if (value) root.setProperty(name, value);
@@ -785,12 +829,18 @@
 
   const onFrame = (msg) => {
     if (msg.pane_id !== paneId) return;
+    document.body.classList.add("drawn");
     if (msg.cols !== size.cols || msg.rows !== size.rows) {
       size = { cols: msg.cols, rows: msg.rows };
       term.resize(msg.cols, msg.rows);
       fit();
     }
-    term.write(msg.data);
+    // Autowrap off first: each row is placed by position, so a row that
+    // xterm measures one cell wider than Kaku (a glyph whose width the two
+    // disagree on) must overwrite its last cell, not wrap. Wrapping on the
+    // last row scrolled the whole screen, and every later frame then drew
+    // over a shifted copy: stale rows stayed until a reload.
+    term.write(NO_WRAP + msg.data);
     historyBtn.style.display = msg.scrolled ? "block" : "none";
     document.title = msg.title ? msg.title + " - Kaku" : "Kaku";
   };
