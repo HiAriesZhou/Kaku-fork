@@ -102,8 +102,16 @@ jobs:
 
       - name: Run tests
         run: |
-          cargo nextest run --locked -E 'not test(shapecache::test::ligatures_jetbrains)'
+          cargo nextest run --locked --features kaku/remote,kaku-gui/remote -E 'not test(shapecache::test::ligatures_jetbrains)'
           cargo nextest run --locked -p wezterm-escape-parser
+
+      - name: Browser terminal regressions
+        env:
+          NODE_PATH: ${{ runner.temp }}/kaku-browser/node_modules
+        run: |
+          npm install --prefix "$RUNNER_TEMP/kaku-browser" --no-save playwright@1.48.2
+          "$RUNNER_TEMP/kaku-browser/node_modules/.bin/playwright" install chromium
+          node --test crates/kaku-remote/tests/web.test.cjs
 
   relay-check:
     name: Relay Build
@@ -170,7 +178,7 @@ jobs:
       # upstream-tracking, etc.) will be added incrementally.
       - name: Run clippy on lint-opt-in crates
         run: |
-          cargo clippy --locked --all-targets \
+          cargo clippy --locked --all-targets --features kaku/remote,kaku-gui/remote \
             -p kaku -p kaku-gui -p mux -p config \
             -- -D warnings
 

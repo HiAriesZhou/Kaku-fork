@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::info;
 
 const MAX_HOSTS: usize = 10_000;
@@ -28,6 +28,7 @@ const MAX_BROWSERS_PER_HOST: usize = 8;
 const MAX_MESSAGE: usize = 4 << 20;
 /// Messages queued toward one socket before it counts as stuck.
 const QUEUE: usize = 256;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const ASSET_TIMEOUT: Duration = Duration::from_secs(10);
 const KIND_DATA: u8 = 0;
 const KIND_ASSET: u8 = 1;
@@ -40,11 +41,16 @@ struct Asset {
     body: Bytes,
 }
 
+struct BrowserLink {
+    data: mpsc::Sender<ws::Message>,
+    close: watch::Sender<Option<u64>>,
+}
+
 struct Host {
     /// Distinguishes this registration from a later one under the same id.
     generation: u64,
     to_host: mpsc::Sender<ws::Message>,
-    browsers: Mutex<HashMap<u32, mpsc::Sender<ws::Message>>>,
+    browsers: Mutex<HashMap<u32, BrowserLink>>,
     assets: Mutex<HashMap<u32, oneshot::Sender<Asset>>>,
     next_id: AtomicU32,
 }
@@ -210,22 +216,41 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
     }
     info!("host {} registered via edge {}", short(&id), edge);
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(msg) = outgoing.recv().await {
-            if sink.send(msg).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
     });
 
-    while let Some(Ok(msg)) = stream.next().await {
+    let connected_at = tokio::time::Instant::now();
+    let ended = loop {
+        let msg = tokio::select! {
+            _ = &mut writer => break "writer-stopped",
+            next = stream.next() => match next {
+                Some(Ok(msg)) => msg,
+                Some(Err(error)) => {
+                    info!(host = short(&id), error = %error, "host transport failed");
+                    break "socket-error";
+                }
+                None => break "eof",
+            }
+        };
         match msg {
             ws::Message::Binary(bytes) if bytes.len() >= 5 => {
                 let kind = bytes[0];
                 let target = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
                 match kind {
                     KIND_DATA => {
-                        let tx = host.browsers.lock().get(&target).cloned();
+                        let tx = host
+                            .browsers
+                            .lock()
+                            .get(&target)
+                            .map(|link| link.data.clone());
                         if let Some(tx) = tx {
                             let payload = bytes.slice(5..);
                             if tx.try_send(ws::Message::Binary(payload)).is_err() {
@@ -249,15 +274,24 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
                 if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(text.as_str()) {
                     if map.get("t").and_then(|t| t.as_str()) == Some("close") {
                         if let Some(c) = map.get("c").and_then(|c| c.as_u64()) {
-                            host.browsers.lock().remove(&(c as u32));
+                            if let Some(tx) = host.browsers.lock().remove(&(c as u32)) {
+                                let code = map.get("code").and_then(|v| v.as_u64()).unwrap_or(4403);
+                                let _ = tx.close.send(Some(code));
+                            }
                         }
                     }
                 }
             }
-            ws::Message::Close(_) => break,
+            ws::Message::Close(_) => break "close-frame",
             _ => {}
         }
-    }
+    };
+    info!(
+        host = short(&id),
+        reason = ended,
+        seconds = connected_at.elapsed().as_secs(),
+        "host connection ended"
+    );
 
     writer.abort();
     let left = state.unregister(&id, host.generation);
@@ -413,58 +447,96 @@ async fn browser_ws(
         })
 }
 
+fn browser_close(code: u64) -> ws::Message {
+    let (code, reason) = match code {
+        4403 => (4403, "invalid link key"),
+        4408 => (4408, "authentication timed out"),
+        _ => (4413, "connection is busy"),
+    };
+    ws::Message::Close(Some(ws::CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
+}
+
 async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut outgoing) = mpsc::channel::<ws::Message>(QUEUE);
+    let (close, mut closing) = watch::channel(None);
     let c = host.next_id.fetch_add(1, Ordering::Relaxed);
-    host.browsers.lock().insert(c, tx);
+    // Reserve atomically after upgrade too: simultaneous handshakes may all
+    // have seen space in browser_ws before any callback ran.
+    let accepted = {
+        let mut browsers = host.browsers.lock();
+        if browsers.len() >= MAX_BROWSERS_PER_HOST {
+            false
+        } else {
+            browsers.insert(c, BrowserLink { data: tx, close });
+            true
+        }
+    };
+    if !accepted {
+        let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(browser_close(4413))).await;
+        return;
+    }
     let open = serde_json::json!({ "t": "open", "c": c }).to_string();
     if host
         .to_host
-        .send(ws::Message::Text(open.into()))
-        .await
+        .try_send(ws::Message::Text(open.into()))
         .is_err()
     {
         host.browsers.lock().remove(&c);
         return;
     }
-
-    // Ends when the host drops this browser (its sender goes away).
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = outgoing.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
+    let mut writer = tokio::spawn(async move {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = closing.changed() => {
+                    let code = *closing.borrow();
+                    let msg = code.map(browser_close).unwrap_or(ws::Message::Close(None));
+                    let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await;
+                    return;
+                }
+                msg = outgoing.recv() => match msg { Some(msg) => msg, None => return },
+            };
+            // Membership loss interrupts even a stalled data write. It never
+            // waits for the old screen queue to drain after host replacement.
+            tokio::select! {
+                biased;
+                _ = closing.changed() => {
+                    let code = *closing.borrow();
+                    let msg = code.map(browser_close).unwrap_or(ws::Message::Close(None));
+                    let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await;
+                    return;
+                }
+                result = tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)) => {
+                    if !matches!(result, Ok(Ok(()))) { return; }
+                }
             }
         }
-        let _ = sink.close().await;
     });
-
     loop {
         tokio::select! {
+            _ = &mut writer => break,
             msg = stream.next() => {
                 let Some(Ok(msg)) = msg else { break };
                 match msg {
                     ws::Message::Binary(payload) => {
+                        // The writer owns the close reason; do not abort it for late input.
+                        if !host.browsers.lock().contains_key(&c) { continue; }
                         let mut frame = Vec::with_capacity(5 + payload.len());
                         frame.push(KIND_DATA);
                         frame.extend_from_slice(&c.to_be_bytes());
                         frame.extend_from_slice(&payload);
-                        if host.to_host.try_send(ws::Message::Binary(frame.into())).is_err() {
-                            break;
-                        }
+                        if host.to_host.try_send(ws::Message::Binary(frame.into())).is_err() { break; }
                     }
                     ws::Message::Close(_) => break,
                     _ => {}
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                if !host.browsers.lock().contains_key(&c) {
-                    break;
-                }
-            }
         }
     }
-
     host.browsers.lock().remove(&c);
     writer.abort();
     let close = serde_json::json!({ "t": "close", "c": c }).to_string();
@@ -526,6 +598,19 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejection_code_reaches_the_browser_without_arbitrary_reason_text() {
+        let ws::Message::Close(Some(frame)) = browser_close(4403) else {
+            panic!("close frame")
+        };
+        assert_eq!(frame.code, 4403);
+        assert_eq!(frame.reason.as_str(), "invalid link key");
+        let ws::Message::Close(Some(frame)) = browser_close(u64::MAX) else {
+            panic!("close frame")
+        };
+        assert_eq!(frame.code, 4413);
+    }
 
     fn test_host(state: &AppState) -> Arc<Host> {
         let (to_host, _rx) = mpsc::channel(1);

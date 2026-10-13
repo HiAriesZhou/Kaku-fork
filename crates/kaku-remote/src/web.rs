@@ -314,10 +314,17 @@ fn collect_tabs() -> Vec<TabInfo> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WebClientMsg {
     /// First message through the relay; proves the page holds the key.
-    Hello,
+    Hello {
+        #[serde(default)]
+        frame_ack: bool,
+    },
     /// Heartbeat; answered with `pong` so the page can tell a dead link
     /// from a quiet terminal, and so idle-timeout proxies see traffic.
     Ping,
+    /// Browser has parsed every frame through this sequence.
+    FrameAck {
+        seq: u64,
+    },
     /// Start mirroring a pane; the rest of the messages act on it.
     Attach {
         pane_id: usize,
@@ -380,6 +387,13 @@ enum WebClientMsg {
         id: u32,
         name: String,
         size: u64,
+        #[serde(default)]
+        transfer: String,
+        #[serde(default)]
+        pane_id: Option<usize>,
+    },
+    UploadCancel {
+        id: u32,
     },
     UploadChunk {
         id: u32,
@@ -425,10 +439,14 @@ enum WebClientMsg {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WebServerMsg<'a> {
     Config(&'a crate::ConfigInfo),
+    Error {
+        detail: &'a str,
+    },
     Tabs {
         tabs: &'a [TabInfo],
     },
     Frame {
+        seq: u64,
         /// The pane this frame draws; the page drops frames still in flight
         /// from the tab it just left.
         pane_id: usize,
@@ -543,6 +561,36 @@ struct Upload {
     path: std::path::PathBuf,
     size: u64,
     written: u64,
+    pane_id: Option<usize>,
+    transfer: String,
+    name: String,
+}
+
+/// Completion receipts survive a transport reconnect, so losing the final
+/// reply never repeats a file or pastes its path twice. Bound their lifetime
+/// and number independently of the terminal's scrollback.
+struct UploadReceipt {
+    at: std::time::Instant,
+    name: String,
+    size: u64,
+    pane_id: Option<usize>,
+    path: std::path::PathBuf,
+}
+static UPLOAD_RECEIPTS: LazyLock<Mutex<HashMap<String, UploadReceipt>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const RECEIPT_TTL: Duration = Duration::from_secs(600);
+const MAX_RECEIPTS: usize = 256;
+fn prune_receipts(receipts: &mut HashMap<String, UploadReceipt>) {
+    receipts.retain(|_, r| r.at.elapsed() < RECEIPT_TTL);
+    if receipts.len() >= MAX_RECEIPTS {
+        if let Some(oldest) = receipts
+            .iter()
+            .min_by_key(|(_, r)| r.at)
+            .map(|(k, _)| k.clone())
+        {
+            receipts.remove(&oldest);
+        }
+    }
 }
 
 /// A session's uploads in progress. A session that ends mid-upload (the
@@ -565,8 +613,8 @@ struct UploadReply {
     id: u32,
     ok: bool,
     detail: String,
-    /// A chunk was written: bytes received so far. The page sends the next
-    /// chunk on this, so its percentage is what reached the Mac.
+    /// A chunk was written: bytes received so far. The page advances its
+    /// bounded send window on this, so progress reflects bytes on the Mac.
     received: Option<u64>,
 }
 
@@ -601,7 +649,44 @@ fn handle_upload(
         })
     };
     match msg {
-        WebClientMsg::UploadStart { id, name, size } => {
+        WebClientMsg::UploadCancel { id } => {
+            if let Some(upload) = uploads.remove(id) {
+                drop(upload.file);
+                let _ = std::fs::remove_file(upload.path);
+            }
+            None
+        }
+        WebClientMsg::UploadStart {
+            id,
+            name,
+            size,
+            transfer,
+            pane_id,
+        } => {
+            let target = (*pane_id).or(attached);
+            if !transfer.is_empty()
+                && (transfer.len() != 32 || !transfer.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return fail(*id, "invalid transfer".into());
+            }
+            if !transfer.is_empty() {
+                let mut receipts = UPLOAD_RECEIPTS.lock();
+                receipts.retain(|_, r| r.at.elapsed() < RECEIPT_TTL);
+                if let Some(done) = receipts.get(transfer) {
+                    if done.name != *name || done.size != *size || done.pane_id != target {
+                        return fail(*id, "transfer does not match the original file".into());
+                    }
+                    return Some(UploadReply {
+                        id: *id,
+                        ok: true,
+                        detail: done.path.display().to_string(),
+                        received: None,
+                    });
+                }
+            }
+            if uploads.len() >= 8 || uploads.contains_key(id) {
+                return fail(*id, "too many files in progress".into());
+            }
             if *size > MAX_UPLOAD_BYTES {
                 return fail(*id, "larger than 50 MB".into());
             }
@@ -611,7 +696,13 @@ fn handle_upload(
                 return fail(*id, format!("cannot create {}: {e}", dir.display()));
             }
             let path = unused_path(&dir, &safe_file_name(name));
-            match std::fs::File::create(&path) {
+            // Never truncate an existing file if two sessions choose a name
+            // together; the losing upload can retry with a fresh name.
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 Ok(file) => {
                     uploads.insert(
                         *id,
@@ -620,6 +711,9 @@ fn handle_upload(
                             path,
                             size: *size,
                             written: 0,
+                            pane_id: target,
+                            transfer: transfer.clone(),
+                            name: name.clone(),
                         },
                     );
                     None
@@ -660,8 +754,26 @@ fn handle_upload(
         WebClientMsg::UploadEnd { id } => {
             let upload = uploads.remove(id)?;
             drop(upload.file);
+            if upload.written != upload.size {
+                let _ = std::fs::remove_file(&upload.path);
+                return fail(*id, "file was not fully received".into());
+            }
             let shown = upload.path.display().to_string();
-            if let Some(pane) = attached.and_then(lookup_pane) {
+            if !upload.transfer.is_empty() {
+                let mut receipts = UPLOAD_RECEIPTS.lock();
+                prune_receipts(&mut receipts);
+                receipts.insert(
+                    upload.transfer,
+                    UploadReceipt {
+                        at: std::time::Instant::now(),
+                        name: upload.name,
+                        size: upload.size,
+                        pane_id: upload.pane_id,
+                        path: upload.path,
+                    },
+                );
+            }
+            if let Some(pane) = upload.pane_id.and_then(lookup_pane) {
                 let quoted = config::configuration().quote_dropped_files.escape(&shown);
                 if let Err(e) = pane.send_paste(&format!("{quoted} ")) {
                     log::debug!("kaku-remote web: pasting an uploaded path failed: {e:#}");
@@ -855,10 +967,10 @@ fn claim_tab_size(pane_id: usize, cols: usize, rows: usize) {
             _ => (cols, rows),
         };
         let (cols, rows) = (cols.min(MAX_COLS), rows.min(MAX_ROWS));
+        WEB_SIZED_TABS.lock().insert(tab_id.into());
         if current.cols == cols && current.rows == rows {
             return;
         }
-        WEB_SIZED_TABS.lock().insert(tab_id.into());
         let cell_width = current.pixel_width / current.cols.max(1);
         let cell_height = current.pixel_height / current.rows.max(1);
         tab.resize(TerminalSize {
@@ -1454,15 +1566,17 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             }
             Ok(())
         }
-        WebClientMsg::Hello
+        WebClientMsg::Hello { .. }
         | WebClientMsg::Redraw
         | WebClientMsg::History { .. }
         | WebClientMsg::Ping
+        | WebClientMsg::FrameAck { .. }
         | WebClientMsg::Attach { .. }
         | WebClientMsg::Verify { .. }
         | WebClientMsg::Search { .. }
         | WebClientMsg::UploadStart { .. }
         | WebClientMsg::UploadChunk { .. }
+        | WebClientMsg::UploadCancel { .. }
         | WebClientMsg::UploadEnd { .. } => Ok(()),
         WebClientMsg::Resize { cols, rows } => {
             let cols = cols.clamp(MIN_COLS, MAX_COLS);
@@ -1519,6 +1633,9 @@ pub(crate) async fn run_session(
     // Frames sent this session; a page's verify only counts once it has
     // applied the same number, so frames in flight never read as drift.
     let mut frames_sent: u64 = 0;
+    let mut frames_acked = 0u64;
+    let mut flow_control = false;
+    let mut last_frame_at = std::time::Instant::now();
     let mut clipboard = CLIPBOARD.subscribe();
     let mut uploads = Uploads::default();
     let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
@@ -1542,6 +1659,20 @@ pub(crate) async fn run_session(
                         continue;
                     }
                 };
+                if matches!(&msg, WebClientMsg::Text { data } | WebClientMsg::Paste { data } if data.len() > MAX_INPUT_LEN) {
+                    if let Some(json) = encode(&WebServerMsg::Error { detail: "Text is larger than 64 KB. Send it as a file instead." }) {
+                        if outbox.send(json).await.is_err() { break; }
+                    }
+                    continue;
+                }
+                if let WebClientMsg::Hello { frame_ack } = msg {
+                    flow_control = frame_ack;
+                    continue;
+                }
+                if let WebClientMsg::FrameAck { seq } = msg {
+                    if seq <= frames_sent { frames_acked = frames_acked.max(seq); }
+                    continue;
+                }
                 if matches!(msg, WebClientMsg::Ping) {
                     let Some(json) = encode(&WebServerMsg::Pong) else { continue };
                     if outbox.send(json).await.is_err() {
@@ -1560,7 +1691,8 @@ pub(crate) async fn run_session(
                     msg,
                     WebClientMsg::UploadStart { .. }
                         | WebClientMsg::UploadChunk { .. }
-                        | WebClientMsg::UploadEnd { .. }
+                        | WebClientMsg::UploadCancel { .. }
+        | WebClientMsg::UploadEnd { .. }
                 ) {
                     continue;
                 }
@@ -1610,17 +1742,8 @@ pub(crate) async fn run_session(
                         let drift = drifted_rows(&shown.lines, rows);
                         if !drift.is_empty() {
                             let pane = attached.and_then(lookup_pane);
-                            let sample: Vec<String> = drift
-                                .iter()
-                                .take(4)
-                                .map(|&i| {
-                                    let kaku: String = shown.lines.get(i).map(|l| row_text(l)).unwrap_or_default().chars().take(40).collect();
-                                    let page: String = rows.get(i).map(|l| l.trim().chars().take(40).collect()).unwrap_or_default();
-                                    format!("row {i}: page {page:?} kaku {kaku:?}")
-                                })
-                                .collect();
                             log::warn!(
-                                "kaku-remote web: screen drift in {} of {} rows (last move {}, {} frames since full, scrolled {}, alt screen {}, mouse grabbed {}); redrawing. {}",
+                                "kaku-remote web: screen drift in {} of {} rows (last move {}, {} frames since full, scrolled {}, alt screen {}, mouse grabbed {}); redrawing",
                                 drift.len(),
                                 shown.lines.len(),
                                 shown.last_move,
@@ -1628,7 +1751,6 @@ pub(crate) async fn run_session(
                                 shown.scrolled,
                                 pane.as_ref().is_some_and(|p| p.is_alt_screen_active()),
                                 pane.as_ref().is_some_and(|p| p.is_mouse_grabbed()),
-                                sample.join("; ")
                             );
                             shown = Shown::default();
                             dirty_frame = true;
@@ -1641,6 +1763,7 @@ pub(crate) async fn run_session(
                         dispatch_tab_action(TabAction::Activate { pane_id });
                     }
                     attached = Some(pane_id);
+                    view.claimed = None;
                     updates = Some(subscribe(&dirty, pane_id));
                     view.pinned_top = None;
                     view.seen_at = None;
@@ -1668,6 +1791,7 @@ pub(crate) async fn run_session(
                 }
             }
             _ = idle.tick() => {
+                if flow_control && frames_sent > frames_acked && last_frame_at.elapsed() > Duration::from_secs(90) { break; }
                 dirty_frame = attached.is_some();
                 // Tab state lives on the GUI thread; the close-confirmation
                 // check reads the Lua config, which only that thread may touch.
@@ -1680,7 +1804,7 @@ pub(crate) async fn run_session(
                     last_tabs = Some(tabs);
                 }
             }
-            _ = frame_tick.tick(), if dirty_frame => {
+            _ = frame_tick.tick(), if dirty_frame && (!flow_control || frames_sent - frames_acked < 4) => {
                 dirty_frame = false;
                 let Some(pane_id) = attached else { continue };
                 let Some(pane) = lookup_pane(pane_id) else {
@@ -1699,6 +1823,7 @@ pub(crate) async fn run_session(
                     continue;
                 };
                 let msg = WebServerMsg::Frame {
+                    seq: frames_sent + 1,
                     pane_id,
                     cols: frame.cols,
                     rows: frame.rows,
@@ -1712,6 +1837,7 @@ pub(crate) async fn run_session(
                     break;
                 }
                 frames_sent += 1;
+                last_frame_at = std::time::Instant::now();
             }
         }
     }
@@ -2011,6 +2137,9 @@ mod tests {
                 path: path.clone(),
                 size: 6,
                 written: 0,
+                pane_id: None,
+                transfer: String::new(),
+                name: String::new(),
             },
         );
         let chunk = WebClientMsg::UploadChunk {
@@ -2027,6 +2156,134 @@ mod tests {
         assert!(path.exists());
         drop(uploads);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_incomplete_upload_cannot_be_completed() {
+        let path = std::env::temp_dir().join(format!("kaku-incomplete-{}", std::process::id()));
+        let mut uploads = Uploads::default();
+        uploads.0.insert(
+            99,
+            Upload {
+                file: std::fs::File::create(&path).unwrap(),
+                path: path.clone(),
+                size: 6,
+                written: 0,
+                pane_id: None,
+                transfer: String::new(),
+                name: String::new(),
+            },
+        );
+        let result =
+            handle_upload(&WebClientMsg::UploadEnd { id: 99 }, &mut uploads.0, None).unwrap();
+        // Remove our fixture even on the old implementation, which keeps it.
+        let remains = path.exists();
+        let _ = std::fs::remove_file(path);
+        assert!(!result.ok, "no data reached the Mac");
+        assert!(!remains, "unfinished file is discarded");
+    }
+
+    #[test]
+    fn completed_upload_receipt_survives_reconnect_without_pasting_again() {
+        let path = std::env::temp_dir().join(format!("kaku-receipt-{}", std::process::id()));
+        let transfer = "ab".repeat(16);
+        let mut uploads = HashMap::new();
+        uploads.insert(
+            7,
+            Upload {
+                file: std::fs::File::create(&path).unwrap(),
+                path: path.clone(),
+                size: 0,
+                written: 0,
+                pane_id: Some(42),
+                transfer: transfer.clone(),
+                name: "empty.txt".into(),
+            },
+        );
+        // Focus has moved to 99, but completion belongs to 42.
+        let first =
+            handle_upload(&WebClientMsg::UploadEnd { id: 7 }, &mut uploads, Some(99)).unwrap();
+        assert!(first.ok);
+        assert_eq!(
+            UPLOAD_RECEIPTS.lock().get(&transfer).unwrap().pane_id,
+            Some(42)
+        );
+        // A fresh session repeats the start after losing the final reply.
+        let mut reconnected = HashMap::new();
+        let reply = handle_upload(
+            &WebClientMsg::UploadStart {
+                id: 8,
+                name: "empty.txt".into(),
+                size: 0,
+                transfer: transfer.clone(),
+                pane_id: Some(42),
+            },
+            &mut reconnected,
+            Some(99),
+        )
+        .unwrap();
+        assert!(reply.ok);
+        assert_eq!(reply.detail, first.detail);
+        assert!(
+            reconnected.is_empty(),
+            "a completed retry never opens a second file"
+        );
+        let mismatch = handle_upload(
+            &WebClientMsg::UploadStart {
+                id: 9,
+                name: "different.txt".into(),
+                size: 0,
+                transfer: transfer.clone(),
+                pane_id: Some(42),
+            },
+            &mut reconnected,
+            Some(99),
+        )
+        .unwrap();
+        assert!(!mismatch.ok);
+        UPLOAD_RECEIPTS.lock().remove(&transfer);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cancelled_upload_discards_only_its_partial_file() {
+        let path = std::env::temp_dir().join(format!("kaku-cancel-{}", std::process::id()));
+        let mut uploads = HashMap::new();
+        uploads.insert(
+            7,
+            Upload {
+                file: std::fs::File::create(&path).unwrap(),
+                path: path.clone(),
+                size: 5,
+                written: 0,
+                pane_id: Some(42),
+                transfer: String::new(),
+                name: "partial".into(),
+            },
+        );
+        assert!(handle_upload(&WebClientMsg::UploadCancel { id: 7 }, &mut uploads, None).is_none());
+        assert!(!path.exists());
+        assert!(uploads.is_empty());
+    }
+
+    #[test]
+    fn matching_dimensions_still_record_browser_ownership() {
+        let source = include_str!("web.rs");
+        let claim = source
+            .split("fn claim_tab_size(")
+            .nth(1)
+            .unwrap()
+            .split("fn split_share(")
+            .next()
+            .unwrap();
+        assert!(
+            claim
+                .find("WEB_SIZED_TABS.lock().insert(tab_id.into());")
+                .unwrap()
+                < claim
+                    .find("if current.cols == cols && current.rows == rows {")
+                    .unwrap()
+        );
     }
 
     #[test]
