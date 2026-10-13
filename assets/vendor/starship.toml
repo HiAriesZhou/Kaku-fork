@@ -24,7 +24,7 @@ format = "$symbol"
 # (tasteful single-glyph markers, not the noisy default ASCII like [!?]).
 # Drop "$git_status" from `format` above to hide the status again.
 [git_branch]
-symbol = " "
+symbol = "\uf418 "
 style = "bold purple"
 format = " [$symbol$branch]($style)"
 truncation_length = 24
@@ -58,8 +58,9 @@ style = 'bold green'
 disabled = true
 
 # Git status indicators: single-character Nerd Font glyphs grouped together
-# with no brackets; counts only show when greater than one. Looks like:
-#   main  ↑2  ?3
+# with no brackets; counts only show when greater than one. The glyphs are
+# \u escapes because literal private-use characters were once stripped from
+# this file, leaving the Git icons blank.
 [git_status]
 format = ' [$ahead_behind$conflicted$staged$modified$untracked$stashed]($style)'
 style = "bold yellow"
@@ -69,8 +70,8 @@ ignore_submodules = true
 ahead = " ↑${count}"
 behind = " ↓${count}"
 diverged = " ⇕"
-conflicted = "  "
-staged = "  "
-modified = "  "
+conflicted = " \uf071 "
+staged = " \uf067 "
+modified = " \uf040 "
 untracked = " ?${count}"
-stashed = "  "
+stashed = " \uf01c "

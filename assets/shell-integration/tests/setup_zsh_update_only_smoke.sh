@@ -49,6 +49,25 @@ if grep -Fq "local: can only be used in a function" "$output_log" "$error_log"; 
 fi
 
 [[ -f "$tmp_home/.config/starship.toml" ]] || fail "starship.toml was not initialized"
+python3 - "$tmp_home/.config/starship.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as config_file:
+    config = tomllib.load(config_file)
+for section, fields in {
+    "git_branch": ("symbol",),
+    "git_status": ("conflicted", "staged", "modified", "stashed"),
+}.items():
+    for field in fields:
+        value = config.get(section, {}).get(field)
+        if not isinstance(value, str) or not value.strip():
+            sys.exit(f"FAIL: starship.toml has a missing or blank {section}.{field}")
+# The character module deliberately supplies only the prompt/input separator.
+for field in ("success_symbol", "error_symbol"):
+    if config.get("character", {}).get(field) != " ":
+        sys.exit(f"FAIL: starship.toml changed character.{field}")
+PY
 [[ -f "$tmp_home/.config/kaku/zsh/kaku.zsh" ]] || fail "kaku.zsh was not generated"
 [[ -f "$tmp_home/.zshrc" ]] || fail ".zshrc was not patched"
 
