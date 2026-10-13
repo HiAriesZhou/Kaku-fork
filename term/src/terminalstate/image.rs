@@ -102,6 +102,16 @@ impl TerminalState {
         let physical_rows = self.screen().physical_rows;
         let cell_pixel_width = self.pixel_width / physical_cols;
         let cell_pixel_height = self.pixel_height / physical_rows;
+        // A pane that reports no pixel size (tmux, headless domains) has no
+        // cell size to place a pixel-addressed image with, and working out
+        // how many cells it spans would divide by zero and kill the pane's
+        // reader. Refuse the image instead (upstream WezTerm #7872).
+        anyhow::ensure!(
+            cell_pixel_width != 0 && cell_pixel_height != 0,
+            "refusing to display image: terminal has no cell pixel dimensions ({}x{})",
+            cell_pixel_width,
+            cell_pixel_height
+        );
         let cell_padding_left = params
             .cell_padding_left
             .min(cell_pixel_width.saturating_sub(1) as u16);
@@ -119,6 +129,14 @@ impl TerminalState {
             .source_height
             .unwrap_or(image_max_height)
             .min(image_max_height);
+        // Nothing to draw (w=0, h=0, or a source origin past the image): an
+        // image that cannot show anything does not take cells either.
+        anyhow::ensure!(
+            draw_width != 0 && draw_height != 0,
+            "refusing to display image with zero draw dimensions ({}x{})",
+            draw_width,
+            draw_height
+        );
 
         let cursor_x = self.cursor.x;
         let cursor_y = self.cursor.y.max(0) as usize;
