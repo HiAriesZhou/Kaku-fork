@@ -53,7 +53,8 @@ async function screen(p, text = 'Password: ', pane = 1) {
     probe.handle({ type: 'frame', seq: 1, pane_id: pane, cols: 80, rows: 24, local_scroll: true,
       data: '\x1b[2J\x1b[1;1H' + text + '\x1b[1;' + (text.length + 1) + 'H\x1b[1 q\x1b[?25h' });
   }, { text, pane });
-  await p.waitForTimeout(100);
+  await p.waitForFunction(expected =>
+    [...document.querySelectorAll('.xterm-rows')].some(rows => rows.textContent.includes(expected)), text);
   await p.evaluate(() => probe.term.focus());
 }
 const text = p => p.locator('.xterm-rows').innerText();
