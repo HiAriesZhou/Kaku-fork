@@ -180,9 +180,11 @@ enum SubCommand {
     )]
     SetCwd(SetCwdCommand),
 
+    // Not launched yet: kept out of --help until the maintainer opens it up.
     #[cfg(feature = "remote")]
     #[command(
         name = "remote",
+        hide = true,
         about = "Show this Kaku's web link, to open its terminals from another device"
     )]
     Remote {

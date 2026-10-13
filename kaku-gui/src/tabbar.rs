@@ -774,6 +774,16 @@ fn foreground_process_title(pane: &dyn mux::pane::Pane) -> Option<String> {
     process_title_from_program(&proc_name)
 }
 
+/// Whether the pane's foreground program is an AI agent CLI (Claude Code,
+/// Codex): its last full-screen view is the conversation, worth keeping
+/// across a restart, unlike vim or htop.
+pub(crate) fn foreground_is_agent_cli(pane: &dyn mux::pane::Pane) -> bool {
+    foreground_process_title(pane)
+        .as_deref()
+        .and_then(|title| title.split_whitespace().next())
+        .is_some_and(|program| matches!(program, "claude" | "codex"))
+}
+
 fn foreground_process_title_for_pane_info(pane: &PaneInformation) -> Option<String> {
     if let Some(prog) = pane.user_vars.get("WEZTERM_PROG") {
         return if prog.is_empty() {

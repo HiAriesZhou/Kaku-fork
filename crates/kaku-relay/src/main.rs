@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::info;
 
 const MAX_HOSTS: usize = 10_000;
@@ -28,6 +28,7 @@ const MAX_BROWSERS_PER_HOST: usize = 8;
 const MAX_MESSAGE: usize = 4 << 20;
 /// Messages queued toward one socket before it counts as stuck.
 const QUEUE: usize = 256;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const ASSET_TIMEOUT: Duration = Duration::from_secs(10);
 const KIND_DATA: u8 = 0;
 const KIND_ASSET: u8 = 1;
@@ -40,24 +41,59 @@ struct Asset {
     body: Bytes,
 }
 
+struct BrowserLink {
+    data: mpsc::Sender<ws::Message>,
+    close: watch::Sender<Option<u64>>,
+}
+
 struct Host {
     /// Distinguishes this registration from a later one under the same id.
     generation: u64,
     to_host: mpsc::Sender<ws::Message>,
-    browsers: Mutex<HashMap<u32, mpsc::Sender<ws::Message>>>,
+    browsers: Mutex<HashMap<u32, BrowserLink>>,
     assets: Mutex<HashMap<u32, oneshot::Sender<Asset>>>,
     next_id: AtomicU32,
 }
 
 #[derive(Clone, Default)]
 struct AppState {
-    hosts: Arc<Mutex<HashMap<String, Arc<Host>>>>,
+    /// Every connected registration per id; the last one serves browsers.
+    /// Two Kakus can share an identity (a second instance on the same Mac):
+    /// when the newer one leaves, the older one, still connected, takes over
+    /// instead of the link reading offline while a Kaku is running.
+    hosts: Arc<Mutex<HashMap<String, Vec<Arc<Host>>>>>,
     generation: Arc<AtomicU64>,
 }
 
 impl AppState {
     fn host(&self, id: &str) -> Option<Arc<Host>> {
-        self.hosts.lock().get(id).cloned()
+        self.hosts
+            .lock()
+            .get(id)
+            .and_then(|all| all.last().cloned())
+    }
+
+    /// Make `host` the one serving `id`; returns the one it displaced.
+    fn register(&self, id: &str, host: Arc<Host>) -> Option<Arc<Host>> {
+        let mut hosts = self.hosts.lock();
+        let all = hosts.entry(id.to_string()).or_default();
+        let displaced = all.last().cloned();
+        all.push(host);
+        displaced
+    }
+
+    /// Drop this registration; returns how many remain for `id`.
+    fn unregister(&self, id: &str, generation: u64) -> usize {
+        let mut hosts = self.hosts.lock();
+        let Some(all) = hosts.get_mut(id) else {
+            return 0;
+        };
+        all.retain(|h| h.generation != generation);
+        let left = all.len();
+        if left == 0 {
+            hosts.remove(id);
+        }
+        left
     }
 }
 
@@ -80,6 +116,60 @@ fn edge(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-")
         .to_string()
+}
+
+/// Browser and OS family from the User-Agent, enough to tell a laptop from
+/// a phone in the logs without recording anything that identifies a person.
+fn device(headers: &HeaderMap) -> &'static str {
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let os = if ua.contains("iPhone") {
+        "iPhone"
+    } else if ua.contains("iPad") {
+        "iPad"
+    } else if ua.contains("Android") {
+        "Android"
+    } else if ua.contains("Windows") {
+        "Windows"
+    } else if ua.contains("Mac OS X") || ua.contains("Macintosh") {
+        "macOS"
+    } else if ua.contains("Linux") {
+        "Linux"
+    } else {
+        "other"
+    };
+    let browser = if ua.contains("Edg/") {
+        "Edge"
+    } else if ua.contains("Chrome/") || ua.contains("CriOS/") {
+        "Chrome"
+    } else if ua.contains("Firefox/") || ua.contains("FxiOS/") {
+        "Firefox"
+    } else if ua.contains("Safari/") {
+        "Safari"
+    } else {
+        "other"
+    };
+    match (browser, os) {
+        ("Chrome", "Windows") => "Chrome Windows",
+        ("Chrome", "macOS") => "Chrome macOS",
+        ("Chrome", "Android") => "Chrome Android",
+        ("Chrome", "iPhone") => "Chrome iPhone",
+        ("Edge", "Windows") => "Edge Windows",
+        ("Edge", "macOS") => "Edge macOS",
+        ("Safari", "macOS") => "Safari macOS",
+        ("Safari", "iPhone") => "Safari iPhone",
+        ("Safari", "iPad") => "Safari iPad",
+        ("Firefox", "Windows") => "Firefox Windows",
+        ("Firefox", "macOS") => "Firefox macOS",
+        (_, "iPhone") => "iPhone",
+        (_, "iPad") => "iPad",
+        (_, "Android") => "Android",
+        (_, "Windows") => "Windows",
+        (_, "macOS") => "macOS",
+        _ => "other",
+    }
 }
 
 fn valid_id(id: &str) -> bool {
@@ -119,28 +209,48 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
         assets: Mutex::new(HashMap::new()),
         next_id: AtomicU32::new(1),
     });
-    // The newest registration wins; the old one's browsers are dropped.
-    if let Some(old) = state.hosts.lock().insert(id.clone(), host.clone()) {
+    // The newest registration serves; the previous one stays connected as a
+    // standby, and its browsers reconnect to this one.
+    if let Some(old) = state.register(&id, host.clone()) {
         old.browsers.lock().clear();
     }
     info!("host {} registered via edge {}", short(&id), edge);
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(msg) = outgoing.recv().await {
-            if sink.send(msg).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
     });
 
-    while let Some(Ok(msg)) = stream.next().await {
+    let connected_at = tokio::time::Instant::now();
+    let ended = loop {
+        let msg = tokio::select! {
+            _ = &mut writer => break "writer-stopped",
+            next = stream.next() => match next {
+                Some(Ok(msg)) => msg,
+                Some(Err(error)) => {
+                    info!(host = short(&id), error = %error, "host transport failed");
+                    break "socket-error";
+                }
+                None => break "eof",
+            }
+        };
         match msg {
             ws::Message::Binary(bytes) if bytes.len() >= 5 => {
                 let kind = bytes[0];
                 let target = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
                 match kind {
                     KIND_DATA => {
-                        let tx = host.browsers.lock().get(&target).cloned();
+                        let tx = host
+                            .browsers
+                            .lock()
+                            .get(&target)
+                            .map(|link| link.data.clone());
                         if let Some(tx) = tx {
                             let payload = bytes.slice(5..);
                             if tx.try_send(ws::Message::Binary(payload)).is_err() {
@@ -164,27 +274,36 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
                 if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(text.as_str()) {
                     if map.get("t").and_then(|t| t.as_str()) == Some("close") {
                         if let Some(c) = map.get("c").and_then(|c| c.as_u64()) {
-                            host.browsers.lock().remove(&(c as u32));
+                            if let Some(tx) = host.browsers.lock().remove(&(c as u32)) {
+                                let code = map.get("code").and_then(|v| v.as_u64()).unwrap_or(4403);
+                                let _ = tx.close.send(Some(code));
+                            }
                         }
                     }
                 }
             }
-            ws::Message::Close(_) => break,
+            ws::Message::Close(_) => break "close-frame",
             _ => {}
         }
-    }
+    };
+    info!(
+        host = short(&id),
+        reason = ended,
+        seconds = connected_at.elapsed().as_secs(),
+        "host connection ended"
+    );
 
     writer.abort();
-    let mut hosts = state.hosts.lock();
-    if hosts
-        .get(&id)
-        .is_some_and(|current| current.generation == host.generation)
-    {
-        hosts.remove(&id);
-    }
-    drop(hosts);
+    let left = state.unregister(&id, host.generation);
     host.browsers.lock().clear();
-    info!("host {} gone", short(&id));
+    if left > 0 {
+        info!(
+            "host {} gone, an earlier registration takes over",
+            short(&id)
+        );
+    } else {
+        info!("host {} gone", short(&id));
+    }
 }
 
 fn parse_asset(payload: Bytes) -> Option<Asset> {
@@ -206,11 +325,26 @@ fn parse_asset(payload: Bytes) -> Option<Asset> {
 
 // ── Browser side ──────────────────────────────────────────────────────────────
 
-const OFFLINE_PAGE: &str = "<!doctype html><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Kaku</title><body style=\"font:15px -apple-system,sans-serif;background:#16161a;\
-color:#999;display:flex;align-items:center;justify-content:center;height:100vh;margin:0\">\
-This Kaku is offline. Open Kaku on the Mac and reload.</body>";
+/// Shown while the Mac's Kaku is not connected. It looks like the terminal
+/// page's own notice and opens the terminal by itself once the Mac is back;
+/// the link's key is still in the address bar, so the reload keeps it.
+const OFFLINE_PAGE: &str = r#"<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kaku</title>
+<style>
+html,body{height:100%;margin:0;background:#15141a;color:#d4d4d8}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:24px;box-sizing:border-box;text-align:center;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+.title{font-size:15px}.detail{font-size:13px;color:#8b8b93}
+</style>
+<div class="title">Kaku on the Mac is offline</div>
+<div class="detail">This page opens the terminal by itself when it is back.</div>
+<script>
+setInterval(function () {
+  fetch(location.pathname, { method: "HEAD", cache: "no-store" })
+    .then(function (r) { if (r.ok) location.reload(); })
+    .catch(function () {});
+}, 3000);
+</script>"#;
 
 async fn fetch_asset(state: &AppState, id: &str, path: &str) -> Response {
     let Some(host) = state.host(id) else {
@@ -304,66 +438,105 @@ async fn browser_ws(
         .max_message_size(MAX_MESSAGE)
         .on_upgrade(move |socket| async move {
             info!(
-                "browser joined host {} via edge {}",
+                "browser joined host {} via edge {} from {}",
                 short(&id),
-                edge(&headers)
+                edge(&headers),
+                device(&headers)
             );
             serve_browser(socket, host).await
         })
 }
 
+fn browser_close(code: u64) -> ws::Message {
+    let (code, reason) = match code {
+        4403 => (4403, "invalid link key"),
+        4408 => (4408, "authentication timed out"),
+        _ => (4413, "connection is busy"),
+    };
+    ws::Message::Close(Some(ws::CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
+}
+
 async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut outgoing) = mpsc::channel::<ws::Message>(QUEUE);
+    let (close, mut closing) = watch::channel(None);
     let c = host.next_id.fetch_add(1, Ordering::Relaxed);
-    host.browsers.lock().insert(c, tx);
+    // Reserve atomically after upgrade too: simultaneous handshakes may all
+    // have seen space in browser_ws before any callback ran.
+    let accepted = {
+        let mut browsers = host.browsers.lock();
+        if browsers.len() >= MAX_BROWSERS_PER_HOST {
+            false
+        } else {
+            browsers.insert(c, BrowserLink { data: tx, close });
+            true
+        }
+    };
+    if !accepted {
+        let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(browser_close(4413))).await;
+        return;
+    }
     let open = serde_json::json!({ "t": "open", "c": c }).to_string();
     if host
         .to_host
-        .send(ws::Message::Text(open.into()))
-        .await
+        .try_send(ws::Message::Text(open.into()))
         .is_err()
     {
         host.browsers.lock().remove(&c);
         return;
     }
-
-    // Ends when the host drops this browser (its sender goes away).
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = outgoing.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
+    let mut writer = tokio::spawn(async move {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = closing.changed() => {
+                    let code = *closing.borrow();
+                    let msg = code.map(browser_close).unwrap_or(ws::Message::Close(None));
+                    let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await;
+                    return;
+                }
+                msg = outgoing.recv() => match msg { Some(msg) => msg, None => return },
+            };
+            // Membership loss interrupts even a stalled data write. It never
+            // waits for the old screen queue to drain after host replacement.
+            tokio::select! {
+                biased;
+                _ = closing.changed() => {
+                    let code = *closing.borrow();
+                    let msg = code.map(browser_close).unwrap_or(ws::Message::Close(None));
+                    let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await;
+                    return;
+                }
+                result = tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)) => {
+                    if !matches!(result, Ok(Ok(()))) { return; }
+                }
             }
         }
-        let _ = sink.close().await;
     });
-
     loop {
         tokio::select! {
+            _ = &mut writer => break,
             msg = stream.next() => {
                 let Some(Ok(msg)) = msg else { break };
                 match msg {
                     ws::Message::Binary(payload) => {
+                        // The writer owns the close reason; do not abort it for late input.
+                        if !host.browsers.lock().contains_key(&c) { continue; }
                         let mut frame = Vec::with_capacity(5 + payload.len());
                         frame.push(KIND_DATA);
                         frame.extend_from_slice(&c.to_be_bytes());
                         frame.extend_from_slice(&payload);
-                        if host.to_host.try_send(ws::Message::Binary(frame.into())).is_err() {
-                            break;
-                        }
+                        if host.to_host.try_send(ws::Message::Binary(frame.into())).is_err() { break; }
                     }
                     ws::Message::Close(_) => break,
                     _ => {}
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                if !host.browsers.lock().contains_key(&c) {
-                    break;
-                }
-            }
         }
     }
-
     host.browsers.lock().remove(&c);
     writer.abort();
     let close = serde_json::json!({ "t": "close", "c": c }).to_string();
@@ -425,6 +598,63 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejection_code_reaches_the_browser_without_arbitrary_reason_text() {
+        let ws::Message::Close(Some(frame)) = browser_close(4403) else {
+            panic!("close frame")
+        };
+        assert_eq!(frame.code, 4403);
+        assert_eq!(frame.reason.as_str(), "invalid link key");
+        let ws::Message::Close(Some(frame)) = browser_close(u64::MAX) else {
+            panic!("close frame")
+        };
+        assert_eq!(frame.code, 4413);
+    }
+
+    fn test_host(state: &AppState) -> Arc<Host> {
+        let (to_host, _rx) = mpsc::channel(1);
+        Arc::new(Host {
+            generation: state.generation.fetch_add(1, Ordering::Relaxed),
+            to_host,
+            browsers: Mutex::new(HashMap::new()),
+            assets: Mutex::new(HashMap::new()),
+            next_id: AtomicU32::new(1),
+        })
+    }
+
+    #[test]
+    fn an_earlier_host_takes_over_when_the_newer_one_leaves() {
+        let state = AppState::default();
+        let first = test_host(&state);
+        let second = test_host(&state);
+        assert!(state.register("id", first.clone()).is_none());
+        let displaced = state
+            .register("id", second.clone())
+            .expect("first displaced");
+        assert_eq!(displaced.generation, first.generation);
+        assert_eq!(state.host("id").unwrap().generation, second.generation);
+
+        // The newer Kaku quits: the first, still connected, serves again.
+        assert_eq!(state.unregister("id", second.generation), 1);
+        assert_eq!(state.host("id").unwrap().generation, first.generation);
+
+        assert_eq!(state.unregister("id", first.generation), 0);
+        assert!(state.host("id").is_none());
+    }
+
+    #[test]
+    fn device_names_browser_and_os_only() {
+        let ua = |s: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(axum::http::header::USER_AGENT, s.parse().unwrap());
+            device(&h)
+        };
+        assert_eq!(ua("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"), "Chrome macOS");
+        assert_eq!(ua("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"), "Safari iPhone");
+        assert_eq!(ua("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0"), "Edge Windows");
+        assert_eq!(device(&HeaderMap::new()), "other");
+    }
 
     #[test]
     fn only_the_secret_owner_matches_an_id() {
