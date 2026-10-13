@@ -3716,7 +3716,7 @@ impl TermWindow {
         self.schedule_title_update();
     }
 
-    fn update_title_impl(&mut self) {
+    pub(crate) fn update_title_impl(&mut self) {
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
             Some(window) => window,

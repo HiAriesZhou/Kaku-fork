@@ -23,7 +23,7 @@ use std::time::Duration;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
 use termwiz::color::ColorAttribute;
 use termwiz::input::{KeyCode, Modifiers};
-use termwiz::surface::{CursorShape, CursorVisibility};
+use termwiz::surface::{CursorShape, CursorVisibility, Line};
 use tokio::sync::{broadcast, mpsc};
 use wezterm_term::{MouseButton, MouseEvent, MouseEventKind, TerminalSize};
 
@@ -77,7 +77,7 @@ pub fn release_web_size(tab_id: usize) {
 /// Tab changes the page asks for. The GUI performs them through the same
 /// key assignments as its own Cmd+T and Close Tab, so cwd inheritance and
 /// the closed-tab history behave as they do on the Mac.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum TabAction {
     /// Open a tab in the window holding this pane.
     New { pane_id: usize },
@@ -89,8 +89,13 @@ pub enum TabAction {
     /// Mac only clears when its own window takes focus, and so never while
     /// the Mac sits unattended.
     Seen { pane_id: usize },
-    /// Make the tab holding this pane the active tab in its Mac window.
+    /// Make the tab holding this pane the active tab in its Mac window, and
+    /// this pane the focused split in that tab.
     Activate { pane_id: usize },
+    /// Rename the tab holding this pane; empty goes back to the computed title.
+    Rename { pane_id: usize, title: String },
+    /// Move the tab holding this pane to `index` in its window.
+    Move { pane_id: usize, index: usize },
 }
 
 pub type TabActionHandler = Arc<dyn Fn(TabAction) + Send + Sync + 'static>;
@@ -213,11 +218,26 @@ a{{color:#9ecbff;word-break:break-all}}p{{color:#999}}</style>
 #[derive(Serialize, PartialEq)]
 struct TabInfo {
     tab_id: usize,
+    /// Tabs reorder within their own Mac window.
+    window_id: usize,
     pane_id: usize,
     title: String,
     active: bool,
     /// Whether closing should ask first, per tab_close_confirmation.
     confirm_close: bool,
+    /// The splits of a tab with more than one pane, in cells, so the page
+    /// can draw the layout and switch between them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    panes: Vec<PaneBox>,
+}
+
+#[derive(Serialize, PartialEq)]
+struct PaneBox {
+    pane_id: usize,
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
 }
 
 /// Tabs in tab bar order across windows, each pointing at its active pane.
@@ -243,13 +263,30 @@ fn collect_tabs() -> Vec<TabInfo> {
                 .filter(|t| !t.is_empty())
                 .cloned()
                 .unwrap_or_else(|| pane.get_title());
+            let positioned = tab.iter_panes_ignoring_zoom();
+            let panes = if positioned.len() > 1 {
+                positioned
+                    .iter()
+                    .map(|p| PaneBox {
+                        pane_id: p.pane.pane_id().into(),
+                        left: p.left,
+                        top: p.top,
+                        width: p.width,
+                        height: p.height,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             tabs.push(TabInfo {
                 tab_id,
+                window_id,
                 pane_id: pane.pane_id().into(),
                 title,
                 active: idx == active_idx,
                 confirm_close: policy
                     .should_prompt(true, || tab.can_close_without_prompting(CloseReason::Tab)),
+                panes,
             });
         }
     }
@@ -340,6 +377,22 @@ enum WebClientMsg {
     CloseTab {
         tab_id: usize,
     },
+    /// Rename a tab, from the page's tab editor; empty clears the name.
+    RenameTab {
+        tab_id: usize,
+        title: String,
+    },
+    /// Move a tab to `index` in its window, from a drag in the page.
+    MoveTab {
+        tab_id: usize,
+        index: usize,
+    },
+    /// Rows of the pane's history ending before stable row `end` (the
+    /// bottom of the screen when absent), for the page to scroll locally.
+    History {
+        #[serde(default)]
+        end: Option<isize>,
+    },
     /// The text of every row the page shows, once it has applied `frames`
     /// frames. Kaku compares it with what it believes the page shows; a
     /// mismatch is logged with enough context to find its cause, then healed
@@ -365,6 +418,9 @@ enum WebServerMsg<'a> {
         rows: usize,
         title: &'a str,
         scrolled: bool,
+        /// A plain shell: scrolling moves through Kaku's history, which the
+        /// page scrolls locally. Otherwise the program gets the wheel.
+        local_scroll: bool,
         data: &'a str,
     },
     /// The attached pane is gone; the page picks another tab. It names the
@@ -391,7 +447,19 @@ enum WebServerMsg<'a> {
     Clipboard {
         text: &'a str,
     },
+    /// History rows for the page's local scroll view: `rows` start at stable
+    /// row `top`, and `first` is the oldest row the pane still holds. Each
+    /// row is SGR runs with `CSI n G` pinning columns after wide glyphs.
+    History {
+        pane_id: usize,
+        first: isize,
+        top: isize,
+        rows: &'a [String],
+    },
 }
+
+/// Rows sent per history request. The page asks for more as it nears the top.
+const HISTORY_PAGE: isize = 400;
 
 // ── Frame rendering ───────────────────────────────────────────────────────────
 
@@ -718,6 +786,21 @@ fn claim_tab_size(pane_id: usize, cols: usize, rows: usize) {
             return;
         };
         let current = tab.get_size();
+        // In a split, the pane is a share of the tab: grow the tab so that
+        // share comes out at the browser's grid. Splits keep their
+        // proportions on resize, so scaling by the share lands within a cell.
+        let (cols, rows) = match tab
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .find(|p| p.pane.pane_id() == PaneId::from(pane_id))
+        {
+            Some(p) if p.width < current.cols || p.height < current.rows => (
+                split_share(cols, current.cols, p.width),
+                split_share(rows, current.rows, p.height),
+            ),
+            _ => (cols, rows),
+        };
+        let (cols, rows) = (cols.min(MAX_COLS), rows.min(MAX_ROWS));
         if current.cols == cols && current.rows == rows {
             return;
         }
@@ -735,11 +818,21 @@ fn claim_tab_size(pane_id: usize, cols: usize, rows: usize) {
     .detach();
 }
 
+/// The tab extent that gives a pane holding `part` of `whole` cells a
+/// size of `want`.
+fn split_share(want: usize, whole: usize, part: usize) -> usize {
+    if part == 0 || part >= whole {
+        return want;
+    }
+    (want * whole + part / 2) / part
+}
+
 struct Frame {
     cols: usize,
     rows: usize,
     title: String,
     scrolled: bool,
+    local_scroll: bool,
     /// One self-contained string per row: it positions itself and starts
     /// from reset attributes, so any subset of rows can be sent alone.
     lines: Vec<String>,
@@ -766,34 +859,8 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
     for row in 0..rows {
         let mut out = String::with_capacity(dims.cols + 16);
         let _ = write!(out, "\x1b[{};1H", row + 1);
-        let mut current: Option<Sgr> = None;
         if let Some(line) = lines.get(row) {
-            let mut col = 0;
-            for cell in line.visible_cells() {
-                if col >= dims.cols {
-                    break;
-                }
-                let sgr = Sgr::from_attrs(cell.attrs());
-                if current.as_ref() != Some(&sgr) {
-                    sgr.write(&mut out);
-                    current = Some(sgr);
-                }
-                let text = cell.str();
-                let width = cell.width().max(1);
-                if text.is_empty() {
-                    out.push(' ');
-                } else {
-                    out.push_str(text);
-                }
-                col += width;
-                // xterm.js has its own width table (Unicode 6 by default), so
-                // for symbols and emoji it can disagree with Kaku about how
-                // many columns a glyph takes and shift the rest of the row.
-                // Pin the next column to Kaku's answer.
-                if !text.is_ascii() && col < dims.cols {
-                    let _ = write!(out, "\x1b[{}G", col + 1);
-                }
-            }
+            render_cells(line, dims.cols, &mut out);
         }
         // Clear the rest of the row with the default background.
         out.push_str("\x1b[0m\x1b[K");
@@ -821,9 +888,61 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
         rows,
         title: pane.get_title(),
         scrolled: view.pinned_top.is_some(),
+        local_scroll: !pane.is_alt_screen_active() && !pane.is_mouse_grabbed(),
         lines: rendered,
         cursor: cursor_out,
     }
+}
+
+/// One row's cells as SGR runs, at most `cols` wide.
+fn render_cells(line: &Line, cols: usize, out: &mut String) {
+    let mut current: Option<Sgr> = None;
+    let mut col = 0;
+    for cell in line.visible_cells() {
+        if col >= cols {
+            break;
+        }
+        let sgr = Sgr::from_attrs(cell.attrs());
+        if current.as_ref() != Some(&sgr) {
+            sgr.write(out);
+            current = Some(sgr);
+        }
+        let text = cell.str();
+        let width = cell.width().max(1);
+        if text.is_empty() {
+            out.push(' ');
+        } else {
+            out.push_str(text);
+        }
+        col += width;
+        // xterm.js has its own width table (Unicode 6 by default), so for
+        // symbols and emoji it can disagree with Kaku about how many columns
+        // a glyph takes and shift the rest of the row. Pin the next column
+        // to Kaku's answer.
+        if !text.is_ascii() && col < cols {
+            let _ = write!(out, "\x1b[{}G", col + 1);
+        }
+    }
+}
+
+/// Up to `HISTORY_PAGE` rows of the pane ending before `end` (the bottom of
+/// the screen when absent), with the first row's stable index and the
+/// oldest row the pane holds.
+fn history_rows(pane: &Arc<dyn Pane>, end: Option<isize>) -> (isize, isize, Vec<String>) {
+    let dims = pane.get_dimensions();
+    let bottom = dims.physical_top + dims.viewport_rows as isize;
+    let end = end.unwrap_or(bottom).clamp(dims.scrollback_top, bottom);
+    let top = (end - HISTORY_PAGE).max(dims.scrollback_top);
+    let (_, lines) = pane.get_lines(top..end);
+    let rows = lines
+        .iter()
+        .map(|line| {
+            let mut out = String::new();
+            render_cells(line, dims.cols, &mut out);
+            out
+        })
+        .collect();
+    (dims.scrollback_top, top, rows)
 }
 
 /// What the browser already shows, so the next frame only carries changes.
@@ -832,6 +951,7 @@ struct Shown {
     cols: usize,
     title: String,
     scrolled: bool,
+    local_scroll: bool,
     lines: Vec<String>,
     cursor: String,
     /// For drift reports: the last row move sent, and frames since a full one.
@@ -885,13 +1005,18 @@ impl Shown {
                 changed = true;
             }
         }
-        if !changed && self.cursor == frame.cursor && self.title == frame.title {
+        if !changed
+            && self.cursor == frame.cursor
+            && self.title == frame.title
+            && self.local_scroll == frame.local_scroll
+        {
             return None;
         }
         data.push_str(&frame.cursor);
         self.cols = frame.cols;
         self.title.clone_from(&frame.title);
         self.scrolled = frame.scrolled;
+        self.local_scroll = frame.local_scroll;
         self.cursor.clone_from(&frame.cursor);
         self.lines.clone_from(&frame.lines);
         Some((frame, data))
@@ -1110,6 +1235,14 @@ fn key_code(name: &str) -> Option<KeyCode> {
     })
 }
 
+/// A pane in tab `tab_id`, which is how tab actions name their tab.
+fn tab_target(tab_id: usize) -> Option<usize> {
+    Mux::try_get()
+        .and_then(|mux| mux.get_tab(mux::tab::TabId::from(tab_id)))
+        .and_then(|tab| tab.get_active_pane())
+        .map(|pane| pane.pane_id().into())
+}
+
 fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
     let interactive = matches!(
         msg,
@@ -1243,17 +1376,32 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             Ok(())
         }
         WebClientMsg::CloseTab { tab_id } => {
-            let target = Mux::try_get()
-                .and_then(|mux| mux.get_tab(mux::tab::TabId::from(tab_id)))
-                .and_then(|tab| tab.get_active_pane());
-            if let Some(target) = target {
-                dispatch_tab_action(TabAction::Close {
-                    pane_id: target.pane_id().into(),
+            if let Some(target) = tab_target(tab_id) {
+                dispatch_tab_action(TabAction::Close { pane_id: target });
+            }
+            Ok(())
+        }
+        WebClientMsg::RenameTab { tab_id, title } => {
+            if let Some(target) = tab_target(tab_id) {
+                let title: String = title.chars().take(200).collect();
+                dispatch_tab_action(TabAction::Rename {
+                    pane_id: target,
+                    title,
+                });
+            }
+            Ok(())
+        }
+        WebClientMsg::MoveTab { tab_id, index } => {
+            if let Some(target) = tab_target(tab_id) {
+                dispatch_tab_action(TabAction::Move {
+                    pane_id: target,
+                    index,
                 });
             }
             Ok(())
         }
         WebClientMsg::Hello
+        | WebClientMsg::History { .. }
         | WebClientMsg::Ping
         | WebClientMsg::Attach { .. }
         | WebClientMsg::Verify { .. }
@@ -1386,6 +1534,17 @@ pub(crate) async fn run_session(
                     }
                     continue;
                 }
+                if let WebClientMsg::History { end } = msg {
+                    let Some(pane_id) = attached else { continue };
+                    let Some(pane) = lookup_pane(pane_id) else { continue };
+                    let (first, top, rows) = history_rows(&pane, end);
+                    let reply = WebServerMsg::History { pane_id, first, top, rows: &rows };
+                    let Some(json) = encode(&reply) else { continue };
+                    if outbox.send(json).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 if let WebClientMsg::Verify { frames, rows } = &msg {
                     if *frames == frames_sent && attached.is_some() {
                         let drift = drifted_rows(&shown.lines, rows);
@@ -1485,6 +1644,7 @@ pub(crate) async fn run_session(
                     rows: frame.rows,
                     title: &frame.title,
                     scrolled: frame.scrolled,
+                    local_scroll: frame.local_scroll,
                     data: &data,
                 };
                 let Some(json) = encode(&msg) else { continue };
@@ -1555,6 +1715,16 @@ mod tests {
     }
 
     #[test]
+    fn a_split_pane_gets_the_browser_grid() {
+        // Half of a 161-column tab is 80: a 100-column browser grows the tab
+        // so that half comes out at 100.
+        assert_eq!(split_share(100, 161, 80), 201);
+        // A lone pane is the whole tab.
+        assert_eq!(split_share(100, 80, 80), 100);
+        assert_eq!(split_share(100, 80, 0), 100);
+    }
+
+    #[test]
     fn closed_names_the_pane_it_reports() {
         // The page ignores a closed notice for a pane it already left; without
         // the id it dropped the tab it had just switched to.
@@ -1584,6 +1754,7 @@ mod tests {
             rows: lines.len(),
             title: "t".into(),
             scrolled: false,
+            local_scroll: true,
             lines: lines.iter().map(|l| l.to_string()).collect(),
             cursor: cursor.into(),
         }
