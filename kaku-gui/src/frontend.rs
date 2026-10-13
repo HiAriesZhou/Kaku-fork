@@ -36,6 +36,17 @@ fn ordinary_window_for_service(
     windows.iter().copied().filter(|id| !is_hotkey(*id)).max()
 }
 
+fn action_window_id(
+    focused: Option<MuxWindowId>,
+    windows: &[MuxWindowId],
+    is_hotkey: impl Fn(MuxWindowId) -> bool,
+) -> Option<MuxWindowId> {
+    focused
+        .filter(|id| windows.contains(id))
+        .or_else(|| windows.iter().copied().find(|id| !is_hotkey(*id)))
+        .or_else(|| windows.first().copied())
+}
+
 fn ordinary_snapshot_focus(
     current: Option<MuxWindowId>,
     remembered: Option<MuxWindowId>,
@@ -355,7 +366,8 @@ fn run_kaku_update_in_tab(auto_confirm: bool) {
 pub fn confirm_and_apply_update() {
     promise::spawn::spawn_into_main_thread(async move {
         if let Some(fe) = try_front_end() {
-            if let Some(gui) = fe.gui_windows().first() {
+            if let Some(gui) = fe.gui_window_for_action() {
+                gui.window.show();
                 gui.window.notify(TermWindowNotif::Apply(Box::new(|tw| {
                     tw.show_update_confirmation();
                 })));
@@ -541,8 +553,12 @@ fn run_kaku_subcommand_in_new_tab(
 
         // Find an existing window to add the tab to, so we don't spawn
         // a separate window that lacks the user's proxy environment.
-        let src_window_id =
-            try_front_end().and_then(|fe| fe.gui_windows().first().map(|w| w.mux_window_id));
+        let src_window_id = try_front_end().and_then(|fe| {
+            fe.gui_window_for_action().map(|gui| {
+                gui.window.show();
+                gui.mux_window_id
+            })
+        });
 
         let spawn_cmd = SpawnCommand {
             domain: SpawnTabDomain::DomainName("local".to_string()),
@@ -1220,7 +1236,8 @@ impl GuiFrontEnd {
                         // window so they open in-place instead of being
                         // silently dropped.
                         if let Some(fe) = try_front_end() {
-                            if let Some(gui) = fe.gui_windows().first() {
+                            if let Some(gui) = fe.gui_window_for_action() {
+                                gui.window.show();
                                 gui.window
                                     .notify(TermWindowNotif::Apply(Box::new(move |tw| {
                                         if let Some(pane) = tw.get_active_pane_or_overlay() {
@@ -1470,6 +1487,18 @@ impl GuiFrontEnd {
         None
     }
 
+    fn gui_window_for_action(&self) -> Option<GuiWin> {
+        let windows = self.gui_windows();
+        let ids: Vec<_> = windows.iter().map(|gui| gui.mux_window_id).collect();
+        let focused = Mux::get()
+            .resolve_focused_pane(&self.client_id)
+            .map(|(_, window_id, _, _)| window_id);
+        let selected = action_window_id(focused, &ids, |id| self.is_hotkey_window(id))?;
+        windows
+            .into_iter()
+            .find(|gui| gui.mux_window_id == selected)
+    }
+
     pub fn focused_mux_window_id(&self) -> Option<MuxWindowId> {
         let mux = Mux::get();
         mux.resolve_focused_pane(&self.client_id)
@@ -1575,6 +1604,79 @@ pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
 mod tests {
     use super::{kaku_config_command, shell_quote_program};
     use std::path::Path;
+
+    #[test]
+    fn action_window_selection_targets_focused_drawer_over_hidden_ordinary() {
+        assert_eq!(
+            super::action_window_id(Some(42), &[7, 42], |id| id == 42),
+            Some(42)
+        );
+        assert_eq!(
+            super::action_window_id(Some(7), &[7, 42], |id| id == 42),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn action_window_selection_supports_drawer_only_and_no_windows() {
+        assert_eq!(
+            super::action_window_id(Some(42), &[42], |id| id == 42),
+            Some(42)
+        );
+        assert_eq!(
+            super::action_window_id(None, &[42], |id| id == 42),
+            Some(42)
+        );
+        assert_eq!(super::action_window_id(None, &[], |_| false), None);
+    }
+
+    #[test]
+    fn action_window_selection_rejects_stale_focus_and_prefers_ordinary_fallback() {
+        assert_eq!(
+            super::action_window_id(Some(99), &[42, 7], |id| id == 42),
+            Some(7)
+        );
+        assert_eq!(
+            super::action_window_id(None, &[42, 7], |id| id == 42),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn action_window_routes_reveal_the_target_before_user_operations() {
+        let source = include_str!("frontend.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for (start, end) in [
+            (
+                "pub fn confirm_and_apply_update()",
+                "pub(crate) fn apply_update_now()",
+            ),
+            ("fn run_kaku_subcommand_in_new_tab(", "impl GuiFrontEnd {"),
+            ("fn app_event_handler(", "pub fn run_forever("),
+        ] {
+            let route = source
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            assert!(route.contains("fe.gui_window_for_action()"), "{}", start);
+            let show = route.find("gui.window.show();").unwrap();
+            let operation = if start.contains("subcommand") {
+                route.find("crate::spawn::spawn_command_impl(").unwrap()
+            } else {
+                route
+                    .find("gui.window\n")
+                    .or_else(|| route.find("gui.window.notify("))
+                    .unwrap()
+            };
+            assert!(show < operation, "{}", start);
+            assert!(!route.contains("fe.gui_windows().first()"), "{}", start);
+        }
+    }
 
     #[test]
     fn composition_service_chooses_highest_ordinary_id() {
