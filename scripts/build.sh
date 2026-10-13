@@ -439,8 +439,15 @@ configure_dmg_layout() {
 	local app_name="$2"
 	local background_name="$3"
 
+	# Finder learns about a freshly attached volume a moment after hdiutil
+	# returns; asking for the disk too early fails with -1728 and left a
+	# Nightly DMG without its window layout. Wait for Finder to see it.
 	osascript >/dev/null <<EOF
 tell application "Finder"
+	repeat 40 times
+		if exists disk "${disk_name}" then exit repeat
+		delay 0.25
+	end repeat
 	tell disk "${disk_name}"
 		open
 		set current view of container window to icon view
@@ -516,7 +523,22 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
 		continue
 	fi
 
-	if ! configure_dmg_layout "$MOUNT_NAME" "$APP_NAME" "$BACKGROUND_IMAGE_NAME"; then
+	LAYOUT_OK=0
+	if configure_dmg_layout "$MOUNT_NAME" "$APP_NAME" "$BACKGROUND_IMAGE_NAME"; then
+		# Finder writes .DS_Store a moment after the script returns.
+		for _ in $(seq 1 20); do
+			[[ -f "$MOUNT_POINT/.DS_Store" ]] && LAYOUT_OK=1 && break
+			sleep 0.25
+		done
+	fi
+	if [[ "$LAYOUT_OK" != "1" ]]; then
+		# A published DMG without its layout opens as a bare file list, so a
+		# release-grade build stops here instead of shipping one.
+		if [[ "$KAKU_REQUIRE_SIGNED_RELEASE" == "1" ]]; then
+			hdiutil_cmd detach "$DEVICE" -force >/dev/null 2>&1 || true
+			echo "Error: Failed to configure Finder layout for DMG."
+			exit 1
+		fi
 		echo "Warning: Failed to configure Finder layout for DMG."
 	fi
 
