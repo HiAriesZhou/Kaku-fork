@@ -34,6 +34,11 @@ const KEEPALIVE: Duration = Duration::from_secs(20);
 /// link died without a close (sleep, network change); reconnect.
 const SILENCE_LIMIT: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Longest a connect, TLS and WebSocket handshake may take. A proxy can
+/// accept the TCP connection locally and then never answer once its own
+/// upstream is gone; without a limit the bridge waited there for hours and
+/// the link stayed offline until Kaku restarted.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ── Identity ──────────────────────────────────────────────────────────────────
 
@@ -232,6 +237,24 @@ enum Browser {
     Active(mpsc::Sender<String>),
 }
 
+type RelaySocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect_relay(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    limit: Duration,
+) -> anyhow::Result<RelaySocket> {
+    // Keystrokes and echoes are tiny frames; Nagle would hold them back.
+    let (socket, _) = tokio::time::timeout(
+        limit,
+        tokio_tungstenite::connect_async_with_config(request, None, true),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("relay handshake timed out after {limit:?}"))?
+    .context("connect to relay")?;
+    Ok(socket)
+}
+
 async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> anyhow::Result<()> {
     let key = identity.sealing_key()?;
     let id = identity.id();
@@ -242,10 +265,7 @@ async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> a
         "x-kaku-secret",
         identity.secret.parse().context("secret header")?,
     );
-    // Keystrokes and echoes are tiny frames; Nagle would hold them back.
-    let (socket, _) = tokio_tungstenite::connect_async_with_config(request, None, true)
-        .await
-        .context("connect to relay")?;
+    let socket = connect_relay(request, CONNECT_TIMEOUT).await?;
     log::info!("kaku-share: registered with relay as {id}");
     let (mut relay_tx, mut relay_rx) = socket.split();
 
@@ -372,6 +392,31 @@ mod tests {
 
     fn identity() -> ShareIdentity {
         ShareIdentity::generate().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_never_answers_the_handshake_is_given_up_on() {
+        // A listener that accepts and stays silent, like a local proxy whose
+        // upstream died: the connect succeeds, the handshake never ends.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _held = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                kept.push(socket);
+            }
+        });
+        let request = format!("ws://{addr}/host/x").into_client_request().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_relay(request, Duration::from_millis(300)),
+        )
+        .await
+        .expect("connect_relay must give up on its own");
+        let Err(err) = result else {
+            panic!("a silent relay must not connect");
+        };
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
     }
 
     #[test]
