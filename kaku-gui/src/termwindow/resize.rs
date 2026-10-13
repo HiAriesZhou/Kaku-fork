@@ -471,8 +471,11 @@ impl super::TermWindow {
         }
 
         // change_scaling below clears the font/metrics caches unconditionally,
-        // forcing a ~330ms default-font reresolve on macOS.
-        if font_scale == self.fonts.get_font_scale() && dimensions.dpi == self.fonts.get_dpi() {
+        // forcing a ~330ms default-font reresolve on macOS. Skip only when the
+        // metrics are still current: a config reload keeps scale and dpi but
+        // can change font, font_size, line_height or cell_width.
+        let key = super::render_metrics_key(&self.config, dimensions.dpi, font_scale);
+        if key == self.render_metrics_key {
             return;
         }
 
@@ -485,6 +488,7 @@ impl super::TermWindow {
         ) {
             Ok((metrics, _cache_hit)) => {
                 self.render_metrics = metrics;
+                self.render_metrics_key = key;
             }
             Err(err) => {
                 log::error!(
