@@ -382,13 +382,19 @@ test('mouse selection copies on release and respects the Mac setting', async t =
   const { p } = await page(t);
   await screen(p, 'hello world');
   await captureClipboard(p);
+  await p.evaluate(() => document.fonts.ready);
+  const initial = await p.locator('.xterm-screen').boundingBox();
+  await p.mouse.click(initial.x + initial.width - 4, initial.y + initial.height - 4);
   const rect = await p.locator('.xterm-screen').boundingBox();
   const cols = await p.evaluate(() => probe.term.cols);
   const select = async () => {
-    const cell = rect.width / cols;
-    await p.mouse.move(rect.x + cell * 0.1, rect.y + 8);
+    await p.mouse.move(rect.x + rect.width / cols * 0.1, rect.y + 8);
     await p.mouse.down();
-    await p.mouse.move(rect.x + cell * 5.8, rect.y + 8, { steps: 4 });
+    // pointerdown re-fits the font. Measure that grid, then end just beyond
+    // the fifth boundary rather than rounding into the following space.
+    const current = await p.locator('.xterm-screen').boundingBox();
+    const cell = current.width / await p.evaluate(() => probe.term.cols);
+    await p.mouse.move(current.x + cell * 5.1, current.y + 8, { steps: 4 });
     assert.equal(await p.evaluate(() => copied.length), 0, 'do not copy intermediate drag selections');
     await p.mouse.up();
   };
