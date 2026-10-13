@@ -179,3 +179,18 @@ impl LineEditBuffer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_to_start_of_line_keeps_the_text_after_the_cursor() {
+        // What Ctrl-U does in a prompt: drop everything before the cursor.
+        let mut buf = LineEditBuffer::default();
+        buf.set_line_and_cursor("hello world", 6);
+        buf.kill_text(Movement::StartOfLine, Movement::StartOfLine);
+        assert_eq!(buf.get_line(), "world");
+        assert_eq!(buf.get_cursor(), 0);
+    }
+}
