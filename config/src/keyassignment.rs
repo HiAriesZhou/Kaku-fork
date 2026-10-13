@@ -124,6 +124,8 @@ pub enum SelectionMode {
 pub enum Pattern {
     CaseSensitiveString(String),
     CaseInSensitiveString(String),
+    /// Case-insensitive unless the text has an uppercase letter.
+    CaseSmartString(String),
     Regex(String),
     CurrentSelectionOrEmptyString,
 }
@@ -131,9 +133,10 @@ pub enum Pattern {
 impl Pattern {
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::CaseSensitiveString(s) | Self::CaseInSensitiveString(s) | Self::Regex(s) => {
-                s.is_empty()
-            }
+            Self::CaseSensitiveString(s)
+            | Self::CaseInSensitiveString(s)
+            | Self::CaseSmartString(s)
+            | Self::Regex(s) => s.is_empty(),
             Self::CurrentSelectionOrEmptyString => true,
         }
     }

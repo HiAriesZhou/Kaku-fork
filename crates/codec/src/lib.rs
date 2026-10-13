@@ -1148,6 +1148,23 @@ pub struct GetImageCellResponse {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn search_pattern_variants_keep_their_wire_positions() {
+        // The mux protocol encodes enum variants by position, so a new
+        // pattern goes last; moving one would break a Kaku talking to a mux
+        // server from another version.
+        use mux::pane::Pattern;
+        let tag = |p: &Pattern| {
+            let mut out = vec![];
+            serde::Serialize::serialize(p, &mut varbincode::Serializer::new(&mut out)).unwrap();
+            out[0]
+        };
+        assert_eq!(tag(&Pattern::CaseSensitiveString("a".into())), 0);
+        assert_eq!(tag(&Pattern::CaseInSensitiveString("a".into())), 1);
+        assert_eq!(tag(&Pattern::Regex("a".into())), 2);
+        assert_eq!(tag(&Pattern::CaseSmartString("a".into())), 3);
+    }
+
     use super::*;
 
     #[test]

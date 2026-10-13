@@ -121,6 +121,8 @@ pub enum Pattern {
     CaseSensitiveString(String),
     CaseInSensitiveString(String),
     Regex(String),
+    // Appended last: the mux protocol encodes variants by position.
+    CaseSmartString(String),
 }
 
 impl Default for Pattern {
@@ -135,6 +137,7 @@ impl std::ops::Deref for Pattern {
         match self {
             Pattern::CaseSensitiveString(s) => s,
             Pattern::CaseInSensitiveString(s) => s,
+            Pattern::CaseSmartString(s) => s,
             Pattern::Regex(s) => s,
         }
     }
@@ -145,6 +148,7 @@ impl std::ops::DerefMut for Pattern {
         match self {
             Pattern::CaseSensitiveString(s) => s,
             Pattern::CaseInSensitiveString(s) => s,
+            Pattern::CaseSmartString(s) => s,
             Pattern::Regex(s) => s,
         }
     }
@@ -155,6 +159,7 @@ pub enum PatternType {
     CaseSensitiveString,
     CaseInSensitiveString,
     Regex,
+    CaseSmartString,
 }
 
 impl From<&Pattern> for PatternType {
@@ -162,6 +167,7 @@ impl From<&Pattern> for PatternType {
         match value {
             Pattern::CaseSensitiveString(_) => PatternType::CaseSensitiveString,
             Pattern::CaseInSensitiveString(_) => PatternType::CaseInSensitiveString,
+            Pattern::CaseSmartString(_) => PatternType::CaseSmartString,
             Pattern::Regex(_) => PatternType::Regex,
         }
     }

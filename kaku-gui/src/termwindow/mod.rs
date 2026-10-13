@@ -6696,6 +6696,7 @@ impl TermWindow {
         match pattern {
             Pattern::CaseSensitiveString(s) => MuxPattern::CaseSensitiveString(s),
             Pattern::CaseInSensitiveString(s) => MuxPattern::CaseInSensitiveString(s),
+            Pattern::CaseSmartString(s) => MuxPattern::CaseSmartString(s),
             Pattern::Regex(s) => MuxPattern::Regex(s),
             Pattern::CurrentSelectionOrEmptyString => {
                 let text = self.selection_text(pane);
@@ -6704,7 +6705,8 @@ impl TermWindow {
                     .next()
                     .map(|s| s.to_string())
                     .unwrap_or_default();
-                MuxPattern::CaseSensitiveString(first_line)
+                // Matches either case until the query has an uppercase letter.
+                MuxPattern::CaseSmartString(first_line)
             }
         }
     }
