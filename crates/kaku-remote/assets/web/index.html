@@ -1531,7 +1531,9 @@
     }
   };
 
+  let copyOnSelect = true;
   const onConfig = (cfg) => {
+    copyOnSelect = cfg.copy_on_select !== false;
     const theme = {};
     if (cfg.background) { theme.background = cfg.background; document.documentElement.style.setProperty("--bg", cfg.background); }
     if (cfg.foreground) { theme.foreground = cfg.foreground; document.documentElement.style.setProperty("--fg", cfg.foreground); }
@@ -1615,6 +1617,66 @@
   const flushCopy = () => { if (pendingCopy !== null) copyToClipboard(pendingCopy); };
   window.addEventListener("focus", flushCopy);
   document.addEventListener("pointerdown", flushCopy, true);
+
+  // Complete a selection locally, with no Mac or relay round-trip. A denied
+  // automatic copy must not overwrite the clipboard on an unrelated later tap.
+  const historySelection = () => {
+    const selection = getSelection();
+    if (!pastOpen || !selection?.rangeCount || selection.isCollapsed) return "";
+    const range = selection.getRangeAt(0);
+    if (!pastEl.contains(range.startContainer) || !pastEl.contains(range.endContainer)) return "";
+    const selected = [...pastRendered].filter(([, row]) => range.intersectsNode(row)).sort((a, b) => a[0] - b[0]);
+    if (!selected.length) return "";
+    const first = selected[0][0], last = selected.at(-1)[0];
+    const lines = [];
+    for (let id = first; id <= last; id++) {
+      const row = pastRendered.get(id);
+      if (row && (id === first || id === last)) {
+        const part = document.createRange();
+        part.selectNodeContents(row);
+        if (row.contains(range.startContainer)) part.setStart(range.startContainer, range.startOffset);
+        if (row.contains(range.endContainer)) part.setEnd(range.endContainer, range.endOffset);
+        lines.push(part.toString());
+      } else lines.push((pastRows[id - pastTop] || "").replace(SEQ, ""));
+    }
+    return lines.join("\n");
+  };
+  let selectionGesture = false;
+  let lastAutoCopy = "";
+  const copySelection = () => {
+    if (!copyOnSelect) return;
+    const text = pastOpen ? historySelection() : term.getSelection();
+    if (!text || text === lastAutoCopy) return;
+    lastAutoCopy = text;
+    pendingCopy = null;
+    navigator.clipboard?.writeText(text).catch(() => {});
+  };
+  stage.addEventListener("pointerdown", ev => {
+    if (ev.button !== 0) return;
+    selectionGesture = true;
+    lastAutoCopy = "";
+  });
+  // xterm finishes its selection on document mouseup; window runs after it.
+  window.addEventListener("mouseup", ev => {
+    if (ev.button !== 0 || !selectionGesture) return;
+    selectionGesture = false;
+    copySelection();
+  });
+  window.addEventListener("touchend", () => {
+    if (selectionGesture) { selectionGesture = false; if (!touchMoved) copySelection(); }
+  }, { passive: true });
+  window.addEventListener("pointercancel", () => { selectionGesture = false; });
+  document.addEventListener("selectionchange", () => {
+    if (TOUCH && pastOpen && !selectionGesture) copySelection();
+  });
+  // Absolute-positioned history rows need explicit line breaks, including
+  // rows outside the virtual DOM between the selected endpoints.
+  document.addEventListener("copy", ev => {
+    const text = historySelection();
+    if (!text || !ev.clipboardData) return;
+    ev.clipboardData.setData("text/plain", text);
+    ev.preventDefault();
+  });
 
   // While this page is in the background, a Kaku tab that wants attention
   // (a finished task's bell) marks the browser tab's title.

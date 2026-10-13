@@ -229,3 +229,96 @@ test('phone, tablet and desktop grids stay within their viewports', async t => {
     assert.deepEqual(errors, []);
   }
 });
+
+async function captureClipboard(p, deny = false) {
+  await p.evaluate(deny => {
+    window.copied = [];
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      writeText: async text => { copied.push(text); if (deny) throw new DOMException('Denied', 'NotAllowedError'); }
+    } });
+  }, deny);
+}
+
+test('mouse selection copies on release and respects the Mac setting', async t => {
+  const { p } = await page(t);
+  await screen(p, 'hello world');
+  await captureClipboard(p);
+  const rect = await p.locator('.xterm-screen').boundingBox();
+  const cols = await p.evaluate(() => probe.term.cols);
+  const select = async () => {
+    const cell = rect.width / cols;
+    await p.mouse.move(rect.x + cell * 0.1, rect.y + 8);
+    await p.mouse.down();
+    await p.mouse.move(rect.x + cell * 5.8, rect.y + 8, { steps: 4 });
+    assert.equal(await p.evaluate(() => copied.length), 0, 'do not copy intermediate drag selections');
+    await p.mouse.up();
+  };
+  await select();
+  assert.deepEqual(await p.evaluate(() => copied), ['hello']);
+  await p.evaluate(() => { copied.length = 0; probe.handle({ type: 'config', copy_on_select: false }); });
+  await select();
+  assert.deepEqual(await p.evaluate(() => copied), []);
+});
+
+test('history auto-copy and manual copy preserve Unicode, newlines and virtual gaps', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await captureClipboard(p);
+  const result = await p.evaluate(() => {
+    probe.openPast();
+    probe.onHistory({ pane_id: 1, first: 0, top: 0,
+      rows: Array.from({ length: 400 }, (_, i) => '\x1b[0;38;2;10;20;30m中文-' + i) });
+    const last = document.querySelector('#past .row:last-child span span').firstChild;
+    // Keep an endpoint at the end while materializing the top; the middle
+    // remains virtual and must still be included in the copied text.
+    const selection = getSelection(), range = document.createRange();
+    range.selectNodeContents(last); selection.removeAllRanges(); selection.addRange(range);
+    probe.pastScroll(1e7);
+    const first = document.querySelector('#past .row span span').firstChild;
+    range.setStart(first, 0); range.setEnd(last, last.length);
+    const expected = Array.from({ length: 400 }, (_, i) => '中文-' + i).join('\n');
+    document.querySelector('#past').dispatchEvent(new PointerEvent('pointerdown', { button: 0, bubbles: true }));
+    window.dispatchEvent(new MouseEvent('mouseup', { button: 0 }));
+    const data = new DataTransfer();
+    document.dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, cancelable: true }));
+    return { automatic: copied.at(-1), manual: data.getData('text/plain'), expected };
+  });
+  assert.equal(result.automatic, result.expected);
+  assert.equal(result.manual, result.expected);
+});
+
+test('denied auto-copy never queues stale text for a later unrelated click', async t => {
+  const { p, errors } = await page(t);
+  await screen(p, 'hello world');
+  await captureClipboard(p, true);
+  await p.evaluate(() => {
+    probe.term.select(0, 0, 5);
+    document.querySelector('#term').dispatchEvent(new PointerEvent('pointerdown', { button: 0, bubbles: true }));
+    window.dispatchEvent(new MouseEvent('mouseup', { button: 0 }));
+  });
+  await p.waitForTimeout(20);
+  await p.evaluate(() => { window.dispatchEvent(new Event('focus')); document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); });
+  assert.deepEqual(await p.evaluate(() => copied), ['hello']);
+  assert.deepEqual(errors, []);
+});
+
+test('touch history selection changes copy locally without copying page labels', async t => {
+  const { p } = await page(t, '#t=fixture', { hasTouch: true, viewport: { width: 375, height: 667 } });
+  await screen(p);
+  await captureClipboard(p);
+  await p.evaluate(() => {
+    probe.openPast();
+    probe.onHistory({ pane_id: 1, first: 0, top: 0, rows: ['\x1b[0m中文 history'] });
+    const range = document.createRange();
+    range.selectNodeContents(document.querySelector('#past .row span span'));
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+  });
+  await p.waitForTimeout(40);
+  assert.deepEqual(await p.evaluate(() => copied), ['中文 history']);
+  await p.evaluate(() => {
+    const range = document.createRange(); range.selectNodeContents(document.querySelector('#bar'));
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+  });
+  await p.waitForTimeout(40);
+  assert.deepEqual(await p.evaluate(() => copied), ['中文 history']);
+});

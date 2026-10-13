@@ -220,6 +220,7 @@ struct ConfigInfo {
     font_family: String,
     font_size: f64,
     line_height: f64,
+    copy_on_select: bool,
     /// Where Kaku draws its tab bar, so the page puts its tabs there too.
     tab_bar_at_bottom: bool,
     /// Kaku's tab bar colors, so the page's tabs look like the window's.
@@ -443,6 +444,7 @@ fn config_info() -> ConfigInfo {
         font_family,
         font_size: cfg.font_size,
         line_height: cfg.line_height,
+        copy_on_select: cfg.copy_on_select,
         tab_bar_at_bottom: cfg.tab_bar_at_bottom,
         tab_bar: palette.tab_bar.as_ref().map(|bar| TabBarInfo {
             background: opt_hex(bar.background.as_ref()),
