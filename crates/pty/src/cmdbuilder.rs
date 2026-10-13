@@ -4,8 +4,6 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
 #[cfg(unix)]
 use std::path::Component;
 use std::path::Path;
@@ -27,15 +25,7 @@ struct EnvEntry {
 
 impl EnvEntry {
     fn map_key(k: OsString) -> OsString {
-        if cfg!(windows) {
-            // Best-effort lowercase transformation of an os string
-            match k.to_str() {
-                Some(s) => s.to_lowercase().into(),
-                None => k,
-            }
-        } else {
-            k
-        }
+        k
     }
 }
 
@@ -101,97 +91,6 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
         }
     }
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStringExt;
-        use winapi::um::processenv::ExpandEnvironmentStringsW;
-        use winreg::enums::{RegType, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-        use winreg::types::FromRegValue;
-        use winreg::{RegKey, RegValue};
-
-        fn reg_value_to_string(value: &RegValue) -> anyhow::Result<OsString> {
-            match value.vtype {
-                RegType::REG_EXPAND_SZ => {
-                    let src = unsafe {
-                        std::slice::from_raw_parts(
-                            value.bytes.as_ptr() as *const u16,
-                            value.bytes.len() / 2,
-                        )
-                    };
-                    let size =
-                        unsafe { ExpandEnvironmentStringsW(src.as_ptr(), std::ptr::null_mut(), 0) };
-                    let mut buf = vec![0u16; size as usize + 1];
-                    unsafe {
-                        ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
-                    };
-
-                    let mut buf = buf.as_slice();
-                    while let Some(0) = buf.last() {
-                        buf = &buf[0..buf.len() - 1];
-                    }
-                    Ok(OsString::from_wide(buf))
-                }
-                _ => Ok(OsString::from_reg_value(value)?),
-            }
-        }
-
-        if let Ok(sys_env) = RegKey::predef(HKEY_LOCAL_MACHINE)
-            .open_subkey("System\\CurrentControlSet\\Control\\Session Manager\\Environment")
-        {
-            for res in sys_env.enum_values() {
-                if let Ok((name, value)) = res {
-                    if name.to_ascii_lowercase() == "username" {
-                        continue;
-                    }
-                    if let Ok(value) = reg_value_to_string(&value) {
-                        log::trace!("adding SYS env: {:?} {:?}", name, value);
-                        env.insert(
-                            EnvEntry::map_key(name.clone().into()),
-                            EnvEntry {
-                                is_from_base_env: true,
-                                preferred_key: name.into(),
-                                value,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-
-        if let Ok(sys_env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment") {
-            for res in sys_env.enum_values() {
-                if let Ok((name, value)) = res {
-                    if let Ok(value) = reg_value_to_string(&value) {
-                        // Merge the system and user paths together
-                        let value = if name.to_ascii_lowercase() == "path" {
-                            match env.get(&EnvEntry::map_key(name.clone().into())) {
-                                Some(entry) => {
-                                    let mut result = OsString::new();
-                                    result.push(&entry.value);
-                                    result.push(";");
-                                    result.push(&value);
-                                    result
-                                }
-                                None => value,
-                            }
-                        } else {
-                            value
-                        };
-
-                        log::trace!("adding USER env: {:?} {:?}", name, value);
-                        env.insert(
-                            EnvEntry::map_key(name.clone().into()),
-                            EnvEntry {
-                                is_from_base_env: true,
-                                preferred_key: name.into(),
-                                value,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-    }
 
     env
 }
@@ -591,174 +490,6 @@ impl CommandBuilder {
     }
 }
 
-#[cfg(windows)]
-impl CommandBuilder {
-    fn search_path(&self, exe: &OsStr) -> OsString {
-        if let Some(path) = self.get_env("PATH") {
-            let extensions = self.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
-            for path in std::env::split_paths(&path) {
-                // Check for exactly the user's string in this path dir
-                let candidate = path.join(&exe);
-                if candidate.exists() {
-                    return candidate.into_os_string();
-                }
-
-                // otherwise try tacking on some extensions.
-                // Note that this really replaces the extension in the
-                // user specified path, so this is potentially wrong.
-                for ext in std::env::split_paths(&extensions) {
-                    // PATHEXT includes the leading `.`, but `with_extension`
-                    // doesn't want that
-                    let ext = ext.to_str().expect("PATHEXT entries must be utf8");
-                    let path = path.join(&exe).with_extension(&ext[1..]);
-                    if path.exists() {
-                        return path.into_os_string();
-                    }
-                }
-            }
-        }
-
-        exe.to_owned()
-    }
-
-    pub(crate) fn current_directory(&self) -> Option<Vec<u16>> {
-        let home: Option<&OsStr> = self
-            .get_env("USERPROFILE")
-            .filter(|path| Path::new(path).is_dir());
-        let cwd: Option<&OsStr> = self.cwd.as_deref().filter(|path| Path::new(path).is_dir());
-        let dir: Option<&OsStr> = cwd.or(home);
-
-        dir.map(|dir| {
-            let mut wide = vec![];
-
-            if Path::new(dir).is_relative() {
-                if let Ok(ccwd) = std::env::current_dir() {
-                    wide.extend(ccwd.join(dir).as_os_str().encode_wide());
-                } else {
-                    wide.extend(dir.encode_wide());
-                }
-            } else {
-                wide.extend(dir.encode_wide());
-            }
-
-            wide.push(0);
-            wide
-        })
-    }
-
-    /// Constructs an environment block for this spawn attempt.
-    /// Uses the current process environment as the base and then
-    /// adds/replaces the environment that was specified via the
-    /// `env` methods.
-    pub(crate) fn environment_block(&self) -> Vec<u16> {
-        // encode the environment as wide characters
-        let mut block = vec![];
-
-        for EnvEntry {
-            is_from_base_env: _,
-            preferred_key,
-            value,
-        } in self.envs.values()
-        {
-            block.extend(preferred_key.encode_wide());
-            block.push(b'=' as u16);
-            block.extend(value.encode_wide());
-            block.push(0);
-        }
-        // and a final terminator for CreateProcessW
-        block.push(0);
-
-        block
-    }
-
-    pub fn get_shell(&self) -> String {
-        let exe: OsString = self
-            .get_env("ComSpec")
-            .unwrap_or(OsStr::new("cmd.exe"))
-            .into();
-        exe.into_string()
-            .unwrap_or_else(|_| "%CompSpec%".to_string())
-    }
-
-    pub(crate) fn cmdline(&self) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
-        let mut cmdline = Vec::<u16>::new();
-
-        let exe: OsString = if self.is_default_prog() {
-            self.get_env("ComSpec")
-                .unwrap_or(OsStr::new("cmd.exe"))
-                .into()
-        } else {
-            self.search_path(&self.args[0])
-        };
-
-        Self::append_quoted(&exe, &mut cmdline);
-
-        // Ensure that we nul terminate the module name, otherwise we'll
-        // ask CreateProcessW to start something random!
-        let mut exe: Vec<u16> = exe.encode_wide().collect();
-        exe.push(0);
-
-        for arg in self.args.iter().skip(1) {
-            cmdline.push(' ' as u16);
-            anyhow::ensure!(
-                !arg.encode_wide().any(|c| c == 0),
-                "invalid encoding for command line argument {:?}",
-                arg
-            );
-            Self::append_quoted(arg, &mut cmdline);
-        }
-        // Ensure that the command line is nul terminated too!
-        cmdline.push(0);
-        Ok((exe, cmdline))
-    }
-
-    // Borrowed from https://github.com/hniksic/rust-subprocess/blob/873dfed165173e52907beb87118b2c0c05d8b8a1/src/popen.rs#L1117
-    // which in turn was translated from ArgvQuote at http://tinyurl.com/zmgtnls
-    fn append_quoted(arg: &OsStr, cmdline: &mut Vec<u16>) {
-        if !arg.is_empty()
-            && !arg.encode_wide().any(|c| {
-                c == ' ' as u16
-                    || c == '\t' as u16
-                    || c == '\n' as u16
-                    || c == '\x0b' as u16
-                    || c == '\"' as u16
-            })
-        {
-            cmdline.extend(arg.encode_wide());
-            return;
-        }
-        cmdline.push('"' as u16);
-
-        let arg: Vec<_> = arg.encode_wide().collect();
-        let mut i = 0;
-        while i < arg.len() {
-            let mut num_backslashes = 0;
-            while i < arg.len() && arg[i] == '\\' as u16 {
-                i += 1;
-                num_backslashes += 1;
-            }
-
-            if i == arg.len() {
-                for _ in 0..num_backslashes * 2 {
-                    cmdline.push('\\' as u16);
-                }
-                break;
-            } else if arg[i] == b'"' as u16 {
-                for _ in 0..num_backslashes * 2 + 1 {
-                    cmdline.push('\\' as u16);
-                }
-                cmdline.push(arg[i]);
-            } else {
-                for _ in 0..num_backslashes {
-                    cmdline.push('\\' as u16);
-                }
-                cmdline.push(arg[i]);
-            }
-            i += 1;
-        }
-        cmdline.push('"' as u16);
-    }
-}
 
 #[cfg(unix)]
 /// Returns true if the path begins with `./` or `../`
@@ -825,14 +556,4 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn test_env_case_insensitive_override() {
-        let mut cmd = CommandBuilder::new("dummy");
-        cmd.env("Cargo_Pkg_Authors", "Not Wez");
-        assert!(cmd.get_env("cargo_pkg_authors") == Some(OsStr::new("Not Wez")));
-
-        cmd.env_remove("cARGO_pKG_aUTHORS");
-        assert!(cmd.get_env("CARGO_PKG_AUTHORS").is_none());
-    }
 }

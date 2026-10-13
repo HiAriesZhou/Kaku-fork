@@ -213,11 +213,6 @@ impl SessionInner {
                 use std::os::unix::io::IntoRawFd;
                 sock.into_raw_fd()
             }
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::IntoRawSocket;
-                sock.into_raw_socket()
-            }
         };
 
         sess.set_option(libssh_rs::SshOption::Socket(raw))?;
@@ -334,15 +329,8 @@ impl SessionInner {
         match self.config.get("proxycommand").map(|s| s.as_str()) {
             Some("none") | None => {}
             Some(proxy_command) => {
-                let mut cmd;
-                if cfg!(windows) {
-                    let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
-                    cmd = std::process::Command::new(comspec);
-                    cmd.args(["/c", proxy_command]);
-                } else {
-                    cmd = std::process::Command::new("sh");
-                    cmd.args(["-c", &format!("exec {}", proxy_command)]);
-                }
+                let mut cmd = std::process::Command::new("sh");
+                cmd.args(["-c", &format!("exec {}", proxy_command)]);
 
                 let (a, b) = socketpair()?;
 
@@ -365,14 +353,6 @@ impl SessionInner {
                     };
 
                     return Ok((Socket::from_raw_fd(dest), Some(KillOnDropChild(child))));
-                }
-                #[cfg(windows)]
-                unsafe {
-                    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-                    return Ok((
-                        Socket::from_raw_socket(a.into_raw_socket()),
-                        Some(KillOnDropChild(child)),
-                    ));
                 }
             }
         }
@@ -870,13 +850,6 @@ impl SessionInner {
                 #[cfg(unix)]
                 {
                     FileDescriptor::new(UnixStream::connect(&identity_agent)?)
-                }
-                #[cfg(windows)]
-                unsafe {
-                    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-                    FileDescriptor::from_raw_socket(
-                        UnixStream::connect(&identity_agent)?.into_raw_socket(),
-                    )
                 }
             };
             fd.set_non_blocking(true)?;

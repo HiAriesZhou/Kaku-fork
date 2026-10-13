@@ -23,20 +23,6 @@ shell-words.workspace = true
 default = []
 serde_support = ["serde"]
 
-[target."cfg(windows)".dependencies]
-bitflags.workspace = true
-lazy_static.workspace = true
-shared_library.workspace = true
-winapi = { workspace=true, features = [
-    "winuser",
-    "consoleapi",
-    "handleapi",
-    "fileapi",
-    "namedpipeapi",
-    "synchapi",
-]}
-winreg.workspace = true
-
 [dev-dependencies]
 futures.workspace = true
 smol.workspace = true

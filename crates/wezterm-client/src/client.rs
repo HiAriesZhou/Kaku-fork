@@ -27,8 +27,6 @@ use std::net::TcpStream;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -503,11 +501,6 @@ pub fn unix_connect_with_retry(
                         use std::os::unix::io::{FromRawFd, IntoRawFd};
                         return Ok(UnixStream::from_raw_fd(a.into_raw_fd()));
                     }
-                    #[cfg(windows)]
-                    unsafe {
-                        use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-                        return Ok(UnixStream::from_raw_socket(a.into_raw_socket()));
-                    }
                 }
             }
         }
@@ -569,19 +562,7 @@ impl AsRawFd for SshStream {
     }
 }
 
-#[cfg(windows)]
-impl AsRawSocket for SshStream {
-    fn as_raw_socket(&self) -> RawSocket {
-        self.stdout.as_raw_socket()
-    }
-}
 
-#[cfg(windows)]
-impl AsSocket for SshStream {
-    fn as_socket(&self) -> BorrowedSocket {
-        self.stdout.as_socket()
-    }
-}
 
 impl Read for SshStream {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {

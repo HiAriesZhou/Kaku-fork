@@ -42,8 +42,6 @@ use downcast_rs::{impl_downcast, Downcast};
 #[cfg(feature = "serde_support")]
 use serde::{Deserialize, Serialize};
 use std::io::Result as IoResult;
-#[cfg(windows)]
-use std::os::windows::prelude::{AsRawHandle, RawHandle};
 
 pub mod cmdbuilder;
 pub use cmdbuilder::CommandBuilder;
@@ -135,10 +133,6 @@ pub trait Child: std::fmt::Debug + ChildKiller + Downcast + Send {
     /// Returns the process identifier of the child process,
     /// if applicable
     fn process_id(&self) -> Option<u32>;
-    /// Returns the process handle of the child process, if applicable.
-    /// Only available on Windows.
-    #[cfg(windows)]
-    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle>;
 }
 impl_downcast!(Child);
 
@@ -277,41 +271,14 @@ impl Child for std::process::Child {
         Some(self.id())
     }
 
-    #[cfg(windows)]
-    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-        Some(std::os::windows::io::AsRawHandle::as_raw_handle(self))
-    }
 }
 
 #[derive(Debug)]
 struct ProcessSignaller {
     pid: Option<u32>,
 
-    #[cfg(windows)]
-    handle: Option<filedescriptor::OwnedHandle>,
 }
 
-#[cfg(windows)]
-impl ChildKiller for ProcessSignaller {
-    fn kill(&mut self) -> IoResult<()> {
-        if let Some(handle) = &self.handle {
-            unsafe {
-                if winapi::um::processthreadsapi::TerminateProcess(handle.as_raw_handle() as _, 127)
-                    == 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-        }
-        Ok(())
-    }
-    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        Box::new(Self {
-            pid: self.pid,
-            handle: self.handle.as_ref().and_then(|h| h.try_clone().ok()),
-        })
-    }
-}
 
 #[cfg(unix)]
 impl ChildKiller for ProcessSignaller {
@@ -365,22 +332,6 @@ impl ChildKiller for std::process::Child {
         std::process::Child::kill(self)
     }
 
-    #[cfg(windows)]
-    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        struct RawDup(RawHandle);
-        impl AsRawHandle for RawDup {
-            fn as_raw_handle(&self) -> RawHandle {
-                self.0
-            }
-        }
-
-        Box::new(ProcessSignaller {
-            pid: self.process_id(),
-            handle: Child::as_raw_handle(self)
-                .as_ref()
-                .and_then(|h| filedescriptor::OwnedHandle::dup(&RawDup(*h)).ok()),
-        })
-    }
 
     #[cfg(unix)]
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
@@ -396,5 +347,3 @@ pub fn native_pty_system() -> Box<dyn PtySystem + Send> {
 
 #[cfg(unix)]
 pub type NativePtySystem = unix::UnixPtySystem;
-#[cfg(windows)]
-pub type NativePtySystem = win::conpty::ConPtySystem;

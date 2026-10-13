@@ -15,6 +15,3 @@ luahelper.workspace = true
 smol.workspace = true
 wezterm-dynamic.workspace = true
 wezterm-open-url.workspace = true
-
-[target."cfg(windows)".dependencies]
-winapi = { workspace=true, features = ["winuser"]}

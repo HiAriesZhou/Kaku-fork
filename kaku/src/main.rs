@@ -605,19 +605,9 @@ fn delegate_to_gui(saver: UmaskSaver) -> anyhow::Result<()> {
     // Restore the original umask
     drop(saver);
 
-    let exe_name = if cfg!(windows) {
-        "kaku-gui.exe"
-    } else {
-        "kaku-gui"
-    };
-
-    let exe = resolve_gui_executable(exe_name)?;
+    let exe = resolve_gui_executable("kaku-gui")?;
 
     let mut cmd = Command::new(&exe);
-    if cfg!(windows) {
-        cmd.arg("--attach-parent-console");
-    }
-
     cmd.args(std::env::args_os().skip(1));
 
     #[cfg(unix)]
@@ -632,14 +622,6 @@ fn delegate_to_gui(saver: UmaskSaver) -> anyhow::Result<()> {
         }
         let res = cmd.exec();
         return Err(anyhow::anyhow!("failed to exec {cmd:?}: {res:?}"));
-    }
-
-    #[cfg(windows)]
-    {
-        let mut child = cmd.spawn()?;
-        let status = child.wait()?;
-        let code = status.code().unwrap_or(1);
-        std::process::exit(code);
     }
 }
 

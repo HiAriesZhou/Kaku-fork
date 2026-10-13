@@ -52,22 +52,5 @@ wezterm-version.workspace = true
 [target."cfg(unix)".dependencies]
 termios.workspace = true
 
-[target."cfg(windows)".dependencies.winapi]
-features = [
-    "winbase",
-    "winerror",
-    "winnls",
-    "winuser",
-    "consoleapi",
-    "handleapi",
-    "fileapi",
-    "synchapi",
-]
-workspace = true
-
-[target."cfg(windows)".build-dependencies]
-cc.workspace = true
-embed-resource.workspace = true
-
 [lints]
 workspace = true

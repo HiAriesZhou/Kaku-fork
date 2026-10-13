@@ -281,11 +281,6 @@ pub fn make_lua_context(config_file: &Path) -> anyhow::Result<Lua> {
                             .ok_or_else(|| anyhow!("current_exe path is not UTF-8"))?,
                     )
                     .context("set wezterm.executable_dir")?;
-                if cfg!(windows) {
-                    // For a portable windows install, force in this path ahead
-                    // of the rest
-                    prefix_path(&mut path_array, &path.join("wezterm_modules"));
-                }
             }
         }
         let config_file_str = config_file
@@ -365,11 +360,6 @@ end
         wezterm_mod.set(
             "running_under_wsl",
             lua.create_function(|_, ()| Ok(crate::running_under_wsl()))?,
-        )?;
-
-        wezterm_mod.set(
-            "default_wsl_domains",
-            lua.create_function(|_, ()| Ok(crate::WslDomain::default_domains()))?,
         )?;
 
         wezterm_mod.set("font", lua.create_function(font)?)?;

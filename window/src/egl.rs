@@ -33,9 +33,6 @@ pub mod ffi {
     pub type EGLNativeDisplayType = *const raw::c_void;
     pub type EGLNativePixmapType = *const raw::c_void;
 
-    #[cfg(target_os = "windows")]
-    pub type EGLNativeWindowType = winapi::shared::windef::HWND;
-    #[cfg(not(target_os = "windows"))]
     pub type EGLNativeWindowType = *const raw::c_void;
 }
 
@@ -395,7 +392,7 @@ impl EglWrapper {
 }
 
 impl GlState {
-    #[cfg_attr(any(windows, target_os = "macos"), allow(unused))]
+    #[cfg_attr(target_os = "macos", allow(unused))]
     pub fn get_connection(&self) -> &Rc<GlConnection> {
         &self.connection
     }
@@ -404,13 +401,9 @@ impl GlState {
         mut func: F,
     ) -> anyhow::Result<Self> {
         let mut paths: Vec<std::path::PathBuf> = vec![
-            #[cfg(target_os = "windows")]
-            "libEGL.dll".into(),
-            #[cfg(target_os = "windows")]
-            "atioglxx.dll".into(),
-            #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+            #[cfg(not(target_os = "macos"))]
             "libEGL.so.1".into(),
-            #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+            #[cfg(not(target_os = "macos"))]
             "libEGL.so".into(),
         ];
 
@@ -467,12 +460,9 @@ impl GlState {
                 }
             }
             // Since we didn't yet succeed, try enabling software rasterization.
-            // However, don't do this on Windows; the EGL implementation on
-            // Windows isn't MESA so there's no point trying a second pass
-            // with the mesa environment set, and if we did, it would just
-            // cause us to try software mode instead of the native opengl
-            // drivers we'd pick up from the WGL fallback.
-            if cfg!(windows) || cfg!(target_os = "macos") {
+            // Not on macOS: its EGL (ANGLE) isn't MESA, so a second pass with
+            // the mesa environment set has no effect.
+            if cfg!(target_os = "macos") {
                 break;
             }
             if prefer_swrast {
@@ -595,18 +585,6 @@ impl GlState {
                 };
 
             let mut attributes = vec![ffi::CONTEXT_MAJOR_VERSION, 3];
-            if cfg!(windows) {
-                // On Windows, where drivers may be dynamically unloaded,
-                // let's make an effort to try to survive that event.
-                for &a in &[
-                    ffi::CONTEXT_OPENGL_ROBUST_ACCESS_EXT,
-                    ffi::TRUE,
-                    ffi::CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT,
-                    ffi::LOSE_CONTEXT_ON_RESET_EXT,
-                ] {
-                    attributes.push(a);
-                }
-            }
             attributes.push(ffi::NONE);
 
             let context = match connection.egl.create_context(

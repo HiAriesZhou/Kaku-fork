@@ -4,10 +4,15 @@ use wezterm_bidi::ParagraphDirectionHint;
 use wezterm_cell::UnicodeVersion;
 use wezterm_surface::{Line, SequenceNo};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum NewlineCanon {
     None,
     LineFeed,
+    /// The default for pastes: the `nano` editor treats \n as a shortcut
+    /// that justifies text <https://savannah.gnu.org/bugs/?49176>, and \r
+    /// is typically fine everywhere else.
+    /// <https://github.com/wezterm/wezterm/issues/1575>
+    #[default]
     CarriageReturn,
     CarriageReturnAndLineFeed,
 }
@@ -95,36 +100,6 @@ fn test_canon() {
         "hello\n\n\nthere",
         NewlineCanon::LineFeed.canonicalize("hello\r\r\n\nthere")
     );
-}
-
-impl Default for NewlineCanon {
-    fn default() -> Self {
-        // This is a bit horrible; in general we try to stick with unix line
-        // endings as the one-true representation because using canonical
-        // CRLF can result in excess blank lines during a paste operation.
-        // On Windows we're in a bit of a frustrating situation: pasting into
-        // Windows console programs requires CRLF otherwise there is no newline
-        // at all, but when in WSL, pasting with CRLF gives excess blank lines.
-        //
-        // To come to a compromise, if wezterm is running on Windows then we'll
-        // use canonical CRLF unless the embedded application has enabled
-        // bracketed paste: we can use bracketed paste mode as a signal that
-        // the application will prefer newlines.
-        //
-        // In practice this means that unix shells and vim will get the
-        // unix newlines in their pastes (which is the UX I want) and
-        // cmd.exe will get CRLF.
-        if cfg!(windows) {
-            Self::CarriageReturnAndLineFeed
-        } else {
-            // For compatibility with the `nano` editor, which unfortunately
-            // treats \n as a shortcut that justifies text
-            // <https://savannah.gnu.org/bugs/?49176>, we default to
-            // \r which is typically fine.
-            // <https://github.com/wezterm/wezterm/issues/1575>
-            Self::CarriageReturn
-        }
-    }
 }
 
 /// TerminalConfiguration allows for the embedding application to pass configuration

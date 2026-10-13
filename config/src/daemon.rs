@@ -25,11 +25,6 @@ pub fn set_sticky_bit(path: &Path) {
             let _ = std::fs::set_permissions(&path, perms);
         }
     }
-
-    #[cfg(windows)]
-    {
-        let _ = path;
-    }
 }
 
 fn open_log(path: PathBuf) -> anyhow::Result<File> {
@@ -45,7 +40,6 @@ fn open_log(path: PathBuf) -> anyhow::Result<File> {
 }
 
 impl DaemonOptions {
-    #[cfg_attr(windows, allow(dead_code))]
     pub fn pid_file(&self) -> PathBuf {
         self.pid_file
             .as_ref()

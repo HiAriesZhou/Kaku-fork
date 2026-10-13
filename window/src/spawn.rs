@@ -1,5 +1,3 @@
-#[cfg(windows)]
-use crate::os::windows::event::EventHandle;
 #[cfg(target_os = "macos")]
 use core_foundation::runloop::*;
 use promise::spawn::{Runnable, SpawnFunc};
@@ -29,8 +27,6 @@ pub(crate) struct SpawnQueue {
     spawned_funcs: Mutex<VecDeque<InstrumentedSpawnFunc>>,
     spawned_funcs_low_pri: Mutex<VecDeque<InstrumentedSpawnFunc>>,
 
-    #[cfg(windows)]
-    pub event_handle: EventHandle,
 
     #[cfg(all(unix, not(target_os = "macos")))]
     write: Mutex<FileDescriptor>,
@@ -121,43 +117,6 @@ impl SpawnQueue {
     }
 }
 
-#[cfg(windows)]
-impl SpawnQueue {
-    fn new_impl() -> anyhow::Result<Self> {
-        let spawned_funcs = Mutex::new(VecDeque::new());
-        let spawned_funcs_low_pri = Mutex::new(VecDeque::new());
-        let event_handle = EventHandle::new_manual_reset().expect("EventHandle creation failed");
-        Ok(Self {
-            spawned_funcs,
-            spawned_funcs_low_pri,
-            event_handle,
-        })
-    }
-
-    fn spawn_impl(&self, f: SpawnFunc, high_pri: bool) {
-        self.queue_func(f, high_pri);
-        self.event_handle.set_event();
-    }
-
-    fn run_impl(&self) -> bool {
-        self.event_handle.reset_event();
-        while let Some(func) = self.pop_func() {
-            func();
-        }
-        self.has_any_queued()
-    }
-
-    fn run_impl_burst(&self, max_funcs: usize) -> bool {
-        self.event_handle.reset_event();
-        for _ in 0..max_funcs {
-            let Some(func) = self.pop_func() else {
-                break;
-            };
-            func();
-        }
-        self.has_any_queued()
-    }
-}
 
 #[cfg(all(unix, not(target_os = "macos")))]
 impl SpawnQueue {

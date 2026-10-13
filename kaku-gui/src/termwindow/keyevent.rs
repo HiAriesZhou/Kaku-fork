@@ -1401,8 +1401,6 @@ mod kitty_encoding_tests {
             repeat_count: 1,
             key_is_down: is_down,
             raw: None,
-            #[cfg(windows)]
-            win32_uni_char: None,
         }
     }
 

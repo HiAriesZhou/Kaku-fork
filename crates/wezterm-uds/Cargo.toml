@@ -9,4 +9,3 @@ documentation = "https://docs.rs/wezterm-uds"
 
 [dependencies]
 async-io.workspace = true
-uds_windows.workspace = true

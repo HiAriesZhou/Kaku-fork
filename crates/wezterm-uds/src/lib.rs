@@ -3,23 +3,13 @@ use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as StreamImpl;
-#[cfg(windows)]
-use std::os::windows::io::{
-    AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, IntoRawSocket, RawSocket,
-};
 use std::path::Path;
-#[cfg(windows)]
-use uds_windows::UnixStream as StreamImpl;
 
 #[cfg(unix)]
 use std::os::unix::net::UnixListener as ListenerImpl;
-#[cfg(windows)]
-use uds_windows::UnixListener as ListenerImpl;
 
 #[cfg(unix)]
 use std::os::unix::net::SocketAddr;
-#[cfg(windows)]
-use uds_windows::SocketAddr;
 
 /// This wrapper makes UnixStream IoSafe on all platforms.
 /// This isn't strictly needed on unix, because async-io
@@ -55,30 +45,6 @@ impl AsRawFd for UnixStream {
     }
 }
 
-#[cfg(windows)]
-impl IntoRawSocket for UnixStream {
-    fn into_raw_socket(self) -> RawSocket {
-        self.0.into_raw_socket()
-    }
-}
-#[cfg(windows)]
-impl AsRawSocket for UnixStream {
-    fn as_raw_socket(&self) -> RawSocket {
-        self.0.as_raw_socket()
-    }
-}
-#[cfg(windows)]
-impl AsSocket for UnixStream {
-    fn as_socket(&self) -> BorrowedSocket {
-        self.0.as_socket()
-    }
-}
-#[cfg(windows)]
-impl FromRawSocket for UnixStream {
-    unsafe fn from_raw_socket(socket: RawSocket) -> UnixStream {
-        UnixStream(StreamImpl::from_raw_socket(socket))
-    }
-}
 
 impl Read for UnixStream {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {

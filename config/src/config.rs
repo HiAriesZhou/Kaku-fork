@@ -20,13 +20,11 @@ use crate::ssh::{SshBackend, SshDomain};
 use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
-use crate::wsl::WslDomain;
 use crate::{
     default_config_with_overrides_applied, default_one_point_oh, default_one_point_oh_f64,
-    default_true, default_win32_acrylic_accent_color, CellWidth, GpuInfo,
-    IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor,
-    SerialDomain, SystemBackdrop, WebGpuPowerPreference, CONFIG_DIRS, CONFIG_FILE_OVERRIDE,
-    CONFIG_OVERRIDES, CONFIG_SKIP,
+    default_true, CellWidth, GpuInfo, IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig,
+    MouseEventTriggerMods, RgbaColor, SerialDomain, WebGpuPowerPreference, CONFIG_DIRS,
+    CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP,
 };
 use anyhow::Context;
 use luahelper::impl_lua_conversion_dynamic;
@@ -379,8 +377,11 @@ pub struct Config {
     #[dynamic(default)]
     pub webgpu_preferred_adapter: Option<GpuInfo>,
 
-    #[dynamic(default)]
-    pub wsl_domains: Option<Vec<WslDomain>>,
+    /// Deprecated and ignored: WSL domains only exist on Windows. Kept so a
+    /// `kaku.lua` shared with a Windows WezTerm setup still loads, with a
+    /// warning instead of a hard error.
+    #[dynamic(default, deprecated = "WSL domains only exist on Windows")]
+    pub wsl_domains: Option<wezterm_dynamic::Value>,
 
     #[dynamic(default)]
     pub exec_domains: Vec<ExecDomain>,
@@ -706,12 +707,12 @@ pub struct Config {
     #[dynamic(default)]
     pub kde_window_background_blur: bool,
 
-    /// Only works on Windows
-    #[dynamic(default)]
-    pub win32_system_backdrop: SystemBackdrop,
+    /// Deprecated and ignored, like `wsl_domains`: Windows window effects.
+    #[dynamic(default, deprecated = "Windows window backdrops do not apply on macOS")]
+    pub win32_system_backdrop: Option<wezterm_dynamic::Value>,
 
-    #[dynamic(default = "default_win32_acrylic_accent_color")]
-    pub win32_acrylic_accent_color: RgbaColor,
+    #[dynamic(default, deprecated = "Windows window backdrops do not apply on macOS")]
+    pub win32_acrylic_accent_color: Option<wezterm_dynamic::Value>,
 
     /// Specifies the alpha value to use when rendering the background
     /// of the window.  The background is taken either from the
@@ -1163,14 +1164,6 @@ impl Config {
         }
     }
 
-    pub fn wsl_domains(&self) -> Vec<WslDomain> {
-        if let Some(domains) = &self.wsl_domains {
-            domains.clone()
-        } else {
-            WslDomain::default_domains()
-        }
-    }
-
     pub fn update_ulimit(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
@@ -1253,22 +1246,6 @@ impl Config {
         let mut paths = vec![];
         for dir in CONFIG_DIRS.iter() {
             paths.push(PathPossibility::optional(dir.join("kaku.lua")))
-        }
-
-        if cfg!(windows) {
-            // On Windows, a common use case is to maintain a thumb drive
-            // with a set of portable tools that don't need to be installed
-            // to run on a target system.  In that scenario, the user would
-            // like to run with the config from their thumbdrive because
-            // either the target system won't have any config, or will have
-            // the config of another user.
-            // So we prioritize that here: if there is a config in the same
-            // dir as the executable that will take precedence.
-            if let Ok(exe_name) = std::env::current_exe() {
-                if let Some(exe_dir) = exe_name.parent() {
-                    paths.insert(0, PathPossibility::optional(exe_dir.join("kaku.lua")));
-                }
-            }
         }
 
         if cfg!(target_os = "macos") {
@@ -1795,11 +1772,6 @@ impl Config {
         for d in &self.exec_domains {
             check_domain(&d.name, "exec domain")?;
         }
-        if let Some(domains) = &self.wsl_domains {
-            for d in domains {
-                check_domain(&d.name, "wsl domain")?;
-            }
-        }
         for d in &self.tls_clients {
             check_domain(&d.name, "tls domain")?;
         }
@@ -1974,14 +1946,6 @@ impl Config {
         let mut paths = self.color_scheme_dirs.clone();
         for dir in CONFIG_DIRS.iter() {
             paths.push(dir.join("colors"));
-        }
-        if cfg!(windows) {
-            // See commentary re: portable tools above!
-            if let Ok(exe_name) = std::env::current_exe() {
-                if let Some(exe_dir) = exe_name.parent() {
-                    paths.insert(0, exe_dir.join("colors"));
-                }
-            }
         }
         paths
     }
@@ -2158,10 +2122,6 @@ impl Config {
             }
         }
 
-        // Augment WSLENV so that TERM related environment propagates
-        // across the win32/wsl boundary
-        let mut wsl_env = std::env::var("WSLENV").ok();
-
         // If we are running as an appimage, we will have "$APPIMAGE"
         // and "$APPDIR" set in the wezterm process. These will be
         // propagated to the child processes. Since some apps (including
@@ -2174,11 +2134,7 @@ impl Config {
         cmd.env_remove("OWD");
 
         for (k, v) in &self.set_environment_variables {
-            if k == "WSLENV" {
-                wsl_env.replace(v.clone());
-            } else {
-                cmd.env(k, v);
-            }
+            cmd.env(k, v);
         }
 
         if !smart_tab_env_is_explicit(cmd) {
@@ -2187,15 +2143,6 @@ impl Config {
                 SmartTabMode::SuggestionFirst => cmd.env(KAKU_TAB_ACCEPT_SUGGEST_FIRST, "1"),
                 SmartTabMode::CompletionFirst => {}
             }
-        }
-
-        if wsl_env.is_some() || cfg!(windows) || crate::version::running_under_wsl() {
-            let mut wsl_env = wsl_env.unwrap_or_default();
-            if !wsl_env.is_empty() {
-                wsl_env.push(':');
-            }
-            wsl_env.push_str("TERM:COLORTERM:TERM_PROGRAM:TERM_PROGRAM_VERSION");
-            cmd.env("WSLENV", wsl_env);
         }
 
         #[cfg(unix)]
@@ -3332,6 +3279,46 @@ mod tests {
     }
 
     #[test]
+    fn windows_only_keys_still_load() {
+        // Kaku dropped its Windows code; a kaku.lua shared with a Windows
+        // WezTerm setup may still set these, and must load with a warning
+        // rather than fail on unknown fields.
+        use std::collections::BTreeMap;
+        use wezterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
+
+        let mut domain: BTreeMap<Value, Value> = BTreeMap::new();
+        domain.insert(
+            Value::String("name".to_string()),
+            Value::String("WSL:Ubuntu".to_string()),
+        );
+        let mut map: BTreeMap<Value, Value> = BTreeMap::new();
+        map.insert(
+            Value::String("wsl_domains".to_string()),
+            Value::Array(vec![Value::Object(domain.into())].into()),
+        );
+        map.insert(
+            Value::String("win32_system_backdrop".to_string()),
+            Value::String("Acrylic".to_string()),
+        );
+        map.insert(
+            Value::String("win32_acrylic_accent_color".to_string()),
+            Value::String("#282828".to_string()),
+        );
+        let result = super::Config::from_dynamic(
+            &Value::Object(map.into()),
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Deny,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "Windows-only keys must still load: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn smart_tab_mode_parses_snake_case_strings() {
         use wezterm_dynamic::{FromDynamic, FromDynamicOptions, Value};
 
@@ -3815,7 +3802,7 @@ fn default_prefer_egl() -> bool {
     if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
         return false;
     }
-    !cfg!(windows)
+    true
 }
 
 fn default_clean_exits() -> Vec<u32> {
@@ -4119,11 +4106,7 @@ pub enum DroppedFileQuoting {
 
 impl Default for DroppedFileQuoting {
     fn default() -> Self {
-        if cfg!(windows) {
-            Self::Windows
-        } else {
-            Self::SpacesOnly
-        }
+        Self::SpacesOnly
     }
 }
 

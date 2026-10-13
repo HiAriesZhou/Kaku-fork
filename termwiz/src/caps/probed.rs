@@ -129,10 +129,10 @@ impl<'a> ProbeCapabilities<'a> {
             write!(self.write, "{TMUX_BEGIN}{query_pixels}{TMUX_END}")?;
         }
 
-        if is_tmux || cfg!(windows) {
+        if is_tmux {
             self.write.flush()?;
-            // I really wanted to avoid a delay here, but tmux and conpty will
-            // both re-order the response to dev_attributes before sending the
+            // I really wanted to avoid a delay here, but tmux will
+            // re-order the response to dev_attributes before sending the
             // response for the passthru of query_pixels if we don't delay.
             // The delay is potentially imperfect for things like a laggy ssh
             // connection. The consequence of the timing being wrong is that

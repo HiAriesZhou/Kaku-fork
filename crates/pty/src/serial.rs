@@ -160,10 +160,6 @@ impl Child for SerialChild {
         None
     }
 
-    #[cfg(windows)]
-    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-        None
-    }
 }
 
 impl ChildKiller for SerialChild {
@@ -279,11 +275,6 @@ impl Read for Reader {
 
             match self.fd.read(buf) {
                 Ok(0) => {
-                    if cfg!(windows) {
-                        // Read timeout with no data available yet;
-                        // loop and try again.
-                        continue;
-                    }
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "EOF on serial port",

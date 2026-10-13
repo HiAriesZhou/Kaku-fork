@@ -156,10 +156,6 @@ impl portable_pty::Child for SshChildProcess {
         None
     }
 
-    #[cfg(windows)]
-    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-        None
-    }
 }
 
 impl portable_pty::ChildKiller for SshChildProcess {

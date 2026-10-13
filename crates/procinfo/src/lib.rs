@@ -56,9 +56,6 @@ pub struct LocalProcessInfo {
     /// A clock value in unspecified system dependent units that
     /// indicates the relative age of the process.
     pub start_time: u64,
-    /// The console handle associated with the process, if any.
-    #[cfg(windows)]
-    pub console: u64,
     /// Child processes, keyed by pid
     pub children: HashMap<u32, LocalProcessInfo>,
 }
@@ -138,8 +135,6 @@ mod tests {
             cwd: PathBuf::new(),
             status: LocalProcessStatus::Run,
             start_time: 0,
-            #[cfg(windows)]
-            console: 0,
             children: children.into_iter().map(|c| (c.pid, c)).collect(),
         }
     }

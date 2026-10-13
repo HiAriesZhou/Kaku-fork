@@ -13,14 +13,3 @@ keywords = ["socketpair", "pipe", "poll", "filedescriptor"]
 [dependencies]
 thiserror.workspace = true
 libc.workspace = true
-
-[target."cfg(windows)".dependencies]
-winapi = { workspace=true, features = [
-    "winuser",
-    "handleapi",
-    "fileapi",
-    "namedpipeapi",
-    "processthreadsapi",
-    "winsock2",
-    "processenv"
-]}

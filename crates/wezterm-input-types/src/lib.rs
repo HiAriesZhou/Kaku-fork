@@ -1336,9 +1336,6 @@ pub struct RawKeyEvent {
     /// The OS and hardware dependent key code for the key
     pub raw_code: u32,
 
-    /// The *other* OS and hardware dependent key code for the key
-    #[cfg(windows)]
-    pub scan_code: u32,
 
     /// How many times this key repeats
     pub repeat_count: u16,
@@ -1516,8 +1513,6 @@ pub struct KeyEvent {
     /// If triggered from a raw key event, here it is.
     pub raw: Option<RawKeyEvent>,
 
-    #[cfg(windows)]
-    pub win32_uni_char: Option<char>,
 }
 
 fn normalize_shift(key: KeyCode, modifiers: Modifiers) -> (KeyCode, Modifiers) {
@@ -1657,75 +1652,10 @@ impl KeyEvent {
         self
     }
 
-    #[cfg(not(windows))]
     pub fn encode_win32_input_mode(&self) -> Option<String> {
         None
     }
 
-    /// <https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md>
-    #[cfg(windows)]
-    pub fn encode_win32_input_mode(&self) -> Option<String> {
-        let phys = self.raw.as_ref()?;
-
-        let vkey = phys.raw_code;
-        let scan_code = phys.scan_code;
-        // <https://docs.microsoft.com/en-us/windows/console/key-event-record-str>
-        // defines the dwControlKeyState values
-        let mut control_key_state = 0;
-        const SHIFT_PRESSED: usize = 0x10;
-        const ENHANCED_KEY: usize = 0x100;
-        const RIGHT_ALT_PRESSED: usize = 0x01;
-        const LEFT_ALT_PRESSED: usize = 0x02;
-        const LEFT_CTRL_PRESSED: usize = 0x08;
-        const RIGHT_CTRL_PRESSED: usize = 0x04;
-
-        if self
-            .modifiers
-            .intersects(Modifiers::SHIFT | Modifiers::LEFT_SHIFT | Modifiers::RIGHT_SHIFT)
-        {
-            control_key_state |= SHIFT_PRESSED;
-        }
-
-        if self.modifiers.contains(Modifiers::RIGHT_ALT) {
-            control_key_state |= RIGHT_ALT_PRESSED;
-        } else if self.modifiers.contains(Modifiers::ALT) {
-            control_key_state |= LEFT_ALT_PRESSED;
-        }
-        if self.modifiers.contains(Modifiers::LEFT_ALT) {
-            control_key_state |= LEFT_ALT_PRESSED;
-        }
-        if self.modifiers.contains(Modifiers::RIGHT_CTRL) {
-            control_key_state |= RIGHT_CTRL_PRESSED;
-        } else if self.modifiers.contains(Modifiers::CTRL) {
-            control_key_state |= LEFT_CTRL_PRESSED;
-        }
-        if self.modifiers.contains(Modifiers::LEFT_CTRL) {
-            control_key_state |= LEFT_CTRL_PRESSED;
-        }
-        if self.modifiers.contains(Modifiers::ENHANCED_KEY) {
-            control_key_state |= ENHANCED_KEY;
-        }
-
-        let key_down = if self.key_is_down { 1 } else { 0 };
-
-        match &self.key {
-            KeyCode::Composed(_) => None,
-            KeyCode::Char(c) => {
-                let uni = self.win32_uni_char.unwrap_or(*c) as u32;
-                Some(format!(
-                    "\u{1b}[{};{};{};{};{};{}_",
-                    vkey, scan_code, uni, key_down, control_key_state, self.repeat_count
-                ))
-            }
-            _ => {
-                let uni = 0;
-                Some(format!(
-                    "\u{1b}[{};{};{};{};{};{}_",
-                    vkey, scan_code, uni, key_down, control_key_state, self.repeat_count
-                ))
-            }
-        }
-    }
 
     pub fn encode_kitty(&self, flags: KittyKeyboardFlags) -> String {
         use KeyCode::*;
@@ -2316,8 +2246,6 @@ impl Default for UIKeyCapRendering {
     fn default() -> Self {
         if cfg!(target_os = "macos") {
             Self::AppleSymbols
-        } else if cfg!(windows) {
-            Self::WindowsSymbols
         } else {
             Self::UnixLong
         }
@@ -2341,8 +2269,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "o".to_string()
@@ -2355,8 +2281,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: false,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[111;1:3u".to_string()
@@ -2378,8 +2302,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[11;1~".to_string()
@@ -2392,8 +2314,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: false,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[11;1:3~".to_string()
@@ -2412,8 +2332,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[105;4u".to_string()
@@ -2426,8 +2344,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[105;4u".to_string()
@@ -2441,8 +2357,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[49;4u".to_string()
@@ -2457,8 +2371,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::K1)
             )
@@ -2474,8 +2386,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[105;6u".to_string()
@@ -2488,8 +2398,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[105;6u".to_string()
@@ -2510,12 +2418,8 @@ mod test {
                     raw_code: 0,
                     leds: KeyboardLedStatus::empty(),
                     phys_code: Some(PhysKeyCode::I),
-                    #[cfg(windows)]
-                    scan_code: 0,
                     repeat_count: 1,
                 }),
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[105;6u".to_string()
@@ -2529,8 +2433,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[105;8u".to_string()
@@ -2543,8 +2445,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[105;8u".to_string()
@@ -2558,8 +2458,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x7f".to_string()
@@ -2573,8 +2471,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[127;5u".to_string()
@@ -2596,8 +2492,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\u{1b}[97:65;1u".to_string()
@@ -2610,8 +2504,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: false,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\u{1b}[97:65;1:3u".to_string()
@@ -2630,8 +2522,6 @@ mod test {
             leds: KeyboardLedStatus::empty(),
             phys_code: phys,
             raw_code: 0,
-            #[cfg(windows)]
-            scan_code: 0,
             repeat_count: 1,
             key_is_down: event.key_is_down,
             handled: Handled::new(),
@@ -2656,8 +2546,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 None
             )
@@ -2673,8 +2561,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: false,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 None
             )
@@ -2690,8 +2576,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 None
             )
@@ -2707,8 +2591,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: false,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 None
             )
@@ -2733,8 +2615,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 None
             )
@@ -2750,8 +2630,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 None
             )
@@ -2768,8 +2646,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 None
             )
@@ -2785,8 +2661,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 None
             )
@@ -2803,8 +2677,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::Keypad0)
             )
@@ -2820,8 +2692,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::Keypad0)
             )
@@ -2838,8 +2708,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::Keypad5)
             )
@@ -2856,8 +2724,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::Keypad5)
             )
@@ -2883,8 +2749,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::Keypad5)
             )
@@ -2900,8 +2764,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: false,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::Keypad5)
             )
@@ -2918,8 +2780,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::Keypad5)
             )
@@ -2936,8 +2796,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: false,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::Keypad5)
             )
@@ -2958,8 +2816,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\"".to_string()
@@ -2973,8 +2829,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\"".to_string()
@@ -2988,8 +2842,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "!".to_string()
@@ -3003,8 +2855,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "".to_string()
@@ -3027,8 +2877,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::A)
             )
@@ -3045,8 +2893,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::A)
             )
@@ -3072,8 +2918,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::A)
             )
@@ -3090,8 +2934,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::A)
             )
@@ -3112,8 +2954,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             " ".to_string()
@@ -3127,8 +2967,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             " ".to_string()
@@ -3143,8 +2981,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::NumLock)
             )
@@ -3161,8 +2997,6 @@ mod test {
                     repeat_count: 1,
                     key_is_down: true,
                     raw: None,
-                    #[cfg(windows)]
-                    win32_uni_char: None,
                 },
                 Some(PhysKeyCode::CapsLock)
             )
@@ -3183,8 +3017,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "q".to_string()
@@ -3198,8 +3030,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\u{1b}[102;9u".to_string()
@@ -3213,8 +3043,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\u{1b}[102;10u".to_string()
@@ -3228,8 +3056,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\u{1b}[102;14u".to_string()
@@ -3249,8 +3075,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[27;1u".to_string()
@@ -3267,8 +3091,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: true,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b".to_string()
@@ -3285,8 +3107,6 @@ mod test {
                 repeat_count: 1,
                 key_is_down: false,
                 raw: None,
-                #[cfg(windows)]
-                win32_uni_char: None,
             }
             .encode_kitty(flags),
             "\x1b[27;1:3u".to_string()
@@ -3302,8 +3122,6 @@ mod test {
             repeat_count: 1,
             key_is_down: true,
             raw: None,
-            #[cfg(windows)]
-            win32_uni_char: None,
         };
         let flags = KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES;
         assert_eq!(event.encode_kitty(flags), "\x1b[3;1~");
