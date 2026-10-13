@@ -787,6 +787,15 @@ impl TabRenameModal {
         }
     }
 
+    fn center_floating_editor(computed: &mut ComputedElement, window_width: f32, floating: bool) {
+        // The layout can shrink below its requested width; position the
+        // floating editor using the box that will actually be painted.
+        if floating {
+            let x = ((window_width - computed.bounds.width()) / 2.0).max(0.0);
+            computed.translate(euclid::vec2(x - computed.bounds.min_x(), 0.0));
+        }
+    }
+
     fn compute(&self, term_window: &mut TermWindow) -> anyhow::Result<Vec<ComputedElement>> {
         let font = term_window
             .fonts
@@ -988,7 +997,7 @@ impl TabRenameModal {
             .display(DisplayType::Block);
 
         let dimensions = term_window.dimensions;
-        let computed = term_window.compute_element(
+        let mut computed = term_window.compute_element(
             &LayoutContext {
                 height: DimensionContext {
                     dpi: dimensions.dpi as f32,
@@ -1008,6 +1017,7 @@ impl TabRenameModal {
             &element,
         )?;
 
+        Self::center_floating_editor(&mut computed, window_width, self.anchor.width == 0);
         Self::update_text_cursor_position(term_window, &computed, cursor_element_idx);
 
         Ok(vec![computed])
@@ -1157,6 +1167,52 @@ mod tests {
     #[test]
     fn clearing_the_value_is_applied_to_restore_the_auto_title() {
         assert!(TabRenameModal::should_apply("pinned", ""));
+    }
+
+    #[test]
+    fn floating_editor_centers_the_painted_box_and_its_cursor() {
+        use crate::termwindow::box_model::*;
+
+        let rect = euclid::rect(240.0, 500.0, 100.0, 30.0);
+        let cursor_rect = euclid::rect(326.0, 504.0, 2.0, 22.0);
+        let box_at = |bounds| ComputedElement {
+            item_type: None,
+            zindex: 120,
+            bounds,
+            border_rect: bounds,
+            border: PixelDimension::default(),
+            border_corners: None,
+            colors: ElementColors::default(),
+            hover_colors: None,
+            padding: bounds,
+            content_rect: bounds,
+            baseline: 0.0,
+            content: ComputedElementContent::Children(vec![]),
+        };
+        // A requested 120px box starts at x=240 in a 600px window,
+        // but the painted text box shrinks to 100px. Its actual center
+        // must be 300px, with the IME cursor moving by the same amount.
+        let mut computed = box_at(rect);
+        computed.content = ComputedElementContent::Children(vec![box_at(cursor_rect)]);
+        TabRenameModal::center_floating_editor(&mut computed, 600.0, true);
+        assert_eq!(computed.bounds.center().x, 300.0);
+        assert_eq!(computed.bounds.min_y(), 500.0);
+        assert_eq!(computed.content_rect.min_x(), 250.0);
+        let ComputedElementContent::Children(children) = &computed.content else {
+            panic!("missing cursor");
+        };
+        assert_eq!(children[0].bounds.min_x(), 336.0);
+
+        // The double-click path keeps the original tab anchor.
+        let mut anchored = box_at(rect);
+        TabRenameModal::center_floating_editor(&mut anchored, 600.0, false);
+        assert_eq!(anchored.bounds, rect);
+
+        for width in [320.0, 768.0, 1280.0] {
+            let mut computed = box_at(rect);
+            TabRenameModal::center_floating_editor(&mut computed, width, true);
+            assert_eq!(computed.bounds.center().x, width / 2.0);
+        }
     }
 
     #[test]
