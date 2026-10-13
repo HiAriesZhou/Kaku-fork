@@ -847,6 +847,13 @@ pub fn start() {
                         throttle_for_sub.clone(),
                     );
                 }
+                MuxNotification::AssignClipboard {
+                    pane_id,
+                    clipboard: Some(text),
+                    ..
+                } => {
+                    web::publish_clipboard((*pane_id).into(), text.clone());
+                }
                 MuxNotification::PaneRemoved(pane_id) => {
                     let id: usize = (*pane_id).into();
                     senders_for_sub.lock().remove(&id);

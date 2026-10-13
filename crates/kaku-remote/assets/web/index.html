@@ -58,6 +58,17 @@
      shows before the theme and the screen arrive. */
   #term { position: absolute; top: 8px; left: 8px; visibility: hidden; }
   body.drawn #term { visibility: visible; }
+  /* Find bar and toast share the tab bar's look. */
+  #find { position: absolute; top: 10px; right: 16px; display: none; align-items: center; gap: 2px; height: 32px; padding: 0 4px 0 10px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); z-index: 5; }
+  #find.show { display: flex; }
+  #find input { width: 200px; border: 0; outline: none; background: transparent; color: var(--fg); font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #find .count { color: var(--muted); font-size: 12px; padding: 0 6px; white-space: nowrap; }
+  #find button { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; }
+  #find button:hover { background: var(--tab-hover-bg); color: var(--fg); }
+  #find svg { width: 10px; height: 10px; }
+  #toast { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); display: none; max-width: calc(100% - 32px); padding: 7px 12px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); color: var(--fg); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; z-index: 5; }
+  #toast.show { display: block; }
+  body.dropping #stage { box-shadow: inset 0 0 0 2px var(--muted); }
   #history { position: absolute; right: 16px; bottom: 16px; display: none; height: 28px; padding: 0 12px; border: 0; border-radius: 14px; background: var(--tab-active-bg); color: var(--tab-active-fg); font: inherit; cursor: pointer; }
   #message { color: var(--muted); padding: 24px; text-align: center; line-height: 1.6; }
   /* Connection state, over the terminal: dimmed while the screen is stale. */
@@ -107,6 +118,8 @@
   <div id="term"></div>
   <button id="history" type="button">Back to live</button>
   <div id="notice"><div class="title"></div><div class="detail"></div></div>
+  <div id="find"><input type="text" placeholder="Find" spellcheck="false" autocomplete="off"><span class="count"></span><button type="button" data-dir="older" title="Previous (Enter)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6.5 5 3.5l3 3"/></svg></button><button type="button" data-dir="newer" title="Next (Shift+Enter)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5 5 6.5l3-3"/></svg></button><button type="button" data-dir="close" title="Close (Esc)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2.5 2.5l5 5M7.5 2.5l-5 5"/></svg></button></div>
+  <div id="toast"></div>
 </div>
 <div id="dialog" role="dialog" aria-modal="true"><div class="card"><div class="title">Close this tab?</div><div class="detail"></div><div class="actions"><button type="button" data-act="cancel">Cancel</button><button type="button" data-act="ok">Close</button></div></div></div>
 <div id="keys"></div>
@@ -240,6 +253,39 @@
     theme: { background: getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#16161a" },
   });
   term.open(termEl);
+
+  // Links: URLs in the screen open with Cmd+click (Ctrl+click off the Mac),
+  // as in Kaku. Cells and string positions differ once a row holds wide
+  // characters, so the row is read cell by cell with each one's column.
+  const URL_RE = /https?:\/\/[^\s<>"'`]+[^\s<>"'`.,;:!?)\]}]/g;
+  term.registerLinkProvider({
+    provideLinks(y, callback) {
+      const line = term.buffer.active.getLine(y - 1);
+      if (!line) return callback(undefined);
+      let text = "";
+      const cols = [];
+      let cell;
+      for (let x = 0; x < line.length; x++) {
+        cell = line.getCell(x, cell);
+        if (!cell || cell.getWidth() === 0) continue;
+        const chars = cell.getChars() || " ";
+        for (const ch of chars) { text += ch; cols.push(x); }
+      }
+      const links = [];
+      for (const m of text.matchAll(URL_RE)) {
+        const start = cols[m.index];
+        const end = cols[m.index + m[0].length - 1];
+        links.push({
+          range: { start: { x: start + 1, y }, end: { x: end + 1, y } },
+          text: m[0],
+          activate: (ev, uri) => {
+            if (ev.metaKey || ev.ctrlKey) window.open(uri, "_blank", "noopener");
+          },
+        });
+      }
+      callback(links.length ? links : undefined);
+    },
+  });
 
   // The terminal sits at the top left with an 8px margin. Cell size comes
   // from xterm.js, which re-measures synchronously when the font changes,
@@ -518,6 +564,9 @@
   termEl.addEventListener("paste", (ev) => {
     ev.preventDefault();
     ev.stopImmediatePropagation();
+    // A copied image or file goes to the Mac as a file; text pastes as text.
+    const files = ev.clipboardData ? [...ev.clipboardData.files] : [];
+    if (files.length) { sendFiles(files, true); return; }
     const data = ev.clipboardData ? ev.clipboardData.getData("text/plain") : "";
     if (data) send({ type: "paste", data });
   }, true);
@@ -594,6 +643,8 @@
     const from = clickFrom;
     clickFrom = null;
     if (!from || ev.button !== 0) return;
+    // Cmd/Ctrl+click is for opening links, not for the program.
+    if (ev.metaKey || ev.ctrlKey) return;
     if (Math.abs(ev.clientX - from[0]) + Math.abs(ev.clientY - from[1]) > 4) return;
     const at = cellAt(ev.clientX, ev.clientY);
     if (at) send({ type: "click", x: at.x, y: at.y });
@@ -852,6 +903,8 @@
 
   const onTabs = (list) => {
     tabs = list;
+    attentionTabs = tabs.some((t) => (t.title || "").endsWith("\u2022"));
+    renderTitle();
     if (followNewTab) {
       const fresh = tabs.find((t) => !followNewTab.has(t.tab_id));
       if (fresh) { followNewTab = null; attach(fresh); return; }
@@ -924,15 +977,159 @@
     // disagree on) must overwrite its last cell, not wrap. Wrapping on the
     // last row scrolled the whole screen, and every later frame then drew
     // over a shifted copy: stale rows stayed until a reload.
-    term.write(NO_WRAP + msg.data);
+    term.write(NO_WRAP + msg.data, markFound);
     historyBtn.style.display = msg.scrolled ? "block" : "none";
-    document.title = msg.title ? msg.title + " - Kaku" : "Kaku";
+    baseTitle = msg.title ? msg.title + " - Kaku" : "Kaku";
+    renderTitle();
   };
+
+  // A program in the pane copied text (OSC 52). Browsers only let a focused
+  // page write the clipboard, so a copy that arrives while it is not focused
+  // is written on the next focus or press.
+  let pendingCopy = null;
+  const copyToClipboard = (text) => {
+    if (!navigator.clipboard) return;
+    pendingCopy = text;
+    navigator.clipboard.writeText(text).then(() => { if (pendingCopy === text) pendingCopy = null; }).catch(() => {});
+  };
+  const flushCopy = () => { if (pendingCopy !== null) copyToClipboard(pendingCopy); };
+  window.addEventListener("focus", flushCopy);
+  document.addEventListener("pointerdown", flushCopy, true);
+
+  // While this page is in the background, a Kaku tab that wants attention
+  // (a finished task's bell) marks the browser tab's title.
+  let baseTitle = "Kaku";
+  let attentionTabs = false;
+  const renderTitle = () => {
+    const away = document.hidden || !document.hasFocus();
+    document.title = (attentionTabs && away ? "\u25cf " : "") + baseTitle;
+  };
+  window.addEventListener("focus", renderTitle);
+  window.addEventListener("blur", renderTitle);
+  document.addEventListener("visibilitychange", renderTitle);
+
+  // Find: Cmd+F (Ctrl+Shift+F off the Mac) searches the pane's whole
+  // history on the Mac; Enter goes to older matches, Shift+Enter to newer.
+  const findEl = document.getElementById("find");
+  const findInput = findEl.querySelector("input");
+  const findCount = findEl.querySelector(".count");
+  let lastQuery = "";
+  let pendingMark = null;
+  const markFound = () => {
+    if (!pendingMark) return;
+    const { row, col, len } = pendingMark;
+    pendingMark = null;
+    term.select(col, term.buffer.active.viewportY + row, len);
+  };
+  const findStep = (older) => {
+    const query = findInput.value;
+    if (!query) return;
+    const restart = query !== lastQuery;
+    lastQuery = query;
+    send({ type: "search", query, older, restart });
+  };
+  const openFind = () => {
+    findEl.classList.add("show");
+    findInput.focus();
+    findInput.select();
+  };
+  const closeFind = () => {
+    if (!findEl.classList.contains("show")) return;
+    findEl.classList.remove("show");
+    findCount.textContent = "";
+    lastQuery = "";
+    term.clearSelection();
+    send({ type: "scroll", lines: -1e9 });
+    term.focus();
+  };
+  findInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); findStep(!ev.shiftKey); }
+    else if (ev.key === "Escape") { ev.preventDefault(); closeFind(); }
+    ev.stopPropagation();
+  });
+  findEl.addEventListener("click", (ev) => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    if (b.dataset.dir === "close") closeFind();
+    else { findStep(b.dataset.dir === "older"); findInput.focus(); }
+  });
+  const onFound = (msg) => {
+    if (!msg.found) { findCount.textContent = "No results"; return; }
+    findCount.textContent = "";
+    pendingMark = msg;
+    // The view moves on the next frame; mark after it, or now if the match
+    // was already on screen and no frame comes.
+    setTimeout(markFound, 250);
+  };
+  const isFindKey = (ev) => ev.code === "KeyF" && !ev.altKey &&
+    (IS_MAC ? ev.metaKey && !ev.ctrlKey && !ev.shiftKey : ev.ctrlKey && ev.shiftKey && !ev.metaKey);
+  window.addEventListener("keydown", (ev) => {
+    if (isFindKey(ev)) { ev.preventDefault(); ev.stopPropagation(); openFind(); }
+  }, true);
+
+  // Send files to the Mac: drop them on the terminal or paste an image. Each
+  // goes in 512 KB chunks over the same sealed channel, lands in
+  // ~/Downloads/Kaku, and its path is pasted into the pane.
+  const toastEl = document.getElementById("toast");
+  let toastTimer = 0;
+  const toast = (text, stay = false) => {
+    clearTimeout(toastTimer);
+    toastEl.textContent = text;
+    toastEl.classList.add("show");
+    if (!stay) toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2500);
+  };
+  let uploadSeq = 0;
+  const uploadWaiters = new Map();
+  const CHUNK = 512 * 1024;
+  const toBase64 = (buf) => {
+    let s = "";
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  };
+  const sendFile = async (file, name) => {
+    if (file.size > 50 * 1024 * 1024) { toast(`${name} is larger than 50 MB`); return; }
+    const id = ++uploadSeq;
+    const done = new Promise((resolve) => uploadWaiters.set(id, resolve));
+    send({ type: "upload_start", id, name, size: file.size });
+    for (let off = 0; off < file.size; off += CHUNK) {
+      toast(`Sending ${name} ${Math.round((off / file.size) * 100)}%`, true);
+      send({ type: "upload_chunk", id, data: toBase64(await file.slice(off, off + CHUNK).arrayBuffer()) });
+    }
+    send({ type: "upload_end", id });
+    const result = await done;
+    toast(result.ok ? `Sent to ${result.detail.replace(/^\/Users\/[^/]+/, "~")}` : `Not sent: ${result.detail}`);
+  };
+  const pastedName = (file) => {
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+    const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
+    return `pasted-${stamp}.${ext}`;
+  };
+  const sendFiles = async (files, pasted) => {
+    for (const f of files) await sendFile(f, pasted ? pastedName(f) : f.name);
+    term.focus();
+  };
+  stage.addEventListener("dragover", (ev) => {
+    if (![...(ev.dataTransfer?.types || [])].includes("Files")) return;
+    ev.preventDefault();
+    document.body.classList.add("dropping");
+  });
+  stage.addEventListener("dragleave", () => document.body.classList.remove("dropping"));
+  stage.addEventListener("drop", (ev) => {
+    document.body.classList.remove("dropping");
+    const files = [...(ev.dataTransfer?.files || [])];
+    if (!files.length) return;
+    ev.preventDefault();
+    sendFiles(files, false);
+  });
 
   const handle = (msg) => {
     if (msg.type === "config") onConfig(msg);
     else if (msg.type === "tabs") onTabs(msg.tabs);
     else if (msg.type === "frame") { framesSeen++; onFrame(msg); }
+    else if (msg.type === "clipboard") copyToClipboard(msg.text);
+    else if (msg.type === "found") onFound(msg);
+    else if (msg.type === "uploaded") { const w = uploadWaiters.get(msg.id); if (w) { uploadWaiters.delete(msg.id); w(msg); } }
     else if (msg.type === "closed") {
       // A tabs update may already have moved the page to another tab; the
       // late notice for the old pane must not drop the tab it moved to.

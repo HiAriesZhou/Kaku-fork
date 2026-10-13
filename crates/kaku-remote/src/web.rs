@@ -128,6 +128,21 @@ pub(crate) fn pane_removed(dirty: &WebDirty, pane_id: usize) {
     dirty.lock().remove(&pane_id);
 }
 
+/// Text a program put on the clipboard (OSC 52: Claude Code's copy, a vim
+/// yank), by pane. The Mac's clipboard gets it as before; a browser viewing
+/// that pane gets it too, since that is where the user is.
+static CLIPBOARD: LazyLock<broadcast::Sender<(usize, Arc<str>)>> =
+    LazyLock::new(|| broadcast::channel(8).0);
+
+/// Larger copies stay on the Mac only.
+const MAX_CLIPBOARD_BYTES: usize = 1 << 20;
+
+pub(crate) fn publish_clipboard(pane_id: usize, text: Arc<str>) {
+    if text.len() <= MAX_CLIPBOARD_BYTES {
+        let _ = CLIPBOARD.send((pane_id, text));
+    }
+}
+
 // ── Static assets ─────────────────────────────────────────────────────────────
 
 /// The page and its files, by path relative to the page. Served locally and,
@@ -296,6 +311,31 @@ enum WebClientMsg {
     },
     /// Open a tab next to the one being viewed.
     NewTab,
+    /// Find `query` in the pane's history, case-insensitively, going to
+    /// older lines from the last match (or the bottom) when `older`, else to
+    /// newer ones. The view moves to the match and a `Found` reply follows.
+    Search {
+        query: String,
+        older: bool,
+        /// A new query: start again from the bottom.
+        #[serde(default)]
+        restart: bool,
+    },
+    /// A file sent from the browser (dropped or pasted), in order: start,
+    /// base64 chunks, end. It lands in ~/Downloads/Kaku and its path is
+    /// pasted into the pane, as a file dropped on the Mac window would be.
+    UploadStart {
+        id: u32,
+        name: String,
+        size: u64,
+    },
+    UploadChunk {
+        id: u32,
+        data: String,
+    },
+    UploadEnd {
+        id: u32,
+    },
     /// Close a tab; the page has already confirmed with the user.
     CloseTab {
         tab_id: usize,
@@ -334,6 +374,23 @@ enum WebServerMsg<'a> {
         pane_id: usize,
     },
     Pong,
+    /// Where a search landed, relative to the rows now shown, or no match.
+    Found {
+        found: bool,
+        row: usize,
+        col: usize,
+        len: usize,
+    },
+    /// How a sent file ended: where it was saved, or why it was not.
+    Uploaded {
+        id: u32,
+        ok: bool,
+        detail: &'a str,
+    },
+    /// Text a program in the attached pane copied, for the browser clipboard.
+    Clipboard {
+        text: &'a str,
+    },
 }
 
 // ── Frame rendering ───────────────────────────────────────────────────────────
@@ -349,6 +406,290 @@ struct View {
     /// When the pane was last reported as seen, to report at most once a
     /// second while typing.
     seen_at: Option<std::time::Instant>,
+    /// The last search match, as (stable row, column), so the next search
+    /// continues from it.
+    found_at: Option<(isize, usize)>,
+}
+
+/// Largest file a browser may send.
+const MAX_UPLOAD_BYTES: u64 = 50 << 20;
+
+/// A file name from the browser, made safe to create: its last component,
+/// no separators or control characters, a sane length, never empty or dots.
+fn safe_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && *c != ':')
+        .take(120)
+        .collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').to_string();
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// `dir/name`, or `dir/stem (2).ext` and so on when that already exists.
+fn unused_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    (2..)
+        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
+}
+
+struct Upload {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    size: u64,
+    written: u64,
+}
+
+/// The outcome of an upload step that the page should hear about.
+struct UploadReply {
+    id: u32,
+    ok: bool,
+    detail: String,
+}
+
+impl UploadReply {
+    fn as_msg(&self) -> WebServerMsg<'_> {
+        WebServerMsg::Uploaded {
+            id: self.id,
+            ok: self.ok,
+            detail: &self.detail,
+        }
+    }
+}
+
+/// Apply one upload message; a reply only when the upload finished or failed.
+fn handle_upload(
+    msg: &WebClientMsg,
+    uploads: &mut HashMap<u32, Upload>,
+    attached: Option<usize>,
+) -> Option<UploadReply> {
+    let fail = |id: u32, why: String| {
+        Some(UploadReply {
+            id,
+            ok: false,
+            detail: why,
+        })
+    };
+    match msg {
+        WebClientMsg::UploadStart { id, name, size } => {
+            if *size > MAX_UPLOAD_BYTES {
+                return fail(*id, "larger than 50 MB".into());
+            }
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+            let dir = home.join("Downloads").join("Kaku");
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                return fail(*id, format!("cannot create {}: {e}", dir.display()));
+            }
+            let path = unused_path(&dir, &safe_file_name(name));
+            match std::fs::File::create(&path) {
+                Ok(file) => {
+                    uploads.insert(
+                        *id,
+                        Upload {
+                            file,
+                            path,
+                            size: *size,
+                            written: 0,
+                        },
+                    );
+                    None
+                }
+                Err(e) => fail(*id, format!("cannot write {}: {e}", path.display())),
+            }
+        }
+        WebClientMsg::UploadChunk { id, data } => {
+            use base64::Engine as _;
+            use std::io::Write as _;
+            let upload = uploads.get_mut(id)?;
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(data) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let gone = uploads.remove(id)?;
+                    let _ = std::fs::remove_file(&gone.path);
+                    return fail(*id, "bad data".into());
+                }
+            };
+            upload.written += bytes.len() as u64;
+            if upload.written > upload.size.max(1) || upload.written > MAX_UPLOAD_BYTES {
+                let gone = uploads.remove(id)?;
+                let _ = std::fs::remove_file(&gone.path);
+                return fail(*id, "more data than announced".into());
+            }
+            if let Err(e) = upload.file.write_all(&bytes) {
+                let gone = uploads.remove(id)?;
+                let _ = std::fs::remove_file(&gone.path);
+                return fail(*id, format!("write failed: {e}"));
+            }
+            None
+        }
+        WebClientMsg::UploadEnd { id } => {
+            let upload = uploads.remove(id)?;
+            drop(upload.file);
+            let shown = upload.path.display().to_string();
+            if let Some(pane) = attached.and_then(lookup_pane) {
+                let quoted = config::configuration().quote_dropped_files.escape(&shown);
+                if let Err(e) = pane.send_paste(&format!("{quoted} ")) {
+                    log::debug!("kaku-remote web: pasting an uploaded path failed: {e:#}");
+                }
+            }
+            Some(UploadReply {
+                id: *id,
+                ok: true,
+                detail: shown,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// One row's text with the cell column of every character, so a match in
+/// the text maps back to columns even with wide characters in the row.
+struct RowText {
+    row: isize,
+    text: String,
+    cols: Vec<usize>,
+    /// The column just past each character, so a wide last character
+    /// counts both of its cells.
+    ends: Vec<usize>,
+}
+
+fn row_text_of(row: isize, line: &wezterm_term::Line) -> RowText {
+    let mut text = String::new();
+    let mut cols = Vec::new();
+    let mut ends = Vec::new();
+    for cell in line.visible_cells() {
+        for ch in cell.str().chars() {
+            for lower in ch.to_lowercase() {
+                text.push(lower);
+                cols.push(cell.cell_index());
+                ends.push(cell.cell_index() + cell.width().max(1));
+            }
+        }
+    }
+    RowText {
+        row,
+        text,
+        cols,
+        ends,
+    }
+}
+
+/// The match nearest to `from` in the given direction within `rows` (which
+/// are in ascending row order): (row, column, width in cells).
+fn find_in_rows(
+    rows: &[RowText],
+    needle: &str,
+    from: Option<(isize, usize)>,
+    older: bool,
+) -> Option<(isize, usize, usize)> {
+    let hit = |r: &RowText, at: usize| {
+        let start = r.cols[at];
+        let end = r.ends[at + needle.chars().count() - 1];
+        (r.row, start, end - start)
+    };
+    let matches = |r: &RowText| -> Vec<usize> {
+        let chars: Vec<char> = r.text.chars().collect();
+        let n: Vec<char> = needle.chars().collect();
+        (0..chars.len().saturating_sub(n.len().saturating_sub(1)))
+            .filter(|&i| chars[i..].starts_with(&n))
+            .collect()
+    };
+    if older {
+        for r in rows.iter().rev() {
+            if from.is_some_and(|(fr, _)| r.row > fr) {
+                continue;
+            }
+            let found = matches(r);
+            let pick = found.into_iter().rev().find(|&i| match from {
+                Some((fr, fc)) if fr == r.row => r.cols[i] < fc,
+                _ => true,
+            });
+            if let Some(i) = pick {
+                return Some(hit(r, i));
+            }
+        }
+    } else {
+        for r in rows {
+            if from.is_some_and(|(fr, _)| r.row < fr) {
+                continue;
+            }
+            let found = matches(r);
+            let pick = found.into_iter().find(|&i| match from {
+                Some((fr, fc)) if fr == r.row => r.cols[i] > fc,
+                _ => true,
+            });
+            if let Some(i) = pick {
+                return Some(hit(r, i));
+            }
+        }
+    }
+    None
+}
+
+/// Search the pane's whole history in chunks from `from` toward `older` or
+/// newer lines, stopping at the first match.
+fn search_pane(
+    pane: &Arc<dyn Pane>,
+    query: &str,
+    from: Option<(isize, usize)>,
+    older: bool,
+) -> Option<(isize, usize, usize)> {
+    const CHUNK: isize = 500;
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    let dims = pane.get_dimensions();
+    let first = dims.scrollback_top;
+    let end = dims.physical_top + dims.viewport_rows as isize;
+    let start = from
+        .map(|(row, _)| row)
+        .unwrap_or(if older { end - 1 } else { first });
+    let mut cursor = start;
+    loop {
+        let range = if older {
+            (cursor - CHUNK + 1).max(first)..(cursor + 1).min(end)
+        } else {
+            cursor.max(first)..(cursor + CHUNK).min(end)
+        };
+        if range.start >= range.end {
+            return None;
+        }
+        let (top, lines) = pane.get_lines(range.clone());
+        let rows: Vec<RowText> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| row_text_of(top + i as isize, line))
+            .collect();
+        if let Some(hit) = find_in_rows(&rows, &needle, from, older) {
+            return Some(hit);
+        }
+        if older {
+            if range.start <= first {
+                return None;
+            }
+            cursor = range.start - 1;
+        } else {
+            if range.end >= end {
+                return None;
+            }
+            cursor = range.end;
+        }
+    }
 }
 
 fn mark_seen(pane_id: usize, view: &mut View) {
@@ -786,6 +1127,7 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
     let result = match msg {
         WebClientMsg::Text { data } => {
             view.pinned_top = None;
+            view.found_at = None;
             if data.len() > MAX_INPUT_LEN {
                 return;
             }
@@ -914,7 +1256,11 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
         WebClientMsg::Hello
         | WebClientMsg::Ping
         | WebClientMsg::Attach { .. }
-        | WebClientMsg::Verify { .. } => Ok(()),
+        | WebClientMsg::Verify { .. }
+        | WebClientMsg::Search { .. }
+        | WebClientMsg::UploadStart { .. }
+        | WebClientMsg::UploadChunk { .. }
+        | WebClientMsg::UploadEnd { .. } => Ok(()),
         WebClientMsg::Resize { cols, rows } => {
             let cols = cols.clamp(MIN_COLS, MAX_COLS);
             let rows = rows.clamp(MIN_ROWS, MAX_ROWS);
@@ -970,6 +1316,8 @@ pub(crate) async fn run_session(
     // Frames sent this session; a page's verify only counts once it has
     // applied the same number, so frames in flight never read as drift.
     let mut frames_sent: u64 = 0;
+    let mut clipboard = CLIPBOARD.subscribe();
+    let mut uploads: HashMap<u32, Upload> = HashMap::new();
     let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle = tokio::time::interval(IDLE_REFRESH);
@@ -993,6 +1341,46 @@ pub(crate) async fn run_session(
                 };
                 if matches!(msg, WebClientMsg::Ping) {
                     let Some(json) = encode(&WebServerMsg::Pong) else { continue };
+                    if outbox.send(json).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                if let Some(reply) = handle_upload(&msg, &mut uploads, attached) {
+                    let Some(json) = encode(&reply.as_msg()) else { continue };
+                    if outbox.send(json).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                if matches!(
+                    msg,
+                    WebClientMsg::UploadStart { .. }
+                        | WebClientMsg::UploadChunk { .. }
+                        | WebClientMsg::UploadEnd { .. }
+                ) {
+                    continue;
+                }
+                if let WebClientMsg::Search { query, older, restart } = &msg {
+                    let Some(pane) = attached.and_then(lookup_pane) else { continue };
+                    if *restart {
+                        view.found_at = None;
+                    }
+                    let hit = search_pane(&pane, query, view.found_at, *older);
+                    let reply = match hit {
+                        Some((row, col, len)) => {
+                            view.found_at = Some((row, col));
+                            let dims = pane.get_dimensions();
+                            let rows = dims.viewport_rows as isize;
+                            let top = (row - rows / 3).clamp(dims.scrollback_top, dims.physical_top);
+                            view.pinned_top = (top < dims.physical_top).then_some(top);
+                            dirty_frame = true;
+                            let shown_top = view.pinned_top.unwrap_or(dims.physical_top);
+                            WebServerMsg::Found { found: true, row: (row - shown_top) as usize, col, len }
+                        }
+                        None => WebServerMsg::Found { found: false, row: 0, col: 0, len: 0 },
+                    };
+                    let Some(json) = encode(&reply) else { continue };
                     if outbox.send(json).await.is_err() {
                         break;
                     }
@@ -1050,6 +1438,16 @@ pub(crate) async fn run_session(
                 Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => dirty_frame = true,
                 Err(broadcast::error::RecvError::Closed) => updates = None,
             },
+            copied = clipboard.recv() => {
+                if let Ok((pane_id, text)) = copied {
+                    if attached == Some(pane_id) {
+                        let Some(json) = encode(&WebServerMsg::Clipboard { text: &text }) else { continue };
+                        if outbox.send(json).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
             _ = idle.tick() => {
                 dirty_frame = attached.is_some();
                 // Tab state lives on the GUI thread; the close-confirmation
@@ -1319,6 +1717,65 @@ mod tests {
             row_text("\x1b[3;1H\x1b[0m⏺ hi\x1b[5G!\x1b[0m\x1b[K"),
             "⏺hi!"
         );
+    }
+
+    fn rt(row: isize, text: &str) -> RowText {
+        let mut cols = Vec::new();
+        let mut ends = Vec::new();
+        let mut col = 0;
+        for ch in text.chars() {
+            cols.push(col);
+            col += if ch.is_ascii() { 1 } else { 2 };
+            ends.push(col);
+        }
+        RowText {
+            row,
+            text: text.to_lowercase(),
+            cols,
+            ends,
+        }
+    }
+
+    #[test]
+    fn search_walks_matches_in_both_directions() {
+        let rows = vec![
+            rt(10, "error one"),
+            rt(11, "fine"),
+            rt(12, "中文 error two error"),
+        ];
+        // "中文 " takes five cells, so the matches start at columns 5 and 15.
+        // From the bottom, older first: the last match in the newest row.
+        let older = |from| find_in_rows(&rows, "error", from, true);
+        assert_eq!(older(None), Some((12, 15, 5)));
+        assert_eq!(older(Some((12, 15))), Some((12, 5, 5)));
+        assert_eq!(older(Some((12, 5))), Some((10, 0, 5)));
+        assert_eq!(older(Some((10, 0))), None);
+        // And newer from there.
+        let newer = find_in_rows(&rows, "error", Some((10, 0)), false);
+        assert_eq!(newer, Some((12, 5, 5)));
+        // Wide characters take two cells.
+        assert_eq!(find_in_rows(&rows, "中文", None, true), Some((12, 0, 4)));
+    }
+
+    #[test]
+    fn uploaded_names_cannot_leave_the_folder() {
+        assert_eq!(safe_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_file_name("C:\\Users\\a\\shot.png"), "shot.png");
+        assert_eq!(safe_file_name(".bashrc"), "bashrc");
+        assert_eq!(safe_file_name(""), "file");
+        assert_eq!(safe_file_name("..."), "file");
+        assert_eq!(safe_file_name("a\u{7}b.md"), "ab.md");
+        let dir = tempfile_dir();
+        std::fs::write(dir.join("note.md"), "x").unwrap();
+        assert_eq!(unused_path(&dir, "note.md"), dir.join("note (2).md"));
+        assert_eq!(unused_path(&dir, "new.md"), dir.join("new.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kaku-web-upload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
