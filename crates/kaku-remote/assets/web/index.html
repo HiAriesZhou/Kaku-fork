@@ -1632,18 +1632,54 @@
     for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
     return btoa(s);
   };
-  const sendFile = async (file, name) => {
-    if (file.size > 50 * 1024 * 1024) { toast(`${name} is larger than 50 MB`); return; }
+  // Each chunk waits for the Mac to say it was written, so the percentage is
+  // what reached the Mac. A link that drops mid-file reconnects and sends the
+  // file again (the Mac discards the partial one), and a file that still
+  // cannot go says so instead of sitting at 0%.
+  const uploadAcks = new Map();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const openSocket = async () => {
+    for (let i = 0; i < 150; i++) {
+      if (ws && ws.readyState === WebSocket.OPEN && paneId !== null) return ws;
+      await sleep(200);
+    }
+    return null;
+  };
+  const sendOnce = async (file, name, socket) => {
     const id = ++uploadSeq;
+    let closed = false;
+    const lost = new Promise((resolve) => socket.addEventListener("close", () => { closed = true; resolve(null); }, { once: true }));
     const done = new Promise((resolve) => uploadWaiters.set(id, resolve));
     send({ type: "upload_start", id, name, size: file.size });
+    let failed = null;
+    done.then((r) => { failed = r; });
     for (let off = 0; off < file.size; off += CHUNK) {
-      toast(`Sending ${name} ${Math.round((off / file.size) * 100)}%`, true);
+      const acked = new Promise((resolve) => uploadAcks.set(id, resolve));
       send({ type: "upload_chunk", id, data: toBase64(await file.slice(off, off + CHUNK).arrayBuffer()) });
+      const received = await Promise.race([acked, done.then(() => null), lost, sleep(30000).then(() => null)]);
+      uploadAcks.delete(id);
+      if (failed) { uploadWaiters.delete(id); return failed; }
+      if (closed || ws !== socket || received === null) { uploadWaiters.delete(id); return null; }
+      toast(`Sending ${name} ${Math.round((received / file.size) * 100)}%`, true);
     }
     send({ type: "upload_end", id });
-    const result = await done;
-    toast(result.ok ? `Sent to ${result.detail.replace(/^\/Users\/[^/]+/, "~")}` : `Not sent: ${result.detail}`);
+    const result = await Promise.race([done, lost, sleep(60000).then(() => null)]);
+    uploadWaiters.delete(id);
+    return result;
+  };
+  const sendFile = async (file, name) => {
+    if (file.size > 50 * 1024 * 1024) { toast(`${name} is larger than 50 MB`); return; }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      toast(attempt ? `Reconnecting to send ${name}` : `Sending ${name} 0%`, true);
+      const socket = await openSocket();
+      if (!socket) break;
+      const result = await sendOnce(file, name, socket);
+      if (result) {
+        toast(result.ok ? `Sent to ${result.detail.replace(/^\/Users\/[^/]+/, "~")}` : `Not sent: ${result.detail}`);
+        return;
+      }
+    }
+    toast(`Not sent: ${name}, the connection dropped. Try again.`);
   };
   const pastedName = (file) => {
     const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
@@ -1675,6 +1711,7 @@
     else if (msg.type === "clipboard") copyToClipboard(msg.text);
     else if (msg.type === "found") onFound(msg);
     else if (msg.type === "history") onHistory(msg);
+    else if (msg.type === "upload_ack") { const a = uploadAcks.get(msg.id); if (a) a(msg.received); }
     else if (msg.type === "uploaded") { const w = uploadWaiters.get(msg.id); if (w) { uploadWaiters.delete(msg.id); w(msg); } }
     else if (msg.type === "closed") {
       // A tabs update may already have moved the page to another tab; the

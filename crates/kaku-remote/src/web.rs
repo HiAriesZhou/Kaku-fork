@@ -452,6 +452,11 @@ enum WebServerMsg<'a> {
         col: usize,
         len: usize,
     },
+    /// A chunk of a sent file reached the Mac: bytes written so far.
+    UploadAck {
+        id: u32,
+        received: u64,
+    },
     /// How a sent file ended: where it was saved, or why it was not.
     Uploaded {
         id: u32,
@@ -537,19 +542,43 @@ struct Upload {
     written: u64,
 }
 
+/// A session's uploads in progress. A session that ends mid-upload (the
+/// link dropped, the tab closed) leaves no partial file behind; the page
+/// sends the file again once it reconnects.
+#[derive(Default)]
+struct Uploads(HashMap<u32, Upload>);
+
+impl Drop for Uploads {
+    fn drop(&mut self) {
+        for (_, upload) in self.0.drain() {
+            drop(upload.file);
+            let _ = std::fs::remove_file(&upload.path);
+        }
+    }
+}
+
 /// The outcome of an upload step that the page should hear about.
 struct UploadReply {
     id: u32,
     ok: bool,
     detail: String,
+    /// A chunk was written: bytes received so far. The page sends the next
+    /// chunk on this, so its percentage is what reached the Mac.
+    received: Option<u64>,
 }
 
 impl UploadReply {
     fn as_msg(&self) -> WebServerMsg<'_> {
-        WebServerMsg::Uploaded {
-            id: self.id,
-            ok: self.ok,
-            detail: &self.detail,
+        match self.received {
+            Some(received) => WebServerMsg::UploadAck {
+                id: self.id,
+                received,
+            },
+            None => WebServerMsg::Uploaded {
+                id: self.id,
+                ok: self.ok,
+                detail: &self.detail,
+            },
         }
     }
 }
@@ -565,6 +594,7 @@ fn handle_upload(
             id,
             ok: false,
             detail: why,
+            received: None,
         })
     };
     match msg {
@@ -617,7 +647,12 @@ fn handle_upload(
                 let _ = std::fs::remove_file(&gone.path);
                 return fail(*id, format!("write failed: {e}"));
             }
-            None
+            Some(UploadReply {
+                id: *id,
+                ok: true,
+                detail: String::new(),
+                received: Some(upload.written),
+            })
         }
         WebClientMsg::UploadEnd { id } => {
             let upload = uploads.remove(id)?;
@@ -633,6 +668,7 @@ fn handle_upload(
                 id: *id,
                 ok: true,
                 detail: shown,
+                received: None,
             })
         }
         _ => None,
@@ -1480,7 +1516,7 @@ pub(crate) async fn run_session(
     // applied the same number, so frames in flight never read as drift.
     let mut frames_sent: u64 = 0;
     let mut clipboard = CLIPBOARD.subscribe();
-    let mut uploads: HashMap<u32, Upload> = HashMap::new();
+    let mut uploads = Uploads::default();
     let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle = tokio::time::interval(IDLE_REFRESH);
@@ -1509,7 +1545,7 @@ pub(crate) async fn run_session(
                     }
                     continue;
                 }
-                if let Some(reply) = handle_upload(&msg, &mut uploads, attached) {
+                if let Some(reply) = handle_upload(&msg, &mut uploads.0, attached) {
                     let Some(json) = encode(&reply.as_msg()) else { continue };
                     if outbox.send(json).await.is_err() {
                         break;
@@ -1952,6 +1988,36 @@ mod tests {
         assert_eq!(newer, Some((12, 5, 5)));
         // Wide characters take two cells.
         assert_eq!(find_in_rows(&rows, "中文", None, true), Some((12, 0, 4)));
+    }
+
+    #[test]
+    fn chunks_are_acknowledged_and_unfinished_uploads_are_removed() {
+        use base64::Engine as _;
+        let path = std::env::temp_dir().join(format!("kaku-upload-test-{}", std::process::id()));
+        let mut uploads = Uploads::default();
+        uploads.0.insert(
+            7,
+            Upload {
+                file: std::fs::File::create(&path).unwrap(),
+                path: path.clone(),
+                size: 6,
+                written: 0,
+            },
+        );
+        let chunk = WebClientMsg::UploadChunk {
+            id: 7,
+            data: base64::engine::general_purpose::STANDARD.encode(b"abc"),
+        };
+        let reply = handle_upload(&chunk, &mut uploads.0, None).expect("a chunk is acknowledged");
+        assert_eq!(reply.received, Some(3));
+        assert!(matches!(
+            reply.as_msg(),
+            WebServerMsg::UploadAck { id: 7, received: 3 }
+        ));
+        // The session ends before upload_end: the partial file goes.
+        assert!(path.exists());
+        drop(uploads);
+        assert!(!path.exists());
     }
 
     #[test]
