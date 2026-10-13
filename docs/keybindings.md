@@ -22,13 +22,15 @@
 | Action | Shortcut |
 | :--- | :--- |
 | New tab | `Cmd + T` |
-| Switch to tab 1–9 | `Cmd + 1` – `Cmd + 9` |
+| Switch to tab 1–8 / last tab | `Cmd + 1` – `Cmd + 8` / `Cmd + 9` |
 | Previous tab | `Cmd + Shift + [` |
 | Next tab | `Cmd + Shift + ]` |
 | Open Tab Navigator | `Cmd + Shift + O` |
 | Close tab | `Cmd + Shift + W` |
 | Reopen closed tab | `Cmd + Shift + T` |
 | Rename tab | Double-click tab title |
+
+> Turn on **Tab Numbers** in Settings (`Cmd + ,`) to show each tab's number, as in `1:dirname`.
 
 ## Panes
 
