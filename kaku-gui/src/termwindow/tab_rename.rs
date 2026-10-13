@@ -639,6 +639,50 @@ impl TabRenameModal {
         Element::with_line(font, &line, palette)
     }
 
+    /// Selected text uses the terminal's selection colors, so a pending
+    /// replace (Cmd+A, Shift+arrows) is visible. A fully transparent
+    /// `selection_fg` keeps the title color, as the terminal does. Kaku
+    /// Light paints the active tab in exactly its selection colors, so when
+    /// the selection would not stand out from the editor, use reverse video.
+    fn selected_text_attrs(
+        attrs: &CellAttributes,
+        palette: &ColorPalette,
+        editor_bg: LinearRgba,
+        editor_fg: LinearRgba,
+    ) -> CellAttributes {
+        const MIN_SELECTION_CONTRAST: f32 = 1.1;
+
+        let mut attrs = attrs.clone();
+        let (sr, sg, sb, alpha) = palette.selection_bg.to_linear().tuple();
+        let (er, eg, eb, _) = editor_bg.tuple();
+        let editor_bg = LinearRgba::with_components(er, eg, eb, 1.0);
+        let shown = LinearRgba::with_components(
+            er + (sr - er) * alpha,
+            eg + (sg - eg) * alpha,
+            eb + (sb - eb) * alpha,
+            1.0,
+        );
+        if shown.contrast_ratio(&editor_bg) < MIN_SELECTION_CONTRAST {
+            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
+                editor_bg.to_srgb(),
+            ));
+            attrs.set_background(ColorAttribute::TrueColorWithDefaultFallback(
+                editor_fg.to_srgb(),
+            ));
+            return attrs;
+        }
+
+        if palette.selection_fg.3 != 0.0 {
+            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
+                palette.selection_fg,
+            ));
+        }
+        attrs.set_background(ColorAttribute::TrueColorWithDefaultFallback(
+            palette.selection_bg,
+        ));
+        attrs
+    }
+
     fn cursor_segment(
         font: &std::rc::Rc<wezterm_font::LoadedFont>,
         metrics: &RenderMetrics,
@@ -844,7 +888,13 @@ impl TabRenameModal {
                 row.push(Self::text_segment(&font, &palette, left, &text_attrs));
             }
 
-            row.push(Self::text_segment(&font, &palette, selected, &text_attrs));
+            let selected_attrs = Self::selected_text_attrs(&text_attrs, &palette, bg, text);
+            row.push(Self::text_segment(
+                &font,
+                &palette,
+                selected,
+                &selected_attrs,
+            ));
             cursor_element_idx = row.len();
             row.push(Self::cursor_segment(
                 &font,
@@ -1107,5 +1157,73 @@ mod tests {
     #[test]
     fn clearing_the_value_is_applied_to_restore_the_auto_title() {
         assert!(TabRenameModal::should_apply("pinned", ""));
+    }
+
+    #[test]
+    fn selected_text_is_drawn_with_the_selection_colors() {
+        use termwiz::cell::CellAttributes;
+        use termwiz::color::SrgbaTuple;
+        use wezterm_term::color::{ColorAttribute, ColorPalette};
+
+        let hex = |s: &str| s.parse::<SrgbaTuple>().unwrap();
+        let attrs = |fg: SrgbaTuple, bg: SrgbaTuple| {
+            let mut attrs = CellAttributes::default();
+            attrs
+                .set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg))
+                .set_background(ColorAttribute::TrueColorWithDefaultFallback(bg));
+            attrs
+        };
+
+        // Cmd+A must look different from the plain title, or typing over a
+        // selection replaces text the user could not see was selected.
+        // Kaku Dark: translucent purple over the active tab surface, title
+        // color kept because the palette sets an opaque selection_fg.
+        let (tab_bg, tab_fg) = (hex("#29263c"), hex("#d5d4d6"));
+        let mut palette = ColorPalette::default();
+        palette.selection_bg = hex("rgba(142,106,217,0.55)");
+        palette.selection_fg = SrgbaTuple(0., 0., 0., 0.);
+        let title = attrs(tab_fg, tab_bg);
+        let selected = TabRenameModal::selected_text_attrs(
+            &title,
+            &palette,
+            tab_bg.to_linear(),
+            tab_fg.to_linear(),
+        );
+        assert_eq!(
+            selected.background(),
+            ColorAttribute::TrueColorWithDefaultFallback(palette.selection_bg)
+        );
+        assert_eq!(selected.foreground(), title.foreground());
+
+        palette.selection_fg = hex("#d5d4d6");
+        let selected = TabRenameModal::selected_text_attrs(
+            &title,
+            &palette,
+            tab_bg.to_linear(),
+            tab_fg.to_linear(),
+        );
+        assert_eq!(
+            selected.foreground(),
+            ColorAttribute::TrueColorWithDefaultFallback(palette.selection_fg)
+        );
+
+        // Kaku Light: the active tab uses the selection colors themselves,
+        // so the editor falls back to reverse video.
+        let (tab_bg, tab_fg) = (hex("#E8E6DB"), hex("#100F0F"));
+        palette.selection_bg = tab_bg;
+        palette.selection_fg = tab_fg;
+        let title = attrs(tab_fg, tab_bg);
+        let selected = TabRenameModal::selected_text_attrs(
+            &title,
+            &palette,
+            tab_bg.to_linear(),
+            tab_fg.to_linear(),
+        );
+        assert_ne!(selected.background(), title.background());
+        assert_ne!(selected.foreground(), title.foreground());
+        assert_eq!(
+            selected.background(),
+            ColorAttribute::TrueColorWithDefaultFallback(tab_fg.to_linear().to_srgb())
+        );
     }
 }
