@@ -308,7 +308,11 @@ fn capture_pane_content(
     if cap == 0 {
         return None;
     }
-    if pane.is_alt_screen_active() {
+    // Full-screen programs are skipped so a vim or htop screen never lands
+    // in the restored history. Claude Code and Codex are the exception: their
+    // last screen is the conversation, and the alternate screen has no
+    // scrollback, so what is kept is exactly that last screen.
+    if pane.is_alt_screen_active() && !crate::tabbar::foreground_is_agent_cli(pane.as_ref()) {
         return None;
     }
     let dims = pane.get_dimensions();

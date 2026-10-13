@@ -33,7 +33,15 @@ const KEEPALIVE: Duration = Duration::from_secs(20);
 /// With pings every 20s, this long without hearing from the relay means the
 /// link died without a close (sleep, network change); reconnect.
 const SILENCE_LIMIT: Duration = Duration::from_secs(60);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const INBOX_TIMEOUT: Duration = Duration::from_secs(2);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Longest a connect, TLS and WebSocket handshake may take. A proxy can
+/// accept the TCP connection locally and then never answer once its own
+/// upstream is gone; without a limit the bridge waited there for hours and
+/// the link stayed offline until Kaku restarted.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ── Identity ──────────────────────────────────────────────────────────────────
 
@@ -217,22 +225,73 @@ pub(crate) async fn run(relay_url: String, dirty: WebDirty) {
                 continue;
             }
         };
-        match serve(&relay_url, &identity, &dirty).await {
+        let mut connected_at = None;
+        match serve(&relay_url, &identity, &dirty, &mut connected_at).await {
             Ok(()) => backoff = Duration::from_secs(1),
             Err(e) => log::info!("kaku-share: relay connection ended: {e:#}"),
         }
+        backoff = retry_delay(
+            backoff,
+            connected_at.map(|at: tokio::time::Instant| at.elapsed()),
+        );
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
+fn retry_delay(previous: Duration, connected_for: Option<Duration>) -> Duration {
+    if connected_for.is_some_and(|duration| duration >= KEEPALIVE) {
+        Duration::from_secs(1)
+    } else {
+        previous
+    }
+}
+
+fn close_browser(c: u32, code: u16) -> Message {
+    Message::Text(
+        serde_json::json!({ "t": "close", "c": c, "code": code })
+            .to_string()
+            .into(),
+    )
+}
+
+async fn deliver_input(inbox: &mpsc::Sender<String>, text: String, limit: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(limit, inbox.send(text)).await,
+        Ok(Ok(()))
+    )
+}
+
 enum Browser {
     /// Connected, but has not yet sent a message that opens with the key.
-    Pending,
+    Pending(tokio::time::Instant),
     Active(mpsc::Sender<String>),
 }
 
-async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> anyhow::Result<()> {
+type RelaySocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect_relay(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    limit: Duration,
+) -> anyhow::Result<RelaySocket> {
+    // Keystrokes and echoes are tiny frames; Nagle would hold them back.
+    let (socket, _) = tokio::time::timeout(
+        limit,
+        tokio_tungstenite::connect_async_with_config(request, None, true),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("relay handshake timed out after {limit:?}"))?
+    .context("connect to relay")?;
+    Ok(socket)
+}
+
+async fn serve(
+    relay_url: &str,
+    identity: &ShareIdentity,
+    dirty: &WebDirty,
+    connected_at: &mut Option<tokio::time::Instant>,
+) -> anyhow::Result<()> {
     let key = identity.sealing_key()?;
     let id = identity.id();
     let mut request = format!("{}/host/{id}", relay_url.trim_end_matches('/'))
@@ -242,18 +301,19 @@ async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> a
         "x-kaku-secret",
         identity.secret.parse().context("secret header")?,
     );
-    // Keystrokes and echoes are tiny frames; Nagle would hold them back.
-    let (socket, _) = tokio_tungstenite::connect_async_with_config(request, None, true)
-        .await
-        .context("connect to relay")?;
+    let socket = connect_relay(request, CONNECT_TIMEOUT).await?;
+    *connected_at = Some(tokio::time::Instant::now());
     log::info!("kaku-share: registered with relay as {id}");
     let (mut relay_tx, mut relay_rx) = socket.split();
 
     // Everything bound for the relay goes through one writer.
     let (to_relay, mut outgoing) = mpsc::channel::<Message>(256);
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(msg) = outgoing.recv().await {
-            if relay_tx.send(msg).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(WRITE_TIMEOUT, relay_tx.send(msg)).await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
@@ -267,8 +327,9 @@ async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> a
     keepalive.tick().await;
     let mut last_heard = tokio::time::Instant::now();
 
-    let result = loop {
+    let result = 'connection: loop {
         tokio::select! {
+            _ = &mut writer => break Err(anyhow::anyhow!("relay writer stopped or timed out")),
             msg = relay_rx.next() => {
                 let msg = match msg {
                     Some(Ok(msg)) => msg,
@@ -279,13 +340,15 @@ async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> a
                 match msg {
                     Message::Text(text) => match serde_json::from_str::<RelayMsg>(text.as_str()) {
                         Ok(RelayMsg::Open { c }) => {
-                            browsers.insert(c, Browser::Pending);
+                            browsers.insert(c, Browser::Pending(tokio::time::Instant::now()));
                         }
                         Ok(RelayMsg::Close { c }) => {
                             browsers.remove(&c);
                         }
                         Ok(RelayMsg::Get { r, p }) => {
-                            let _ = to_relay.send(Message::Binary(asset_frame(r, &p).into())).await;
+                            if to_relay.try_send(Message::Binary(asset_frame(r, &p).into())).is_err() {
+                                break Err(anyhow::anyhow!("relay output queue is full"));
+                            }
                         }
                         Err(e) => log::debug!("kaku-share: unknown relay message: {e}"),
                     },
@@ -297,21 +360,28 @@ async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> a
                         let Some(text) = open(&key, &bytes[5..]) else {
                             // Wrong key or tampered: drop this browser.
                             browsers.remove(&c);
-                            let close = format!(r#"{{"t":"close","c":{c}}}"#);
-                            let _ = to_relay.send(Message::Text(close.into())).await;
+                            if to_relay.try_send(close_browser(c, 4403)).is_err() {
+                                break Err(anyhow::anyhow!("relay output queue is full"));
+                            }
                             continue;
                         };
                         let inbox = match browsers.get(&c) {
                             Some(Browser::Active(inbox)) => inbox.clone(),
-                            Some(Browser::Pending) => {
+                            Some(Browser::Pending(_)) => {
                                 let inbox = start_session(c, dirty.clone(), key.clone(), to_relay.clone());
                                 browsers.insert(c, Browser::Active(inbox.clone()));
                                 inbox
                             }
                             None => continue,
                         };
-                        if inbox.send(text).await.is_err() {
+                        // A burst of typing may briefly fill the mailbox while
+                        // the session awaits the GUI. Preserve it, but never
+                        // wait indefinitely and starve heartbeat/reset work.
+                        if !deliver_input(&inbox, text, INBOX_TIMEOUT).await {
                             browsers.remove(&c);
+                            if to_relay.try_send(close_browser(c, 4413)).is_err() {
+                                break Err(anyhow::anyhow!("relay output queue is full"));
+                            }
                         }
                     }
                     Message::Close(_) => break Ok(()),
@@ -322,11 +392,20 @@ async fn serve(relay_url: &str, identity: &ShareIdentity, dirty: &WebDirty) -> a
                 if last_heard.elapsed() > SILENCE_LIMIT {
                     break Err(anyhow::anyhow!("relay went silent"));
                 }
-                if to_relay.send(Message::Ping(Vec::new().into())).await.is_err() {
+                if to_relay.try_send(Message::Ping(Vec::new().into())).is_err() {
                     break Ok(());
                 }
             }
             _ = identity_check.tick() => {
+                let expired: Vec<u32> = browsers.iter().filter_map(|(&id, browser)| {
+                    matches!(browser, Browser::Pending(at) if at.elapsed() >= AUTH_TIMEOUT).then_some(id)
+                }).collect();
+                for c in expired {
+                    browsers.remove(&c);
+                    if to_relay.try_send(close_browser(c, 4408)).is_err() {
+                        break 'connection Err(anyhow::anyhow!("relay output queue is full"));
+                    }
+                }
                 // A reset identity means a new link; re-register under it so
                 // the old one stops working.
                 if read_identity().as_ref() != Some(identity) {
@@ -358,7 +437,10 @@ fn start_session(
                 break;
             };
             let msg = Message::Binary(frame(KIND_DATA, c, &sealed).into());
-            if to_relay.send(msg).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(WRITE_TIMEOUT, to_relay.send(msg)).await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
@@ -372,6 +454,82 @@ mod tests {
 
     fn identity() -> ShareIdentity {
         ShareIdentity::generate().unwrap()
+    }
+
+    #[test]
+    fn a_healthy_connection_resets_error_backoff() {
+        assert_eq!(
+            retry_delay(MAX_BACKOFF, Some(KEEPALIVE)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(retry_delay(MAX_BACKOFF, None), MAX_BACKOFF);
+        assert_eq!(
+            retry_delay(MAX_BACKOFF, Some(Duration::from_millis(10))),
+            MAX_BACKOFF
+        );
+    }
+
+    #[test]
+    fn rejection_carries_a_distinguishable_code() {
+        let Message::Text(text) = close_browser(7, 4403) else {
+            panic!("control frame")
+        };
+        let json: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+        assert_eq!(json["code"], 4403);
+        assert_eq!(json["c"], 7);
+    }
+
+    #[tokio::test]
+    async fn input_bursts_wait_for_a_busy_session_without_losing_keys() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut received = Vec::new();
+            while let Some(text) = rx.recv().await {
+                received.push(text);
+            }
+            received
+        });
+        for i in 0..200 {
+            assert!(deliver_input(&tx, i.to_string(), INBOX_TIMEOUT).await);
+        }
+        drop(tx);
+        assert_eq!(
+            reader.await.unwrap(),
+            (0..200).map(|n| n.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_session_cannot_block_control_work_forever() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send("first".into()).await.unwrap();
+        assert!(!deliver_input(&tx, "second".into(), Duration::from_millis(20)).await);
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_never_answers_the_handshake_is_given_up_on() {
+        // A listener that accepts and stays silent, like a local proxy whose
+        // upstream died: the connect succeeds, the handshake never ends.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _held = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                kept.push(socket);
+            }
+        });
+        let request = format!("ws://{addr}/host/x").into_client_request().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_relay(request, Duration::from_millis(300)),
+        )
+        .await
+        .expect("connect_relay must give up on its own");
+        let Err(err) = result else {
+            panic!("a silent relay must not connect");
+        };
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
     }
 
     #[test]

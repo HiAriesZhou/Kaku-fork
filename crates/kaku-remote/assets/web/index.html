@@ -2,9 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="referrer" content="no-referrer">
 <title>Kaku</title>
+<link rel="icon" type="image/png" href="assets/icon.png">
+<link rel="apple-touch-icon" href="assets/icon.png">
 <link rel="stylesheet" href="assets/xterm.css">
 <style>
   @font-face { font-family: "Kaku Mono"; src: url("assets/font-regular.ttf") format("truetype"); font-weight: 400; }
@@ -12,18 +14,68 @@
   :root { --bg: #16161a; --fg: #d4d4d8; --muted: #8b8b93; --line: rgba(255,255,255,0.08); }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); }
   body { display: flex; flex-direction: column; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  body.tabs-bottom #bar { order: 2; border-bottom: 0; border-top: 1px solid var(--line); }
-  #bar { display: flex; align-items: center; gap: 2px; height: 34px; padding: 0 10px; border-bottom: 1px solid var(--line); flex: none; overflow-x: auto; }
-  #bar button { flex: none; max-width: 220px; height: 26px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font: inherit; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
-  #bar button:hover { background: var(--line); }
-  #bar button[aria-current="true"] { background: var(--line); color: var(--fg); }
-  #bar .tab { display: flex; align-items: center; gap: 6px; padding-right: 6px; }
+  /* The tab bar follows Kaku's own: monospace titles, the active tab as a
+     filled block in Kaku's tab colors, no rule between it and the terminal. */
+  :root { --mono: "Kaku Mono", monospace; --bar-bg: var(--bg); --tab-fg: var(--muted); --tab-active-bg: rgba(255,255,255,0.08); --tab-active-fg: var(--fg); --tab-hover-bg: rgba(255,255,255,0.05); --tab-hover-fg: var(--fg); }
+  body.tabs-bottom #bar { order: 2; }
+  #bar { display: flex; align-items: stretch; height: 32px; padding: 0; background: var(--bar-bg); flex: none; font: var(--bar-font, 15px) var(--mono); }
+  /* Tabs scroll sideways when they do not fit; a fade at either end says
+     there are more that way. */
+  #tabs { display: flex; align-items: stretch; flex: 0 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  #tabs::-webkit-scrollbar { display: none; }
+  #tabs.more-left { -webkit-mask-image: linear-gradient(to right, transparent, #000 32px); mask-image: linear-gradient(to right, transparent, #000 32px); }
+  #tabs.more-right { -webkit-mask-image: linear-gradient(to left, transparent, #000 32px); mask-image: linear-gradient(to left, transparent, #000 32px); }
+  #tabs.more-left.more-right { -webkit-mask-image: linear-gradient(to right, transparent, #000 32px, #000 calc(100% - 32px), transparent); mask-image: linear-gradient(to right, transparent, #000 32px, #000 calc(100% - 32px), transparent); }
+  #tools { display: flex; align-items: stretch; flex: none; margin-left: auto; }
+  #bar button { flex: none; max-width: 240px; height: auto; padding: 0 12px; border: 0; border-radius: 0; background: transparent; color: var(--tab-fg); font: inherit; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; outline: none; }
+  #bar button:hover { background: var(--tab-hover-bg); color: var(--tab-hover-fg); }
+  #bar button[aria-current="true"] { background: var(--tab-active-bg); color: var(--tab-active-fg); }
+  #bar button:focus-visible { box-shadow: inset 0 0 0 1px var(--tab-fg); }
+  /* Even padding on both sides; the right padding holds the attention dot,
+     or the close mark while the pointer is over the tab, as Kaku's own tab
+     bar uses its trailing cell. The mark never covers the title, never sits
+     on the edge, and the dot leaving does not resize the tab. */
+  #bar .tab { position: relative; display: flex; align-items: center; padding: 0 var(--tab-pad, 14px); }
   #bar .tab span:first-child { overflow: hidden; text-overflow: ellipsis; }
-  #bar .close { flex: none; width: 16px; height: 16px; line-height: 16px; border-radius: 4px; text-align: center; opacity: 0; }
-  #bar .tab:hover .close, #bar .tab[aria-current="true"] .close { opacity: 0.6; }
-  #bar .close:hover { opacity: 1; background: var(--line); }
-  #bar .add { width: 26px; padding: 0; font-size: 16px; }
-  #status { margin-left: auto; padding-left: 12px; color: var(--muted); white-space: nowrap; }
+  #bar .slot { position: absolute; top: 0; right: 0; bottom: 0; width: var(--tab-pad, 14px); }
+  #bar .dot, #bar .close { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; transition: opacity 0.15s; }
+  #bar .dot::after { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--dot, #daae76); }
+  #bar .dot.in { animation: dot-in 0.25s ease-out; }
+  #bar .dot.out { animation: dot-out 0.3s ease-in forwards; }
+  @keyframes dot-in { from { opacity: 0; transform: scale(0.4); } }
+  @keyframes dot-out { to { opacity: 0; transform: scale(0.4); } }
+  /* Drawn, not a font glyph: a glyph sits on the text baseline and reads
+     off-center; the icon is centered in its box exactly. */
+  #bar .close { inset: 50% auto auto 50%; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 3px; opacity: 0; pointer-events: none; }
+  #bar .close svg { width: 8px; height: 8px; }
+  #bar .tab:hover .dot { opacity: 0; }
+  #bar .tab:hover .close { opacity: 0.7; pointer-events: auto; }
+  #bar .close:hover { opacity: 1; background: var(--tab-hover-bg); }
+  #bar .add { width: 38px; padding: 0; font-size: 19px; }
+  #bar .tab.drop-before { box-shadow: inset 2px 0 0 var(--tab-active-fg); }
+  #bar .tab.drop-after { box-shadow: inset -2px 0 0 var(--tab-active-fg); }
+  #bar .tab input { width: 12ch; min-width: 4ch; padding: 0; border: 0; outline: none; background: transparent; color: var(--tab-active-fg); font: inherit; }
+  /* Right side: the split map, help and full screen, one size and one icon
+     weight, like the + button. */
+  #bar .tool { display: flex; align-items: center; justify-content: center; width: 38px; padding: 0; }
+  #bar .tool svg { width: 14px; height: 14px; }
+  #bar .panes { width: auto; padding: 0 10px; cursor: default; }
+  #bar .panes:hover { background: transparent; }
+  .map { position: relative; width: 26px; height: 16px; }
+  .map button { position: absolute; padding: 0 !important; border: 1px solid var(--tab-fg) !important; border-radius: 2px !important; background: transparent; opacity: 0.6; cursor: pointer; box-sizing: border-box; }
+  .map button:hover { opacity: 1; background: transparent !important; }
+  .map button[aria-current="true"] { background: var(--tab-fg) !important; opacity: 1; }
+  /* Menus and panels share the find bar's look. */
+  #menu { position: fixed; display: none; min-width: 150px; padding: 4px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); box-shadow: 0 6px 24px rgba(0,0,0,0.25); z-index: 20; }
+  #menu.show { display: block; }
+  #menu { max-height: calc(100% - 16px); overflow-y: auto; }
+  #menu button { display: block; width: 100%; height: 28px; padding: 0 10px; border: 0; border-radius: 5px; background: transparent; color: var(--fg); font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-align: left; cursor: pointer; }
+  #menu button:hover, #menu button:focus-visible { background: var(--tab-hover-bg); outline: none; }
+  #menu hr { height: 1px; margin: 4px 6px; border: 0; background: var(--line); }
+  #help .card { width: min(380px, calc(100vw - 32px)); }
+  #help dl { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin: 12px 0 0; font-size: 13px; }
+  #help dt { color: var(--fg); font-family: var(--mono); white-space: nowrap; }
+  #help dd { margin: 0; color: var(--muted); }
   #stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
   /* Chrome squeezes runs of CJK punctuation by default. xterm.js measures a
      glyph as 32 copies in a row, so it read "，" as half width while rows draw
@@ -31,17 +83,110 @@
      every Chinese punctuation mark. Keep punctuation at its full width in
      both places. */
   .xterm, .xterm * { text-spacing-trim: space-all; }
-  #term { position: absolute; top: 8px; left: 8px; }
-  #history { position: absolute; right: 16px; bottom: 16px; display: none; height: 28px; padding: 0 12px; border: 0; border-radius: 14px; background: var(--line); color: var(--fg); font: inherit; cursor: pointer; }
+  /* Hidden until Kaku's first frame, so xterm's default black canvas never
+     shows before the theme and the screen arrive. */
+  #term { position: absolute; top: 8px; left: 8px; visibility: hidden; }
+  body.drawn #term { visibility: visible; }
+  /* Find bar and toast share the tab bar's look. */
+  #find { position: absolute; top: 10px; right: 16px; display: none; align-items: center; gap: 2px; height: 32px; padding: 0 4px 0 10px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); z-index: 5; }
+  #find.show { display: flex; }
+  #find input { width: 200px; border: 0; outline: none; background: transparent; color: var(--fg); font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #find .count { color: var(--muted); font-size: 12px; padding: 0 6px; white-space: nowrap; }
+  #find button { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; }
+  #find button:hover { background: var(--tab-hover-bg); color: var(--fg); }
+  #find svg { width: 10px; height: 10px; }
+  #toast { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); display: none; max-width: calc(100% - 32px); padding: 7px 12px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); color: var(--fg); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; z-index: 5; }
+  #toast.show { display: block; }
+  body.dropping #stage { box-shadow: inset 0 0 0 2px var(--muted); }
+  #history { position: absolute; right: 16px; bottom: 16px; z-index: 2; display: none; height: 28px; padding: 0 12px; border: 0; border-radius: 14px; background: var(--tab-active-bg); color: var(--tab-active-fg); font: inherit; cursor: pointer; }
   #message { color: var(--muted); padding: 24px; text-align: center; line-height: 1.6; }
+  #message img, #notice .logo { width: 56px; height: 56px; margin-bottom: 8px; }
+  #message img { display: block; margin: 15vh auto 8px; }
+  /* Connection state, over the terminal: dimmed while the screen is stale. */
+  #notice { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 24px; text-align: center; pointer-events: none; }
+  #notice.show { display: flex; }
+  #notice .title { color: var(--fg); font-size: 15px; }
+  #notice .detail { color: var(--muted); font-size: 13px; }
+  #notice .logo { display: none; }
+  #notice.brand .logo { display: block; }
+  #notice .trust { display: none; align-items: center; gap: 5px; margin-top: 10px; color: var(--muted); font-size: 12px; }
+  #notice.brand .trust.on { display: flex; }
+  #notice .trust svg { width: 11px; height: 11px; }
+  #term { transition: opacity 0.2s; }
+  /* History, scrolled here rather than on the Mac, so it follows the finger
+     or the wheel with no round trip. It sits exactly over the terminal and
+     draws rows the way it does: each run placed at Kaku's column. */
+  #past { position: absolute; top: 8px; left: 8px; display: none; overflow: hidden; background: var(--bg); color: var(--fg); white-space: pre; cursor: text; z-index: 1; -webkit-user-select: text; user-select: text; }
+  #past.show { display: block; }
+  #past .row { position: relative; }
+  #past .run { position: absolute; top: 0; }
+  #past .u { text-decoration: underline; }
+  #past .s { text-decoration: line-through; }
+  #past .us { text-decoration: underline line-through; }
+  #past .i { font-style: italic; }
+  body.stale #term { opacity: 0.3; }
+  /* In-page confirmation instead of the browser's own dialog. */
+  #dialog { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.25); z-index: 10; }
+  #dialog.show { display: flex; }
+  #dialog .card { width: min(300px, calc(100vw - 32px)); padding: 16px; border-radius: 10px; background: var(--bar-bg); border: 1px solid var(--line); }
+  #dialog .title { font-size: 14px; color: var(--fg); }
+  #dialog .detail { margin-top: 4px; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #help { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.25); z-index: 10; }
+  #help.show { display: flex; }
+  #help .card { padding: 16px; border-radius: 10px; background: var(--bar-bg); border: 1px solid var(--line); }
+  #help .title { font-size: 14px; color: var(--fg); }
+  #dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  #dialog button { height: 28px; padding: 0 12px; border: 0; border-radius: 6px; font: 13px inherit; font-family: inherit; cursor: pointer; background: var(--line); color: var(--fg); }
+  #dialog button:hover, #dialog button:focus-visible { background: var(--tab-active-bg); outline: none; }
+  /* Phones and tablets: a key row for what touch keyboards lack, finger-size
+     targets, room for the home indicator, and a 16px input so iOS does not
+     zoom the page when the keyboard opens. */
+  #keys { display: none; }
+  body.touch { box-sizing: border-box; padding-bottom: env(safe-area-inset-bottom); }
+  body.touch #bar { height: 44px; }
+  body.touch #dialog button { height: 40px; }
+  body.touch #bar { --tab-pad: 24px; }
+  body.touch #bar .close { width: 20px; height: 20px; margin: -10px 0 0 -11px; }
+  body.touch #bar .close svg { width: 10px; height: 10px; }
+  body.touch #bar .tab[aria-current="true"] .dot { opacity: 0; }
+  body.touch #bar .tab[aria-current="true"] .close { opacity: 0.7; pointer-events: auto; }
+  body.touch #bar .add { width: 36px; }
+  body.touch #keys { display: flex; order: 3; flex: none; gap: 6px; padding: 6px 8px; overflow-x: auto; scrollbar-width: none; border-top: 1px solid var(--line); }
+  body.touch #keys::-webkit-scrollbar { display: none; }
+  body.touch #keys.more-right { -webkit-mask-image: linear-gradient(to left, transparent, #000 40px); mask-image: linear-gradient(to left, transparent, #000 40px); }
+  body.touch #keys button { flex: none; min-width: 40px; height: 36px; padding: 0 10px; border: 0; border-radius: 6px; background: var(--line); color: var(--fg); font: inherit; -webkit-user-select: none; user-select: none; }
+  body.touch #keys button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+  body.touch .xterm-helper-textarea { font-size: 16px !important; }
+  /* A phone on its side has little height: slimmer bars, and the key row
+     only while the keyboard is up. */
+  @media (orientation: landscape) and (max-height: 500px) {
+    body.touch #bar { height: 34px; }
+    body.touch #keys { padding: 4px 8px; }
+    body.touch #keys button { height: 30px; }
+    body.touch:not(.kb) #keys { display: none; }
+  }
+  /* Dragging scrolls the terminal, so the browser must not take the gesture.
+     Touches also land on the stable screen element rather than a row: xterm
+     replaces row elements as frames arrive, and a touch whose target left
+     the page stops reaching any listener mid-drag. */
+  body.touch #stage { touch-action: none; }
+  body.touch .xterm-rows { pointer-events: none; }
 </style>
 </head>
 <body>
-<div id="bar"><span id="status"></span></div>
+<div id="bar"><div id="tabs"></div><div id="tools"></div></div>
 <div id="stage">
   <div id="term"></div>
+  <div id="past"></div>
   <button id="history" type="button">Back to live</button>
+  <div id="notice"><img class="logo" src="assets/icon.png" alt=""><div class="title"></div><div class="detail"></div><div class="trust"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.5" y="5.5" width="7" height="5" rx="1"/><path d="M4 5.5V4a2 2 0 0 1 4 0v1.5"/></svg>End-to-end encrypted, the relay cannot read it</div></div>
+  <div id="find"><input type="text" placeholder="Find" spellcheck="false" autocomplete="off"><span class="count"></span><button type="button" data-dir="older" title="Previous (Enter)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6.5 5 3.5l3 3"/></svg></button><button type="button" data-dir="newer" title="Next (Shift+Enter)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5 5 6.5l3-3"/></svg></button><button type="button" data-dir="close" title="Close (Esc)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2.5 2.5l5 5M7.5 2.5l-5 5"/></svg></button></div>
+  <div id="toast"></div>
 </div>
+<div id="dialog" role="dialog" aria-modal="true"><div class="card"><div class="title">Close this tab?</div><div class="detail"></div><div class="actions"><button type="button" data-act="cancel">Cancel</button><button type="button" data-act="ok">Close</button></div></div></div>
+<div id="menu" role="menu"></div>
+<div id="help" role="dialog" aria-modal="true"><div class="card"><div class="title">Shortcuts</div><dl></dl></div></div>
+<div id="keys"></div>
 <script src="assets/xterm.js"></script>
 <script>
 (() => {
@@ -55,20 +200,23 @@
   const SECRET_SLOT = "kaku.link:" + location.pathname;
   let stored = null;
   try { stored = JSON.parse(sessionStorage.getItem(SECRET_SLOT) || "null"); } catch (_) {}
-  const token = params.get("t") || (stored && stored.t) || null;
-  const keyText = params.get("k") || (stored && stored.k) || null;
-  if (params.get("t") || params.get("k")) {
-    try { sessionStorage.setItem(SECRET_SLOT, JSON.stringify({ t: token, k: keyText })); } catch (_) {}
-    history.replaceState(null, "", location.pathname + location.search);
-  }
+  const supplied = params.has("t") || params.has("k");
+  const token = supplied ? params.get("t") : (stored && stored.t) || null;
+  const keyText = supplied ? params.get("k") : (stored && stored.k) || null;
+  // Erase fragments even when invalid, but never persist an invalid key.
+  if (supplied) history.replaceState(null, "", location.pathname + location.search);
   const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
   const bar = document.getElementById("bar");
-  const statusEl = document.getElementById("status");
+  const tabsEl = document.getElementById("tabs");
+  const toolsEl = document.getElementById("tools");
   const stage = document.getElementById("stage");
   const termEl = document.getElementById("term");
   const historyBtn = document.getElementById("history");
 
-  const showMessage = (text) => { stage.innerHTML = '<div id="message"></div>'; stage.firstChild.textContent = text; };
+  const showMessage = (text) => {
+    stage.innerHTML = '<div id="message"><img src="assets/icon.png" alt=""><div></div></div>';
+    stage.querySelector("#message div").textContent = text;
+  };
   if (!token && !keyText) {
     showMessage("Open this page from the link Kaku gives you.");
     return;
@@ -82,8 +230,23 @@
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   const fromBase64Url = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
-  const keyPromise = keyText
-    ? crypto.subtle.importKey("raw", fromBase64Url(keyText), "AES-GCM", false, ["encrypt", "decrypt"])
+  let rawKey = null;
+  if (keyText) {
+    try {
+      if (typeof keyText !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(keyText)) throw new Error();
+      rawKey = fromBase64Url(keyText);
+      if (rawKey.length !== 32) throw new Error();
+    } catch (_) {
+      try { sessionStorage.removeItem(SECRET_SLOT); } catch (_) {}
+      showMessage("This link is invalid. Copy the complete link from Kaku on the Mac.");
+      return;
+    }
+  }
+  if (supplied) {
+    try { sessionStorage.setItem(SECRET_SLOT, JSON.stringify({ t: token, k: keyText })); } catch (_) {}
+  }
+  const keyPromise = rawKey
+    ? crypto.subtle.importKey("raw", rawKey, "AES-GCM", false, ["encrypt", "decrypt"])
     : null;
   const TO_HOST = enc.encode("kaku-web c2h");
   const FROM_HOST = enc.encode("kaku-web h2c");
@@ -123,7 +286,7 @@
       const bytes = new Uint8Array(data);
       const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12), additionalData: FROM_HOST }, key, bytes.slice(12));
       handle(JSON.parse(dec.decode(plain)));
-    }).catch(() => setStatus("This link is no longer valid"));
+    }).catch(() => setNotice("This link no longer works", "Get the current link from Kaku on the Mac.", { stale: true }));
   };
 
   // ── Terminal ───────────────────────────────────────────────────────────
@@ -132,11 +295,33 @@
   // Kaku's own font size; the page only shrinks below it until Kaku has
   // resized the tab to this window.
   let baseFontSize = 15;
+  const TOUCH = matchMedia("(pointer: coarse)").matches;
+  if (TOUCH) document.body.classList.add("touch");
   let fontSize = baseFontSize;
   let size = { cols: 0, rows: 0 };
   let retry = 0;
 
-  const setStatus = (text) => { statusEl.textContent = text; };
+  // What the page tells the user about the link, over the terminal. A stale
+  // screen dims so it does not pass for a live one.
+  const noticeEl = document.getElementById("notice");
+  let noticeTimer = 0;
+  let everConnected = false;
+  // Connecting and offline pages carry the Kaku mark, and on a relay link
+  // say that what passes through it is sealed end to end.
+  noticeEl.querySelector(".trust").classList.toggle("on", !!keyText);
+  const setNotice = (title, detail = "", { stale = false, delay = 0, brand = false } = {}) => {
+    clearTimeout(noticeTimer);
+    const apply = () => {
+      noticeEl.querySelector(".title").textContent = title;
+      noticeEl.querySelector(".detail").textContent = detail;
+      noticeEl.classList.toggle("brand", brand || !everConnected);
+      noticeEl.classList.toggle("show", !!title);
+      document.body.classList.toggle("stale", !!title && stale);
+    };
+    if (delay && title) noticeTimer = setTimeout(apply, delay);
+    else apply();
+  };
+  const clearNotice = () => setNotice("");
 
   // Kaku's own fallback order (JetBrains Mono, PingFang SC, Apple Symbols,
   // Apple Color Emoji), then the Windows equivalents for CJK and emoji.
@@ -148,8 +333,63 @@
     cursorInactiveStyle: "bar",
     scrollback: 0,
     allowTransparency: false,
+    // Bold text draws at the regular weight: heavier glyphs read as smeared
+    // in the browser.
+    fontWeightBold: "normal",
+    theme: { background: getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#16161a" },
   });
   term.open(termEl);
+
+  // Links: URLs in the screen open with Cmd+click (Ctrl+click off the Mac),
+  // as in Kaku. Cells and string positions differ once a row holds wide
+  // characters, so the row is read cell by cell with each one's column.
+  const URL_RE = /https?:\/\/[^\s<>"'`，。；：！？、（）【】「」『』“”‘’]+/gi;
+  const linkText = candidate => {
+    const stack = [];
+    const pairs = { ")": "(", "]": "[", "}": "{" };
+    for (let i = 0; i < candidate.length; i++) {
+      const ch = candidate[i];
+      if ("([{".includes(ch)) stack.push(ch);
+      else if (pairs[ch]) {
+        if (stack.at(-1) !== pairs[ch]) return candidate.slice(0, i).replace(/[.,;:!?]+$/, "");
+        stack.pop();
+      }
+    }
+    return candidate.replace(/[.,;:!?]+$/, "");
+  };
+  term.registerLinkProvider({
+    provideLinks(y, callback) {
+      const line = term.buffer.active.getLine(y - 1);
+      if (!line) return callback(undefined);
+      let text = "";
+      const cols = [];
+      let cell;
+      for (let x = 0; x < line.length; x++) {
+        cell = line.getCell(x, cell);
+        if (!cell || cell.getWidth() === 0) continue;
+        const chars = cell.getChars() || " ";
+        for (const ch of chars) {
+          text += ch;
+          // RegExp indices count UTF-16 code units, including surrogate pairs.
+          for (let i = 0; i < ch.length; i++) cols.push(x);
+        }
+      }
+      const links = [];
+      for (const m of text.matchAll(URL_RE)) {
+        const uri = linkText(m[0]);
+        const start = cols[m.index];
+        const end = cols[m.index + uri.length - 1];
+        links.push({
+          range: { start: { x: start + 1, y }, end: { x: end + Math.max(1, line.getCell(end)?.getWidth() || 1), y } },
+          text: uri,
+          activate: (ev, uri) => {
+            if (ev.metaKey || ev.ctrlKey) window.open(uri, "_blank", "noopener");
+          },
+        });
+      }
+      callback(links.length ? links : undefined);
+    },
+  });
 
   // The terminal sits at the top left with an 8px margin. Cell size comes
   // from xterm.js, which re-measures synchronously when the font changes,
@@ -167,17 +407,38 @@
     if (Math.abs(px - fontSize) < 0.05) return;
     fontSize = px;
     term.options.fontSize = px;
+    // On a phone the terminal runs below Kaku's size; the tab titles follow
+    // it, as Kaku's own tab bar uses the terminal's size.
+    if (TOUCH) document.documentElement.style.setProperty("--bar-font", Math.max(11, px) + "px");
   };
+  // Pinch to make the text larger or smaller on a phone, kept per browser.
+  let userScale = 1;
+  try { userScale = Number(localStorage.getItem("kaku.scale")) || 1; } catch (_) {}
 
   // Ask Kaku to size the tab to the grid this window holds at Kaku's font
   // size. The Mac takes the tab back on its next local input, and the page
   // claims it again on its own next input.
   let claimed = "";
+  // On a phone, Kaku's own size leaves about 38 columns on a portrait screen,
+  // and the tab on the Mac narrows to match. Size the font for about 50
+  // columns across the screen's shorter side, so landscape gets more. The
+  // screen, not the window, so the keyboard opening does not change it.
+  const PHONE_COLS = 50;
+  const claimFont = () => {
+    if (!TOUCH) return baseFontSize;
+    setFont(baseFontSize);
+    const cell = cellSize();
+    if (!cell) return baseFontSize;
+    const across = Math.min(screen.width, screen.height) - MARGIN * 2;
+    const px = Math.floor((baseFontSize * across) / (PHONE_COLS * cell.width) * userScale * 4) / 4;
+    return Math.max(8, Math.min(baseFontSize * 1.6, px));
+  };
   const fit = () => {
     const availW = stage.clientWidth - MARGIN * 2;
     const availH = stage.clientHeight - MARGIN * 2;
     if (availW <= 0 || availH <= 0) return;
-    setFont(baseFontSize);
+    const want = claimFont();
+    setFont(want);
     const base = cellSize();
     if (!base) return;
     if (ws && ws.readyState === WebSocket.OPEN && paneId !== null) {
@@ -192,7 +453,7 @@
     // Until Kaku applies that size, the current grid may be larger than the
     // window; shrink the font just enough for it to fit.
     if (!size.cols) return;
-    let px = baseFontSize;
+    let px = want;
     for (let i = 0; i < 40; i++) {
       const cell = cellSize();
       if (!cell || (size.cols * cell.width <= availW && size.rows * cell.height <= availH) || px <= 6) break;
@@ -206,6 +467,31 @@
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(fit, 100);
   }).observe(stage);
+  // Moving to a display with another pixel density changes the cell size
+  // without resizing the page, which left a gap at the right and bottom until
+  // the next input. Re-fit when the density changes.
+  // The media query fires in browsers that report the change; the poll
+  // covers the ones that only update devicePixelRatio.
+  let density = window.devicePixelRatio;
+  const densityChanged = () => {
+    if (window.devicePixelRatio === density) return;
+    density = window.devicePixelRatio;
+    document.body.dataset.dpr = String(density);
+    fit();
+  };
+  const watchDensity = () => {
+    const mq = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    mq.addEventListener("change", () => { densityChanged(); watchDensity(); }, { once: true });
+  };
+  watchDensity();
+  setInterval(densityChanged, 2000);
+  // Coming back to the page means using it here: claim the tab's size again,
+  // in case the Mac took it back meanwhile.
+  const reclaim = () => { claimed = ""; fit(); };
+  window.addEventListener("focus", reclaim);
+  // A press anywhere on the page means this side is in use, as a click in
+  // the Mac window is for the Mac.
+  document.addEventListener("pointerdown", reclaim, true);
 
   // Keys that are not plain text go to Kaku, which encodes them for the
   // pane's current modes. Plain characters and IME text arrive via onData.
@@ -237,8 +523,40 @@
     return (IS_MAC ? MAC_SHORTCUTS : OTHER_SHORTCUTS)[mod + "+" + name] || null;
   };
 
+  // Kaku's tab keys: Cmd+1-9, Cmd+Shift+[ and ], Cmd+W, Cmd+T. Browsers keep
+  // most of these for their own tabs; in full screen the page asks for them
+  // with the Keyboard Lock API, and wherever they do arrive they act here.
+  const tabKey = (ev) => {
+    if (!IS_MAC || !ev.metaKey || ev.ctrlKey || ev.altKey) return null;
+    if (!ev.shiftKey && /^Digit[1-9]$/.test(ev.code)) return { go: Number(ev.code.slice(5)) - 1 };
+    if (ev.shiftKey && ev.code === "BracketLeft") return { step: -1 };
+    if (ev.shiftKey && ev.code === "BracketRight") return { step: 1 };
+    if (!ev.shiftKey && ev.code === "KeyW") return { close: true };
+    if (!ev.shiftKey && ev.code === "KeyT") return { add: true };
+    return null;
+  };
+  const runTabKey = (k) => {
+    const at = tabs.findIndex((t) => t.tab_id === tabId);
+    if (k.close) { if (at >= 0) closeTab(tabs[at]); return; }
+    if (k.add) { newTab(); return; }
+    const next = k.step ? tabs[(at + k.step + tabs.length) % tabs.length] : tabs[k.go];
+    if (next && next.tab_id !== tabId) attach(next, true);
+  };
+  window.addEventListener("keydown", (ev) => {
+    // Outside the terminal (the tab bar, the page) the same keys still work.
+    if (termEl.contains(ev.target) || dialogEl.contains(ev.target)) return;
+    const k = tabKey(ev);
+    if (k) { ev.preventDefault(); runTabKey(k); }
+  });
+
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.isComposing || ev.keyCode === 229) return true;
+    const tk = tabKey(ev);
+    if (tk) {
+      if (ev.type === "keydown") runTabKey(tk);
+      ev.preventDefault();
+      return false;
+    }
     const shortcut = shortcutFor(ev);
     if (shortcut) {
       if (ev.type === "keydown") send({ type: "key", ctrl: false, alt: false, shift: false, ...shortcut });
@@ -283,34 +601,513 @@
     ev.preventDefault();
     return false;
   });
-  term.onData((data) => send({ type: "text", data }));
+  // Key row for touch keyboards, which have no Esc, Tab, Ctrl or arrows.
+  // Ctrl stays down for the next key, typed or tapped. Buttons act on
+  // pointerdown and never take focus, so the keyboard stays open.
+  let ctrlDown = false;
+  let ctrlButton = null;
+  const setCtrl = (on) => {
+    ctrlDown = on;
+    if (ctrlButton) ctrlButton.setAttribute("aria-pressed", String(on));
+  };
+  // Only the Mac can decide whether a program echoes its input. A visible
+  // cursor also exists at password prompts, so never paint unconfirmed text.
+  term.onData((data) => {
+    closePast();
+    if (ctrlDown && data.length === 1) {
+      setCtrl(false);
+      send({ type: "key", key: data.toLowerCase(), ctrl: true, alt: false, shift: false });
+      return;
+    }
+    send({ type: "text", data });
+  });
+  if (TOUCH) {
+    const keysEl = document.getElementById("keys");
+    // Most used first, for driving Claude Code and Codex from a phone: Esc
+    // and the arrows answer their prompts, Shift+Tab switches modes, ^C stops.
+    const KEY_ROW = [
+      ["Esc", { key: "Escape" }],
+      ["↑", { key: "ArrowUp" }],
+      ["↓", { key: "ArrowDown" }],
+      ["Tab", { key: "Tab" }],
+      ["⇧Tab", { key: "Tab", shift: true }],
+      ["^C", { key: "c", ctrl: true }],
+      ["Ctrl", "ctrl"],
+      ["←", { key: "ArrowLeft" }],
+      ["→", { key: "ArrowRight" }],
+      ["/", "/"],
+      ["-", "-"],
+      ["|", "|"],
+      ["~", "~"],
+    ];
+    for (const [label, action] of KEY_ROW) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.tabIndex = -1;
+      b.textContent = label;
+      if (action === "ctrl") { ctrlButton = b; b.setAttribute("aria-pressed", "false"); }
+      b.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        if (action === "ctrl") { setCtrl(!ctrlDown); return; }
+        if (typeof action === "string") {
+          if (ctrlDown) { setCtrl(false); send({ type: "key", key: action, ctrl: true, alt: false, shift: false }); }
+          else send({ type: "text", data: action });
+          return;
+        }
+        const ctrl = action.ctrl || ctrlDown;
+        setCtrl(false);
+        send({ type: "key", alt: false, shift: false, ...action, ctrl });
+      });
+      // Keep the tap from moving focus off the terminal or becoming a click.
+      b.addEventListener("touchstart", (ev) => ev.preventDefault(), { passive: false });
+      keysEl.append(b);
+    }
+    // More keys off to the right fade out at the edge.
+    const keysEdge = () => keysEl.classList.toggle("more-right", keysEl.scrollLeft + keysEl.clientWidth < keysEl.scrollWidth - 2);
+    keysEl.addEventListener("scroll", keysEdge, { passive: true });
+    new ResizeObserver(keysEdge).observe(keysEl);
+    // When the keyboard opens, iOS shrinks only the visual viewport: size the
+    // page to it so the prompt and the key row stay above the keyboard.
+    if (window.visualViewport) {
+      const vv = window.visualViewport;
+      // The keyboard is up when the visible height drops well below the
+      // tallest seen in this orientation.
+      const tallest = {};
+      const sync = () => {
+        document.body.style.height = vv.height + "px";
+        window.scrollTo(0, 0);
+        const side = screen.orientation ? screen.orientation.type.split("-")[0] : String(innerWidth > innerHeight);
+        tallest[side] = Math.max(tallest[side] || 0, vv.height);
+        document.body.classList.toggle("kb", vv.height < tallest[side] * 0.8);
+      };
+      vv.addEventListener("resize", sync);
+      vv.addEventListener("scroll", sync);
+      sync();
+    }
+  }
 
+  const pasteText = data => {
+    if (enc.encode(data).length > 65536) { toast("Text is larger than 64 KB. Send it as a file instead."); return; }
+    if (data) { closePast(); send({ type: "paste", data }); }
+  };
   termEl.addEventListener("paste", (ev) => {
     ev.preventDefault();
     ev.stopImmediatePropagation();
+    // A copied image or file goes to the Mac as a file; text pastes as text.
+    const files = ev.clipboardData ? [...ev.clipboardData.files] : [];
+    if (files.length) { sendFiles(files, true); return; }
     const data = ev.clipboardData ? ev.clipboardData.getData("text/plain") : "";
-    if (data) send({ type: "paste", data });
+    pasteText(data);
   }, true);
 
+  // A trackpad fires about 60 wheel events a second. Sum them and send at
+  // most one scroll per animation frame, so a fling is a few messages rather
+  // than a queue the remote Mac keeps answering after the fingers stop.
   let wheelRemainder = 0;
+  let wheelPending = 0;
+  let wheelFrame = 0;
+  const flushWheel = () => {
+    wheelFrame = 0;
+    if (wheelPending !== 0) {
+      send({ type: "scroll", lines: wheelPending });
+      verifySoon();
+    }
+    wheelPending = 0;
+  };
+  // Tell Kaku what this page shows, once the frames it has sent are drawn;
+  // Kaku logs and redraws if that differs from what it sent. Run after a
+  // scroll settles, where stale rows have shown up, and every 10 seconds.
+  let framesSeen = 0;
+  let verifyTimer = 0;
+  const verify = () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN || paneId === null || !size.cols) return;
+    term.write("", () => {
+      const buf = term.buffer.active;
+      const rows = [];
+      for (let y = 0; y < term.rows; y++) {
+        const line = buf.getLine(buf.viewportY + y);
+        rows.push(line ? line.translateToString(true) : "");
+      }
+      send({ type: "verify", frames: framesSeen, rows });
+    });
+  };
+  const verifySoon = () => {
+    clearTimeout(verifyTimer);
+    verifyTimer = setTimeout(verify, 1000);
+  };
+  setInterval(verify, 10000);
+  // Positive lines move toward history.
+  const queueScroll = (lines) => {
+    wheelRemainder += lines;
+    const whole = Math.trunc(wheelRemainder);
+    if (whole !== 0) {
+      wheelRemainder -= whole;
+      wheelPending += whole;
+      if (!wheelFrame) wheelFrame = requestAnimationFrame(flushWheel);
+    }
+  };
+  const rowHeight = () => { const c = cellSize(); return c ? c.height : Math.max(1, fontSize * 1.2); };
+  // ── History, scrolled locally ──────────────────────────────────────────
+  // In a plain shell, scrolling back fetches Kaku's history rows once and
+  // scrolls them here, so the view follows the finger or the wheel pixel by
+  // pixel. A program that takes the mouse or the alternate screen still gets
+  // the scroll, on the Mac.
+  const pastEl = document.getElementById("past");
+  let localScroll = false;
+  let pastOpen = false;
+  let pastLoading = false;
+  let pastPending = 0;
+  let pastTop = 0;
+  let pastFirst = 0;
+  let pastCell = null;
+  let pastRows = [];
+  let pastSpacer = null;
+  const pastRendered = new Map();
+  // Stable row nodes preserve native text selection while the visible
+  // window moves. Selected rows stay until the user releases the selection.
+  const renderPast = () => {
+    if (!pastOpen || !pastCell) return;
+    const h = pastCell.height;
+    const count = Math.ceil(pastEl.clientHeight / h);
+    const start = Math.max(0, Math.floor(pastEl.scrollTop / h) - count);
+    const end = Math.min(pastRows.length, start + count * 3);
+    if (!pastSpacer) {
+      pastSpacer = document.createElement("div");
+      pastEl.append(pastSpacer);
+    }
+    pastSpacer.style.height = pastRows.length * h + "px";
+    const selection = window.getSelection();
+    const range = selection && !selection.isCollapsed && selection.rangeCount ? selection.getRangeAt(0) : null;
+    for (const [id, row] of pastRendered) {
+      if ((id < pastTop + start || id >= pastTop + end) && !(range && range.intersectsNode(row))) {
+        row.remove();
+        pastRendered.delete(id);
+      } else row.style.top = (id - pastTop) * h + "px";
+    }
+    for (let i = end - 1; i >= start; i--) {
+      const id = pastTop + i;
+      if (pastRendered.has(id)) continue;
+      const row = rowElement(pastRows[i], pastCell);
+      row.style.position = "absolute";
+      row.style.top = i * h + "px";
+      row.style.left = "0";
+      row.style.width = "100%";
+      const following = [...pastRendered.keys()].filter(k => k > id).sort((a, b) => a - b)[0];
+      pastEl.insertBefore(row, pastRendered.get(following) || null);
+      pastRendered.set(id, row);
+    }
+  };
+  pastEl.addEventListener("scroll", renderPast, { passive: true });
+  const PALETTE = (() => {
+    const p = [];
+    const steps = [0, 95, 135, 175, 215, 255];
+    for (let i = 0; i < 16; i++) p.push(null);
+    for (let r = 0; r < 6; r++) for (let g = 0; g < 6; g++) for (let b = 0; b < 6; b++) p.push(`rgb(${steps[r]},${steps[g]},${steps[b]})`);
+    for (let i = 0; i < 24; i++) { const v = 8 + i * 10; p.push(`rgb(${v},${v},${v})`); }
+    return p;
+  })();
+  const ANSI_NAMES = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+  const XTERM_16 = ["#2e3436", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
+    "#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec"];
+  const paletteColor = (i) => {
+    if (i >= 16) return PALETTE[i];
+    const t = term.options.theme || {};
+    const name = i < 8 ? ANSI_NAMES[i] : "bright" + ANSI_NAMES[i - 8][0].toUpperCase() + ANSI_NAMES[i - 8].slice(1);
+    return t[name] || XTERM_16[i];
+  };
+  // Kaku's rows: SGR runs ("CSI 0;...m"), "CSI n G" pinning a column after a
+  // wide glyph. Each run is placed at its column, so glyphs the browser
+  // measures differently never shift the rest of the row.
+  const SEQ = /\x1b\[([0-9;]*)([mGK])/g;
+  const styleOf = (params) => {
+    const p = params.split(";").map(Number);
+    const st = { fg: null, bg: null, bold: false, dim: false, italic: false, under: false, inverse: false, hidden: false, strike: false };
+    for (let i = 0; i < p.length; i++) {
+      const n = p[i];
+      if (n === 1) st.bold = true;
+      else if (n === 2) st.dim = true;
+      else if (n === 3) st.italic = true;
+      else if (n === 4 || n === 21) st.under = true;
+      else if (n === 7) st.inverse = true;
+      else if (n === 8) st.hidden = true;
+      else if (n === 9) st.strike = true;
+      else if (n === 38 || n === 48) {
+        let c = null;
+        if (p[i + 1] === 5) { c = paletteColor(p[i + 2]); i += 2; }
+        else if (p[i + 1] === 2) { c = `rgb(${p[i + 2]},${p[i + 3]},${p[i + 4]})`; i += 4; }
+        if (n === 38) st.fg = c; else st.bg = c;
+      }
+    }
+    return st;
+  };
+  const rowElement = (data, cell) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.style.height = cell.height + "px";
+    let col = 0;
+    let st = styleOf("0");
+    let run = null;
+    let span = null;
+    const startRun = () => {
+      run = document.createElement("span");
+      run.className = "run";
+      run.style.left = col * cell.width + "px";
+      row.append(run);
+      span = null;
+    };
+    const put = (text) => {
+      if (!run) startRun();
+      if (!span) {
+        span = document.createElement("span");
+        let fg = st.fg, bg = st.bg;
+        if (st.inverse) { fg = st.bg || "var(--bg)"; bg = st.fg || "var(--fg)"; }
+        if (fg) span.style.color = fg;
+        if (bg) span.style.background = bg;
+        if (st.dim) span.style.opacity = "0.6";
+        if (st.hidden) span.style.visibility = "hidden";
+        const deco = (st.under ? "u" : "") + (st.strike ? "s" : "");
+        if (deco) span.classList.add(deco);
+        if (st.italic) span.classList.add("i");
+        run.append(span);
+      }
+      span.textContent += text;
+      col += [...text].length;
+    };
+    let last = 0;
+    for (const m of data.matchAll(SEQ)) {
+      if (m.index > last) put(data.slice(last, m.index));
+      last = m.index + m[0].length;
+      if (m[2] === "m") { st = styleOf(m[1] || "0"); span = null; }
+      else if (m[2] === "G") { col = Math.max(0, Number(m[1]) - 1); run = null; }
+    }
+    if (last < data.length) put(data.slice(last));
+    return row;
+  };
+  const pastMax = () => Math.max(0, pastEl.scrollHeight - pastEl.clientHeight);
+  const openPast = () => {
+    if (pastOpen || pastLoading || paneId === null) return;
+    pastLoading = true;
+    send({ type: "history" });
+  };
+  const closePast = () => {
+    pastPending = 0;
+    pastLoading = false;
+    if (!pastOpen) return;
+    pastOpen = false;
+    pastEl.classList.remove("show");
+    pastEl.textContent = "";
+    pastRows = [];
+    pastSpacer = null;
+    pastRendered.clear();
+    showHistoryButton();
+  };
+  const onHistory = (msg) => {
+    if (msg.pane_id !== paneId || !pastLoading) return;
+    const cell = cellSize();
+    const screenEl = termEl.querySelector(".xterm-screen");
+    const rowsEl = termEl.querySelector(".xterm-rows");
+    if (!cell || !screenEl || !rowsEl) { pastLoading = false; return; }
+
+    if (!pastOpen) {
+      // Exactly over the terminal, in its font, so opening shows no change.
+      const rs = getComputedStyle(rowsEl);
+      for (const prop of ["fontFamily", "fontSize", "fontWeight", "letterSpacing", "fontKerning", "fontVariantLigatures"]) pastEl.style[prop] = rs[prop];
+      pastEl.style.lineHeight = cell.height + "px";
+      pastEl.style.width = screenEl.offsetWidth + "px";
+      pastEl.style.height = screenEl.offsetHeight + "px";
+      pastEl.textContent = "";
+      pastRows = msg.rows;
+      pastSpacer = null;
+      pastRendered.clear();
+      pastTop = msg.top;
+      pastCell = cell;
+      pastOpen = true;
+      pastEl.classList.add("show");
+      renderPast();
+      pastEl.scrollTop = pastMax();
+      renderPast();
+      pastTop = msg.top;
+      pastFirst = msg.first;
+      pastLoading = false;
+      const pending = pastPending;
+      pastPending = 0;
+      pastScroll(pending);
+    } else {
+      // Older rows, above what is shown; keep the view where it was.
+      const position = pastEl.scrollTop;
+      pastRows = msg.rows.concat(pastRows);
+      pastTop = msg.top;
+      renderPast();
+      pastEl.scrollTop = position + msg.rows.length * pastCell.height;
+      renderPast();
+      pastTop = msg.top;
+      pastFirst = msg.first;
+      pastLoading = false;
+    }
+    showHistoryButton();
+  };
+  // Positive moves toward older rows, in pixels.
+  const pastScroll = (px) => {
+    if (!pastOpen) {
+      if (px <= 0) return;
+      pastPending += px;
+      openPast();
+      return;
+    }
+    pastEl.scrollTop -= px;
+    renderPast();
+    if (px < 0 && pastEl.scrollTop >= pastMax() - 0.5) { closePast(); return; }
+    if (!pastLoading && pastTop > pastFirst && pastEl.scrollTop < pastEl.clientHeight * 2) {
+      pastLoading = true;
+      send({ type: "history", end: pastTop });
+    }
+  };
+  // Positive moves toward history.
+  const scrollInput = (px) => {
+    if (pastOpen || (localScroll && !findEl.classList.contains("show"))) pastScroll(px);
+    else queueScroll(px / rowHeight());
+  };
+  let serverScrolled = false;
+  const showHistoryButton = () => { historyBtn.style.display = serverScrolled || pastOpen ? "block" : "none"; };
+
   stage.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
-    const lineHeight = Math.max(1, fontSize * 1.2);
-    const px = ev.deltaMode === 1 ? ev.deltaY * lineHeight : ev.deltaY;
-    wheelRemainder += -px / lineHeight;
-    const lines = Math.trunc(wheelRemainder);
-    if (lines !== 0) {
-      wheelRemainder -= lines;
-      send({ type: "scroll", lines });
+    const lineHeight = rowHeight();
+    const px = ev.deltaMode === 1 ? ev.deltaY * lineHeight : ev.deltaMode === 2 ? ev.deltaY * stage.clientHeight : ev.deltaY;
+    scrollInput(-px);
+  }, { passive: false, capture: true });
+
+  // A click without a drag goes to the cell under it, for TUIs that asked
+  // for the mouse; Kaku drops it otherwise, so selecting text still works.
+  let clickFrom = null;
+  const cellAt = (cx, cy) => {
+    const screenEl = termEl.querySelector(".xterm-screen");
+    const cell = cellSize();
+    if (!screenEl || !cell) return null;
+    const rect = screenEl.getBoundingClientRect();
+    const x = Math.floor((cx - rect.left) / cell.width);
+    const y = Math.floor((cy - rect.top) / cell.height);
+    if (x < 0 || y < 0 || x >= term.cols || y >= term.rows) return null;
+    return { x, y };
+  };
+  // On a phone, the tap that brings up the keyboard is not a click for the
+  // program: it pressed Claude Code's "Jump to bottom" and the like.
+  let focusedAtPress = false;
+  stage.addEventListener("pointerdown", () => {
+    focusedAtPress = !!term.textarea && document.activeElement === term.textarea;
+  }, true);
+  stage.addEventListener("mousedown", (ev) => {
+    clickFrom = ev.button === 0 && !pastEl.contains(ev.target) && (!TOUCH || focusedAtPress) ? [ev.clientX, ev.clientY] : null;
+  }, true);
+  stage.addEventListener("mouseup", (ev) => {
+    const from = clickFrom;
+    clickFrom = null;
+    if (!from || ev.button !== 0) return;
+    // Cmd/Ctrl+click is for opening links, not for the program.
+    if (ev.metaKey || ev.ctrlKey) return;
+    if (Math.abs(ev.clientX - from[0]) + Math.abs(ev.clientY - from[1]) > 4) return;
+    const at = cellAt(ev.clientX, ev.clientY);
+    if (at) send({ type: "click", x: at.x, y: at.y });
+  }, true);
+
+  // Touch: drag to scroll a row per row height, and keep going briefly after
+  // a flick. A tap without movement still reaches xterm.js and focuses it.
+  let touchY = null;
+  let touchMoved = false;
+  let touchVel = 0;
+  let touchAt = 0;
+  let flingFrame = 0;
+  // Two fingers pinch the text size: the terminal previews the scale under
+  // the fingers, and on release the page refits and claims the new grid.
+  let pinchFrom = 0;
+  let pinchRatio = 1;
+  const fingerGap = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  stage.addEventListener("touchstart", (ev) => {
+    cancelAnimationFrame(flingFrame);
+    if (ev.touches.length === 2 && TOUCH) {
+      touchY = null;
+      pinchFrom = fingerGap(ev.touches);
+      pinchRatio = 1;
+      return;
     }
+    if (ev.touches.length !== 1) { touchY = null; return; }
+    touchY = ev.touches[0].clientY;
+    touchMoved = false;
+    touchVel = 0;
+    touchAt = performance.now();
+  }, { passive: true, capture: true });
+  stage.addEventListener("touchmove", (ev) => {
+    if (pinchFrom && ev.touches.length === 2) {
+      ev.preventDefault();
+      pinchRatio = Math.max(0.5, Math.min(2, fingerGap(ev.touches) / pinchFrom));
+      termEl.style.transformOrigin = "0 0";
+      termEl.style.transform = `scale(${pinchRatio})`;
+      return;
+    }
+    if (touchY === null || ev.touches.length !== 1) return;
+    const y = ev.touches[0].clientY;
+    const dy = y - touchY;
+    if (!touchMoved && Math.abs(dy) < 8) return;
+    touchMoved = true;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const now = performance.now();
+    touchVel = dy / Math.max(1, now - touchAt);
+    touchAt = now;
+    touchY = y;
+    scrollInput(dy);
+  }, { passive: false, capture: true });
+  stage.addEventListener("touchend", (ev) => {
+    if (pinchFrom) {
+      if (ev.touches.length) return;
+      pinchFrom = 0;
+      termEl.style.transform = "";
+      if (Math.abs(pinchRatio - 1) > 0.05) {
+        userScale = Math.max(0.6, Math.min(1.8, userScale * pinchRatio));
+        try { localStorage.setItem("kaku.scale", String(userScale)); } catch (_) {}
+        closePast();
+        reclaim();
+      }
+      ev.preventDefault();
+      return;
+    }
+    if (touchY === null) return;
+    touchY = null;
+    if (!touchMoved) return;
+    ev.preventDefault();
+    let v = touchVel;
+    let last = performance.now();
+    const step = (now) => {
+      v *= Math.pow(0.95, (now - last) / 16);
+      scrollInput(v * (now - last));
+      last = now;
+      if (Math.abs(v) > 0.05) flingFrame = requestAnimationFrame(step);
+    };
+    if (Math.abs(v) > 0.3) flingFrame = requestAnimationFrame(step);
   }, { passive: false, capture: true });
 
   historyBtn.addEventListener("click", () => {
+    closePast();
     send({ type: "scroll", lines: -1e9 });
     term.focus();
   });
-  stage.addEventListener("mousedown", () => term.focus());
+  // A press in the history view selects its text; elsewhere it focuses the
+  // terminal.
+  stage.addEventListener("mousedown", (ev) => { if (!pastEl.contains(ev.target)) term.focus(); });
+  // Typing while reading history goes back to live, as on the Mac.
+  window.addEventListener("keydown", (ev) => {
+    if (!pastOpen || ev.metaKey || ev.ctrlKey || ev.isComposing) return;
+    if (findEl.contains(ev.target) || dialogEl.contains(ev.target) || ev.target.tagName === "INPUT") return;
+    if (["Shift", "Alt", "Control", "Meta", "CapsLock"].includes(ev.key)) return;
+    closePast();
+    if (!termEl.contains(ev.target)) {
+      ev.preventDefault();
+      term.focus();
+      if (ev.key.length === 1) send({ type: "text", data: ev.key });
+      else if (NAMED.has(ev.key)) send({ type: "key", key: ev.key, ctrl: false, alt: ev.altKey, shift: ev.shiftKey });
+    }
+  }, true);
 
   // ── Tabs ───────────────────────────────────────────────────────────────
   let tabs = [];
@@ -319,54 +1116,463 @@
   let followNewTab = null;
   let followUntil = 0;
 
-  const attach = (tab) => {
+  // What each tab last looked like, so switching back draws it at once and
+  // the Mac's fresh frame, a network round trip later, only corrects it.
+  // Resize, then reset. Growing xterm.js's rows with no scrollback leaves its
+  // buffer one line short of the viewport (baseY 1 over rows+0 lines), so
+  // the last row took no writes and kept stale text: the ghost rows seen
+  // while scrolling on a phone. A reset clears that; what follows a size
+  // change is always a full frame (or a snapshot), so nothing is lost.
+  const resizeTerm = (cols, rows) => {
+    term.resize(cols, rows);
+    term.reset();
+  };
+  const snapshots = new Map();
+  const NO_WRAP = "\x1b[?7l";
+  const sgrColor = (cell, fg) => {
+    const base = fg ? 30 : 40;
+    if (fg ? cell.isFgDefault() : cell.isBgDefault()) return [base + 9];
+    const c = fg ? cell.getFgColor() : cell.getBgColor();
+    if (fg ? cell.isFgRGB() : cell.isBgRGB()) return [base + 8, 2, (c >> 16) & 255, (c >> 8) & 255, c & 255];
+    return [base + 8, 5, c];
+  };
+  const snapshot = () => {
+    const buf = term.buffer.active;
+    let out = "";
+    let cell = buf.getNullCell();
+    for (let y = 0; y < term.rows; y++) {
+      const line = buf.getLine(buf.viewportY + y);
+      if (!line) continue;
+      out += `\x1b[${y + 1};1H`;
+      // Stop after the last cell that shows anything; erase the rest, as
+      // Kaku's own frames do.
+      let end = 0;
+      for (let x = 0; x < term.cols; x++) {
+        cell = line.getCell(x, cell);
+        if (cell && (cell.getChars() || !cell.isBgDefault() || cell.isInverse())) end = x + 1;
+      }
+      let last = "";
+      for (let x = 0; x < end; x++) {
+        cell = line.getCell(x, cell);
+        if (!cell || cell.getWidth() === 0) continue;
+        const sgr = [0];
+        if (cell.isBold()) sgr.push(1);
+        if (cell.isDim()) sgr.push(2);
+        if (cell.isItalic()) sgr.push(3);
+        if (cell.isUnderline()) sgr.push(4);
+        if (cell.isInverse()) sgr.push(7);
+        if (cell.isInvisible()) sgr.push(8);
+        if (cell.isStrikethrough()) sgr.push(9);
+        sgr.push(...sgrColor(cell, true), ...sgrColor(cell, false));
+        const code = `\x1b[${sgr.join(";")}m`;
+        if (code !== last) { out += code; last = code; }
+        out += cell.getChars() || " ";
+      }
+      out += "\x1b[0m\x1b[K";
+    }
+    return { cols: term.cols, rows: term.rows, data: out };
+  };
+
+  const attach = (tab, focus = false) => {
+    closePast();
+    if (paneId !== null && size.cols) snapshots.set(paneId, snapshot());
     paneId = tab.pane_id;
     tabId = tab.tab_id;
     claimed = "";
     size = { cols: 0, rows: 0 };
+    send({ type: "attach", pane_id: paneId, focus });
+    const saved = snapshots.get(paneId);
+    if (saved) {
+      size = { cols: saved.cols, rows: saved.rows };
+      resizeTerm(saved.cols, saved.rows);
+      fit();
+      term.write(NO_WRAP + "\x1b[?25l\x1b[0m\x1b[2J" + saved.data);
+    }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
-    send({ type: "attach", pane_id: paneId });
     renderTabs();
     term.focus();
   };
 
+  // Close confirmation in the page's own style: Enter closes, Esc cancels.
+  const dialogEl = document.getElementById("dialog");
+  let dialogDone = null;
+  const askClose = (title, kind = "tab") => new Promise((resolve) => {
+    dialogEl.querySelector(".title").textContent = `Close this ${kind}?`;
+    if (dialogDone) dialogDone(false);
+    dialogEl.querySelector(".detail").textContent = title;
+    dialogEl.classList.add("show");
+    dialogDone = (ok) => {
+      dialogDone = null;
+      dialogEl.classList.remove("show");
+      term.focus();
+      resolve(ok);
+    };
+    dialogEl.querySelector('[data-act="ok"]').focus();
+  });
+  dialogEl.addEventListener("click", (ev) => {
+    if (!dialogDone) return;
+    const act = ev.target.closest("[data-act]");
+    if (act) dialogDone(act.dataset.act === "ok");
+    else if (ev.target === dialogEl) dialogDone(false);
+  });
+  dialogEl.addEventListener("keydown", (ev) => {
+    if (!dialogDone) return;
+    if (ev.key === "Escape") { ev.preventDefault(); dialogDone(false); }
+    else if (ev.key === "Enter") { ev.preventDefault(); dialogDone(ev.target.dataset.act !== "cancel"); }
+    ev.stopPropagation();
+  }, true);
+
+  // Full screen is where Kaku's tab keys reach the page: the Keyboard Lock
+  // API (Chrome, Edge) hands them over instead of the browser acting on them.
+  // Esc goes to the terminal too; holding it leaves full screen.
+  const LOCKED_KEYS = ["Escape", "KeyW", "KeyT", "BracketLeft", "BracketRight",
+    "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9"];
+  if (document.fullscreenEnabled && !TOUCH) {
+    const fs = document.createElement("button");
+    fs.type = "button";
+    fs.className = "tool fs";
+    const icon = (inFs) => inFs
+      ? '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 1v5H1M10 1v5h5M6 15v-5H1M10 15v-5h5"/></svg>'
+      : '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1 6V1h5M15 6V1h-5M1 10v5h5M15 10v5h-5"/></svg>';
+    const sync = () => {
+      const inFs = !!document.fullscreenElement;
+      fs.innerHTML = icon(inFs);
+      fs.title = inFs ? "Exit Full Screen" : "Full Screen, so Cmd+1-9, Cmd+W and Cmd+T work as in Kaku";
+      if (!inFs && navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+    };
+    fs.addEventListener("click", () => {
+      if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
+      document.documentElement.requestFullscreen().then(() => {
+        if (navigator.keyboard && navigator.keyboard.lock) return navigator.keyboard.lock(LOCKED_KEYS);
+      }).catch(() => {}).finally(() => term.focus());
+    });
+    document.addEventListener("fullscreenchange", sync);
+    sync();
+    toolsEl.append(fs);
+  }
+
+  // Shortcuts: Cmd+/ (Ctrl+Shift+/ off the Mac) or the ? button.
+  const helpEl = document.getElementById("help");
+  const HELP = IS_MAC ? [
+    ["⌘1–9", "Go to a tab"], ["⌘⇧[  ⌘⇧]", "Previous or next tab"], ["⌘T  ⌘W", "New or close tab"],
+    ["⌘F", "Find in history"], ["⌘K", "Clear"], ["⇧↩", "New line without running"],
+    ["⌘ click", "Open a link"], ["Drop or paste", "Send files to ~/Downloads/Kaku"],
+    ["Double click", "Rename a tab"], ["⌘/", "These shortcuts"],
+  ] : [
+    ["Ctrl+Shift+F", "Find in history"], ["Ctrl+Shift+C  V", "Copy or paste"], ["Shift+Enter", "New line without running"],
+    ["Ctrl click", "Open a link"], ["Drop or paste", "Send files to ~/Downloads/Kaku"],
+    ["Double click", "Rename a tab"], ["Ctrl+Shift+/", "These shortcuts"],
+  ];
+  const helpList = helpEl.querySelector("dl");
+  for (const [k, v] of HELP) {
+    const dt = document.createElement("dt");
+    dt.textContent = k;
+    const dd = document.createElement("dd");
+    dd.textContent = v;
+    helpList.append(dt, dd);
+  }
+  if (document.fullscreenEnabled && IS_MAC) {
+    const note = document.createElement("dd");
+    note.style.gridColumn = "1 / -1";
+    note.textContent = "The tab keys reach this page in full screen.";
+    helpList.append(note);
+  }
+  const toggleHelp = (on = !helpEl.classList.contains("show")) => {
+    helpEl.classList.toggle("show", on);
+    if (!on) term.focus();
+  };
+  helpEl.addEventListener("click", () => toggleHelp(false));
+  window.addEventListener("keydown", (ev) => {
+    const isHelp = ev.code === "Slash" && !ev.altKey && (IS_MAC ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && ev.shiftKey && !ev.metaKey);
+    if (isHelp) { ev.preventDefault(); ev.stopPropagation(); toggleHelp(); }
+    else if (ev.key === "Escape" && helpEl.classList.contains("show")) { ev.preventDefault(); ev.stopPropagation(); toggleHelp(false); }
+  }, true);
+  if (!TOUCH) {
+    const helpBtn = document.createElement("button");
+    helpBtn.type = "button";
+    helpBtn.className = "tool";
+    helpBtn.title = IS_MAC ? "Shortcuts (⌘/)" : "Shortcuts (Ctrl+Shift+/)";
+    helpBtn.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="6.5"/><path d="M6.2 6.2a1.9 1.9 0 1 1 2.6 1.8c-.5.2-.8.6-.8 1.1v.4"/><circle cx="8" cy="11.6" r=".4" fill="currentColor"/></svg>';
+    helpBtn.addEventListener("click", () => toggleHelp());
+    toolsEl.prepend(helpBtn);
+  }
+
+  const closeTab = (t) => {
+    const go = () => send({ type: "close_tab", tab_id: t.tab_id });
+    if (t.confirm_close) askClose(t.title || "Tab").then((ok) => { if (ok) go(); });
+    else go();
+  };
+  const newTab = () => {
+    followNewTab = new Set(tabs.map((t) => t.tab_id));
+    followUntil = Date.now() + 5000;
+    send({ type: "new_tab" });
+  };
+
+  const dotted = new Set();
+  // Renaming happens in place in the tab; the tabs list arriving meanwhile
+  // must not redraw the bar under the editor.
+  let renaming = null;
+  let dragTab = null;
   const renderTabs = () => {
-    bar.querySelectorAll("button").forEach((b) => b.remove());
+    if (renaming) return;
+    tabsEl.textContent = "";
     for (const t of tabs) {
       const b = document.createElement("button");
       b.type = "button";
       b.className = "tab";
       b.setAttribute("aria-current", String(t.tab_id === tabId));
+      // Kaku marks a tab that wants attention (an unread bell, a paused or
+      // failed task) with a trailing dot in its title; draw it as a dot.
+      const title = t.title || "Tab";
+      const attention = title.endsWith("•");
       const label = document.createElement("span");
-      label.textContent = t.title || "Tab";
+      label.textContent = attention ? title.slice(0, -1).trimEnd() : title;
       const close = document.createElement("span");
       close.className = "close";
-      close.textContent = "×";
+      close.innerHTML = '<svg viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M1 1l6 6M7 1L1 7"/></svg>';
       close.title = "Close Tab";
       close.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        if (t.confirm_close && !confirm("Close this tab?")) return;
-        send({ type: "close_tab", tab_id: t.tab_id });
+        closeTab(t);
       });
-      b.append(label, close);
-      b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t); else term.focus(); });
-      bar.insertBefore(b, statusEl);
+      const slot = document.createElement("span");
+      slot.className = "slot";
+      // The dot fades in when it appears and out when it goes, in place.
+      const had = dotted.has(t.tab_id);
+      if (attention || had) {
+        const dot = document.createElement("i");
+        dot.className = "dot" + (attention ? (had ? "" : " in") : " out");
+        if (!attention) dot.addEventListener("animationend", () => dot.remove());
+        slot.append(dot);
+      }
+      if (attention) dotted.add(t.tab_id);
+      else dotted.delete(t.tab_id);
+      slot.append(close);
+      b.append(label, slot);
+      b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t, true); else term.focus(); });
+      // Double click renames, as on the Mac; right click opens the tab menu.
+      b.addEventListener("auxclick", ev => { if (ev.button === 1) { ev.preventDefault(); closeTab(t); } });
+      b.addEventListener("mousedown", ev => { if (ev.button === 1) ev.preventDefault(); });
+      b.addEventListener("dblclick", () => renameTab(t, b, label));
+      b.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        openMenu(ev.clientX, ev.clientY, [
+          ["New Tab", newTab],
+          ["Rename Tab", () => renameTab(t, b, label)],
+          null,
+          ["Close Tab", () => closeTab(t)],
+        ]);
+      });
+      // Drag a tab to reorder it within its Mac window.
+      if (!TOUCH) {
+        b.draggable = true;
+        b.addEventListener("dragstart", (ev) => {
+          dragTab = t;
+          ev.dataTransfer.effectAllowed = "move";
+          ev.dataTransfer.setData("text/x-kaku-tab", String(t.tab_id));
+        });
+        b.addEventListener("dragend", () => { dragTab = null; clearDropMarks(); });
+        b.addEventListener("dragover", (ev) => {
+          if (!dragTab || dragTab.window_id !== t.window_id || dragTab === t) return;
+          ev.preventDefault();
+          const r = b.getBoundingClientRect();
+          const after = ev.clientX > r.left + r.width / 2;
+          clearDropMarks();
+          b.classList.add(after ? "drop-after" : "drop-before");
+        });
+        b.addEventListener("drop", (ev) => {
+          if (!dragTab || dragTab.window_id !== t.window_id) return;
+          ev.preventDefault();
+          const after = b.classList.contains("drop-after");
+          clearDropMarks();
+          moveTab(dragTab, t, after);
+        });
+      }
+      tabsEl.append(b);
     }
     const add = document.createElement("button");
     add.type = "button";
     add.className = "add";
     add.textContent = "+";
     add.title = "New Tab";
-    add.addEventListener("click", () => {
-      followNewTab = new Set(tabs.map((t) => t.tab_id));
-      followUntil = Date.now() + 5000;
-      send({ type: "new_tab" });
+    add.addEventListener("click", newTab);
+    tabsEl.append(add);
+    renderPanes();
+    const active = tabsEl.querySelector('.tab[aria-current="true"]');
+    if (active) active.scrollIntoView({ block: "nearest", inline: "nearest" });
+    tabsEdge();
+  };
+  const clearDropMarks = () => tabsEl.querySelectorAll(".drop-before, .drop-after").forEach((e) => e.classList.remove("drop-before", "drop-after"));
+  // Kaku's own order is per window; the page lists every window's tabs in a
+  // row, so a move is told to the Mac as an index within that window.
+  const moveTab = (from, to, after) => {
+    const same = tabs.filter((x) => x.window_id === from.window_id);
+    const rest = same.filter((x) => x !== from);
+    let idx = rest.indexOf(to) + (after ? 1 : 0);
+    if (same.indexOf(from) === idx) return;
+    rest.splice(idx, 0, from);
+    const others = tabs.filter((x) => x.window_id !== from.window_id);
+    const firstAt = tabs.findIndex((x) => x.window_id === from.window_id);
+    tabs = [...others.slice(0, firstAt), ...rest, ...others.slice(firstAt)];
+    renderTabs();
+    send({ type: "move_tab", tab_id: from.tab_id, index: idx });
+  };
+  const renameTab = (t, b, label) => {
+    if (renaming) return;
+    const input = document.createElement("input");
+    const initial = label.textContent;
+    input.value = initial;
+    input.spellcheck = false;
+    input.style.width = Math.max(4, initial.length + 1) + "ch";
+    renaming = t.tab_id;
+    label.replaceWith(input);
+    b.draggable = false;
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = (apply) => {
+      if (done) return;
+      done = true;
+      renaming = null;
+      const value = input.value.trim();
+      // Untouched leaves the computed title alone, as Kaku's editor does.
+      if (apply && value !== initial) {
+        t.title = value || t.title;
+        send({ type: "rename_tab", tab_id: t.tab_id, title: value });
+      }
+      renderTabs();
+      term.focus();
+    };
+    input.addEventListener("input", () => { input.style.width = Math.max(4, input.value.length + 1) + "ch"; });
+    input.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+      if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+      else if (ev.key === "Escape") { ev.preventDefault(); finish(false); }
     });
-    bar.insertBefore(add, statusEl);
+    input.addEventListener("blur", () => finish(true));
+    input.addEventListener("click", (ev) => ev.stopPropagation());
+    input.addEventListener("dblclick", (ev) => ev.stopPropagation());
+  };
+  // More tabs than fit: fade the side that has more, and a vertical wheel
+  // scrolls them sideways.
+  const tabsEdge = () => {
+    tabsEl.classList.toggle("more-left", tabsEl.scrollLeft > 2);
+    tabsEl.classList.toggle("more-right", tabsEl.scrollLeft + tabsEl.clientWidth < tabsEl.scrollWidth - 2);
+  };
+  tabsEl.addEventListener("scroll", tabsEdge, { passive: true });
+  new ResizeObserver(tabsEdge).observe(tabsEl);
+  tabsEl.addEventListener("wheel", (ev) => {
+    if (Math.abs(ev.deltaY) <= Math.abs(ev.deltaX)) return;
+    ev.preventDefault();
+    tabsEl.scrollLeft += ev.deltaY;
+  }, { passive: false });
+
+  // A tab split into panes shows its layout; click a pane to view it, which
+  // also focuses it on the Mac.
+  const panesTool = document.createElement("div");
+  panesTool.className = "tool panes";
+  panesTool.title = "Panes in this tab";
+  toolsEl.prepend(panesTool);
+  const renderPanes = () => {
+    const t = tabs.find((x) => x.tab_id === tabId);
+    const list = (t && t.panes) || [];
+    panesTool.style.display = list.length > 1 ? "flex" : "none";
+    panesTool.textContent = "";
+    if (list.length < 2) return;
+    const w = Math.max(...list.map((p) => p.left + p.width));
+    const h = Math.max(...list.map((p) => p.top + p.height));
+    const map = document.createElement("div");
+    map.className = "map";
+    for (const p of list) {
+      const box = document.createElement("button");
+      box.type = "button";
+      box.tabIndex = -1;
+      box.style.left = (p.left / w) * 100 + "%";
+      box.style.top = (p.top / h) * 100 + "%";
+      box.style.width = `calc(${(p.width / w) * 100}% - 1px)`;
+      box.style.height = `calc(${(p.height / h) * 100}% - 1px)`;
+      box.setAttribute("aria-current", String(p.pane_id === paneId));
+      box.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (p.pane_id !== paneId) {
+          paneChosen = { id: p.pane_id, until: Date.now() + 3000 };
+          attach({ tab_id: t.tab_id, pane_id: p.pane_id }, true);
+        }
+        else term.focus();
+      });
+      map.append(box);
+    }
+    panesTool.append(map);
   };
 
+  // Tab menu, in the page's own style.
+  const menuEl = document.getElementById("menu");
+  const closeMenu = () => menuEl.classList.remove("show");
+  const openMenu = (x, y, items) => {
+    menuEl.textContent = "";
+    for (const item of items) {
+      if (!item) { menuEl.append(document.createElement("hr")); continue; }
+      const mb = document.createElement("button");
+      mb.type = "button";
+      mb.textContent = item[0];
+      mb.addEventListener("click", () => { closeMenu(); item[1](); });
+      menuEl.append(mb);
+    }
+    menuEl.classList.add("show");
+    const r = menuEl.getBoundingClientRect();
+    menuEl.style.left = Math.max(8, Math.min(x, innerWidth - r.width - 8)) + "px";
+    menuEl.style.top = Math.max(8, Math.min(y, innerHeight - r.height - 8)) + "px";
+  };
+  document.addEventListener("pointerdown", (ev) => { if (!menuEl.contains(ev.target)) closeMenu(); }, true);
+  window.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && menuEl.classList.contains("show")) { ev.preventDefault(); ev.stopPropagation(); closeMenu(); } }, true);
+  window.addEventListener("blur", closeMenu);
+
+  const closePane = target => {
+    const tab = tabs.find(t => t.pane_id === target || (t.panes || []).some(p => p.pane_id === target));
+    if (!tab) return;
+    if (!tab.panes || tab.panes.length < 2) { closeTab(tab); return; }
+    const pane = tab.panes.find(p => p.pane_id === target);
+    const go = () => send({ type: "close_pane", pane_id: target });
+    if (pane?.confirm_close !== false) askClose(tab.title || "Pane", "pane").then(ok => { if (ok) go(); });
+    else go();
+  };
+  stage.addEventListener("contextmenu", ev => {
+    if (findEl.contains(ev.target) || !termEl.contains(ev.target) && !pastEl.contains(ev.target)) return;
+    // Keep the phone's native selection handles and Copy menu.
+    if (TOUCH || paneId === null) return;
+    ev.preventDefault();
+    const target = paneId;
+    const selected = pastOpen ? historySelection() : term.getSelection();
+    const items = [];
+    if (selected) items.push(["Copy", () => {
+      pendingCopy = null;
+      if (!navigator.clipboard) { toast("Use the keyboard shortcut to copy"); return; }
+      navigator.clipboard.writeText(selected).catch(() => toast("Use the keyboard shortcut to copy"));
+    }]);
+    items.push(["Paste", async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (paneId !== target) { toast("Pane changed. Paste again in the target pane."); return; }
+        pasteText(text);
+        term.focus();
+      } catch (_) { toast("Use the keyboard shortcut to paste"); }
+    }], ["Search", openFind], null);
+    for (const direction of ["Left", "Right", "Up", "Down"]) {
+      items.push(["Split " + direction, () => send({ type: "split_pane", pane_id: target, direction })]);
+    }
+    items.push(null, ["Close Pane", () => closePane(target)]);
+    openMenu(ev.clientX, ev.clientY, items);
+  });
+
+  // After picking a split in the page, the Mac reports its new focused
+  // pane a moment later; until then the old one is not a reason to follow.
+  let paneChosen = { id: null, until: 0 };
   const onTabs = (list) => {
     tabs = list;
+    const livePanes = new Set(tabs.flatMap(t => (t.panes?.length ? t.panes : [{ pane_id: t.pane_id }]).map(p => p.pane_id)));
+    for (const id of snapshots.keys()) if (!livePanes.has(id)) snapshots.delete(id);
+    attentionTabs = tabs.some((t) => (t.title || "").endsWith("\u2022"));
+    renderTitle();
     if (followNewTab) {
       const fresh = tabs.find((t) => !followNewTab.has(t.tab_id));
       if (fresh) { followNewTab = null; attach(fresh); return; }
@@ -378,8 +1584,8 @@
       try { saved = Number(localStorage.getItem("kaku.tab")); } catch (_) {}
       const target = tabs.find((t) => t.tab_id === saved) || tabs.find((t) => t.active) || tabs[0];
       if (target) attach(target);
-      else { renderTabs(); setStatus("No tabs"); }
-    } else if (current.pane_id !== paneId) {
+      else { renderTabs(); setNotice("No tabs open", "Open one with the + button."); }
+    } else if (current.pane_id !== paneId && !(paneChosen.id === paneId && Date.now() < paneChosen.until && (current.panes || []).some((p) => p.pane_id === paneId))) {
       // Follow the tab when focus moves to another split on the Mac.
       attach(current);
     } else {
@@ -387,7 +1593,9 @@
     }
   };
 
+  let copyOnSelect = true;
   const onConfig = (cfg) => {
+    copyOnSelect = cfg.copy_on_select !== false;
     const theme = {};
     if (cfg.background) { theme.background = cfg.background; document.documentElement.style.setProperty("--bg", cfg.background); }
     if (cfg.foreground) { theme.foreground = cfg.foreground; document.documentElement.style.setProperty("--fg", cfg.foreground); }
@@ -402,6 +1610,19 @@
     }
     if (cfg.line_height) term.options.lineHeight = cfg.line_height;
     document.body.classList.toggle("tabs-bottom", !!cfg.tab_bar_at_bottom);
+    const root = document.documentElement.style;
+    root.setProperty("--mono", term.options.fontFamily);
+    // Kaku's retro tab bar draws titles in the terminal font at its size,
+    // so the page's tabs use the same size as its terminal text.
+    if (cfg.font_size && !TOUCH) root.setProperty("--bar-font", Math.max(12, cfg.font_size - 1) + "px");
+    const bar = cfg.tab_bar || {};
+    // Kaku's attention dot: gold on the dark theme, darker on the light one.
+    const light = /^#fffcf0$/i.test(bar.background || "");
+    root.setProperty("--dot", light ? "#AD8301" : "#daae76");
+    for (const [name, value] of [["--bar-bg", bar.background], ["--tab-active-bg", bar.active_bg], ["--tab-active-fg", bar.active_fg],
+      ["--tab-fg", bar.inactive_fg], ["--tab-hover-bg", bar.hover_bg], ["--tab-hover-fg", bar.hover_fg]]) {
+      if (value) root.setProperty(name, value);
+    }
     // One pixel under Kaku's size reads closer to the native window.
     if (cfg.font_size) { baseFontSize = Math.max(8, cfg.font_size - 1); fontSize = baseFontSize; term.options.fontSize = fontSize; }
     // xterm.js measures cells only when a font option changes, so once the
@@ -414,22 +1635,313 @@
   };
 
   const onFrame = (msg) => {
+    const socket = ws;
+    if (msg.pane_id !== paneId) {
+      if (msg.seq) send({ type: "frame_ack", seq: msg.seq });
+      return;
+    }
+    document.body.classList.add("drawn");
     if (msg.cols !== size.cols || msg.rows !== size.rows) {
-      size = { cols: msg.cols, rows: msg.rows };
-      term.resize(msg.cols, msg.rows);
+      closePast();
+        size = { cols: msg.cols, rows: msg.rows };
+      resizeTerm(msg.cols, msg.rows);
       fit();
     }
-    term.write(msg.data);
-    historyBtn.style.display = msg.scrolled ? "block" : "none";
-    document.title = msg.title ? msg.title + " - Kaku" : "Kaku";
+    localScroll = !!msg.local_scroll;
+    if (!localScroll) closePast();
+    // Autowrap off first: each row is placed by position, so a row that
+    // xterm measures one cell wider than Kaku (a glyph whose width the two
+    // disagree on) must overwrite its last cell, not wrap. Wrapping on the
+    // last row scrolled the whole screen, and every later frame then drew
+    // over a shifted copy: stale rows stayed until a reload.
+    term.write(NO_WRAP + msg.data, () => {
+      if (ws !== socket) return;
+      if (msg.pane_id === paneId) markFound();
+      if (msg.seq) send({ type: "frame_ack", seq: msg.seq });
+    });
+    serverScrolled = !!msg.scrolled;
+    showHistoryButton();
+    // A title that already names Kaku (a cwd called kaku) is not repeated.
+    const t = (msg.title || "").trim();
+    baseTitle = !t ? "Kaku" : /\bkaku\b/i.test(t) ? t : t + " - Kaku";
+    renderTitle();
   };
 
+  // A program in the pane copied text (OSC 52). Browsers only let a focused
+  // page write the clipboard, so a copy that arrives while it is not focused
+  // is written on the next focus or press.
+  let pendingCopy = null;
+  const copyToClipboard = (text) => {
+    if (!navigator.clipboard) return;
+    pendingCopy = text;
+    navigator.clipboard.writeText(text).then(() => { if (pendingCopy === text) pendingCopy = null; }).catch(() => {});
+  };
+  const flushCopy = () => { if (pendingCopy !== null) copyToClipboard(pendingCopy); };
+  window.addEventListener("focus", flushCopy);
+  document.addEventListener("pointerdown", flushCopy, true);
+
+  // Complete a selection locally, with no Mac or relay round-trip. A denied
+  // automatic copy must not overwrite the clipboard on an unrelated later tap.
+  const historySelection = () => {
+    const selection = getSelection();
+    if (!pastOpen || !selection?.rangeCount || selection.isCollapsed) return "";
+    const range = selection.getRangeAt(0);
+    if (!pastEl.contains(range.startContainer) || !pastEl.contains(range.endContainer)) return "";
+    const selected = [...pastRendered].filter(([, row]) => range.intersectsNode(row)).sort((a, b) => a[0] - b[0]);
+    if (!selected.length) return "";
+    const first = selected[0][0], last = selected.at(-1)[0];
+    const lines = [];
+    for (let id = first; id <= last; id++) {
+      const row = pastRendered.get(id);
+      if (row && (id === first || id === last)) {
+        const part = document.createRange();
+        part.selectNodeContents(row);
+        if (row.contains(range.startContainer)) part.setStart(range.startContainer, range.startOffset);
+        if (row.contains(range.endContainer)) part.setEnd(range.endContainer, range.endOffset);
+        lines.push(part.toString());
+      } else lines.push((pastRows[id - pastTop] || "").replace(SEQ, ""));
+    }
+    return lines.join("\n");
+  };
+  let selectionGesture = false;
+  let lastAutoCopy = "";
+  const copySelection = () => {
+    if (!copyOnSelect) return;
+    const text = pastOpen ? historySelection() : term.getSelection();
+    if (!text || text === lastAutoCopy) return;
+    lastAutoCopy = text;
+    pendingCopy = null;
+    navigator.clipboard?.writeText(text).catch(() => {});
+  };
+  stage.addEventListener("pointerdown", ev => {
+    if (ev.button !== 0) return;
+    selectionGesture = true;
+    lastAutoCopy = "";
+  });
+  // xterm finishes its selection on document mouseup; window runs after it.
+  window.addEventListener("mouseup", ev => {
+    if (ev.button !== 0 || !selectionGesture) return;
+    selectionGesture = false;
+    copySelection();
+  });
+  window.addEventListener("touchend", () => {
+    if (selectionGesture) { selectionGesture = false; if (!touchMoved) copySelection(); }
+  }, { passive: true });
+  window.addEventListener("pointercancel", () => { selectionGesture = false; });
+  document.addEventListener("selectionchange", () => {
+    if (TOUCH && pastOpen && !selectionGesture) copySelection();
+  });
+  // Absolute-positioned history rows need explicit line breaks, including
+  // rows outside the virtual DOM between the selected endpoints.
+  document.addEventListener("copy", ev => {
+    const text = historySelection();
+    if (!text || !ev.clipboardData) return;
+    ev.clipboardData.setData("text/plain", text);
+    ev.preventDefault();
+  });
+
+  // While this page is in the background, a Kaku tab that wants attention
+  // (a finished task's bell) marks the browser tab's title.
+  let baseTitle = "Kaku";
+  let attentionTabs = false;
+  const renderTitle = () => {
+    const away = document.hidden || !document.hasFocus();
+    document.title = (attentionTabs && away ? "\u25cf " : "") + baseTitle;
+  };
+  window.addEventListener("focus", renderTitle);
+  window.addEventListener("blur", renderTitle);
+  document.addEventListener("visibilitychange", renderTitle);
+
+  // Find: Cmd+F (Ctrl+Shift+F off the Mac) searches the pane's whole
+  // history on the Mac; Enter goes to older matches, Shift+Enter to newer.
+  const findEl = document.getElementById("find");
+  const findInput = findEl.querySelector("input");
+  const findCount = findEl.querySelector(".count");
+  let lastQuery = "";
+  let pendingMark = null;
+  const markFound = () => {
+    if (!pendingMark) return;
+    const { row, col, len } = pendingMark;
+    pendingMark = null;
+    term.select(col, term.buffer.active.viewportY + row, len);
+  };
+  const findStep = (older) => {
+    const query = findInput.value;
+    if (!query) return;
+    const restart = query !== lastQuery;
+    lastQuery = query;
+    send({ type: "search", query, older, restart });
+  };
+  const openFind = () => {
+    closePast();
+    findEl.classList.add("show");
+    findInput.focus();
+    findInput.select();
+  };
+  const closeFind = () => {
+    if (!findEl.classList.contains("show")) return;
+    findEl.classList.remove("show");
+    findCount.textContent = "";
+    lastQuery = "";
+    term.clearSelection();
+    send({ type: "scroll", lines: -1e9 });
+    term.focus();
+  };
+  findInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); findStep(!ev.shiftKey); }
+    else if (ev.key === "Escape") { ev.preventDefault(); closeFind(); }
+    ev.stopPropagation();
+  });
+  findEl.addEventListener("click", (ev) => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    if (b.dataset.dir === "close") closeFind();
+    else { findStep(b.dataset.dir === "older"); findInput.focus(); }
+  });
+  const onFound = (msg) => {
+    if (!msg.found) { findCount.textContent = "No results"; return; }
+    findCount.textContent = "";
+    pendingMark = msg;
+    // The view moves on the next frame; mark after it, or now if the match
+    // was already on screen and no frame comes.
+    setTimeout(markFound, 250);
+  };
+  const isFindKey = (ev) => ev.code === "KeyF" && !ev.altKey &&
+    (IS_MAC ? ev.metaKey && !ev.ctrlKey && !ev.shiftKey : ev.ctrlKey && ev.shiftKey && !ev.metaKey);
+  window.addEventListener("keydown", (ev) => {
+    if (isFindKey(ev)) { ev.preventDefault(); ev.stopPropagation(); openFind(); }
+  }, true);
+
+  // Send files to the Mac: drop them on the terminal or paste an image. Each
+  // goes in 64 KB chunks over the same sealed channel, lands in
+  // ~/Downloads/Kaku, and its path is pasted into the pane.
+  const toastEl = document.getElementById("toast");
+  let toastTimer = 0;
+  const toast = (text, stay = false) => {
+    clearTimeout(toastTimer);
+    toastEl.textContent = text;
+    toastEl.classList.add("show");
+    if (!stay) toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2500);
+  };
+  let uploadSeq = 0;
+  const uploadWaiters = new Map();
+  const CHUNK = 64 * 1024;
+  const toBase64 = (buf) => {
+    let s = "";
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  };
+  // Each chunk is acknowledged by the Mac after it is written; the percentage is
+  // what reached the Mac. A link that drops mid-file reconnects and sends the
+  // file again (the Mac discards the partial one), and a file that still
+  // cannot go says so instead of sitting at 0%.
+  const uploadAcks = new Map();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const openSocket = async () => {
+    for (let i = 0; i < 150; i++) {
+      if (ws && ws.readyState === WebSocket.OPEN && paneId !== null) return ws;
+      await sleep(200);
+    }
+    return null;
+  };
+  const sendOnce = async (file, name, socket, transfer, target) => {
+    const id = ++uploadSeq;
+    let finishLost;
+    const lost = new Promise(resolve => { finishLost = () => resolve(null); });
+    socket.addEventListener("close", finishLost, { once: true });
+    const done = new Promise(resolve => uploadWaiters.set(id, resolve));
+    let result = null;
+    done.then(value => { result = value; });
+    let timer;
+    const wait = async (promises, ms) => {
+      try {
+        return await Promise.race([...promises, lost, new Promise(resolve => { timer = setTimeout(() => resolve(null), ms); })]);
+      } finally { clearTimeout(timer); }
+    };
+    try {
+      send({ type: "upload_start", id, name, size: file.size, transfer, pane_id: target });
+      // Eight small chunks in flight keep the original 512 KB window while
+      // giving interactive keys a chance between chunks on the shared link.
+      for (let off = 0; off < file.size; off += CHUNK * 8) {
+        const end = Math.min(file.size, off + CHUNK * 8);
+        const acked = new Promise(resolve => uploadAcks.set(id, received => {
+          toast(`Sending ${name} ${Math.round((received / file.size) * 100)}%`, true);
+          if (received >= end) resolve(received);
+        }));
+        for (let pos = off; pos < end; pos += CHUNK) {
+          const data = toBase64(await file.slice(pos, Math.min(pos + CHUNK, end)).arrayBuffer());
+          if (result || ws !== socket || socket.readyState !== WebSocket.OPEN) return result;
+          send({ type: "upload_chunk", id, data });
+        }
+        const received = await wait([acked, done], 30000);
+        if (result) return result;
+        if (received === null || ws !== socket) return null;
+      }
+      send({ type: "upload_end", id });
+      return await wait([done], 60000);
+    } finally {
+      socket.removeEventListener("close", finishLost);
+      uploadWaiters.delete(id);
+      uploadAcks.delete(id);
+      if (ws === socket && socket.readyState === WebSocket.OPEN) send({ type: "upload_cancel", id });
+    }
+  };
+  const sendFile = async (file, name, target = paneId) => {
+    if (file.size > 50 * 1024 * 1024) { toast(`${name} is larger than 50 MB`); return; }
+    const transfer = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      toast(attempt ? `Reconnecting to send ${name}` : `Sending ${name} 0%`, true);
+      const socket = await openSocket();
+      if (!socket) break;
+      const result = await sendOnce(file, name, socket, transfer, target);
+      if (result) {
+        toast(result.ok ? `Sent to ${result.detail.replace(/^\/Users\/[^/]+/, "~")}` : `Not sent: ${result.detail}`);
+        return;
+      }
+    }
+    toast(`Not sent: ${name}, the connection dropped. Try again.`);
+  };
+  const pastedName = (file) => {
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+    const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
+    return `pasted-${stamp}.${ext}`;
+  };
+  const sendFiles = async (files, pasted) => {
+    const target = paneId;
+    for (const f of files) await sendFile(f, pasted ? pastedName(f) : f.name, target);
+    term.focus();
+  };
+  stage.addEventListener("dragover", (ev) => {
+    if (![...(ev.dataTransfer?.types || [])].includes("Files")) return;
+    ev.preventDefault();
+    document.body.classList.add("dropping");
+  });
+  stage.addEventListener("dragleave", () => document.body.classList.remove("dropping"));
+  stage.addEventListener("drop", (ev) => {
+    document.body.classList.remove("dropping");
+    const files = [...(ev.dataTransfer?.files || [])];
+    if (!files.length) return;
+    ev.preventDefault();
+    sendFiles(files, false);
+  });
+
   const handle = (msg) => {
-    if (msg.type === "config") onConfig(msg);
+    if (msg.type === "error") toast(msg.detail);
+    else if (msg.type === "config") onConfig(msg);
     else if (msg.type === "tabs") onTabs(msg.tabs);
-    else if (msg.type === "frame") onFrame(msg);
+    else if (msg.type === "frame") { framesSeen++; onFrame(msg); }
+    else if (msg.type === "clipboard") copyToClipboard(msg.text);
+    else if (msg.type === "found") onFound(msg);
+    else if (msg.type === "history") onHistory(msg);
+    else if (msg.type === "upload_ack") { const a = uploadAcks.get(msg.id); if (a) a(msg.received); }
+    else if (msg.type === "uploaded") { const w = uploadWaiters.get(msg.id); if (w) { uploadWaiters.delete(msg.id); w(msg); } }
     else if (msg.type === "closed") {
+      // A tabs update may already have moved the page to another tab; the
+      // late notice for the old pane must not drop the tab it moved to.
+      if (msg.pane_id !== paneId) return;
       const gone = paneId;
+      snapshots.delete(gone);
       tabId = null;
       paneId = null;
       onTabs(tabs.filter((t) => t.pane_id !== gone));
@@ -452,35 +1964,100 @@
     send({ type: "ping" });
   }, 20000);
 
+  // Through the relay the page's own address answers 404 while the Mac's
+  // Kaku is not connected, and fails outright without a network.
+  const explainOffline = () => {
+    if (!keyPromise) {
+      setNotice("Kaku is not running", "This page reconnects when it is back.", { stale: true, brand: true });
+      return;
+    }
+    fetch(location.pathname, { method: "HEAD", cache: "no-store" }).then((res) => {
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+      if (res.status === 404) setNotice("Kaku on the Mac is offline", "This page reconnects when it is back.", { stale: true, brand: true });
+    }).catch(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+      setNotice("No connection", "Check this device's network. Retrying.", { stale: true });
+    });
+  };
+  let reconnectTimer = 0;
+  let linkRejected = false;
+  let handshakeTimer = 0;
   const connect = () => {
-    setStatus("Connecting");
+    clearTimeout(reconnectTimer);
+    clearTimeout(handshakeTimer);
+    if (linkRejected) return;
+    if (!everConnected) setNotice("Connecting to Kaku", "", { delay: 400 });
     const socket = new WebSocket(wsUrl());
     socket.binaryType = "arraybuffer";
     ws = socket;
+    handshakeTimer = setTimeout(() => { if (ws === socket) socket.close(); }, 20000);
     lastHeard = Date.now();
     pingSentAt = 0;
+    framesSeen = 0;
     sendChain = Promise.resolve();
     recvChain = Promise.resolve();
     socket.onopen = () => {
-      retry = 0;
-      setStatus("");
+      // A WebSocket upgrade is not an authenticated Kaku session.
       // Through the relay, Kaku starts the session only after this first
       // message opens with the key.
-      if (keyPromise) send({ type: "hello" });
+      send({ type: "hello", frame_ack: true });
       // Re-attach after a reconnect; the server keeps no per-browser state.
       if (paneId !== null) send({ type: "attach", pane_id: paneId });
     };
-    socket.onmessage = (ev) => { lastHeard = Date.now(); receive(ev.data, handle); };
+    socket.onmessage = (ev) => {
+      if (ws !== socket) return;
+      receive(ev.data, (msg) => {
+        if (ws !== socket) return;
+        lastHeard = Date.now();
+        if (msg.type === "config" || msg.type === "tabs" || msg.type === "frame" || msg.type === "pong") {
+          clearTimeout(handshakeTimer);
+          retry = 0;
+          everConnected = true;
+          clearNotice();
+        }
+        handle(msg);
+      });
+    };
     socket.onclose = (ev) => {
       if (ws !== socket) return;
-      if (ev.code === 4404) setStatus("This Kaku is offline");
-      else setStatus("Disconnected, retrying");
+      clearTimeout(handshakeTimer);
+      closePast();
+      if (ev.code === 4403 || ev.code === 1008) {
+        linkRejected = true;
+        try { sessionStorage.removeItem(SECRET_SLOT); } catch (_) {}
+        setNotice("This link no longer works", "Copy the current link from Kaku on the Mac.", { stale: true });
+        return;
+      }
+      // A quick blip reconnects before anyone notices; say something only if
+      // it lasts, and after a few failures say why when the page can tell.
+      setNotice("Reconnecting", "", { stale: true, delay: retry ? 0 : 800 });
+      if (retry >= 2) explainOffline();
       claimed = "";
       const delay = Math.min(5000, 500 * 2 ** retry++);
-      setTimeout(connect, delay);
+      reconnectTimer = setTimeout(connect, delay);
     };
   };
   connect();
+
+  // Phones suspend a page in the background and its socket often dies
+  // there. On return, reconnect at once, or check the link with a ping
+  // instead of waiting out the heartbeat.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || linkRejected) return;
+    reclaim();
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      retry = 0;
+      connect();
+      return;
+    }
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const socket = ws;
+    pingSentAt = Date.now();
+    send({ type: "ping" });
+    setTimeout(() => {
+      if (ws === socket && pingSentAt > lastHeard) socket.close();
+    }, 3000);
+  });
 })();
 </script>
 </body>

@@ -6,6 +6,7 @@ use termwiz::cell::CellAttributes;
 use termwiz::color::ColorSpec as TWColorSpec;
 pub use termwiz::color::{AnsiColor, ColorAttribute, RgbColor, SrgbaTuple};
 use wezterm_dynamic::{FromDynamic, ToDynamic};
+pub use wezterm_term::color::is_light_color;
 use wezterm_term::color::ColorPalette;
 
 #[derive(Debug, Copy, Clone, FromDynamic, ToDynamic)]
@@ -720,14 +721,6 @@ fn default_button_hover_bg() -> RgbaColor {
 
 fn default_button_bg() -> RgbaColor {
     RgbColor::new_8bpc(0x33, 0x33, 0x33).into()
-}
-
-/// True when an sRGB color reads as visually light using YIQ-style luminance.
-/// Shared so window-chrome decisions (NSAppearance) and renderer decisions
-/// (text contrast, glyph weight) cannot drift apart.
-pub fn is_light_color(color: &SrgbaTuple) -> bool {
-    let luminance = 0.299 * color.0 + 0.587 * color.1 + 0.114 * color.2;
-    luminance > 0.5
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq, FromDynamic, ToDynamic)]

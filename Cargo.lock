@@ -3042,6 +3042,8 @@ dependencies = [
  "getrandom 0.3.4",
  "log",
  "mux",
+ "objc2",
+ "objc2-foundation",
  "parking_lot",
  "promise",
  "qrcode",

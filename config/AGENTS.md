@@ -40,6 +40,8 @@ The AI config TUI lives in the `kaku` CLI crate and shares terminal UI primitive
 
 - Loading priority: user config first, bundled config second.
 - Keep reload-safe behavior for startup hooks and subscriptions.
+- `color::is_light_color` re-exports the terminal core's classification so `COLORFGBG`, window chrome and DEC mode 2031 reports use the same palette policy. Keep that shared policy when changing color classification.
+- After mutating a live `TermConfig` client palette, call `pane.set_config(config)` so the terminal compares its subscribed palette snapshot and emits mode 2031 notifications. Updating only the provider bypasses the terminal's reload boundary.
 - `KAKU_CONFIG_FILE` is an output, not an input. Config loading exports it (`config/src/config.rs`) and `effective_config_file_path()` (`config/src/lib.rs`), the GUI single-instance check (`kaku-gui/src/main.rs`), `assets/shell-integration/setup_{zsh,fish}.sh`, and the bundled `kaku.lua` all read it back. Do not turn it into a config path override; the only supported override is `--config-file` (`CONFIG_FILE_OVERRIDE`).
 - Keep bundled fallback config authoritative at `assets/macos/Kaku.app/Contents/Resources/kaku.lua`.
 - Kaku Dark, Kaku Light, and the Kaku Theme alias must also resolve for standalone user configs that do not load the bundled Lua defaults. Their `src/scheme_data.rs` mirrors are checked against every bundled palette field by `builtin_kaku_scheme_mirrors_match_complete_bundled_palettes`; synchronize both when changing a Kaku palette.

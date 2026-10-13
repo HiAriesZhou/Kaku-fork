@@ -19,11 +19,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
+mod awake;
 mod share;
 mod web;
 
 pub use share::{load_or_create_identity, reset_identity, ShareIdentity};
-pub use web::{publish_tab_title, set_tab_action_handler, TabAction, TabActionHandler};
+pub use web::{
+    publish_tab_title, release_web_size, set_tab_action_handler, tab_is_web_sized,
+    window_relayout_resizes_tab, TabAction, TabActionHandler,
+};
 
 // ── Token ─────────────────────────────────────────────────────────────────────
 
@@ -216,11 +220,24 @@ struct ConfigInfo {
     font_family: String,
     font_size: f64,
     line_height: f64,
+    copy_on_select: bool,
     /// Where Kaku draws its tab bar, so the page puts its tabs there too.
     tab_bar_at_bottom: bool,
+    /// Kaku's tab bar colors, so the page's tabs look like the window's.
+    tab_bar: Option<TabBarInfo>,
     /// Capability flags for the iOS client. Currently emits "ai_chat" when an
     /// AI handler is registered at boot.
     features: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TabBarInfo {
+    background: Option<String>,
+    active_bg: Option<String>,
+    active_fg: Option<String>,
+    inactive_fg: Option<String>,
+    hover_bg: Option<String>,
+    hover_fg: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -427,7 +444,22 @@ fn config_info() -> ConfigInfo {
         font_family,
         font_size: cfg.font_size,
         line_height: cfg.line_height,
+        copy_on_select: cfg.copy_on_select,
         tab_bar_at_bottom: cfg.tab_bar_at_bottom,
+        tab_bar: palette.tab_bar.as_ref().map(|bar| TabBarInfo {
+            background: opt_hex(bar.background.as_ref()),
+            active_bg: bar.active_tab.as_ref().map(|t| rgba_to_hex(&t.bg_color)),
+            active_fg: bar.active_tab.as_ref().map(|t| rgba_to_hex(&t.fg_color)),
+            inactive_fg: bar.inactive_tab.as_ref().map(|t| rgba_to_hex(&t.fg_color)),
+            hover_bg: bar
+                .inactive_tab_hover
+                .as_ref()
+                .map(|t| rgba_to_hex(&t.bg_color)),
+            hover_fg: bar
+                .inactive_tab_hover
+                .as_ref()
+                .map(|t| rgba_to_hex(&t.fg_color)),
+        }),
         features,
     }
 }
@@ -816,6 +848,13 @@ pub fn start() {
                         senders_for_sub.clone(),
                         throttle_for_sub.clone(),
                     );
+                }
+                MuxNotification::AssignClipboard {
+                    pane_id,
+                    clipboard: Some(text),
+                    ..
+                } => {
+                    web::publish_clipboard((*pane_id).into(), text.clone());
                 }
                 MuxNotification::PaneRemoved(pane_id) => {
                     let id: usize = (*pane_id).into();

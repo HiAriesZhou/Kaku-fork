@@ -460,6 +460,25 @@ impl crate::TermWindow {
                 Some(top) => top..top + dims.viewport_rows as StableRowIndex,
                 None => dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex,
             };
+            // A browser can size the tab taller than this window. Draw the rows
+            // that fit, keeping the bottom where the cursor and newest output
+            // are, instead of running over the tab bar. Only for web-sized tabs:
+            // a window mid-resize briefly has the same mismatch and must not jump.
+            #[cfg(feature = "remote")]
+            let stable_range = {
+                let fits = (self.terminal_size.rows as isize - pos.top as isize).max(0);
+                let overflow = dims.viewport_rows as isize - fits;
+                let web_sized = || {
+                    mux::Mux::get()
+                        .resolve_pane_id(pane_id)
+                        .is_some_and(|(_, _, tab_id)| kaku_remote::tab_is_web_sized(tab_id.into()))
+                };
+                if overflow > 0 && web_sized() {
+                    (stable_range.start + overflow)..stable_range.end
+                } else {
+                    stable_range
+                }
+            };
 
             pos.pane
                 .apply_hyperlinks(stable_range.clone(), &self.config.hyperlink_rules);

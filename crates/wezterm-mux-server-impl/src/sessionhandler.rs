@@ -924,7 +924,10 @@ impl SessionHandler {
 
                             match pane.get_config() {
                                 Some(config) => match config.downcast_ref::<TermConfig>() {
-                                    Some(tc) => tc.set_client_palette(palette),
+                                    Some(tc) => {
+                                        tc.set_client_palette(palette);
+                                        pane.set_config(config);
+                                    }
                                     None => {
                                         log::error!(
                                             "pane {pane_id} doesn't \

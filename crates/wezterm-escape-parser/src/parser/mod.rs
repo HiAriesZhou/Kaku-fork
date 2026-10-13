@@ -366,6 +366,39 @@ mod test {
         String::from_utf8(res).unwrap()
     }
 
+    #[test]
+    fn color_scheme_requests_round_trip() {
+        for (input, expected) in [
+            (
+                "\x1b[?996n",
+                CSI::Device(Box::new(Device::RequestColorScheme)),
+            ),
+            (
+                "\x1b[?2031h",
+                CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                    DecPrivateModeCode::ColorSchemeReporting,
+                ))),
+            ),
+            (
+                "\x1b[?2031l",
+                CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                    DecPrivateModeCode::ColorSchemeReporting,
+                ))),
+            ),
+            (
+                "\x1b[?2031$p",
+                CSI::Mode(Mode::QueryDecPrivateMode(DecPrivateMode::Code(
+                    DecPrivateModeCode::ColorSchemeReporting,
+                ))),
+            ),
+            ("\x1b[5n", CSI::Device(Box::new(Device::StatusReport))),
+        ] {
+            let actions = Parser::new().parse_as_vec(input.as_bytes());
+            assert_eq!(actions, vec![Action::CSI(expected)]);
+            assert_eq!(encode(&actions), input);
+        }
+    }
+
     // <https://github.com/markbt/streampager/issues/57>
     #[test]
     fn osc_bel_parse_first_as_vec() {

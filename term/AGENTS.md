@@ -16,6 +16,7 @@
 ## Practical Rules
 
 - Keep GUI assumptions out of terminal core.
+- Color scheme reporting uses pane-local DEC mode 2031 and DSR 996/997. Notify subscribers after effective configuration palette changes, including same-mode palette changes, and answer subsequent OSC color queries from the new palette. Reloads with an unchanged effective palette and application-issued OSC color writes do not notify; cancellation, RIS and DECSTR clear the subscription. `color::is_light_color` is shared with config/window chrome so the reported scheme stays consistent with Kaku's colors.
 - Keep normal-screen and alternate-screen behavior distinct; wheel scrolling and inline AI status must not corrupt terminal state.
 - Preserve selection and cursor invariants that GUI overlays and inline assistant status depend on.
 - Only the terminal wrap attribute proves that physical rows form one logical line. Full-width output followed by text in column zero can still be independent commands. Keep both indented and unindented hard-newline regressions, alongside soft-wrap coverage, when changing hyperlink grouping (#547).

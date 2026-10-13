@@ -1,5 +1,100 @@
 use super::*;
+use crate::color::SrgbaTuple;
 use k9::assert_equal as assert_eq;
+
+#[derive(Debug)]
+struct ThemeConfig(Arc<Mutex<ColorPalette>>);
+
+impl TerminalConfiguration for ThemeConfig {
+    fn color_palette(&self) -> ColorPalette {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+fn theme_config(background: SrgbaTuple) -> Arc<ThemeConfig> {
+    let mut palette = ColorPalette::default();
+    palette.background = background;
+    Arc::new(ThemeConfig(Arc::new(Mutex::new(palette))))
+}
+
+#[test]
+fn color_scheme_query_reports_the_terminal_palette() {
+    let writer = SharedWriter::default();
+    let mut term = TestTerm::new_with_writer(4, 40, 0, Box::new(writer.clone()));
+    term.set_config(theme_config(SrgbaTuple(0., 0., 0., 1.)));
+    term.print("\x1b[?2031$p\x1b[?996n");
+    wait_for_writer_output(&writer, b"\x1b[?2031;2$y\x1b[?997;1n");
+    writer.clear();
+    term.set_config(theme_config(SrgbaTuple(1., 1., 1., 1.)));
+    term.print("\x1b[?996n");
+    wait_for_writer_output(&writer, b"\x1b[?997;2n");
+}
+
+#[test]
+fn color_scheme_subscription_notifies_after_reload_with_fresh_colors() {
+    let writer = SharedWriter::default();
+    let mut term = TestTerm::new_with_writer(4, 40, 0, Box::new(writer.clone()));
+    // A live provider can change before set_config is called. Compare against
+    // the subscribed snapshot, rather than reading old colors from that provider.
+    let config = theme_config(SrgbaTuple(0., 0., 0., 1.));
+    term.set_config(config.clone());
+    term.print("\x1b[?2031h\x1b[?2031$p");
+    wait_for_writer_output(&writer, b"\x1b[?2031;1$y");
+    writer.clear();
+    config.0.lock().unwrap().background = SrgbaTuple(1., 1., 1., 1.);
+    term.set_config(config.clone());
+    term.print("\x1b]11;?\x1b\\");
+    wait_for_writer_output(&writer, b"\x1b[?997;2n\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+    writer.clear();
+    term.set_config(config);
+    term.print("\x1b[?2031$p");
+    wait_for_writer_output(&writer, b"\x1b[?2031;1$y");
+}
+
+#[test]
+fn color_scheme_subscription_covers_palette_changes_without_a_mode_flip() {
+    let writer = SharedWriter::default();
+    let mut term = TestTerm::new_with_writer(4, 40, 0, Box::new(writer.clone()));
+    let config = theme_config(SrgbaTuple(0., 0., 0., 1.));
+    term.set_config(config.clone());
+    term.print("\x1b[?2031h");
+    config.0.lock().unwrap().colors.0[4] = SrgbaTuple(1., 0., 0., 1.);
+    term.set_config(config);
+    wait_for_writer_output(&writer, b"\x1b[?997;1n");
+}
+
+#[test]
+fn color_scheme_subscription_is_per_pane_and_can_be_cancelled_or_reset() {
+    for reset in ["\x1b[?2031l", "\x1bc", "\x1b[!p"] {
+        let writer = SharedWriter::default();
+        let other_writer = SharedWriter::default();
+        let mut term = TestTerm::new_with_writer(4, 40, 0, Box::new(writer.clone()));
+        let mut other = TestTerm::new_with_writer(4, 40, 0, Box::new(other_writer.clone()));
+        let dark = theme_config(SrgbaTuple(0., 0., 0., 1.));
+        term.set_config(dark.clone());
+        other.set_config(dark);
+        term.print("\x1b[?2031h");
+        let light = theme_config(SrgbaTuple(1., 1., 1., 1.));
+        term.set_config(light.clone());
+        other.set_config(light);
+        wait_for_writer_output(&writer, b"\x1b[?997;2n");
+        other.print("\x1b[?2031$p");
+        wait_for_writer_output(&other_writer, b"\x1b[?2031;2$y");
+        writer.clear();
+        term.print(reset);
+        term.set_config(theme_config(SrgbaTuple(0., 0., 0., 1.)));
+        term.print("\x1b[?2031$p");
+        wait_for_writer_output(&writer, b"\x1b[?2031;2$y");
+    }
+}
+
+#[test]
+fn color_scheme_subscription_does_not_echo_application_color_updates() {
+    let writer = SharedWriter::default();
+    let mut term = TestTerm::new_with_writer(4, 40, 0, Box::new(writer.clone()));
+    term.print("\x1b[?2031h\x1b]11;#ffffff\x1b\\\x1b[?2031$p");
+    wait_for_writer_output(&writer, b"\x1b[?2031;1$y");
+}
 
 #[test]
 fn streamed_wrapped_url_keeps_complete_destination_on_every_row() {
