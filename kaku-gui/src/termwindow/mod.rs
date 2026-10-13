@@ -4921,6 +4921,7 @@ impl TermWindow {
             ScrollToTop => self.scroll_to_top(pane),
             ScrollToBottom => self.scroll_to_bottom(pane),
             ShowTabNavigator => self.show_tab_navigator(),
+            RenameCurrentTab => self.begin_active_tab_rename()?,
             ShowDebugOverlay => {
                 crate::frontend::run_kaku_doctor_in_new_tab();
             }

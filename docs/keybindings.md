@@ -28,7 +28,7 @@
 | Open Tab Navigator | `Cmd + Shift + O` |
 | Close tab | `Cmd + Shift + W` |
 | Reopen closed tab | `Cmd + Shift + T` |
-| Rename tab | Double-click tab title |
+| Rename tab | `Cmd + Shift + I` or double-click tab title |
 
 ## Panes
 

@@ -251,6 +251,7 @@ impl CommandDef {
             MoveTabToNewWindow,
             TogglePaneZoomState,
             ShowTabNavigator,
+            RenameCurrentTab,
             // Help menu
             ShowDebugOverlay,
             OpenUri("https://github.com/tw93/Kaku".to_string()),
@@ -770,6 +771,7 @@ impl CommandDef {
                     ActivateTabRelative(1) => 31,
                     ActivateLastTab => 32,
                     ShowTabNavigator => 33,
+                    RenameCurrentTab => 34,
                     MoveTabRelative(-1) => 40,
                     MoveTabRelative(1) => 41,
                     PaneSelect(PaneSelectArguments {
@@ -2176,6 +2178,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window"],
             icon: None,
         },
+        RenameCurrentTab => CommandDef {
+            brief: "Rename Tab".into(),
+            doc: "Edit the title of the active tab".into(),
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "i".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window"],
+            icon: None,
+        },
         DetachDomain(SpawnTabDomain::CurrentPaneDomain) => CommandDef {
             brief: "Detach the domain of the active pane".into(),
             doc: "Detaches (disconnects from) the domain of the active pane".into(),
@@ -2687,6 +2697,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         TogglePaneZoomState,
         ActivateLastTab,
         ShowTabNavigator,
+        RenameCurrentTab,
         // ----------------- Help
         OpenUri("https://github.com/tw93/Kaku".to_string()),
         OpenUri("https://github.com/tw93/Kaku/issues/".to_string()),
@@ -2905,6 +2916,40 @@ mod tests {
             )]
         );
         assert_eq!(cmd.menubar, &["Shell"]);
+    }
+
+    #[test]
+    fn rename_current_tab_has_default_shortcut_palette_and_menubar() {
+        let config = ConfigHandle::default_config();
+        let cmd_shift = Modifiers::SUPER.union(Modifiers::SHIFT);
+        let cmd =
+            derive_command_from_key_assignment(&KeyAssignment::RenameCurrentTab).expect("command");
+
+        assert_eq!(cmd.brief, "Rename Tab");
+        assert_eq!(cmd.keys, vec![(cmd_shift, "i".into())]);
+        assert_eq!(cmd.menubar, &["Window"]);
+        // Cmd+R stays clear-screen; the rename chord must not collide with
+        // another default binding.
+        let map = crate::inputmap::InputMap::new(&config);
+        let bound: Vec<_> = map
+            .keys
+            .default
+            .iter()
+            .filter(|((key, mods), _)| {
+                *mods == cmd_shift && matches!(key, KeyCode::Char('i' | 'I'))
+            })
+            .map(|(_, entry)| entry.action.clone())
+            .collect();
+        assert!(!bound.is_empty());
+        assert!(bound
+            .iter()
+            .all(|action| *action == KeyAssignment::RenameCurrentTab));
+        assert!(CommandDef::actions_for_palette_only(&config)
+            .iter()
+            .any(|cmd| cmd.action == KeyAssignment::RenameCurrentTab));
+        assert!(CommandDef::actions_for_palette_and_menubar(&config)
+            .iter()
+            .any(|cmd| cmd.action == KeyAssignment::RenameCurrentTab && !cmd.menubar.is_empty()));
     }
 
     #[test]
