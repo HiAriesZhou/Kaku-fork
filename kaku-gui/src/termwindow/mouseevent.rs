@@ -745,7 +745,8 @@ impl super::TermWindow {
             UIItemType::TabBar(_) => {
                 self.update_title_post_status();
             }
-            UIItemType::CloseTab(_)
+            UIItemType::Touch(_)
+            | UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -756,7 +757,8 @@ impl super::TermWindow {
     fn enter_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
             UIItemType::TabBar(_) => {}
-            UIItemType::CloseTab(_)
+            UIItemType::Touch(_)
+            | UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -875,6 +877,10 @@ impl super::TermWindow {
             if let Err(err) = modal.mouse_event(modal_event, self) {
                 log::error!("modal mouse event: {err:#}");
             }
+            return;
+        }
+
+        if self.touch_mouse_event(&event, context) {
             return;
         }
 
@@ -1213,6 +1219,9 @@ impl super::TermWindow {
     }
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
+        if let Some(press) = self.touch_press.as_mut() {
+            press.cancelled = true;
+        }
         self.mouse.current_mouse_event = None;
         self.scrollbar.hovering = false;
         self.update_title();
@@ -1393,6 +1402,7 @@ impl super::TermWindow {
     ) {
         self.mouse.last_ui_item.replace(item.clone());
         match item.item_type.clone() {
+            UIItemType::Touch(_) => {}
             UIItemType::TabBar(tab_bar_item) => {
                 self.mouse_event_tab_bar(tab_bar_item, item, event, context);
             }

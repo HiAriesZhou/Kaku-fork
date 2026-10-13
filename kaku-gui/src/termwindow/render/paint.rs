@@ -617,6 +617,9 @@ impl crate::TermWindow {
 
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
+        if !self.show_tab_bar {
+            self.paint_hidden_touch_entry()?;
+        }
         drop(layers);
         self.paint_modal().context("paint_modal")?;
         self.paint_toast().context("paint_toast")?;

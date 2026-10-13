@@ -246,3 +246,11 @@ Note that no terminal renders half-block QR codes perfectly square: with common 
 ## Can I use Kaku with tiling window managers (yabai, AeroSpace)?
 
 Kaku is compatible with yabai and AeroSpace. If you see continuous flickering, it is usually caused by the tiling WM fighting with Kaku's fullscreen/resize logic. Disabling Kaku's native fullscreen (`config.native_macos_fullscreen_mode = false`) or excluding Kaku from the tiling WM's managed window list typically resolves it.
+
+## How do I use Kaku through a phone or tablet remote desktop?
+
+Click **Touch** to switch the current window to larger controls. Click it again to return to the desktop layout. With one tab, the button stays at the right of the integrated titlebar. **Window > Touch Mode** also works when the tab bar or titlebar is disabled.
+
+Touch mode shows a close button on each visible tab, **+** for a new tab, and **Menu** for copy, paste, text size and pane zoom. Drag the tab strip sideways or scroll over it to reach more tabs. **Menu > Tabs** also opens the full list. Closing a tab follows your existing confirmation setting.
+
+Hold a tab title for half a second to open its menu. This works when the remote client forwards a held left press to the Mac. If the client handles long presses itself, tap **Menu** instead. Terminal mouse input stays with applications such as vim and tmux. The terminal font and line height stay unchanged when switching layouts.

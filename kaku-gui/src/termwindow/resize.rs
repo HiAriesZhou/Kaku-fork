@@ -564,7 +564,7 @@ impl super::TermWindow {
             // fall back to the estimated value (cell_height * 1.75) to avoid
             // triggering the expensive ~480ms CoreText first-load on the
             // synthetic resize event that fires inside Window::new_window.
-            if self.fonts.is_title_font_loaded() {
+            if self.touch_mode || self.fonts.is_title_font_loaded() {
                 self.tab_bar_pixel_height().unwrap_or(0.)
             } else {
                 Self::estimated_tab_bar_pixel_height(&self.config, &self.render_metrics)

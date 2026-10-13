@@ -251,6 +251,7 @@ impl CommandDef {
             MoveTabToNewWindow,
             TogglePaneZoomState,
             ShowTabNavigator,
+            ToggleTouchMode,
             // Help menu
             ShowDebugOverlay,
             OpenUri("https://github.com/tw93/Kaku".to_string()),
@@ -2166,6 +2167,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &[],
+            icon: None,
+        },
+        ToggleTouchMode => CommandDef {
+            brief: "Touch Mode".into(),
+            doc: "Toggle larger controls for remote touch input in this window".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window"],
             icon: None,
         },
         ShowTabNavigator => CommandDef {

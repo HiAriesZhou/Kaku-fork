@@ -91,6 +91,7 @@ pub mod resize;
 mod selection;
 pub mod spawn;
 pub mod tab_rename;
+mod touch;
 pub mod webgpu;
 
 fn window_configuration(window_state: WindowState, overrides: &Value) -> ConfigHandle {
@@ -753,6 +754,7 @@ pub enum TermWindowNotif {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UIItemType {
+    Touch(touch::TouchAction),
     TabBar(TabBarItem),
     CloseTab(usize),
     AboveScrollThumb,
@@ -1063,6 +1065,12 @@ pub struct TermWindow {
     /// `KeyboardInputState` in `keyevent.rs`.
     keyboard: KeyboardInputState,
     show_tab_bar: bool,
+    touch_mode: bool,
+    touch_scroll_offset: f32,
+    touch_scroll_max: f32,
+    touch_last_active_tab: Option<TabId>,
+    touch_panel: Option<touch::TouchPanel>,
+    touch_press: Option<touch::TouchPress>,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
     fancy_tab_bar: Option<box_model::ComputedElement>,
@@ -1312,6 +1320,10 @@ impl TermWindow {
 
     fn focus_changed(&mut self, focused: bool, window: &Window) {
         log::trace!("Setting focus to {:?}", focused);
+        if !focused {
+            self.touch_press = None;
+            self.touch_panel = None;
+        }
         if focused {
             // On macOS a closed window is only hidden (see close_requested) and a
             // Dock click brings it back via makeKeyAndOrderFront, which lands here.
@@ -1813,6 +1825,12 @@ impl TermWindow {
             show_tab_bar,
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
+            touch_mode: false,
+            touch_scroll_offset: 0.,
+            touch_scroll_max: 0.,
+            touch_last_active_tab: None,
+            touch_panel: None,
+            touch_press: None,
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -3262,6 +3280,9 @@ impl TermWindow {
     /// Decide whether the tab bar should be visible based on tab count,
     /// fullscreen state, and config.
     fn should_show_tab_bar(&self, num_tabs: usize) -> bool {
+        if self.touch_mode {
+            return true;
+        }
         let is_full_screen = self.layout_is_effective_fullscreen();
         if is_full_screen {
             // Always show tab bar in fullscreen mode to display the right status (time)
@@ -3813,7 +3834,10 @@ impl TermWindow {
         };
 
         let new_tab_bar = TabBarState::new(
-            self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
+            self.dimensions
+                .pixel_width
+                .saturating_sub(self.touch_toggle_width() as usize)
+                / self.render_metrics.cell_size.width as usize,
             if hovering_in_tab_bar {
                 Some(self.mouse.last_mouse_coords.0)
             } else {
@@ -4967,6 +4991,7 @@ impl TermWindow {
             ScrollToPrompt(n) => self.scroll_to_prompt(*n, pane)?,
             ScrollToTop => self.scroll_to_top(pane),
             ScrollToBottom => self.scroll_to_bottom(pane),
+            ToggleTouchMode => self.toggle_touch_mode(),
             ShowTabNavigator => self.show_tab_navigator(),
             ShowDebugOverlay => {
                 crate::frontend::run_kaku_doctor_in_new_tab();
