@@ -249,9 +249,11 @@
   // Sealing and opening are async; chain them so messages keep their order.
   let sendChain = Promise.resolve();
   let recvChain = Promise.resolve();
+  let onInputSent = null;
   const send = (msg) => {
     const socket = ws;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (onInputSent && (msg.type === "key" || msg.type === "paste" || msg.type === "click")) onInputSent();
     const json = JSON.stringify(msg);
     if (!keyPromise) { socket.send(json); return; }
     sendChain = sendChain.then(async () => {
@@ -577,13 +579,80 @@
     ctrlDown = on;
     if (ctrlButton) ctrlButton.setAttribute("aria-pressed", String(on));
   };
+  // ── Predictive echo ──────────────────────────────────────────────────
+  // Over a slow link a typed character shows at once, where the Mac's
+  // cursor will put it, and the Mac's own echo confirms it a round trip
+  // later, as mosh does. Only plain characters at a visible cursor are
+  // drawn ahead; a wrong or missing echo asks the Mac to redraw and holds
+  // predictions off for a moment. Any other key waits for the pending ones
+  // to settle, since it moves the cursor in ways the page cannot know.
+  const pending = [];
+  let serverCursor = null;
+  let predictPausedUntil = 0;
+  let predictBlocked = false;
+  let echoMs = 300;
+  const CURSOR_AT_END = /\x1b\[(\d+);(\d+)H\x1b\[\d q(\x1b\[\?25h)?$/;
+  const cellChar = (x, y) => {
+    const buf = term.buffer.active;
+    const line = buf.getLine(buf.viewportY + y);
+    const cell = line && line.getCell(x);
+    return cell ? cell.getChars() : "";
+  };
+  const drawPending = () => {
+    if (!pending.length) return;
+    term.write(pending.map((p) => `\x1b[${p.y + 1};${p.x + 1}H\x1b[0m${p.ch}`).join(""));
+  };
+  const dropPending = (wrong) => {
+    if (!pending.length) return;
+    pending.length = 0;
+    predictBlocked = false;
+    if (wrong) {
+      predictPausedUntil = performance.now() + 2000;
+      send({ type: "redraw" });
+    }
+  };
+  const predict = (data) => {
+    if (data.length !== 1 || data < " " || data > "~") return false;
+    if (!serverCursor || pastOpen || serverScrolled || predictBlocked || performance.now() < predictPausedUntil) return false;
+    const x = serverCursor.x + pending.length;
+    if (x >= term.cols - 1) return false;
+    const p = { x, y: serverCursor.y, ch: data, at: performance.now() };
+    pending.push(p);
+    term.write(`\x1b[${p.y + 1};${p.x + 1}H\x1b[0m${p.ch}`);
+    return true;
+  };
+  // After each frame: the echoes that arrived confirm their predictions, a
+  // different character means the guess was wrong, and the rest are drawn
+  // again over the rows the frame rewrote.
+  const settlePredictions = (data) => {
+    const m = CURSOR_AT_END.exec(data);
+    serverCursor = m && m[3] ? { y: Number(m[1]) - 1, x: Number(m[2]) - 1 } : null;
+    while (pending.length) {
+      const p = pending[0];
+      if (!serverCursor || serverCursor.y !== p.y) { dropPending(true); return; }
+      if (serverCursor.x <= p.x) break;
+      if (cellChar(p.x, p.y) !== p.ch) { dropPending(true); return; }
+      echoMs = echoMs * 0.8 + (performance.now() - p.at) * 0.2;
+      pending.shift();
+    }
+    if (!pending.length) predictBlocked = false;
+    drawPending();
+  };
+  setInterval(() => {
+    if (pending.length && performance.now() - pending[0].at > Math.max(1000, echoMs * 3)) dropPending(true);
+  }, 200);
+  const blockPredictions = () => { if (pending.length) predictBlocked = true; };
+  onInputSent = blockPredictions;
+
   term.onData((data) => {
     closePast();
     if (ctrlDown && data.length === 1) {
       setCtrl(false);
+      blockPredictions();
       send({ type: "key", key: data.toLowerCase(), ctrl: true, alt: false, shift: false });
       return;
     }
+    if (!predict(data)) blockPredictions();
     send({ type: "text", data });
   });
   if (TOUCH) {
@@ -681,7 +750,7 @@
   let framesSeen = 0;
   let verifyTimer = 0;
   const verify = () => {
-    if (!ws || ws.readyState !== WebSocket.OPEN || paneId === null || !size.cols) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN || paneId === null || !size.cols || pending.length) return;
     term.write("", () => {
       const buf = term.buffer.active;
       const rows = [];
@@ -1087,6 +1156,7 @@
 
   const attach = (tab, focus = false) => {
     closePast();
+    dropPending(false);
     if (paneId !== null && size.cols) snapshots.set(paneId, snapshot());
     paneId = tab.pane_id;
     tabId = tab.tab_id;
@@ -1507,6 +1577,7 @@
     document.body.classList.add("drawn");
     if (msg.cols !== size.cols || msg.rows !== size.rows) {
       closePast();
+      dropPending(false);
       size = { cols: msg.cols, rows: msg.rows };
       resizeTerm(msg.cols, msg.rows);
       fit();
@@ -1518,7 +1589,7 @@
     // disagree on) must overwrite its last cell, not wrap. Wrapping on the
     // last row scrolled the whole screen, and every later frame then drew
     // over a shifted copy: stale rows stayed until a reload.
-    term.write(NO_WRAP + msg.data, markFound);
+    term.write(NO_WRAP + msg.data, () => { markFound(); settlePredictions(msg.data); });
     serverScrolled = !!msg.scrolled;
     showHistoryButton();
     // A title that already names Kaku (a cwd called kaku) is not repeated.

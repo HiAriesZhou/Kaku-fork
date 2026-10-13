@@ -402,6 +402,9 @@ enum WebClientMsg {
         tab_id: usize,
         index: usize,
     },
+    /// Send every row again: the page drew a typed character ahead of the
+    /// Mac's echo and the echo did not come, so its copy no longer matches.
+    Redraw,
     /// Rows of the pane's history ending before stable row `end` (the
     /// bottom of the screen when absent), for the page to scroll locally.
     History {
@@ -1452,6 +1455,7 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             Ok(())
         }
         WebClientMsg::Hello
+        | WebClientMsg::Redraw
         | WebClientMsg::History { .. }
         | WebClientMsg::Ping
         | WebClientMsg::Attach { .. }
@@ -1583,6 +1587,11 @@ pub(crate) async fn run_session(
                     if outbox.send(json).await.is_err() {
                         break;
                     }
+                    continue;
+                }
+                if matches!(msg, WebClientMsg::Redraw) {
+                    shown = Shown::default();
+                    dirty_frame = attached.is_some();
                     continue;
                 }
                 if let WebClientMsg::History { end } = msg {
