@@ -16,6 +16,14 @@ primary_region = 'nrt'
   min_machines_running = 1
   processes = ['app']
 
+  # Each Mac holds one socket, each open page another, and offline pages
+  # poll; fly's default of 25 would turn friends away. The relay sheds
+  # floods itself (byte budgets, per-address and per-id caps).
+  [http_service.concurrency]
+    type = 'connections'
+    soft_limit = 800
+    hard_limit = 1000
+
 [[vm]]
   memory = '256mb'
   cpu_kind = 'shared'

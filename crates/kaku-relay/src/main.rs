@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -25,9 +25,25 @@ use tracing::info;
 
 const MAX_HOSTS: usize = 10_000;
 const MAX_BROWSERS_PER_HOST: usize = 8;
-const MAX_MESSAGE: usize = 4 << 20;
+/// Browser sockets per client address for one host, so one address cannot
+/// take every slot with sockets that never authenticate.
+const MAX_BROWSERS_PER_ADDR: usize = 4;
+/// Registrations kept per id: the serving one and one standby (a second
+/// Kaku on the same Mac). A newer one pushes the oldest out.
+const MAX_REGISTRATIONS_PER_ID: usize = 2;
+/// A Mac sends frames of a whole screen; a page sends keys, pastes capped at
+/// 64 KB and 64 KB upload chunks.
+const MAX_HOST_MESSAGE: usize = 4 << 20;
+const MAX_BROWSER_MESSAGE: usize = 512 << 10;
 /// Messages queued toward one socket before it counts as stuck.
 const QUEUE: usize = 256;
+/// Bytes queued toward one Mac. Counting messages alone let a host that
+/// stopped reading hold hundreds of megabytes.
+const HOST_QUEUE_BYTES: usize = 8 << 20;
+/// The Mac pings every 20 s and a page every 20 s (a background tab about
+/// once a minute); silence past these means a half-open socket.
+const HOST_SILENCE: Duration = Duration::from_secs(75);
+const BROWSER_SILENCE: Duration = Duration::from_secs(150);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const ASSET_TIMEOUT: Duration = Duration::from_secs(10);
 const KIND_DATA: u8 = 0;
@@ -44,15 +60,44 @@ struct Asset {
 struct BrowserLink {
     data: mpsc::Sender<ws::Message>,
     close: watch::Sender<Option<u64>>,
+    addr: String,
 }
 
 struct Host {
     /// Distinguishes this registration from a later one under the same id.
     generation: u64,
     to_host: mpsc::Sender<ws::Message>,
+    /// Bytes waiting in `to_host`.
+    queued: AtomicUsize,
+    /// Ends this registration when newer ones push it out.
+    evicted: tokio::sync::Notify,
     browsers: Mutex<HashMap<u32, BrowserLink>>,
     assets: Mutex<HashMap<u32, oneshot::Sender<Asset>>>,
     next_id: AtomicU32,
+}
+
+fn message_len(msg: &ws::Message) -> usize {
+    match msg {
+        ws::Message::Binary(b) => b.len(),
+        ws::Message::Text(t) => t.len(),
+        _ => 0,
+    }
+}
+
+impl Host {
+    /// Queue a message for the Mac within the byte budget.
+    fn send(&self, msg: ws::Message) -> bool {
+        let len = message_len(&msg);
+        if self.queued.fetch_add(len, Ordering::Relaxed) + len > HOST_QUEUE_BYTES {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        if self.to_host.try_send(msg).is_err() {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
 }
 
 #[derive(Clone, Default)]
@@ -79,6 +124,10 @@ impl AppState {
         let all = hosts.entry(id.to_string()).or_default();
         let displaced = all.last().cloned();
         all.push(host);
+        while all.len() > MAX_REGISTRATIONS_PER_ID {
+            let oldest = all.remove(0);
+            oldest.evicted.notify_one();
+        }
         displaced
     }
 
@@ -195,7 +244,7 @@ async fn host_ws(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     upgrade
-        .max_message_size(MAX_MESSAGE)
+        .max_message_size(MAX_HOST_MESSAGE)
         .on_upgrade(move |socket| serve_host(socket, id, edge(&headers), state))
 }
 
@@ -205,6 +254,8 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
     let host = Arc::new(Host {
         generation: state.generation.fetch_add(1, Ordering::Relaxed),
         to_host,
+        queued: AtomicUsize::new(0),
+        evicted: tokio::sync::Notify::new(),
         browsers: Mutex::new(HashMap::new()),
         assets: Mutex::new(HashMap::new()),
         next_id: AtomicU32::new(1),
@@ -216,8 +267,12 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
     }
     info!("host {} registered via edge {}", short(&id), edge);
 
+    let writer_host = host.clone();
     let mut writer = tokio::spawn(async move {
         while let Some(msg) = outgoing.recv().await {
+            writer_host
+                .queued
+                .fetch_sub(message_len(&msg), Ordering::Relaxed);
             if !matches!(
                 tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await,
                 Ok(Ok(()))
@@ -231,6 +286,8 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
     let ended = loop {
         let msg = tokio::select! {
             _ = &mut writer => break "writer-stopped",
+            _ = host.evicted.notified() => break "evicted",
+            _ = tokio::time::sleep(HOST_SILENCE) => break "silent",
             next = stream.next() => match next {
                 Some(Ok(msg)) => msg,
                 Some(Err(error)) => {
@@ -359,11 +416,7 @@ async fn fetch_asset(state: &AppState, id: &str, path: &str) -> Response {
     let (tx, rx) = oneshot::channel();
     host.assets.lock().insert(request, tx);
     let get = serde_json::json!({ "t": "get", "r": request, "p": path }).to_string();
-    if host
-        .to_host
-        .try_send(ws::Message::Text(get.into()))
-        .is_err()
-    {
+    if !host.send(ws::Message::Text(get.into())) {
         host.assets.lock().remove(&request);
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -435,11 +488,15 @@ async fn browser_ws(
     let Some(host) = state.host(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if host.browsers.lock().len() >= MAX_BROWSERS_PER_HOST {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    }
+    // Fly puts the real client address here; without it (local runs) every
+    // browser shares one bucket.
+    let addr = headers
+        .get("fly-client-ip")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
     upgrade
-        .max_message_size(MAX_MESSAGE)
+        .max_message_size(MAX_BROWSER_MESSAGE)
         .on_upgrade(move |socket| async move {
             info!(
                 "browser joined host {} via edge {} from {}",
@@ -447,7 +504,7 @@ async fn browser_ws(
                 edge(&headers),
                 device(&headers)
             );
-            serve_browser(socket, host).await
+            serve_browser(socket, host, addr).await
         })
 }
 
@@ -455,6 +512,7 @@ fn browser_close(code: u64) -> ws::Message {
     let (code, reason) = match code {
         4403 => (4403, "invalid link key"),
         4408 => (4408, "authentication timed out"),
+        4426 => (4426, "page is out of date"),
         _ => (4413, "connection is busy"),
     };
     ws::Message::Close(Some(ws::CloseFrame {
@@ -463,19 +521,27 @@ fn browser_close(code: u64) -> ws::Message {
     }))
 }
 
-async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>) {
+async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut outgoing) = mpsc::channel::<ws::Message>(QUEUE);
     let (close, mut closing) = watch::channel(None);
     let c = host.next_id.fetch_add(1, Ordering::Relaxed);
-    // Reserve atomically after upgrade too: simultaneous handshakes may all
-    // have seen space in browser_ws before any callback ran.
+    // Reserve atomically, after the upgrade: simultaneous handshakes would
+    // all have seen space in a check made before it.
     let accepted = {
         let mut browsers = host.browsers.lock();
-        if browsers.len() >= MAX_BROWSERS_PER_HOST {
+        let from_addr = browsers.values().filter(|b| b.addr == addr).count();
+        if browsers.len() >= MAX_BROWSERS_PER_HOST || from_addr >= MAX_BROWSERS_PER_ADDR {
             false
         } else {
-            browsers.insert(c, BrowserLink { data: tx, close });
+            browsers.insert(
+                c,
+                BrowserLink {
+                    data: tx,
+                    close,
+                    addr,
+                },
+            );
             true
         }
     };
@@ -484,34 +550,33 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>) {
         return;
     }
     let open = serde_json::json!({ "t": "open", "c": c }).to_string();
-    if host
-        .to_host
-        .try_send(ws::Message::Text(open.into()))
-        .is_err()
-    {
+    if !host.send(ws::Message::Text(open.into())) {
         host.browsers.lock().remove(&c);
         return;
     }
     let mut writer = tokio::spawn(async move {
+        // Leaving the host's list (rejected key, host replaced) ends the
+        // socket with its reason, even in the middle of a stalled write; it
+        // never waits for an old screen queue to drain.
+        let close_with_reason = |closing: &watch::Receiver<Option<u64>>| {
+            closing
+                .borrow()
+                .map(browser_close)
+                .unwrap_or(ws::Message::Close(None))
+        };
         loop {
             let msg = tokio::select! {
                 biased;
                 _ = closing.changed() => {
-                    let code = *closing.borrow();
-                    let msg = code.map(browser_close).unwrap_or(ws::Message::Close(None));
-                    let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await;
+                    let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(close_with_reason(&closing))).await;
                     return;
                 }
                 msg = outgoing.recv() => match msg { Some(msg) => msg, None => return },
             };
-            // Membership loss interrupts even a stalled data write. It never
-            // waits for the old screen queue to drain after host replacement.
             tokio::select! {
                 biased;
                 _ = closing.changed() => {
-                    let code = *closing.borrow();
-                    let msg = code.map(browser_close).unwrap_or(ws::Message::Close(None));
-                    let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await;
+                    let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(close_with_reason(&closing))).await;
                     return;
                 }
                 result = tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)) => {
@@ -523,6 +588,7 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>) {
     loop {
         tokio::select! {
             _ = &mut writer => break,
+            _ = tokio::time::sleep(BROWSER_SILENCE) => break,
             msg = stream.next() => {
                 let Some(Ok(msg)) = msg else { break };
                 match msg {
@@ -533,7 +599,9 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>) {
                         frame.push(KIND_DATA);
                         frame.extend_from_slice(&c.to_be_bytes());
                         frame.extend_from_slice(&payload);
-                        if host.to_host.try_send(ws::Message::Binary(frame.into())).is_err() { break; }
+                        // Past the Mac's byte budget this browser is the one
+                        // flooding it; let it go rather than the Mac.
+                        if !host.send(ws::Message::Binary(frame.into())) { break; }
                     }
                     ws::Message::Close(_) => break,
                     _ => {}
@@ -544,7 +612,7 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>) {
     host.browsers.lock().remove(&c);
     writer.abort();
     let close = serde_json::json!({ "t": "close", "c": c }).to_string();
-    let _ = host.to_host.try_send(ws::Message::Text(close.into()));
+    let _ = host.send(ws::Message::Text(close.into()));
 }
 
 async fn health() -> &'static str {
@@ -621,14 +689,49 @@ mod tests {
     }
 
     fn test_host(state: &AppState) -> Arc<Host> {
-        let (to_host, _rx) = mpsc::channel(1);
+        let (to_host, rx) = mpsc::channel(QUEUE);
+        // Keep the receiver alive so sends are judged by the budget alone.
+        std::mem::forget(rx);
         Arc::new(Host {
             generation: state.generation.fetch_add(1, Ordering::Relaxed),
             to_host,
+            queued: AtomicUsize::new(0),
+            evicted: tokio::sync::Notify::new(),
             browsers: Mutex::new(HashMap::new()),
             assets: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
         })
+    }
+
+    #[test]
+    fn a_third_registration_pushes_out_the_oldest() {
+        let state = AppState::default();
+        let hosts: Vec<_> = (0..3).map(|_| test_host(&state)).collect();
+        for h in &hosts {
+            state.register("id", h.clone());
+        }
+        let kept: Vec<u64> = state.hosts.lock()["id"]
+            .iter()
+            .map(|h| h.generation)
+            .collect();
+        assert_eq!(kept, vec![hosts[1].generation, hosts[2].generation]);
+        // The pushed-out one was told to end.
+        let notified = hosts[0].evicted.notified();
+        tokio::pin!(notified);
+        assert!(futures_util::FutureExt::now_or_never(notified.as_mut()).is_some());
+    }
+
+    #[test]
+    fn a_host_queue_is_bounded_by_bytes() {
+        let state = AppState::default();
+        let host = test_host(&state);
+        let big = || ws::Message::Binary(vec![0u8; 3 << 20].into());
+        assert!(host.send(big()));
+        assert!(host.send(big()));
+        // A third 3 MB message would pass 8 MB queued.
+        assert!(!host.send(big()));
+        assert_eq!(host.queued.load(Ordering::Relaxed), 6 << 20);
+        assert!(host.send(ws::Message::Text("small".into())));
     }
 
     #[test]
