@@ -371,6 +371,9 @@ fn run() -> anyhow::Result<()> {
                 None => format!("http://127.0.0.1:{}/#t={}", state.port, state.token),
             };
             println!("{}", kaku_remote::render_qr_terminal(&url));
+            if state.tunnel_relay.is_some() {
+                println!("Open this complete link once, then bookmark the short address in that browser.");
+            }
             if reset {
                 println!("The previous link stops working within a few seconds.");
             }

@@ -1069,7 +1069,7 @@ fn default_remote_bind() -> String {
 }
 
 fn default_tunnel_url() -> String {
-    "wss://kaku-relay.fly.dev".to_string()
+    "wss://r.kaku.fun".to_string()
 }
 
 fn default_remote_tunnel() -> bool {

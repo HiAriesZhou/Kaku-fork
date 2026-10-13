@@ -72,7 +72,7 @@
   #menu button { display: block; width: 100%; height: 28px; padding: 0 10px; border: 0; border-radius: 5px; background: transparent; color: var(--fg); font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-align: left; cursor: pointer; }
   #menu button:hover, #menu button:focus-visible { background: var(--tab-hover-bg); outline: none; }
   #menu hr { height: 1px; margin: 4px 6px; border: 0; background: var(--line); }
-  #help .card { width: min(380px, calc(100vw - 32px)); }
+  #help .card { box-sizing: border-box; width: min(380px, calc(100vw - 32px)); max-height: calc(100% - 32px); overflow-y: auto; }
   #help dl { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin: 12px 0 0; font-size: 13px; }
   #help dt { color: var(--fg); font-family: var(--mono); white-space: nowrap; }
   #help dd { margin: 0; color: var(--muted); }
@@ -194,12 +194,20 @@
   // #t=<token>: this Mac or the LAN, plain WebSocket to Kaku.
   // #k=<key>: through the relay, every message sealed with this key, which
   // never leaves the browser because fragments are not sent to servers.
-  // Either one moves to this tab's session storage and out of the address
-  // bar, so it does not linger in history on a borrowed computer; a reload
-  // in the same tab still finds it.
+  // Remember verified relay keys across tabs and browser restarts. LAN tokens
+  // remain tab-only because they change on every Mac app launch.
   const SECRET_SLOT = "kaku.link:" + location.pathname;
-  let stored = null;
-  try { stored = JSON.parse(sessionStorage.getItem(SECRET_SLOT) || "null"); } catch (_) {}
+  const readLink = (persistent) => {
+    try { return JSON.parse((persistent ? localStorage : sessionStorage).getItem(SECRET_SLOT) || "null"); }
+    catch (_) { return null; }
+  };
+  let stored = readLink(false) || readLink(true);
+  const forgetLink = () => {
+    for (const persistent of [false, true]) {
+      try { (persistent ? localStorage : sessionStorage).removeItem(SECRET_SLOT); } catch (_) {}
+    }
+  };
+  const originalFragment = location.hash;
   const supplied = params.has("t") || params.has("k");
   const token = supplied ? params.get("t") : (stored && stored.t) || null;
   const keyText = supplied ? params.get("k") : (stored && stored.k) || null;
@@ -218,7 +226,7 @@
     stage.querySelector("#message div").textContent = text;
   };
   if (!token && !keyText) {
-    showMessage("Open this page from the link Kaku gives you.");
+    showMessage("Open the complete link from Kaku on your Mac once, then bookmark this page in this browser.");
     return;
   }
   if (keyText && !(window.crypto && crypto.subtle)) {
@@ -237,14 +245,33 @@
       rawKey = fromBase64Url(keyText);
       if (rawKey.length !== 32) throw new Error();
     } catch (_) {
-      try { sessionStorage.removeItem(SECRET_SLOT); } catch (_) {}
+      forgetLink();
       showMessage("This link is invalid. Copy the complete link from Kaku on the Mac.");
       return;
     }
   }
   if (supplied) {
-    try { sessionStorage.setItem(SECRET_SLOT, JSON.stringify({ t: token, k: keyText })); } catch (_) {}
+    try { sessionStorage.setItem(SECRET_SLOT, JSON.stringify({ t: token, k: keyText })); }
+    catch (_) {
+      // If storage is blocked, preserve the only usable copy for reloads.
+      history.replaceState(null, "", location.pathname + location.search + originalFragment);
+    }
   }
+  let remembered = false;
+  let rememberAttempted = false;
+  const rememberLink = () => {
+    if (!keyText || rememberAttempted) return;
+    rememberAttempted = true;
+    try {
+      const previous = readLink(true);
+      localStorage.setItem(SECRET_SLOT, JSON.stringify({ k: keyText }));
+      remembered = true;
+      history.replaceState(null, "", location.pathname + location.search);
+      if (!previous || previous.k !== keyText) toast("Browser remembered. Bookmark this page.");
+    } catch (_) {
+      toast("Not saved. Keep the complete link.", true);
+    }
+  };
   const keyPromise = rawKey
     ? crypto.subtle.importKey("raw", rawKey, "AES-GCM", false, ["encrypt", "decrypt"])
     : null;
@@ -1279,6 +1306,18 @@
   }
   const toggleHelp = (on = !helpEl.classList.contains("show")) => {
     helpEl.classList.toggle("show", on);
+    if (keyText && on) {
+      let note = helpList.querySelector(".connection-note");
+      if (!note) {
+        note = document.createElement("dd");
+        note.className = "connection-note";
+        note.style.gridColumn = "1 / -1";
+        helpList.append(note);
+      }
+      note.textContent = remembered
+        ? "Bookmark this address to return in this browser. On a new browser, open the complete link from your Mac."
+        : "Keep the complete link from your Mac until this browser remembers the connection.";
+    }
     if (!on) term.focus();
   };
   helpEl.addEventListener("click", () => toggleHelp(false));
@@ -2014,6 +2053,7 @@
           retry = 0;
           everConnected = true;
           clearNotice();
+          rememberLink();
         }
         handle(msg);
       });
@@ -2024,7 +2064,7 @@
       closePast();
       if (ev.code === 4403 || ev.code === 1008) {
         linkRejected = true;
-        try { sessionStorage.removeItem(SECRET_SLOT); } catch (_) {}
+        forgetLink();
         setNotice("This link no longer works", "Copy the current link from Kaku on the Mac.", { stale: true });
         return;
       }
