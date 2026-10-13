@@ -14,7 +14,8 @@
 # Usage:
 #   ./scripts/nightly.sh                     # build + notarize + publish
 #   ./scripts/nightly.sh --upload-only       # skip build/notarize; re-publish existing dist/Kaku.dmg
-#   ./scripts/nightly.sh --features=remote    # enable optional cargo features
+#   ./scripts/nightly.sh --private           # signed, notarized build with the web
+#                                            # terminal, written to dist/private, never published
 #
 # Requirements (same credentials as scripts/release.sh):
 #   - Developer ID Application certificate in Keychain (or KAKU_SIGNING_IDENTITY)
@@ -38,20 +39,28 @@ DMG_PATH="$OUT_DIR/Kaku.dmg"
 DMG_ASSET_NAME="Kaku-nightly.dmg"
 DMG_ASSET_PATH="$OUT_DIR/$DMG_ASSET_NAME"
 UPLOAD_ONLY=0
+PRIVATE=0
 FEATURES=""
 
 for arg in "$@"; do
     case "$arg" in
         --upload-only) UPLOAD_ONLY=1 ;;
+        --private) PRIVATE=1 ;;
         --features=*) FEATURES="${arg#--features=}" ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
 
 # The web terminal is not launched yet; Nightly is public, so it must not
-# carry it. Build it locally with CARGO_FEATURES=remote ./scripts/build.sh.
-if [[ ",$FEATURES," == *",remote,"* ]]; then
-    echo "The remote feature stays out of public builds until it launches." >&2
+# carry it. --private builds it into a separate directory for handing out by
+# hand, and stops before anything is published.
+if [[ "$PRIVATE" -eq 1 ]]; then
+    [[ "$UPLOAD_ONLY" -eq 1 ]] && { echo "--private never publishes; it cannot be combined with --upload-only." >&2; exit 1; }
+    FEATURES="${FEATURES:+$FEATURES,}remote"
+    OUT_DIR="${PRIVATE_OUT_DIR:-$REPO_ROOT/dist/private}"
+    DMG_PATH="$OUT_DIR/Kaku.dmg"
+elif [[ ",$FEATURES," == *",remote,"* ]]; then
+    echo "The remote feature stays out of public builds until it launches; use --private." >&2
     exit 1
 fi
 
@@ -77,11 +86,13 @@ trap 'rm -f "$LOCK"' EXIT
 
 # --- Pre-flight (fail before a multi-minute build) ---------------------------
 
-if ! command -v gh >/dev/null 2>&1; then
-    die "gh CLI not found. Install from https://cli.github.com/"
-fi
-if ! gh auth status >/dev/null 2>&1; then
-    die "gh CLI not authenticated. Run: gh auth login"
+if [[ "$PRIVATE" -eq 0 ]]; then
+    if ! command -v gh >/dev/null 2>&1; then
+        die "gh CLI not found. Install from https://cli.github.com/"
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        die "gh CLI not authenticated. Run: gh auth login"
+    fi
 fi
 
 # Tie the nightly tag to the exact commit being built; this also fails loudly
@@ -126,6 +137,30 @@ if [[ "$UPLOAD_ONLY" -eq 0 ]]; then
 fi
 
 [[ -f "$DMG_PATH" ]] || die "$DMG_PATH not found. Run without --upload-only to build it."
+
+if [[ "$PRIVATE" -eq 1 ]]; then
+    PRIVATE_DMG="$OUT_DIR/Kaku-private-$SHORT_SHA.dmg"
+    cp -f "$DMG_PATH" "$PRIVATE_DMG"
+    log "Private build ready, not published: $PRIVATE_DMG ($(du -sh "$PRIVATE_DMG" | cut -f1))"
+    exit 0
+fi
+
+# Last guard before anything goes public: the packaged app must not carry the
+# web terminal, whichever way it was built.
+if grep -aq 'kaku-remote: starting on' "$OUT_DIR/Kaku.app/Contents/MacOS/kaku-gui" 2>/dev/null; then
+    die "$OUT_DIR/Kaku.app contains the web terminal; refusing to publish it."
+fi
+MOUNT_DIR=$(mktemp -d /tmp/kaku-nightly-dmg.XXXXXX)
+if hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_DIR" "$DMG_PATH" >/dev/null; then
+    if grep -aq 'kaku-remote: starting on' "$MOUNT_DIR/Kaku.app/Contents/MacOS/kaku-gui"; then
+        hdiutil detach "$MOUNT_DIR" >/dev/null
+        die "$DMG_PATH contains the web terminal; refusing to publish it."
+    fi
+    hdiutil detach "$MOUNT_DIR" >/dev/null
+else
+    die "Could not mount $DMG_PATH to check it before publishing."
+fi
+rmdir "$MOUNT_DIR" 2>/dev/null || true
 
 # Rename for download clarity; cp preserves the stapled notarization ticket.
 cp -f "$DMG_PATH" "$DMG_ASSET_PATH"
