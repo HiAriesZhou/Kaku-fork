@@ -821,6 +821,7 @@ mod test {
 
     #[test]
     fn fallback_that_resolves_nothing_stays_loaded() {
+        config::use_test_configuration();
         let db = FontDatabase::with_built_in().unwrap();
         let resolve = |family: &str| {
             db.resolve(&FontAttributes::new(family), 14)

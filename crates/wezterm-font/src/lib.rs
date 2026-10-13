@@ -932,9 +932,7 @@ impl FontConfigInner {
         // previous zoom level instead of resolving and loading them again.
         // Not across a DPI change, which fixes the faces' HarfBuzz load flags,
         // nor for a bitmap font, whose file is picked per pixel size.
-        // ponytail: only the primary face is checked; a bitmap fallback font
-        // shipped as one file per size keeps its first file while zooming.
-        let rescaled = self.rescaled.borrow_mut().remove(style).filter(|old| {
+        let mut rescaled = self.rescaled.borrow_mut().remove(style).filter(|old| {
             old.dpi == dpi
                 && old
                     .handles
@@ -942,6 +940,36 @@ impl FontConfigInner {
                     .first()
                     .is_none_or(|primary| primary.pixel_sizes.is_empty())
         });
+        if let Some(old) = &rescaled {
+            let old_handles = old.handles.borrow();
+            if old_handles.iter().any(|font| !font.pixel_sizes.is_empty()) {
+                // Bitmap fallback families may select a different file at the
+                // new pixel size. Reuse multi-strike faces (such as emoji) only
+                // while their resolved source, face and variation stay the same.
+                let same_bitmap_files = if def_font.is_some() {
+                    // A non-default style can be resized again by cap-height
+                    // matching below. Select bitmap files at that final size.
+                    false
+                } else {
+                    let (resolved, _) =
+                        self.resolve_font_helper_impl(&style.font_with_fallback(), pixel_size)?;
+                    old_handles
+                        .iter()
+                        .filter(|font| !font.pixel_sizes.is_empty())
+                        .all(|old| {
+                            resolved.iter().any(|new| {
+                                old.handle.source == new.handle.source
+                                    && old.handle.index == new.handle.index
+                                    && old.handle.variation == new.handle.variation
+                            })
+                        })
+                };
+                drop(old_handles);
+                if !same_bitmap_files {
+                    rescaled = None;
+                }
+            }
+        }
         let (mut shaper, mut handles) = match &rescaled {
             Some(old) => (Rc::clone(&old.shaper), Rc::clone(&old.handles)),
             None => {
@@ -1253,6 +1281,68 @@ mod macos_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_reselects_a_size_specific_bitmap_fallback_file() {
+        config::use_test_configuration();
+        let fonts = FontConfiguration::new(None, 72).unwrap();
+        let before = fonts.default_font().unwrap();
+        {
+            let mut handles = before.handles.borrow_mut();
+            assert!(handles.len() > 1);
+            // Keep real font bytes for the shaper, but model a bitmap family
+            // whose old-size file differs from the newly resolved fallback.
+            let fallback = &mut handles[1];
+            fallback.pixel_sizes = vec![12];
+            fallback.handle.source = crate::locator::FontDataSource::Memory {
+                name: "size-specific-12px".to_string(),
+                data: Arc::new(
+                    fallback
+                        .handle
+                        .source
+                        .load_data()
+                        .unwrap()
+                        .into_owned()
+                        .into_boxed_slice(),
+                ),
+            };
+        }
+        fonts.change_scaling(2.0, 72);
+        let after = fonts.default_font().unwrap();
+        assert!(!Rc::ptr_eq(&before.shaper, &after.shaper));
+        assert_ne!(
+            before.handles.borrow()[1].handle.source,
+            after.handles.borrow()[1].handle.source
+        );
+    }
+
+    #[test]
+    fn zoom_keeps_a_bitmap_fallback_when_its_file_is_unchanged() {
+        config::use_test_configuration();
+        let fonts = FontConfiguration::new(None, 72).unwrap();
+        let before = fonts.default_font().unwrap();
+        before.handles.borrow_mut()[1].pixel_sizes = vec![12, 24];
+        fonts.change_scaling(2.0, 72);
+        let after = fonts.default_font().unwrap();
+        assert!(Rc::ptr_eq(&before.shaper, &after.shaper));
+        assert!(Rc::ptr_eq(&before.handles, &after.handles));
+    }
+
+    #[test]
+    fn cap_height_scaled_style_reselects_bitmap_fallbacks_at_its_final_size() {
+        config::use_test_configuration();
+        let mut cfg = (*config::configuration()).clone();
+        cfg.use_cap_height_to_scale_fallback_fonts = true;
+        config::use_this_configuration(cfg);
+        let fonts = FontConfiguration::new(None, 72).unwrap();
+        let mut style = config::configuration().font.clone();
+        style.font[0] = FontAttributes::new("Roboto");
+        let before = fonts.resolve_font(&style).unwrap();
+        before.handles.borrow_mut()[1].pixel_sizes = vec![12, 24];
+        fonts.change_scaling(2.0, 72);
+        let after = fonts.resolve_font(&style).unwrap();
+        assert!(!Rc::ptr_eq(&before.shaper, &after.shaper));
+    }
 
     #[test]
     fn zoom_step_reuses_loaded_shaper_until_config_changes() {
