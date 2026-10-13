@@ -562,6 +562,28 @@ test('middle click closes the clicked tab through the same confirmation path', a
   assert.equal(await p.evaluate(() => messages.some(m => m.type === 'attach' && m.pane_id === 2)), false);
 });
 
+test('the close confirmation answers to N, Y and clicks outside it, like Kaku', async t => {
+  const { p } = await page(t); await screen(p);
+  await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'tabs', tabs: [
+    { tab_id: 1, pane_id: 1, title: 'one', active: true },
+    { tab_id: 2, pane_id: 2, title: 'two', confirm_close: true },
+  ] }); });
+  const closes = () => p.evaluate(() => messages.filter(m => m.type === 'close_tab').length);
+  const ask = () => p.locator('#bar .tab').nth(1).click({ button: 'middle' });
+  await ask();
+  assert.equal(await p.locator('#dialog .title').innerText(), 'Close this tab?');
+  assert.equal(await p.locator('#dialog [data-act="ok"]').innerText(), '[Y] Confirm');
+  await p.keyboard.press('n');
+  assert.equal(await p.locator('#dialog.show').count(), 0);
+  await ask();
+  await p.mouse.click(5, 300);
+  assert.equal(await p.locator('#dialog.show').count(), 0);
+  assert.equal(await closes(), 0);
+  await ask();
+  await p.keyboard.press('y');
+  assert.equal(await closes(), 1);
+});
+
 test('terminal menu copies its selection and shares paste limits and pane guards', async t => {
   const { p } = await page(t); await screen(p, 'hello world'); await captureClipboard(p);
   await p.evaluate(() => { probe.term.select(0, 0, 5); navigator.clipboard.readText = async () => 'pasted'; });

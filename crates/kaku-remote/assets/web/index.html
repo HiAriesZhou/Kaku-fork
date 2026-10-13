@@ -59,6 +59,14 @@
      weight, like the + button. */
   #bar .tool { display: flex; align-items: center; justify-content: center; width: 38px; padding: 0; }
   #bar .tool svg { width: 14px; height: 14px; }
+  /* Help shows only while the pointer is over the bar (Cmd+/ always works). */
+  #bar .tool.help { opacity: 0; transition: opacity 0.15s; }
+  #bar:hover .tool.help, #bar .tool.help:focus-visible { opacity: 1; }
+  /* In full screen the system clock is hidden; Kaku shows the time at the
+     right end of its tab bar there, and so does the page. */
+  #bar .clock { display: none; align-items: center; gap: 5px; padding: 0 10px; color: var(--tab-fg); white-space: nowrap; }
+  #bar .clock svg { width: 12px; height: 12px; }
+  body.fullscreen #bar .clock { display: flex; }
   #bar .panes { width: auto; padding: 0 10px; cursor: default; }
   #bar .panes:hover { background: transparent; }
   .map { position: relative; width: 26px; height: 16px; }
@@ -129,25 +137,26 @@
   #past .i { font-style: italic; }
   body.stale #term { opacity: 0.3; }
   /* In-page confirmation instead of the browser's own dialog. */
-  #dialog { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.25); z-index: 10; }
+  /* Close confirmation drawn like Kaku's own: it takes over the terminal
+     area, a rounded box in the terminal font, text buttons that invert on
+     hover or focus. */
+  #dialog { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: var(--bg); z-index: 10; outline: none; }
   #dialog.show { display: flex; }
-  #dialog .card { width: min(300px, calc(100vw - 32px)); padding: 16px; border-radius: 10px; background: var(--bar-bg); border: 1px solid var(--line); }
-  #dialog .title { font-size: 14px; color: var(--fg); }
-  #dialog .detail { margin-top: 4px; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #dialog .card { max-width: calc(100% - 4ch); padding: 1em 2ch; border: 1px solid var(--muted); border-radius: 6px; color: var(--fg); line-height: 1.4; }
+  #dialog .actions { display: flex; justify-content: center; gap: 3ch; margin-top: 1em; }
+  #dialog button { padding: 0; border: 0; background: transparent; color: var(--fg); font: inherit; cursor: pointer; white-space: pre; }
+  #dialog button:hover, #dialog button:focus-visible { background: var(--fg); color: var(--bg); font-weight: bold; outline: none; }
+  body.touch #dialog button { padding: 8px 6px; }
   #help { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.25); z-index: 10; }
   #help.show { display: flex; }
   #help .card { padding: 16px; border-radius: 10px; background: var(--bar-bg); border: 1px solid var(--line); }
   #help .title { font-size: 14px; color: var(--fg); }
-  #dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
-  #dialog button { height: 28px; padding: 0 12px; border: 0; border-radius: 6px; font: 13px inherit; font-family: inherit; cursor: pointer; background: var(--line); color: var(--fg); }
-  #dialog button:hover, #dialog button:focus-visible { background: var(--tab-active-bg); outline: none; }
   /* Phones and tablets: a key row for what touch keyboards lack, finger-size
      targets, room for the home indicator, and a 16px input so iOS does not
      zoom the page when the keyboard opens. */
   #keys { display: none; }
   body.touch { box-sizing: border-box; padding-bottom: env(safe-area-inset-bottom); }
   body.touch #bar { height: 44px; }
-  body.touch #dialog button { height: 40px; }
   body.touch #bar { --tab-pad: 24px; }
   body.touch #bar .close { width: 20px; height: 20px; margin: -10px 0 0 -11px; }
   body.touch #bar .close svg { width: 10px; height: 10px; }
@@ -179,6 +188,7 @@
 <body>
 <div id="bar"><div id="tabs"></div><div id="tools"></div></div>
 <div id="stage">
+  <div id="dialog" role="dialog" aria-modal="true" tabindex="-1"><div class="card"><div class="title"></div><div class="detail"></div><div class="actions"><button type="button" data-act="cancel" tabindex="-1">[N] Cancel</button><button type="button" data-act="ok" tabindex="-1">[Y] Confirm</button></div></div></div>
   <div id="term"></div>
   <div id="past"></div>
   <button id="history" type="button">Back to live</button>
@@ -186,7 +196,6 @@
   <div id="find"><input type="text" placeholder="Find" spellcheck="false" autocomplete="off"><span class="count"></span><button type="button" data-dir="older" title="Previous (Enter)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6.5 5 3.5l3 3"/></svg></button><button type="button" data-dir="newer" title="Next (Shift+Enter)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5 5 6.5l3-3"/></svg></button><button type="button" data-dir="close" title="Close (Esc)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2.5 2.5l5 5M7.5 2.5l-5 5"/></svg></button></div>
   <div id="toast"></div>
 </div>
-<div id="dialog" role="dialog" aria-modal="true"><div class="card"><div class="title">Close this tab?</div><div class="detail"></div><div class="actions"><button type="button" data-act="cancel">Cancel</button><button type="button" data-act="ok">Close</button></div></div></div>
 <div id="menu" role="menu"></div>
 <div id="help" role="dialog" aria-modal="true"><div class="card"><div class="title">Shortcuts</div><dl></dl></div></div>
 <div id="keys"></div>
@@ -1323,10 +1332,19 @@
   // Close confirmation in the page's own style: Enter closes, Esc cancels.
   const dialogEl = document.getElementById("dialog");
   let dialogDone = null;
-  const askClose = (title, kind = "tab") => new Promise((resolve) => {
-    dialogEl.querySelector(".title").textContent = `Close this ${kind}?`;
+  // Kaku's own wording (overlay/confirm_close_pane.rs).
+  const CLOSE_TEXT = {
+    tab: ["Close this tab?", "All panes in this tab will be terminated."],
+    pane: ["Close this pane?", "The running process in this pane will be terminated."],
+  };
+  const askClose = (_title, kind = "tab") => new Promise((resolve) => {
     if (dialogDone) dialogDone(false);
-    dialogEl.querySelector(".detail").textContent = title;
+    const [title, detail] = CLOSE_TEXT[kind] || CLOSE_TEXT.tab;
+    dialogEl.querySelector(".title").textContent = title;
+    dialogEl.querySelector(".detail").textContent = detail;
+    const card = dialogEl.querySelector(".card");
+    card.style.fontFamily = term.options.fontFamily;
+    card.style.fontSize = fontSize + "px";
     dialogEl.classList.add("show");
     dialogDone = (ok) => {
       dialogDone = null;
@@ -1334,18 +1352,19 @@
       term.focus();
       resolve(ok);
     };
-    dialogEl.querySelector('[data-act="ok"]').focus();
+    dialogEl.focus();
   });
   dialogEl.addEventListener("click", (ev) => {
     if (!dialogDone) return;
     const act = ev.target.closest("[data-act]");
-    if (act) dialogDone(act.dataset.act === "ok");
-    else if (ev.target === dialogEl) dialogDone(false);
+    // As in Kaku, a click anywhere but Confirm cancels.
+    dialogDone(!!act && act.dataset.act === "ok");
   });
   dialogEl.addEventListener("keydown", (ev) => {
     if (!dialogDone) return;
-    if (ev.key === "Escape") { ev.preventDefault(); dialogDone(false); }
-    else if (ev.key === "Enter") { ev.preventDefault(); dialogDone(ev.target.dataset.act !== "cancel"); }
+    const key = ev.key.toLowerCase();
+    if (key === "escape" || key === "n") { ev.preventDefault(); dialogDone(false); }
+    else if (key === "enter" || key === "y") { ev.preventDefault(); dialogDone(ev.target.dataset.act !== "cancel"); }
     ev.stopPropagation();
   }, true);
 
@@ -1375,6 +1394,21 @@
     });
     document.addEventListener("fullscreenchange", sync);
     sync();
+    const clock = document.createElement("span");
+    clock.className = "clock";
+    clock.innerHTML = '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="6" cy="6" r="4.8"/><path d="M6 3.4V6l1.8 1.1"/></svg><span></span>';
+    let clockTimer = 0;
+    const tick = () => {
+      const now = new Date();
+      clock.lastChild.textContent = String(now.getHours()).padStart(2, "0") + ":" + String(now.getMinutes()).padStart(2, "0");
+      clearTimeout(clockTimer);
+      if (document.fullscreenElement) clockTimer = setTimeout(tick, 60000 - (now.getSeconds() * 1000 + now.getMilliseconds()) + 50);
+    };
+    document.addEventListener("fullscreenchange", () => {
+      document.body.classList.toggle("fullscreen", !!document.fullscreenElement);
+      tick();
+    });
+    toolsEl.append(clock);
     toolsEl.append(fs);
   }
 
@@ -1429,7 +1463,7 @@
   if (!TOUCH) {
     const helpBtn = document.createElement("button");
     helpBtn.type = "button";
-    helpBtn.className = "tool";
+    helpBtn.className = "tool help";
     helpBtn.title = IS_MAC ? "Shortcuts (⌘/)" : "Shortcuts (Ctrl+Shift+/)";
     helpBtn.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="6.5"/><path d="M6.2 6.2a1.9 1.9 0 1 1 2.6 1.8c-.5.2-.8.6-.8 1.1v.4"/><circle cx="8" cy="11.6" r=".4" fill="currentColor"/></svg>';
     helpBtn.addEventListener("click", () => toggleHelp());
