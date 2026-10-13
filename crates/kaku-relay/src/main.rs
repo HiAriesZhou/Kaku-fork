@@ -401,6 +401,10 @@ async fn page_redirect(Path(id): Path<String>) -> Response {
     Redirect::permanent(&format!("/t/{id}/")).into_response()
 }
 
+async fn short_page_redirect(Path(id): Path<String>) -> Response {
+    Redirect::permanent(&format!("/{id}/")).into_response()
+}
+
 async fn page(Path(id): Path<String>, State(state): State<AppState>) -> Response {
     if !valid_id(&id) {
         return StatusCode::NOT_FOUND.into_response();
@@ -557,6 +561,10 @@ fn app(state: AppState) -> Router {
         .route("/t/{id}/ws", get(browser_ws))
         .route("/t/{id}/assets/{name}", get(page_asset))
         .route("/health", get(health))
+        .route("/{id}", get(short_page_redirect))
+        .route("/{id}/", get(page))
+        .route("/{id}/ws", get(browser_ws))
+        .route("/{id}/assets/{name}", get(page_asset))
         .with_state(state)
 }
 

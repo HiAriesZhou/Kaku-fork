@@ -12,8 +12,8 @@ before(async () => {
 });
 after(async () => { await browser?.close(); });
 
-async function page(t, hash = '#t=fixture', options = {}) {
-  const p = await browser.newPage({ viewport: { width: 1000, height: 600 }, ...options });
+async function page(t, hash = '#t=fixture', options = {}, context = browser) {
+  const p = await context.newPage({ viewport: { width: 1000, height: 600 }, ...options });
   t.after(() => p.close());
   const errors = [];
   p.on('pageerror', e => errors.push(e.message));
@@ -83,6 +83,143 @@ test('malformed link fails visibly without caching a bad key or throwing', async
     assert.deepEqual(errors, []);
     assert.equal(await p.evaluate(() => sessionStorage.getItem('kaku.link:/')), null);
   }
+});
+
+// Use a real sealed host message: opening the socket alone must not remember a key.
+async function authenticate(p, keyText) {
+  await p.evaluate(async keyText => {
+    const raw = Uint8Array.from(atob(keyText.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt']);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv,
+      additionalData: new TextEncoder().encode('kaku-web h2c') }, key,
+      new TextEncoder().encode(JSON.stringify({ type: 'pong' }))));
+    const frame = new Uint8Array(12 + data.length); frame.set(iv); frame.set(data, 12);
+    connections.at(-1).onmessage({ data: frame.buffer });
+  }, keyText);
+  await p.waitForTimeout(100);
+}
+
+test('verified relay link survives a fresh browser session and rejection forgets it', async t => {
+  const key = Buffer.alloc(32, 7).toString('base64url');
+  const { p, errors } = await page(t, '#k=' + key);
+  assert.equal(await p.evaluate(() => location.hash), '');
+  assert.equal(await p.evaluate(() => localStorage.getItem('kaku.link:/')), null);
+  await authenticate(p, key);
+  assert.equal(await p.evaluate(() => JSON.parse(localStorage.getItem('kaku.link:/')).k), key);
+  assert.match(await p.locator('#toast').innerText(), /Bookmark/);
+  // Drop all tab storage, as when every tab closes, retaining only persistent storage.
+  await p.evaluate(() => sessionStorage.clear());
+  await p.reload();
+  await p.waitForTimeout(100);
+  assert.equal(await p.evaluate(() => connections.length), 1);
+  await authenticate(p, key);
+  assert.deepEqual(errors, []);
+  await p.evaluate(() => connections.at(-1).close(4403));
+  assert.equal(await p.evaluate(() => localStorage.getItem('kaku.link:/')), null);
+  await p.reload();
+  assert.match(await p.locator('#stage').innerText(), /complete link/i);
+});
+
+test('remembered relay link opens in a new tab and a restarted browser context', async t => {
+  const key = Buffer.alloc(32, 9).toString('base64url');
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  const { p } = await page(t, '#k=' + key, {}, context);
+  await authenticate(p, key);
+  const next = await page(t, '', {}, context);
+  assert.equal(await next.p.evaluate(() => connections.length), 1);
+  const state = await context.storageState();
+  const restarted = await browser.newContext({ storageState: state });
+  t.after(() => restarted.close());
+  const restored = await page(t, '', {}, restarted);
+  assert.equal(await restored.p.evaluate(() => connections.length), 1);
+  await authenticate(restored.p, key);
+  assert.deepEqual(restored.errors, []);
+});
+
+test('remembered connection survives closing and relaunching the browser process', async t => {
+  const profile = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'kaku-browser-'));
+  const options = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+    ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {};
+  let context;
+  t.after(async () => { await context?.close(); fs.rmSync(profile, { recursive: true, force: true }); });
+  context = await chromium.launchPersistentContext(profile, options);
+  const key = Buffer.alloc(32, 14).toString('base64url');
+  const first = await page(t, '#k=' + key, {}, context);
+  await authenticate(first.p, key);
+  await context.close();
+  context = await chromium.launchPersistentContext(profile, options);
+  const next = await page(t, '', {}, context);
+  assert.equal(await next.p.evaluate(() => connections.length), 1);
+  await authenticate(next.p, key);
+  assert.deepEqual(next.errors, []);
+});
+
+test('blocked persistent storage keeps a usable tab connection and explains the limit', async t => {
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  await context.addInitScript(() => {
+    Object.defineProperty(window, 'localStorage', { get() { throw new DOMException('blocked', 'SecurityError'); } });
+  });
+  const key = Buffer.alloc(32, 10).toString('base64url');
+  const { p, errors } = await page(t, '#k=' + key, {}, context);
+  await authenticate(p, key);
+  assert.match(await p.locator('#toast').innerText(), /Not saved/);
+  await p.reload();
+  await p.waitForTimeout(100);
+  assert.equal(await p.evaluate(() => connections.length), 1);
+  assert.deepEqual(errors, []);
+});
+
+test('blocked browser storage preserves the complete link across reloads', async t => {
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  await context.addInitScript(() => {
+    for (const name of ['localStorage', 'sessionStorage']) {
+      Object.defineProperty(window, name, { get() { throw new DOMException('blocked', 'SecurityError'); } });
+    }
+  });
+  const key = Buffer.alloc(32, 11).toString('base64url');
+  const { p, errors } = await page(t, '#k=' + key, {}, context);
+  await authenticate(p, key);
+  assert.equal(await p.evaluate(() => location.hash), '#k=' + key);
+  await p.reload();
+  await p.waitForTimeout(100);
+  assert.equal(await p.evaluate(() => connections.length), 1);
+  assert.deepEqual(errors, []);
+});
+
+test('existing tab credentials become remembered after a verified response', async t => {
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  const key = Buffer.alloc(32, 12).toString('base64url');
+  await context.addInitScript(key => sessionStorage.setItem('kaku.link:/', JSON.stringify({ k: key })), key);
+  const { p } = await page(t, '', {}, context);
+  await authenticate(p, key);
+  assert.equal(await p.evaluate(() => JSON.parse(localStorage.getItem('kaku.link:/')).k), key);
+});
+
+test('connection help and first-use notice fit narrow and short viewports', async t => {
+  const key = Buffer.alloc(32, 13).toString('base64url');
+  const { p } = await page(t, '#k=' + key);
+  await authenticate(p, key);
+  for (const width of [375, 1280]) for (const height of [240, 900]) {
+    await p.setViewportSize({ width, height });
+    await p.locator('button[title^="Shortcuts"]').click();
+    const box = await p.locator('#help .card').boundingBox();
+    assert.ok(box.x >= 15 && box.x + box.width <= width - 15);
+    assert.ok(box.y >= 15 && box.y + box.height <= height - 15);
+    assert.ok(await p.locator('.connection-note').count());
+    await p.keyboard.press('Escape');
+    assert.equal(await p.locator('#toast').evaluate(el => el.scrollWidth <= el.clientWidth), true);
+  }
+});
+
+test('local LAN token stays tab-only', async t => {
+  const { p } = await page(t);
+  assert.equal(await p.evaluate(() => localStorage.getItem('kaku.link:/')), null);
+  assert.ok(await p.evaluate(() => sessionStorage.getItem('kaku.link:/')));
 });
 
 test('authentication rejection stops reconnecting', async t => {

@@ -122,12 +122,15 @@ async function until(fn, ms = 15000) {
     await until(() => fs.existsSync(identityPath));
     const identity = JSON.parse(fs.readFileSync(identityPath));
     const id = crypto.createHash('sha256').update(identity.secret).digest('hex').slice(0, 32);
-    const relayBase = `http://127.0.0.1:${relay}/t/${id}/`;
+    const relayBase = `http://127.0.0.1:${relay}/${id}/`;
+    const legacyBase = `http://127.0.0.1:${relay}/t/${id}/`;
+    await until(async () => (await fetch(legacyBase)).ok);
     await until(async () => (await fetch(relayBase)).ok);
     const bad = await browser.newPage();
     await bad.goto(relayBase + '#k=' + crypto.randomBytes(32).toString('base64url'));
     await bad.waitForFunction(() => document.querySelector('#notice .title')?.textContent === 'This link no longer works');
-    const encrypted = await browser.newPage();
+    const encryptedContext = await browser.newContext();
+    const encrypted = await encryptedContext.newPage();
     await encrypted.addInitScript(() => {
       const Original = WebSocket;
       window.__testSockets = [];
@@ -137,6 +140,21 @@ async function until(fn, ms = 15000) {
     });
     await encrypted.goto(relayBase + '#k=' + identity.key);
     await encrypted.waitForSelector('body.drawn');
+    await encrypted.waitForFunction(() => localStorage.getItem('kaku.link:' + location.pathname));
+    assert.equal(new URL(encrypted.url()).hash, '');
+    const returning = await encrypted.context().newPage();
+    await returning.goto(relayBase);
+    await returning.waitForSelector('body.drawn');
+    await returning.close();
+    if (process.env.KAKU_TEST_SCREENSHOTS) {
+      fs.mkdirSync(process.env.KAKU_TEST_SCREENSHOTS, { recursive: true });
+      await encrypted.setViewportSize({ width: 375, height: 700 });
+      await encrypted.screenshot({ path: path.join(process.env.KAKU_TEST_SCREENSHOTS, 'remembered-phone.png') });
+      await encrypted.locator('button[title^="Shortcuts"]').click();
+      await encrypted.screenshot({ path: path.join(process.env.KAKU_TEST_SCREENSHOTS, 'connection-help-phone.png') });
+      await encrypted.keyboard.press('Escape');
+      await encrypted.setViewportSize({ width: 1280, height: 900 });
+    }
     await encrypted.locator('.xterm-helper-textarea').focus();
     await encrypted.keyboard.type('echo ENCRYPTED-OK\n');
     await encrypted.waitForFunction(() => [...document.querySelectorAll('.xterm-rows > div')].some(row => row.textContent.trim() === 'ENCRYPTED-OK'));
@@ -215,8 +233,15 @@ async function until(fn, ms = 15000) {
     await new Promise(resolve => racing.once('open', resolve));
     for (let i = 0; i < 100; i++) racing.send(Buffer.from('queued-input'));
     assert.equal(await Promise.race([rejected, sleep(2000).then(() => 'timeout')]), 4403);
+    const reset = start(path.join(app, 'Contents/MacOS/kaku'), ['remote', '--reset'], {
+      HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), TMPDIR: path.join(home, 'tmp/')
+    });
+    const resetExit = await new Promise(resolve => reset.once('exit', resolve));
+    assert.equal(resetExit, 0);
+    await until(async () => (await fetch(relayBase)).status === 404);
+    assert.notEqual(JSON.parse(fs.readFileSync(identityPath)).key, identity.key);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ localTerminal: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', wrongKey: 'pass', idleAuthentication: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass' }));
+    console.log(JSON.stringify({ localTerminal: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', wrongKey: 'pass', idleAuthentication: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass', rememberedNewTab: 'pass', resetRevokesLink: 'pass' }));
   } finally {
     for (const ws of sockets) ws.terminate();
     await browser?.close();

@@ -82,7 +82,7 @@ impl ShareIdentity {
 
     /// The page link for a relay at `relay_url` (ws:// or wss://).
     pub fn link(&self, relay_url: &str) -> String {
-        format!("{}/t/{}/#k={}", http_base(relay_url), self.id(), self.key)
+        format!("{}/{}/#k={}", http_base(relay_url), self.id(), self.key)
     }
 }
 
@@ -547,7 +547,7 @@ mod tests {
         let link = a.link("wss://relay.example.com/");
         assert_eq!(
             link,
-            format!("https://relay.example.com/t/{}/#k={}", a.id(), a.key)
+            format!("https://relay.example.com/{}/#k={}", a.id(), a.key)
         );
         assert!(!link.contains(&a.secret));
     }
