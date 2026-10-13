@@ -107,10 +107,13 @@
   #notice.show { display: flex; }
   #notice .title { color: var(--fg); font-size: 15px; }
   #notice .detail { color: var(--muted); font-size: 13px; }
+  #notice .detail:empty { display: none; }
   #notice .logo { display: none; }
   #notice.brand .logo { display: block; }
-  #notice .trust { display: none; align-items: center; gap: 5px; margin-top: 10px; color: var(--muted); font-size: 12px; }
-  #notice.brand .trust.on { display: flex; }
+  #notice .trust { display: none; align-items: center; gap: 5px; color: var(--muted); font-size: 13px; }
+  /* One line under the title: the detail when there is one, otherwise
+     the encryption note. */
+  #notice.brand:not(.has-detail) .trust.on { display: flex; }
   #notice .trust svg { width: 11px; height: 11px; }
   #term { transition: opacity 0.2s; }
   /* History, scrolled here rather than on the Mac, so it follows the finger
@@ -179,7 +182,7 @@
   <div id="term"></div>
   <div id="past"></div>
   <button id="history" type="button">Back to live</button>
-  <div id="notice"><img class="logo" src="assets/icon.png" alt=""><div class="title"></div><div class="detail"></div><div class="trust"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.5" y="5.5" width="7" height="5" rx="1"/><path d="M4 5.5V4a2 2 0 0 1 4 0v1.5"/></svg>End-to-end encrypted, the relay cannot read it</div></div>
+  <div id="notice"><img class="logo" src="assets/icon.png" alt=""><div class="title"></div><div class="detail"></div><div class="trust"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.5" y="5.5" width="7" height="5" rx="1"/><path d="M4 5.5V4a2 2 0 0 1 4 0v1.5"/></svg>End-to-end encrypted</div></div>
   <div id="find"><input type="text" placeholder="Find" spellcheck="false" autocomplete="off"><span class="count"></span><button type="button" data-dir="older" title="Previous (Enter)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6.5 5 3.5l3 3"/></svg></button><button type="button" data-dir="newer" title="Next (Shift+Enter)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5 5 6.5l3-3"/></svg></button><button type="button" data-dir="close" title="Close (Esc)"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2.5 2.5l5 5M7.5 2.5l-5 5"/></svg></button></div>
   <div id="toast"></div>
 </div>
@@ -389,6 +392,7 @@
     const apply = () => {
       noticeEl.querySelector(".title").textContent = title;
       noticeEl.querySelector(".detail").textContent = detail;
+      noticeEl.classList.toggle("has-detail", !!detail);
       noticeEl.classList.toggle("brand", brand || !everConnected);
       noticeEl.classList.toggle("show", !!title);
       document.body.classList.toggle("stale", !!title && stale);
