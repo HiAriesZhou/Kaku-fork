@@ -1056,6 +1056,10 @@ pub struct TermWindow {
     terminal_size: TerminalSize,
     pub mux_window_id: MuxWindowId,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
+    /// Set when this window goes away; the mux subscription ends on its
+    /// next notification. Nothing else ends it: during a workspace switch
+    /// `mux_window_id` can briefly name a window that no longer exists.
+    mux_subscription_dead: Arc<AtomicBool>,
     pub render_metrics: RenderMetrics,
     /// The `render_metrics_key` that `render_metrics` was computed for.
     render_metrics_key: RenderMetricsCacheKey,
@@ -1809,6 +1813,7 @@ impl TermWindow {
             focused: None,
             mux_window_id,
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
+            mux_subscription_dead: Arc::new(AtomicBool::new(false)),
             fonts: Rc::clone(&fontconfig),
             render_metrics,
             render_metrics_key: render_metrics_key(
@@ -3013,14 +3018,13 @@ impl TermWindow {
             | MuxNotification::PaneRemoved(_)
             | MuxNotification::PaneOutput(_)
             | MuxNotification::Alert { .. } => {
-                // Verify window still exists
+                // The window can be missing while a workspace switch is
+                // still settling its id: skip this notification but keep
+                // the subscription, or the window stops repainting until
+                // the next key (upstream WezTerm #7444).
                 let mux = Mux::get();
                 if mux.get_window(mux_window_id).is_none() {
-                    log::debug!(
-                        "mux_window_id={} not found, cancel subscription",
-                        mux_window_id
-                    );
-                    return false;
+                    return true;
                 }
             }
             MuxNotification::PaneAdded(_) => {
@@ -3039,7 +3043,7 @@ impl TermWindow {
         let window = self.window.clone().expect("window to be valid on startup");
         let mux_window_id = Arc::clone(&self.mux_window_id_for_subscriptions);
         let mux = Mux::get();
-        let dead = Arc::new(AtomicBool::new(false));
+        let dead = Arc::clone(&self.mux_subscription_dead);
         mux.subscribe(move |n| {
             if dead.load(Ordering::Relaxed) {
                 return false;
@@ -3062,12 +3066,10 @@ impl TermWindow {
                         return true;
                     }
                 }
-                MuxNotification::WindowRemoved(window_id) => {
-                    if *window_id != mux_window_id {
-                        return true;
-                    }
-                    dead.store(true, Ordering::Relaxed);
-                    return false;
+                // Even our own id: it may be the old one of a workspace
+                // switch. The subscription ends when this window drops.
+                MuxNotification::WindowRemoved(_) => {
+                    return true;
                 }
                 // Notifications with pane_id: check pane ownership
                 MuxNotification::PaneOutput(pane_id)
@@ -6710,6 +6712,8 @@ impl TermWindow {
 
 impl Drop for TermWindow {
     fn drop(&mut self) {
+        // Ends the mux subscription on its next notification.
+        self.mux_subscription_dead.store(true, Ordering::Relaxed);
         self.clear_all_overlays();
         resize::clear_deferred_font_scale_pty_resize(self.mux_window_id);
         if let Some(window) = self.window.take() {
