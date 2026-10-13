@@ -7,6 +7,13 @@ use std::fmt;
 use std::result::Result;
 pub use wezterm_cell::color::{AnsiColor, ColorAttribute, RgbColor, SrgbaTuple};
 
+/// Shared dark/light classification for terminal reports and window chrome.
+/// Uses the existing YIQ-style perceived brightness policy, not WCAG contrast.
+pub fn is_light_color(color: &SrgbaTuple) -> bool {
+    let luminance = 0.299 * color.0 + 0.587 * color.1 + 0.114 * color.2;
+    luminance > 0.5
+}
+
 #[derive(Clone, PartialEq)]
 pub struct Palette256(pub [SrgbaTuple; 256]);
 

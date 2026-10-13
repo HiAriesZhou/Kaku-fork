@@ -777,6 +777,7 @@ impl<'a> Performer<'a> {
                 self.application_keypad = false;
                 self.bracketed_paste = false;
                 self.focus_tracking = false;
+                self.color_scheme_reported_palette = None;
                 self.mouse_tracking = false;
                 self.alternate_scroll = false;
                 self.mouse_encoding = MouseEncoding::X10;

@@ -457,6 +457,8 @@ pub enum Device {
     RequestSecondaryDeviceAttributes,
     RequestTertiaryDeviceAttributes,
     StatusReport,
+    /// Query the terminal's dark/light color scheme (DSR 996).
+    RequestColorScheme,
     /// https://github.com/mintty/mintty/issues/881
     /// https://gitlab.gnome.org/GNOME/vte/-/issues/235
     RequestTerminalNameAndVersion,
@@ -482,6 +484,7 @@ impl Display for Device {
             Device::RequestTerminalNameAndVersion => write!(f, ">q")?,
             Device::RequestTerminalParameters(n) => write!(f, "{};1;1;128;128;1;0x", n + 2)?,
             Device::StatusReport => write!(f, "5n")?,
+            Device::RequestColorScheme => write!(f, "?996n")?,
             Device::XtSmGraphics(g) => {
                 write!(f, "?{};{}", g.item, g.action_or_status)?;
                 for v in &g.value {
@@ -949,6 +952,9 @@ pub enum DecPrivateModeCode {
     /// <https://github.com/contour-terminal/terminal-unicode-core/>
     /// Grapheme clustering mode
     GraphemeClustering = 2027,
+
+    /// Notify the application when the terminal's color palette changes.
+    ColorSchemeReporting = 2031,
 
     /// Applies to sixel and regis modes
     UsePrivateColorRegistersForEachGraphic = 1070,
@@ -1851,6 +1857,9 @@ impl<'a> CSIParser<'a> {
                 .map(|dev| CSI::Device(Box::new(dev))),
 
             ('S', [CsiParam::P(b'?'), ..]) => XtSmGraphics::parse(params),
+            ('n', [CsiParam::P(b'?'), CsiParam::Integer(996)]) => {
+                Ok(CSI::Device(Box::new(Device::RequestColorScheme)))
+            }
             ('p', [CsiParam::Integer(_), CsiParam::P(b'$')])
             | ('p', [CsiParam::P(b'?'), CsiParam::Integer(_), CsiParam::P(b'$')]) => {
                 self.decrqm(params)

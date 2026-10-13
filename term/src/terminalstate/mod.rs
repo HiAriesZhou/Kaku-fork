@@ -398,6 +398,9 @@ pub struct TerminalState {
     progress: Progress,
 
     palette: Option<ColorPalette>,
+    /// Mode 2031 is pane-local. A snapshot also handles live config providers
+    /// whose palette changes before set_config receives the reload.
+    color_scheme_reported_palette: Option<ColorPalette>,
 
     pixel_width: usize,
     pixel_height: usize,
@@ -625,6 +628,7 @@ impl TerminalState {
             title: "kaku".to_string(),
             icon_title: None,
             palette: None,
+            color_scheme_reported_palette: None,
             pixel_height: size.pixel_height,
             pixel_width: size.pixel_width,
             dpi: size.dpi,
@@ -673,6 +677,23 @@ impl TerminalState {
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
         self.config = config;
         self.palette.take();
+        if let Some(previous) = &self.color_scheme_reported_palette {
+            let palette = self.palette();
+            if *previous != palette {
+                self.report_color_scheme();
+                self.color_scheme_reported_palette = Some(palette);
+            }
+        }
+    }
+
+    fn report_color_scheme(&mut self) {
+        let report: &[u8] = if crate::color::is_light_color(&self.palette().background) {
+            b"\x1b[?997;2n"
+        } else {
+            b"\x1b[?997;1n"
+        };
+        self.write_all_to_pty("color scheme report", report);
+        self.flush_pty("color scheme report");
     }
 
     pub fn get_config(&self) -> Arc<dyn TerminalConfiguration> {
@@ -1443,6 +1464,7 @@ impl TerminalState {
                 self.dec_auto_wrap = true;
                 self.application_cursor_keys = false;
                 self.modify_other_keys = None;
+                self.color_scheme_reported_palette = None;
                 self.application_keypad = false;
                 self.alternate_scroll = false;
                 self.top_and_bottom_margins = 0..self.screen().physical_rows as i64;
@@ -1519,6 +1541,7 @@ impl TerminalState {
                 self.write_all_to_pty("device status report", b"\x1b[0n");
                 self.flush_pty("device status report");
             }
+            Device::RequestColorScheme => self.report_color_scheme(),
             Device::XtSmGraphics(g) => {
                 let response = if matches!(g.item, XtSmGraphicsItem::Unspecified(_)) {
                     XtSmGraphics {
@@ -1857,6 +1880,22 @@ impl TerminalState {
             }
             Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::BracketedPaste)) => {
                 self.decqrm_response(mode, true, self.bracketed_paste);
+            }
+
+            Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ColorSchemeReporting,
+            )) => {
+                self.color_scheme_reported_palette = Some(self.palette());
+            }
+            Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ColorSchemeReporting,
+            )) => {
+                self.color_scheme_reported_palette = None;
+            }
+            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::ColorSchemeReporting,
+            )) => {
+                self.decqrm_response(mode, true, self.color_scheme_reported_palette.is_some());
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
