@@ -390,22 +390,23 @@ impl crate::TermWindow {
         } else {
             0.
         };
-        top_tab_bar_height + self.get_os_border().top.get() as f32
+        borders::terminal_first_row_offset(top_tab_bar_height, self.get_os_border().top.get())
     }
 
     pub fn padding_left_top(&self) -> (f32, f32) {
         let h_context = DimensionContext {
             dpi: self.dimensions.dpi as f32,
-            pixel_max: self.terminal_size.pixel_width as f32,
+            pixel_max: super::resize::padding_pixel_max(
+                self.window_state,
+                self.dimensions.pixel_width,
+                self.terminal_size.pixel_width,
+            ),
             pixel_cell: self.render_metrics.cell_size.width as f32,
         };
 
-        let padding_left = self
-            .config
-            .window_padding
-            .left
-            .evaluate_as_pixels(h_context);
-        let padding_right = self.config.window_padding.right;
+        let padding = super::resize::effective_window_padding(&self.config, self.window_state);
+        let padding_left = padding.left.evaluate_as_pixels(h_context);
+        let padding_right = padding.right;
         let tab_bar_height = if self.show_tab_bar {
             self.tab_bar_pixel_height().unwrap_or(0.) as usize
         } else {
