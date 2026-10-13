@@ -707,6 +707,7 @@ pub enum KeyAssignment {
     ScrollToBottom,
     ShowTabNavigator,
     RenameCurrentTab,
+    ToggleTouchMode,
     ShowDebugOverlay,
     HideApplication,
     QuitApplication,

@@ -7,6 +7,10 @@ use window::color::LinearRgba;
 const INTEGRATED_BUTTONS_TOP_TAB_INSET_POINTS: f32 = 3.0;
 const INTEGRATED_BUTTONS_TOP_CLEARANCE_POINTS: f32 = 16.0;
 
+pub(crate) fn terminal_first_row_offset(top_tab_bar_height: f32, border_top: usize) -> f32 {
+    top_tab_bar_height + border_top as f32
+}
+
 fn integrated_buttons_top_inset_pixels(dpi: f32, top_tab_bar_visible: bool) -> usize {
     let points = if top_tab_bar_visible {
         INTEGRATED_BUTTONS_TOP_TAB_INSET_POINTS
@@ -22,11 +26,12 @@ fn integrated_buttons_top_inset_pixels(dpi: f32, top_tab_bar_visible: bool) -> u
 
 pub(crate) fn integrated_buttons_top_inset(
     config: &Config,
-    is_fullscreen: bool,
+    window_state: ::window::WindowState,
     top_tab_bar_visible: bool,
     dpi: f32,
 ) -> usize {
-    if !is_fullscreen
+    if !window_state
+        .intersects(::window::WindowState::FULL_SCREEN | ::window::WindowState::HOTKEY_WINDOW)
         && config
             .window_decorations
             .contains(::window::WindowDecorations::INTEGRATED_BUTTONS)
@@ -78,7 +83,7 @@ impl crate::TermWindow {
             let top_tab_bar_visible = self.show_tab_bar && !self.config.tab_bar_at_bottom;
             let integrated_top_inset = integrated_buttons_top_inset(
                 &self.config,
-                is_fullscreen,
+                self.effective_layout_window_state(),
                 top_tab_bar_visible,
                 self.dimensions.dpi as f32,
             )
@@ -297,10 +302,9 @@ impl crate::TermWindow {
             &self.render_metrics,
         );
 
-        let is_fullscreen = self.layout_is_effective_fullscreen();
         let extra_top = integrated_buttons_top_inset(
             &self.config,
-            is_fullscreen,
+            self.effective_layout_window_state(),
             self.show_tab_bar && !self.config.tab_bar_at_bottom,
             self.dimensions.dpi as f32,
         );
@@ -317,21 +321,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_first_row_offset_routes_all_content_consumers() {
+        let render = include_str!("mod.rs");
+        let offset = render
+            .split("pub fn terminal_first_row_offset(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn padding_left_top(")
+            .next()
+            .unwrap();
+        assert!(offset.contains("borders::terminal_first_row_offset("));
+        assert!(offset.contains("self.get_os_border().top.get()"));
+        assert!(offset.contains("self.show_tab_bar && !self.config.tab_bar_at_bottom"));
+        assert!(!offset.contains("WindowState::HOTKEY_WINDOW"));
+        for consumer in [
+            include_str!("pane.rs"),
+            include_str!("split.rs"),
+            include_str!("../mouseevent.rs"),
+        ] {
+            assert!(consumer.contains("self.terminal_first_row_offset()"));
+            assert!(!consumer.contains("content_border_top("));
+        }
+    }
+
+    #[test]
+    fn first_row_offset_keeps_supplied_notch_and_top_tab_bar() {
+        assert_eq!(terminal_first_row_offset(56., 64), 120.);
+        assert_eq!(terminal_first_row_offset(0., 64), 64.);
+    }
+
+    #[test]
+    fn first_row_offset_external_screen_keeps_only_tab_height() {
+        for height in [0., 56., 56.5] {
+            assert_eq!(terminal_first_row_offset(height, 0), height);
+        }
+    }
+
+    #[test]
+    fn fullscreen_first_row_starts_below_notch_and_top_tab_bar() {
+        let safe_area = 64;
+        let tab_bar_height = 56;
+        let padding_top = 19;
+        let content_top =
+            terminal_first_row_offset(tab_bar_height as f32, safe_area) + padding_top as f32;
+        assert_eq!(content_top, 139.);
+        assert!(content_top >= (safe_area + tab_bar_height) as f32);
+    }
+
+    #[test]
+    fn first_row_offset_preserves_ordinary_windowed_border_under_top_tabs() {
+        // Upstream #562 keeps this inset for ordinary pane/split/mouse alignment too.
+        assert_eq!(terminal_first_row_offset(56., 64), 120.);
+        assert_eq!(terminal_first_row_offset(0., 64), 64.);
+    }
+
+    #[test]
+    fn hotkey_drawer_does_not_reserve_ordinary_traffic_light_clearance() {
+        let mut config = Config::default_config();
+        config.window_decorations =
+            ::window::WindowDecorations::INTEGRATED_BUTTONS | ::window::WindowDecorations::RESIZE;
+        for dpi in [72.0, 144.0, 192.0] {
+            for visible in [false, true] {
+                assert_eq!(
+                    integrated_buttons_top_inset(
+                        &config,
+                        ::window::WindowState::HOTKEY_WINDOW,
+                        visible,
+                        dpi
+                    ),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn integrated_buttons_top_inset_is_state_sensitive() {
         let mut config = Config::default_config();
         config.window_decorations =
             ::window::WindowDecorations::INTEGRATED_BUTTONS | ::window::WindowDecorations::RESIZE;
 
-        assert_eq!(integrated_buttons_top_inset(&config, false, true, 144.0), 6);
         assert_eq!(
-            integrated_buttons_top_inset(&config, false, false, 144.0),
+            integrated_buttons_top_inset(&config, ::window::WindowState::empty(), true, 144.0),
+            6
+        );
+        assert_eq!(
+            integrated_buttons_top_inset(&config, ::window::WindowState::empty(), false, 144.0),
             32
         );
-        assert_eq!(integrated_buttons_top_inset(&config, true, true, 144.0), 0);
+        assert_eq!(
+            integrated_buttons_top_inset(&config, ::window::WindowState::FULL_SCREEN, true, 144.0),
+            0
+        );
 
         config.window_decorations =
             ::window::WindowDecorations::TITLE | ::window::WindowDecorations::RESIZE;
-        assert_eq!(integrated_buttons_top_inset(&config, false, true, 144.0), 0);
+        assert_eq!(
+            integrated_buttons_top_inset(&config, ::window::WindowState::empty(), true, 144.0),
+            0
+        );
     }
 
     #[test]

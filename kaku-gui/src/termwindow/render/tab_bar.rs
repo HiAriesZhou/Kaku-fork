@@ -24,6 +24,9 @@ impl crate::TermWindow {
     pub fn paint_tab_bar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         let tab_bar_height = self.tab_bar_pixel_height()?;
         let tab_bar_y = self.tab_bar_y(tab_bar_height);
+        if self.touch_mode {
+            return self.paint_touch_bar();
+        }
         let panes = self.get_panes_to_render();
         let force_opaque_tab_bar_background = forces_opaque_kaku_tui_window_background(&panes);
 
@@ -66,6 +69,7 @@ impl crate::TermWindow {
 
             let mut fancy_ui_items = self.paint_fancy_tab_bar()?;
             self.ui_items.append(&mut fancy_ui_items);
+            self.paint_touch_toggle(tab_bar_y)?;
             return Ok(());
         }
 
@@ -169,6 +173,7 @@ impl crate::TermWindow {
             layers,
         )?;
 
+        self.paint_touch_toggle(tab_bar_y)?;
         Ok(())
     }
 
@@ -207,6 +212,9 @@ impl crate::TermWindow {
     }
 
     pub fn tab_bar_pixel_height(&self) -> anyhow::Result<f32> {
+        if self.touch_mode {
+            return Ok(self.touch_bar_height());
+        }
         Self::tab_bar_pixel_height_impl(&self.config, &self.fonts, &self.render_metrics)
     }
 }
