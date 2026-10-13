@@ -47,6 +47,8 @@
 - AI HTTP transport must preserve both sides of proxy behavior: external API hosts should honor detected system proxy settings, while loopback, private LAN, link-local, CGNAT/Tailscale-style, `.local`, `NO_PROXY`, and macOS ExceptionsList model endpoints should bypass the proxy and connect directly. Do not describe this as full SOCKS support unless reqwest SOCKS support is actually enabled and smoke-tested. Exception: the `http_request` tool always connects directly to the public IP addresses resolved and validated before approval, for both HTTP and HTTPS. It must never pass that hostname to a proxy for independent resolution; users on proxy-only networks receive a connection error instead of weakening the SSRF boundary.
 - Wrap macOS worker thread spawns in the existing autorelease-pool helper so shutdown does not reintroduce use-after-free crashes.
 
+- Remote pane operations in `src/remote_tabs.rs` retain a stable `PaneId`. Do not send a remote split through `spawn_command_impl`, which resolves the active pane again after queuing. Browser-confirmed closes must bypass `AlwaysPrompt` without switching to another pane, and preserve the last-pane tab restore bookkeeping. The isolated remote live smoke covers both paths.
+
 ## Known Pitfalls
 
 - During window drag, terminal move/wheel events may need suppression.

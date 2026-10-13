@@ -104,6 +104,13 @@ pub enum TabAction {
     /// Mac only clears when its own window takes focus, and so never while
     /// the Mac sits unattended.
     Seen { pane_id: usize },
+    /// Split the named pane through the native spawn path.
+    Split {
+        pane_id: usize,
+        direction: config::keyassignment::PaneDirection,
+    },
+    /// Close the named pane after the browser completed confirmation.
+    ClosePane { pane_id: usize },
     /// Make the tab holding this pane the active tab in its Mac window, and
     /// this pane the focused split in that tab.
     Activate { pane_id: usize },
@@ -253,6 +260,7 @@ struct PaneBox {
     top: usize,
     width: usize,
     height: usize,
+    confirm_close: bool,
 }
 
 /// Tabs in tab bar order across windows, each pointing at its active pane.
@@ -288,6 +296,11 @@ fn collect_tabs() -> Vec<TabInfo> {
                         top: p.top,
                         width: p.width,
                         height: p.height,
+                        confirm_close: config::configuration()
+                            .pane_close_confirmation
+                            .should_prompt(true, || {
+                                p.pane.can_close_without_prompting(CloseReason::Pane)
+                            }),
                     })
                     .collect()
             } else {
@@ -402,6 +415,14 @@ enum WebClientMsg {
     UploadEnd {
         id: u32,
     },
+    SplitPane {
+        pane_id: usize,
+        direction: config::keyassignment::PaneDirection,
+    },
+    /// Close a pane; the page has already confirmed with the user.
+    ClosePane {
+        pane_id: usize,
+    },
     /// Close a tab; the page has already confirmed with the user.
     CloseTab {
         tab_id: usize,
@@ -416,8 +437,7 @@ enum WebClientMsg {
         tab_id: usize,
         index: usize,
     },
-    /// Send every row again: the page drew a typed character ahead of the
-    /// Mac's echo and the echo did not come, so its copy no longer matches.
+    /// Send every row again when the browser needs a fresh screen.
     Redraw,
     /// Rows of the pane's history ending before stable row `end` (the
     /// bottom of the screen when absent), for the page to scroll locally.
@@ -1539,6 +1559,27 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             dispatch_tab_action(TabAction::New {
                 pane_id: pane.pane_id().into(),
             });
+            Ok(())
+        }
+        WebClientMsg::SplitPane { pane_id, direction } => {
+            use config::keyassignment::PaneDirection;
+            if lookup_pane(pane_id).is_some()
+                && matches!(
+                    direction,
+                    PaneDirection::Left
+                        | PaneDirection::Right
+                        | PaneDirection::Up
+                        | PaneDirection::Down
+                )
+            {
+                dispatch_tab_action(TabAction::Split { pane_id, direction });
+            }
+            Ok(())
+        }
+        WebClientMsg::ClosePane { pane_id } => {
+            if lookup_pane(pane_id).is_some() {
+                dispatch_tab_action(TabAction::ClosePane { pane_id });
+            }
             Ok(())
         }
         WebClientMsg::CloseTab { tab_id } => {

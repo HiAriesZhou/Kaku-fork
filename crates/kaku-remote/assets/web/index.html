@@ -68,6 +68,7 @@
   /* Menus and panels share the find bar's look. */
   #menu { position: fixed; display: none; min-width: 150px; padding: 4px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); box-shadow: 0 6px 24px rgba(0,0,0,0.25); z-index: 20; }
   #menu.show { display: block; }
+  #menu { max-height: calc(100% - 16px); overflow-y: auto; }
   #menu button { display: block; width: 100%; height: 28px; padding: 0 10px; border: 0; border-radius: 5px; background: transparent; color: var(--fg); font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-align: left; cursor: pointer; }
   #menu button:hover, #menu button:focus-visible { background: var(--tab-hover-bg); outline: none; }
   #menu hr { height: 1px; margin: 4px 6px; border: 0; background: var(--line); }
@@ -342,7 +343,20 @@
   // Links: URLs in the screen open with Cmd+click (Ctrl+click off the Mac),
   // as in Kaku. Cells and string positions differ once a row holds wide
   // characters, so the row is read cell by cell with each one's column.
-  const URL_RE = /https?:\/\/[^\s<>"'`]+[^\s<>"'`.,;:!?)\]}]/g;
+  const URL_RE = /https?:\/\/[^\s<>"'`，。；：！？、（）【】「」『』“”‘’]+/gi;
+  const linkText = candidate => {
+    const stack = [];
+    const pairs = { ")": "(", "]": "[", "}": "{" };
+    for (let i = 0; i < candidate.length; i++) {
+      const ch = candidate[i];
+      if ("([{".includes(ch)) stack.push(ch);
+      else if (pairs[ch]) {
+        if (stack.at(-1) !== pairs[ch]) return candidate.slice(0, i).replace(/[.,;:!?]+$/, "");
+        stack.pop();
+      }
+    }
+    return candidate.replace(/[.,;:!?]+$/, "");
+  };
   term.registerLinkProvider({
     provideLinks(y, callback) {
       const line = term.buffer.active.getLine(y - 1);
@@ -354,15 +368,20 @@
         cell = line.getCell(x, cell);
         if (!cell || cell.getWidth() === 0) continue;
         const chars = cell.getChars() || " ";
-        for (const ch of chars) { text += ch; cols.push(x); }
+        for (const ch of chars) {
+          text += ch;
+          // RegExp indices count UTF-16 code units, including surrogate pairs.
+          for (let i = 0; i < ch.length; i++) cols.push(x);
+        }
       }
       const links = [];
       for (const m of text.matchAll(URL_RE)) {
+        const uri = linkText(m[0]);
         const start = cols[m.index];
-        const end = cols[m.index + m[0].length - 1];
+        const end = cols[m.index + uri.length - 1];
         links.push({
-          range: { start: { x: start + 1, y }, end: { x: end + 1, y } },
-          text: m[0],
+          range: { start: { x: start + 1, y }, end: { x: end + Math.max(1, line.getCell(end)?.getWidth() || 1), y } },
+          text: uri,
           activate: (ev, uri) => {
             if (ev.metaKey || ev.ctrlKey) window.open(uri, "_blank", "noopener");
           },
@@ -667,6 +686,10 @@
     }
   }
 
+  const pasteText = data => {
+    if (enc.encode(data).length > 65536) { toast("Text is larger than 64 KB. Send it as a file instead."); return; }
+    if (data) { closePast(); send({ type: "paste", data }); }
+  };
   termEl.addEventListener("paste", (ev) => {
     ev.preventDefault();
     ev.stopImmediatePropagation();
@@ -674,8 +697,7 @@
     const files = ev.clipboardData ? [...ev.clipboardData.files] : [];
     if (files.length) { sendFiles(files, true); return; }
     const data = ev.clipboardData ? ev.clipboardData.getData("text/plain") : "";
-    if (enc.encode(data).length > 65536) { toast("Text is larger than 64 KB. Send it as a file instead."); return; }
-    if (data) send({ type: "paste", data });
+    pasteText(data);
   }, true);
 
   // A trackpad fires about 60 wheel events a second. Sum them and send at
@@ -1174,7 +1196,8 @@
   // Close confirmation in the page's own style: Enter closes, Esc cancels.
   const dialogEl = document.getElementById("dialog");
   let dialogDone = null;
-  const askClose = (title) => new Promise((resolve) => {
+  const askClose = (title, kind = "tab") => new Promise((resolve) => {
+    dialogEl.querySelector(".title").textContent = `Close this ${kind}?`;
     if (dialogDone) dialogDone(false);
     dialogEl.querySelector(".detail").textContent = title;
     dialogEl.classList.add("show");
@@ -1328,6 +1351,8 @@
       b.append(label, slot);
       b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t, true); else term.focus(); });
       // Double click renames, as on the Mac; right click opens the tab menu.
+      b.addEventListener("auxclick", ev => { if (ev.button === 1) { ev.preventDefault(); closeTab(t); } });
+      b.addEventListener("mousedown", ev => { if (ev.button === 1) ev.preventDefault(); });
       b.addEventListener("dblclick", () => renameTab(t, b, label));
       b.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
@@ -1495,12 +1520,49 @@
     }
     menuEl.classList.add("show");
     const r = menuEl.getBoundingClientRect();
-    menuEl.style.left = Math.min(x, innerWidth - r.width - 8) + "px";
-    menuEl.style.top = Math.min(y, innerHeight - r.height - 8) + "px";
+    menuEl.style.left = Math.max(8, Math.min(x, innerWidth - r.width - 8)) + "px";
+    menuEl.style.top = Math.max(8, Math.min(y, innerHeight - r.height - 8)) + "px";
   };
   document.addEventListener("pointerdown", (ev) => { if (!menuEl.contains(ev.target)) closeMenu(); }, true);
   window.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && menuEl.classList.contains("show")) { ev.preventDefault(); ev.stopPropagation(); closeMenu(); } }, true);
   window.addEventListener("blur", closeMenu);
+
+  const closePane = target => {
+    const tab = tabs.find(t => t.pane_id === target || (t.panes || []).some(p => p.pane_id === target));
+    if (!tab) return;
+    if (!tab.panes || tab.panes.length < 2) { closeTab(tab); return; }
+    const pane = tab.panes.find(p => p.pane_id === target);
+    const go = () => send({ type: "close_pane", pane_id: target });
+    if (pane?.confirm_close !== false) askClose(tab.title || "Pane", "pane").then(ok => { if (ok) go(); });
+    else go();
+  };
+  stage.addEventListener("contextmenu", ev => {
+    if (findEl.contains(ev.target) || !termEl.contains(ev.target) && !pastEl.contains(ev.target)) return;
+    // Keep the phone's native selection handles and Copy menu.
+    if (TOUCH || paneId === null) return;
+    ev.preventDefault();
+    const target = paneId;
+    const selected = pastOpen ? historySelection() : term.getSelection();
+    const items = [];
+    if (selected) items.push(["Copy", () => {
+      pendingCopy = null;
+      if (!navigator.clipboard) { toast("Use the keyboard shortcut to copy"); return; }
+      navigator.clipboard.writeText(selected).catch(() => toast("Use the keyboard shortcut to copy"));
+    }]);
+    items.push(["Paste", async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (paneId !== target) { toast("Pane changed. Paste again in the target pane."); return; }
+        pasteText(text);
+        term.focus();
+      } catch (_) { toast("Use the keyboard shortcut to paste"); }
+    }], ["Search", openFind], null);
+    for (const direction of ["Left", "Right", "Up", "Down"]) {
+      items.push(["Split " + direction, () => send({ type: "split_pane", pane_id: target, direction })]);
+    }
+    items.push(null, ["Close Pane", () => closePane(target)]);
+    openMenu(ev.clientX, ev.clientY, items);
+  });
 
   // After picking a split in the page, the Mac reports its new focused
   // pane a moment later; until then the old one is not a reason to follow.

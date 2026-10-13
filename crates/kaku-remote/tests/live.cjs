@@ -36,7 +36,7 @@ async function until(fn, ms = 15000) {
     fs.mkdirSync(path.join(home, '.config/kaku'), { recursive: true });
     fs.mkdirSync(path.join(home, 'tmp'));
     const config = path.join(home, '.config/kaku/kaku.lua');
-    fs.writeFileSync(config, `return {default_prog={'/bin/zsh','-f'}, default_cwd=${JSON.stringify(home)}, restore_previous_session=false, initial_cols=80, initial_rows=24, font_size=16, remote={enabled=true,bind='127.0.0.1',port=${local},tunnel=true,tunnel_url='ws://127.0.0.1:${relay}'}}`);
+    fs.writeFileSync(config, `return {default_prog={'/bin/zsh','-f'}, default_cwd=${JSON.stringify(home)}, restore_previous_session=false, pane_close_confirmation="AlwaysPrompt", tab_close_confirmation="AlwaysPrompt", initial_cols=80, initial_rows=24, font_size=16, remote={enabled=true,bind='127.0.0.1',port=${local},tunnel=true,tunnel_url='ws://127.0.0.1:${relay}'}}`);
     start(path.join(root, 'crates/kaku-relay/target/debug/kaku-relay'), [], { PORT: String(relay) });
     await until(async () => { try { return (await fetch(`http://127.0.0.1:${relay}/health`)).ok; } catch { return false; } });
     const app = process.env.KAKU_TEST_APP || path.join(root, 'dist/Kaku.app');
@@ -67,17 +67,40 @@ async function until(fn, ms = 15000) {
     const tabs = await until(() => received.find(m => m.type === 'tabs'));
     const pane = tabs.tabs[0].pane_id;
     send({ type: 'attach', pane_id: pane });
+    send({ type: 'split_pane', pane_id: pane, direction: 'Right' });
+    const two = await until(() => received.filter(m => m.type === 'tabs').at(-1)?.tabs.find(t => t.panes?.length === 2));
+    const right = two.panes.find(p => p.pane_id !== pane).pane_id;
+    send({ type: 'split_pane', pane_id: pane, direction: 'Down' });
+    send({ type: 'attach', pane_id: right, focus: true });
+    const three = await until(() => received.filter(m => m.type === 'tabs').at(-1)?.tabs.find(t => t.panes?.length === 3));
+    const originalBox = three.panes.find(p => p.pane_id === pane);
+    const lower = three.panes.find(p => p.pane_id !== pane && p.pane_id !== right);
+    assert.equal(lower.left, originalBox.left, 'queued split keeps the original pane despite a following focus');
+    assert.ok(lower.top > originalBox.top);
+    // Already confirmed browser actions must not open a second Mac overlay,
+    // even when the native policy is AlwaysPrompt.
+    send({ type: 'close_pane', pane_id: lower.pane_id });
+    await until(() => received.filter(m => m.type === 'tabs').at(-1)?.tabs.find(t => t.panes?.length === 2));
+    send({ type: 'close_pane', pane_id: right });
+    await until(() => received.filter(m => m.type === 'tabs').at(-1)?.tabs.some(t => t.pane_id === pane && !t.panes?.length));
+    send({ type: 'attach', pane_id: pane });
+    // Reset the measurement window after the pane-operation frames.
+    send({ type: 'hello', frame_ack: true });
+    const prior = received.filter(m => m.type === 'frame').at(-1);
+    const flowStart = received.filter(m => m.type === 'frame').length;
+    if (prior) send({ type: 'frame_ack', seq: prior.seq });
     await sleep(200);
+
     send({ type: 'text', data: 'for i in {1..30}; do echo FLOW-$i; sleep 0.03; done\n' });
     await sleep(1500);
-    const frames = received.filter(m => m.type === 'frame');
+    const frames = received.filter(m => m.type === 'frame').slice(flowStart);
     assert.equal(frames.length, 4, 'slow consumers receive at most four unacknowledged frames');
     send({ type: 'frame_ack', seq: 1000000 }); await sleep(100);
-    assert.equal(received.filter(m => m.type === 'frame').length, 4, 'future ACK cannot release the window');
+    assert.equal(received.filter(m => m.type === 'frame').length - flowStart, 4, 'future ACK cannot release the window');
     send({ type: 'frame_ack', seq: frames.at(-1).seq });
     const latest = await until(() => received.filter(m => m.type === 'frame').at(-1).seq > frames.at(-1).seq);
     assert.ok(latest);
-    assert.ok(received.filter(m => m.type === 'frame').slice(4).some(m => m.data.includes('FLOW-30')), 'ACK releases the latest coalesced screen');
+    assert.ok(received.filter(m => m.type === 'frame').slice(flowStart + 4).some(m => m.data.includes('FLOW-30')), 'ACK releases the latest coalesced screen');
     // Pages already open before the upgrade still use the old hello.
     send({ type: 'hello' });
     const beforeLegacy = received.filter(m => m.type === 'frame').length;
@@ -193,7 +216,7 @@ async function until(fn, ms = 15000) {
     for (let i = 0; i < 100; i++) racing.send(Buffer.from('queued-input'));
     assert.equal(await Promise.race([rejected, sleep(2000).then(() => 'timeout')]), 4403);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ localTerminal: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', wrongKey: 'pass', idleAuthentication: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', rejectionWithQueuedInput: 'pass' }));
+    console.log(JSON.stringify({ localTerminal: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', wrongKey: 'pass', idleAuthentication: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass' }));
   } finally {
     for (const ws of sockets) ws.terminate();
     await browser?.close();

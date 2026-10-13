@@ -33,6 +33,7 @@ async function page(t, hash = '#t=fixture', options = {}) {
     window.WebSocket = Socket;
   });
   const html = fs.readFileSync(process.env.KAKU_WEB_SOURCE || path.join(root, 'crates/kaku-remote/assets/web/index.html'), 'utf8')
+    .replace('term.registerLinkProvider({', 'term.registerLinkProvider(window.testLinkProvider = {')
     .replace(/\}\)\(\);\s*<\/script>/, 'window.probe = {term, handle, attach, openPast, onHistory, pastScroll, sendFile, sendFiles, snapshots};\n})();\n</script>');
   await p.route('http://localhost:9988/**', route => {
     const name = new URL(route.request().url()).pathname.split('/').pop();
@@ -321,4 +322,106 @@ test('touch history selection changes copy locally without copying page labels',
   });
   await p.waitForTimeout(40);
   assert.deepEqual(await p.evaluate(() => copied), ['中文 history']);
+});
+
+test('links exclude sentence punctuation and retain balanced paths and Unicode cell ranges', async t => {
+  const { p } = await page(t);
+  const issue = 'https://github.com/tw93/Mole/issues/1734#issuecomment-6140809506';
+  const cases = [
+    [`#1734 (${issue})，并以`, issue],
+    ['见 https://example.com/a，后续说明', 'https://example.com/a'],
+    ['(https://example.com/Function_(math)).', 'https://example.com/Function_(math)'],
+    ['[https://example.com/a?x=1&y=2#section]。', 'https://example.com/a?x=1&y=2#section'],
+    ['😀 https://example.com/中文', 'https://example.com/中文'],
+    ['https://example.com/a%29?q=%E4%B8%AD', 'https://example.com/a%29?q=%E4%B8%AD'],
+  ];
+  for (const [source, expected] of cases) {
+    const found = await p.evaluate(async source => {
+      probe.term.resize(180, 24);
+      await new Promise(resolve => probe.term.write('\x1b[?7l\x1b[2J\x1b[H' + source, resolve));
+      const links = await new Promise(resolve => testLinkProvider.provideLinks(1, resolve));
+      const opened = []; window.open = url => opened.push(url);
+      for (const link of links || []) link.activate({ ctrlKey: true }, link.text);
+      return { links: (links || []).map(l => ({ text: l.text, range: l.range })), opened };
+    }, source);
+    assert.deepEqual(found.opened, [expected]);
+    if (source.startsWith('😀')) {
+      // Bundled xterm Unicode table gives this emoji one cell, but two UTF-16 units.
+      assert.equal(found.links[0].range.start.x, 3);
+      assert.equal(found.links[0].range.end.x, 26);
+    }
+  }
+});
+
+test('middle click closes the clicked tab through the same confirmation path', async t => {
+  const { p } = await page(t); await screen(p);
+  await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'tabs', tabs: [
+    { tab_id: 1, pane_id: 1, title: 'one', active: true },
+    { tab_id: 2, pane_id: 2, title: 'two', confirm_close: true },
+  ] }); });
+  await p.locator('#bar .tab').nth(1).click({ button: 'middle' });
+  assert.equal(await p.locator('#dialog.show').count(), 1);
+  assert.equal(await p.evaluate(() => messages.some(m => m.type === 'close_tab')), false);
+  await p.locator('#dialog [data-act="cancel"]').click();
+  assert.equal(await p.evaluate(() => messages.some(m => m.type === 'close_tab')), false);
+  await p.locator('#bar .tab').nth(1).click({ button: 'middle' });
+  await p.locator('#dialog [data-act="ok"]').click();
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'close_tab')), [{ type: 'close_tab', tab_id: 2 }]);
+  assert.equal(await p.evaluate(() => messages.some(m => m.type === 'attach' && m.pane_id === 2)), false);
+});
+
+test('terminal menu copies its selection and shares paste limits and pane guards', async t => {
+  const { p } = await page(t); await screen(p, 'hello world'); await captureClipboard(p);
+  await p.evaluate(() => { probe.term.select(0, 0, 5); navigator.clipboard.readText = async () => 'pasted'; });
+  const menu = async () => p.locator('.xterm-screen').click({ button: 'right', position: { x: 20, y: 10 } });
+  await menu(); await p.locator('#menu button').getByText('Copy', { exact: true }).click();
+  assert.deepEqual(await p.evaluate(() => copied), ['hello']);
+  await menu(); await p.locator('#menu button').getByText('Paste', { exact: true }).click();
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'paste').at(-1).data), 'pasted');
+  await p.evaluate(() => { navigator.clipboard.readText = async () => '中'.repeat(23000); });
+  await menu(); await p.locator('#menu button').getByText('Paste', { exact: true }).click();
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'paste').length), 1);
+  await p.evaluate(() => { navigator.clipboard.readText = () => new Promise(resolve => { window.finishRead = resolve; }); });
+  await menu(); await p.locator('#menu button').getByText('Paste', { exact: true }).click();
+  await p.evaluate(() => { probe.attach({ tab_id: 2, pane_id: 2 }, true); finishRead('wrong pane'); });
+  await p.waitForTimeout(20);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'paste').length), 1);
+});
+
+test('pane actions retain the menu target and close confirmation names a pane', async t => {
+  const { p } = await page(t); await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [
+    { tab_id: 1, pane_id: 1, title: 'split', panes: [
+      { pane_id: 1, left: 0, top: 0, width: 40, height: 24, confirm_close: true },
+      { pane_id: 3, left: 40, top: 0, width: 40, height: 24, confirm_close: false },
+    ] }, { tab_id: 2, pane_id: 2, title: 'two' },
+  ] }));
+  await p.locator('.xterm-screen').click({ button: 'right', position: { x: 20, y: 10 } });
+  await p.locator('#menu button').getByText('Split Right', { exact: true }).click();
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'split_pane')), [{ type: 'split_pane', pane_id: 1, direction: 'Right' }]);
+  await p.locator('.xterm-screen').click({ button: 'right', position: { x: 20, y: 10 } });
+  await p.locator('#menu button').getByText('Close Pane', { exact: true }).click();
+  assert.equal(await p.locator('#dialog .title').innerText(), 'Close this pane?');
+  await p.evaluate(() => probe.attach({ tab_id: 2, pane_id: 2 }, true));
+  await p.locator('#dialog [data-act="ok"]').click();
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'close_pane')), [{ type: 'close_pane', pane_id: 1 }]);
+});
+
+test('terminal menu fits narrow and short viewport corners', async t => {
+  const { p } = await page(t); await screen(p);
+  for (const [width, height] of [[375, 240], [375, 900], [1280, 900], [1280, 240]]) {
+    await p.setViewportSize({ width, height });
+    await p.evaluate(() => document.querySelector('#term').dispatchEvent(new MouseEvent('contextmenu', {
+      clientX: innerWidth - 2, clientY: innerHeight - 2, bubbles: true, cancelable: true,
+    })));
+    const bounds = await p.locator('#menu').boundingBox();
+    assert.ok(bounds.x >= 0 && bounds.y >= 0);
+    assert.ok(bounds.x + bounds.width <= width && bounds.y + bounds.height <= height);
+    if (process.env.KAKU_TEST_SCREENSHOTS) {
+      fs.mkdirSync(process.env.KAKU_TEST_SCREENSHOTS, { recursive: true });
+      await p.screenshot({ path: path.join(process.env.KAKU_TEST_SCREENSHOTS, `menu-${width}-${height}.png`) });
+    }
+    await p.keyboard.press('Escape');
+    assert.equal(await p.locator('#menu.show').count(), 0);
+  }
 });
