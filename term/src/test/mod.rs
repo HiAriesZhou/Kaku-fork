@@ -1753,6 +1753,17 @@ fn test_cursor_hidden_before_alt_screen_stays_hidden() {
 }
 
 #[test]
+fn rectangle_checksum_requests_get_no_reply() {
+    let writer = SharedWriter::default();
+    let mut term = TestTerm::new_with_writer(5, 10, 100, Box::new(writer.clone()));
+    term.print("secret");
+    // DECRQCRA over the whole screen, then a DA1 query that is always
+    // answered: only the DA1 reply may come back.
+    term.print("\x1b[1;1;1;5;10*y\x1b[c");
+    wait_for_writer_output(&writer, b"\x1b[?65;4;6;18;22;52c");
+}
+
+#[test]
 fn shell_prompt_reset_stops_abandoned_mouse_reports() {
     use crate::input::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
