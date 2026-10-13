@@ -269,7 +269,7 @@
       history.replaceState(null, "", location.pathname + location.search);
       if (!previous || previous.k !== keyText) toast("Browser remembered. Bookmark this page.");
     } catch (_) {
-      toast("Not saved. Keep the complete link.", true);
+      toast("Not saved. Keep the complete link.");
     }
   };
   const keyPromise = rawKey
@@ -288,32 +288,76 @@
   };
 
   let ws = null;
+  // Through the relay, Kaku opens each connection with a random challenge
+  // in the clear. Every message after it, both ways, is sealed with that
+  // challenge and its position in the stream, so the relay cannot replay a
+  // recorded connection, repeat or reorder messages, or move them between
+  // browsers. Nothing is sent before the challenge arrives.
+  const CHALLENGE_TAG = "KCH1";
+  let link = null;
+  const newLink = () => {
+    let ready;
+    const promise = new Promise((resolve) => { ready = resolve; });
+    return { challenge: null, sendSeq: 0, recvSeq: 0, ready, promise };
+  };
+  const aad = (label, challenge, seq) => {
+    const out = new Uint8Array(label.length + 24);
+    out.set(label);
+    out.set(challenge, label.length);
+    new DataView(out.buffer).setBigUint64(label.length + 16, BigInt(seq));
+    return out;
+  };
   // Sealing and opening are async; chain them so messages keep their order.
   let sendChain = Promise.resolve();
   let recvChain = Promise.resolve();
+  // Anything typed, from any key path (keyboard, the phone's key row,
+  // paste), goes back to the live screen first, as on the Mac.
+  const INPUT_TYPES = new Set(["key", "text", "paste"]);
   const send = (msg) => {
     const socket = ws;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (INPUT_TYPES.has(msg.type)) closePast();
     const json = JSON.stringify(msg);
     if (!keyPromise) { socket.send(json); return; }
+    const conn = link;
     sendChain = sendChain.then(async () => {
       const key = await keyPromise;
       const iv = crypto.getRandomValues(new Uint8Array(12));
-      const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: TO_HOST }, key, enc.encode(json)));
+      const additionalData = aad(TO_HOST, conn.challenge, conn.sendSeq++);
+      const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData }, key, enc.encode(json)));
       const out = new Uint8Array(12 + sealed.length);
       out.set(iv);
       out.set(sealed, 12);
       if (socket.readyState === WebSocket.OPEN) socket.send(out);
     }).catch(() => {});
   };
-  const receive = (data, handle) => {
+  const receive = (socket, data, handle) => {
     if (!keyPromise) { handle(JSON.parse(data)); return; }
+    const conn = link;
     recvChain = recvChain.then(async () => {
-      const key = await keyPromise;
       const bytes = new Uint8Array(data);
-      const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12), additionalData: FROM_HOST }, key, bytes.slice(12));
+      if (!conn.challenge) {
+        const tag = dec.decode(bytes.slice(0, 4));
+        if (bytes.length !== 20 || tag !== CHALLENGE_TAG) throw new Error("no challenge");
+        conn.challenge = bytes.slice(4);
+        conn.ready();
+        return;
+      }
+      const key = await keyPromise;
+      let plain;
+      try {
+        plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12), additionalData: aad(FROM_HOST, conn.challenge, conn.recvSeq++) }, key, bytes.slice(12));
+      } catch (_) {
+        // A wrong key is reported by Kaku itself (close code 4403); a
+        // message that does not open here was altered or replayed on the
+        // way, so start over on a fresh connection.
+        throw new Error("sealed message did not open");
+      }
       handle(JSON.parse(dec.decode(plain)));
-    }).catch(() => setNotice("This link no longer works", "Get the current link from Kaku on the Mac.", { stale: true }));
+    }).catch((err) => {
+      if (/did not open|no challenge/.test(err && err.message)) { if (ws === socket) socket.close(); return; }
+      console.error("kaku web:", err);
+    });
   };
 
   // ── Terminal ───────────────────────────────────────────────────────────
@@ -336,8 +380,12 @@
   // Connecting and offline pages carry the Kaku mark, and on a relay link
   // say that what passes through it is sealed end to end.
   noticeEl.querySelector(".trust").classList.toggle("on", !!keyText);
-  const setNotice = (title, detail = "", { stale = false, delay = 0, brand = false } = {}) => {
+  // "link": about the connection, cleared as soon as Kaku answers.
+  // "tabs": about what Kaku has open, cleared only when that changes.
+  let noticeKind = "link";
+  const setNotice = (title, detail = "", { stale = false, delay = 0, brand = false, kind = "link" } = {}) => {
     clearTimeout(noticeTimer);
+    noticeKind = kind;
     const apply = () => {
       noticeEl.querySelector(".title").textContent = title;
       noticeEl.querySelector(".detail").textContent = detail;
@@ -348,7 +396,7 @@
     if (delay && title) noticeTimer = setTimeout(apply, delay);
     else apply();
   };
-  const clearNotice = () => setNotice("");
+  const clearNotice = (kind = "link") => { if (noticeKind === kind) setNotice(""); };
 
   // Kaku's own fallback order (JetBrains Mono, PingFang SC, Apple Symbols,
   // Apple Color Emoji), then the Windows equivalents for CJK and emoji.
@@ -576,6 +624,27 @@
     if (k) { ev.preventDefault(); runTabKey(k); }
   });
 
+  // Which Option key is held, for Kaku's composed-key settings: by default
+  // the right Option types characters (é, or @ on many layouts) and the
+  // left one is Alt.
+  let composeOption = { left: false, right: true };
+  const optionHeld = { left: false, right: false };
+  const trackOption = (ev) => {
+    if (ev.key !== "Alt") return;
+    const down = ev.type === "keydown";
+    if (ev.location === 1) optionHeld.left = down;
+    else if (ev.location === 2) optionHeld.right = down;
+  };
+  window.addEventListener("keydown", trackOption, true);
+  window.addEventListener("keyup", trackOption, true);
+  window.addEventListener("blur", () => { optionHeld.left = optionHeld.right = false; });
+  const composesCharacter = (ev) => {
+    // AltGr (Windows, Linux) arrives as Ctrl+Alt; the character is the point.
+    if (!IS_MAC && ev.getModifierState && ev.getModifierState("AltGraph")) return true;
+    if (!IS_MAC || !ev.altKey || ev.ctrlKey || ev.metaKey) return false;
+    return (optionHeld.right && composeOption.right) || (optionHeld.left && composeOption.left);
+  };
+
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.isComposing || ev.keyCode === 229) return true;
     const tk = tabKey(ev);
@@ -609,6 +678,8 @@
       return false;
     }
     let key = null;
+    // A typed character comes through onData like any other.
+    if (ev.key.length === 1 && composesCharacter(ev)) return true;
     if (NAMED.has(ev.key) || /^F([1-9]|1[0-9]|2[0-4])$/.test(ev.key)) {
       key = ev.key;
     } else if (ev.ctrlKey || ev.altKey) {
@@ -640,7 +711,6 @@
   // Only the Mac can decide whether a program echoes its input. A visible
   // cursor also exists at password prompts, so never paint unconfirmed text.
   term.onData((data) => {
-    closePast();
     if (ctrlDown && data.length === 1) {
       setCtrl(false);
       send({ type: "key", key: data.toLowerCase(), ctrl: true, alt: false, shift: false });
@@ -715,7 +785,7 @@
 
   const pasteText = data => {
     if (enc.encode(data).length > 65536) { toast("Text is larger than 64 KB. Send it as a file instead."); return; }
-    if (data) { closePast(); send({ type: "paste", data }); }
+    if (data) send({ type: "paste", data });
   };
   termEl.addEventListener("paste", (ev) => {
     ev.preventDefault();
@@ -746,8 +816,13 @@
   // scroll settles, where stale rows have shown up, and every 10 seconds.
   let framesSeen = 0;
   let verifyTimer = 0;
-  const verify = () => {
+  // The periodic check only runs after something changed; idle, it would
+  // upload the whole screen every 10 s on a phone's data plan.
+  let verified = { socket: null, frames: -1 };
+  const verify = (force = false) => {
     if (!ws || ws.readyState !== WebSocket.OPEN || paneId === null || !size.cols) return;
+    if (!force && verified.socket === ws && verified.frames === framesSeen) return;
+    verified = { socket: ws, frames: framesSeen };
     term.write("", () => {
       const buf = term.buffer.active;
       const rows = [];
@@ -760,9 +835,9 @@
   };
   const verifySoon = () => {
     clearTimeout(verifyTimer);
-    verifyTimer = setTimeout(verify, 1000);
+    verifyTimer = setTimeout(() => verify(true), 1000);
   };
-  setInterval(verify, 10000);
+  setInterval(() => verify(), 10000);
   // Positive lines move toward history.
   const queueScroll = (lines) => {
     wheelRemainder += lines;
@@ -783,6 +858,7 @@
   let localScroll = false;
   let pastOpen = false;
   let pastLoading = false;
+  let pastRequest = 0;
   let pastPending = 0;
   let pastTop = 0;
   let pastFirst = 0;
@@ -819,8 +895,14 @@
       row.style.top = i * h + "px";
       row.style.left = "0";
       row.style.width = "100%";
-      const following = [...pastRendered.keys()].filter(k => k > id).sort((a, b) => a - b)[0];
-      pastEl.insertBefore(row, pastRendered.get(following) || null);
+      // Rows keep document order for selection. Building bottom-up, the row
+      // below is almost always the one just placed; search only otherwise.
+      let next = pastRendered.get(id + 1);
+      if (!next) {
+        const following = [...pastRendered.keys()].filter(k => k > id).sort((a, b) => a - b)[0];
+        next = pastRendered.get(following);
+      }
+      pastEl.insertBefore(row, next || null);
       pastRendered.set(id, row);
     }
   };
@@ -836,11 +918,12 @@
   const ANSI_NAMES = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
   const XTERM_16 = ["#2e3436", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
     "#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec"];
+  // xterm.js theme key for palette entry 0-15: "red", "brightRed", ...
+  const themeName = (i) => i < 8 ? ANSI_NAMES[i] : "bright" + ANSI_NAMES[i - 8][0].toUpperCase() + ANSI_NAMES[i - 8].slice(1);
   const paletteColor = (i) => {
     if (i >= 16) return PALETTE[i];
     const t = term.options.theme || {};
-    const name = i < 8 ? ANSI_NAMES[i] : "bright" + ANSI_NAMES[i - 8][0].toUpperCase() + ANSI_NAMES[i - 8].slice(1);
-    return t[name] || XTERM_16[i];
+    return t[themeName(i)] || XTERM_16[i];
   };
   // Kaku's rows: SGR runs ("CSI 0;...m"), "CSI n G" pinning a column after a
   // wide glyph. Each run is placed at its column, so glyphs the browser
@@ -914,7 +997,7 @@
   const openPast = () => {
     if (pastOpen || pastLoading || paneId === null) return;
     pastLoading = true;
-    send({ type: "history" });
+    send({ type: "history", request: ++pastRequest });
   };
   const closePast = () => {
     pastPending = 0;
@@ -929,7 +1012,9 @@
     showHistoryButton();
   };
   const onHistory = (msg) => {
-    if (msg.pane_id !== paneId || !pastLoading) return;
+    // A reply to a request made before the view closed and reopened would
+    // open it at the wrong rows; only the latest request counts.
+    if (msg.pane_id !== paneId || !pastLoading || msg.request !== pastRequest) return;
     const cell = cellSize();
     const screenEl = termEl.querySelector(".xterm-screen");
     const rowsEl = termEl.querySelector(".xterm-rows");
@@ -953,7 +1038,6 @@
       renderPast();
       pastEl.scrollTop = pastMax();
       renderPast();
-      pastTop = msg.top;
       pastFirst = msg.first;
       pastLoading = false;
       const pending = pastPending;
@@ -967,7 +1051,6 @@
       renderPast();
       pastEl.scrollTop = position + msg.rows.length * pastCell.height;
       renderPast();
-      pastTop = msg.top;
       pastFirst = msg.first;
       pastLoading = false;
     }
@@ -986,7 +1069,7 @@
     if (px < 0 && pastEl.scrollTop >= pastMax() - 0.5) { closePast(); return; }
     if (!pastLoading && pastTop > pastFirst && pastEl.scrollTop < pastEl.clientHeight * 2) {
       pastLoading = true;
-      send({ type: "history", end: pastTop });
+      send({ type: "history", end: pastTop, request: ++pastRequest });
     }
   };
   // Positive moves toward history.
@@ -1025,7 +1108,9 @@
     focusedAtPress = !!term.textarea && document.activeElement === term.textarea;
   }, true);
   stage.addEventListener("mousedown", (ev) => {
-    clickFrom = ev.button === 0 && !pastEl.contains(ev.target) && (!TOUCH || focusedAtPress) ? [ev.clientX, ev.clientY] : null;
+    // Only presses on the terminal itself; the find bar, "Back to live" and
+    // the history view sit over it and are not the program's.
+    clickFrom = ev.button === 0 && termEl.contains(ev.target) && (!TOUCH || focusedAtPress) ? [ev.clientX, ev.clientY] : null;
   }, true);
   stage.addEventListener("mouseup", (ev) => {
     const from = clickFrom;
@@ -1113,6 +1198,15 @@
     };
     if (Math.abs(v) > 0.3) flingFrame = requestAnimationFrame(step);
   }, { passive: false, capture: true });
+  // iOS cancels a gesture for a system swipe or a notification: drop the
+  // pinch preview and the drag, or the next one-finger touchend would apply
+  // the stale pinch scale.
+  stage.addEventListener("touchcancel", () => {
+    pinchFrom = 0;
+    pinchRatio = 1;
+    termEl.style.transform = "";
+    touchY = null;
+  }, { passive: true, capture: true });
 
   historyBtn.addEventListener("click", () => {
     closePast();
@@ -1123,17 +1217,19 @@
   // terminal.
   stage.addEventListener("mousedown", (ev) => { if (!pastEl.contains(ev.target)) term.focus(); });
   // Typing while reading history goes back to live, as on the Mac.
+  // Keys pressed while the history view has focus (after selecting in it)
+  // go to the terminal; copying the selection stays the browser's.
   window.addEventListener("keydown", (ev) => {
-    if (!pastOpen || ev.metaKey || ev.ctrlKey || ev.isComposing) return;
+    if (!pastOpen || ev.metaKey || ev.isComposing || termEl.contains(ev.target)) return;
     if (findEl.contains(ev.target) || dialogEl.contains(ev.target) || ev.target.tagName === "INPUT") return;
     if (["Shift", "Alt", "Control", "Meta", "CapsLock"].includes(ev.key)) return;
-    closePast();
-    if (!termEl.contains(ev.target)) {
-      ev.preventDefault();
-      term.focus();
-      if (ev.key.length === 1) send({ type: "text", data: ev.key });
-      else if (NAMED.has(ev.key)) send({ type: "key", key: ev.key, ctrl: false, alt: ev.altKey, shift: ev.shiftKey });
-    }
+    if (!IS_MAC && ev.ctrlKey && /^[cC]$/.test(ev.key) && String(window.getSelection())) return;
+    ev.preventDefault();
+    term.focus();
+    if (ev.ctrlKey && /^Key[A-Z]$/.test(ev.code)) send({ type: "key", key: ev.code.slice(3).toLowerCase(), ctrl: true, alt: ev.altKey, shift: ev.shiftKey });
+    else if (ev.key.length === 1 && !ev.ctrlKey) send({ type: "text", data: ev.key });
+    else if (NAMED.has(ev.key)) send({ type: "key", key: ev.key, ctrl: ev.ctrlKey, alt: ev.altKey, shift: ev.shiftKey });
+    else closePast();
   }, true);
 
   // ── Tabs ───────────────────────────────────────────────────────────────
@@ -1352,6 +1448,7 @@
   // must not redraw the bar under the editor.
   let renaming = null;
   let dragTab = null;
+  let scrolledTo = null;
   const renderTabs = () => {
     if (renaming) return;
     tabsEl.textContent = "";
@@ -1359,6 +1456,7 @@
       const b = document.createElement("button");
       b.type = "button";
       b.className = "tab";
+      b.dataset.tab = String(t.tab_id);
       b.setAttribute("aria-current", String(t.tab_id === tabId));
       // Kaku marks a tab that wants attention (an unread bell, a paused or
       // failed task) with a trailing dot in its title; draw it as a dot.
@@ -1392,12 +1490,12 @@
       // Double click renames, as on the Mac; right click opens the tab menu.
       b.addEventListener("auxclick", ev => { if (ev.button === 1) { ev.preventDefault(); closeTab(t); } });
       b.addEventListener("mousedown", ev => { if (ev.button === 1) ev.preventDefault(); });
-      b.addEventListener("dblclick", () => renameTab(t, b, label));
+      b.addEventListener("dblclick", () => renameTab(t));
       b.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
         openMenu(ev.clientX, ev.clientY, [
           ["New Tab", newTab],
-          ["Rename Tab", () => renameTab(t, b, label)],
+          ["Rename Tab", () => renameTab(t)],
           null,
           ["Close Tab", () => closeTab(t)],
         ]);
@@ -1437,8 +1535,13 @@
     add.addEventListener("click", newTab);
     tabsEl.append(add);
     renderPanes();
-    const active = tabsEl.querySelector('.tab[aria-current="true"]');
-    if (active) active.scrollIntoView({ block: "nearest", inline: "nearest" });
+    // Bring the active tab into view when it changes, not on every title
+    // update, which would snap the strip back while someone scrolls it.
+    if (tabId !== scrolledTo) {
+      scrolledTo = tabId;
+      const active = tabsEl.querySelector('.tab[aria-current="true"]');
+      if (active) active.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
     tabsEdge();
   };
   const clearDropMarks = () => tabsEl.querySelectorAll(".drop-before, .drop-after").forEach((e) => e.classList.remove("drop-before", "drop-after"));
@@ -1456,8 +1559,13 @@
     renderTabs();
     send({ type: "move_tab", tab_id: from.tab_id, index: idx });
   };
-  const renameTab = (t, b, label) => {
+  // The tab bar is rebuilt whenever a title changes, so a menu opened a
+  // moment ago may hold a button that is gone; edit the one on the page.
+  const renameTab = (t) => {
     if (renaming) return;
+    const b = tabsEl.querySelector(`.tab[data-tab="${t.tab_id}"]`);
+    const label = b && b.querySelector("span");
+    if (!label) return;
     const input = document.createElement("input");
     const initial = label.textContent;
     input.value = initial;
@@ -1622,8 +1730,8 @@
       let saved = null;
       try { saved = Number(localStorage.getItem("kaku.tab")); } catch (_) {}
       const target = tabs.find((t) => t.tab_id === saved) || tabs.find((t) => t.active) || tabs[0];
-      if (target) attach(target);
-      else { renderTabs(); setNotice("No tabs open", "Open one with the + button."); }
+      if (target) { clearNotice("tabs"); attach(target); }
+      else { renderTabs(); setNotice("No tabs open", "Open one with the + button.", { kind: "tabs" }); }
     } else if (current.pane_id !== paneId && !(paneChosen.id === paneId && Date.now() < paneChosen.until && (current.panes || []).some((p) => p.pane_id === paneId))) {
       // Follow the tab when focus moves to another split on the Mac.
       attach(current);
@@ -1634,15 +1742,15 @@
 
   let copyOnSelect = true;
   const onConfig = (cfg) => {
+    if (typeof cfg.compose_right_option === "boolean") composeOption = { left: !!cfg.compose_left_option, right: cfg.compose_right_option };
     copyOnSelect = cfg.copy_on_select !== false;
     const theme = {};
     if (cfg.background) { theme.background = cfg.background; document.documentElement.style.setProperty("--bg", cfg.background); }
     if (cfg.foreground) { theme.foreground = cfg.foreground; document.documentElement.style.setProperty("--fg", cfg.foreground); }
     if (cfg.cursor_bg) theme.cursor = cfg.cursor_bg;
     if (cfg.cursor_fg) theme.cursorAccent = cfg.cursor_fg;
-    const names = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
-    (cfg.ansi || []).forEach((c, i) => { if (names[i]) theme[names[i]] = c; });
-    (cfg.brights || []).forEach((c, i) => { if (names[i]) theme["bright" + names[i][0].toUpperCase() + names[i].slice(1)] = c; });
+    (cfg.ansi || []).slice(0, 8).forEach((c, i) => { theme[themeName(i)] = c; });
+    (cfg.brights || []).slice(0, 8).forEach((c, i) => { theme[themeName(i + 8)] = c; });
     term.options.theme = theme;
     if (cfg.font_family && cfg.font_family !== "JetBrains Mono") {
       term.options.fontFamily = '"' + cfg.font_family + '", ' + FONT_STACK;
@@ -1663,7 +1771,7 @@
       if (value) root.setProperty(name, value);
     }
     // One pixel under Kaku's size reads closer to the native window.
-    if (cfg.font_size) { baseFontSize = Math.max(8, cfg.font_size - 1); fontSize = baseFontSize; term.options.fontSize = fontSize; }
+    if (cfg.font_size) { baseFontSize = Math.max(8, cfg.font_size - 1); setFont(baseFontSize); }
     // xterm.js measures cells only when a font option changes, so once the
     // bundled font is in, nudge the size to measure it instead of the
     // fallback face it saw first; fit() then sets Kaku's size back.
@@ -1923,7 +2031,8 @@
       socket.removeEventListener("close", finishLost);
       uploadWaiters.delete(id);
       uploadAcks.delete(id);
-      if (ws === socket && socket.readyState === WebSocket.OPEN) send({ type: "upload_cancel", id });
+      // Only an attempt that did not finish leaves anything to clean up.
+      if (!result && ws === socket && socket.readyState === WebSocket.OPEN) send({ type: "upload_cancel", id });
     }
   };
   const sendFile = async (file, name, target = paneId) => {
@@ -1933,7 +2042,14 @@
       toast(attempt ? `Reconnecting to send ${name}` : `Sending ${name} 0%`, true);
       const socket = await openSocket();
       if (!socket) break;
-      const result = await sendOnce(file, name, socket, transfer, target);
+      let result;
+      try {
+        result = await sendOnce(file, name, socket, transfer, target);
+      } catch (_) {
+        // The file could not be read (moved, or on a share that dropped).
+        toast(`Not sent: ${name} could not be read`);
+        return;
+      }
       if (result) {
         toast(result.ok ? `Sent to ${result.detail.replace(/^\/Users\/[^/]+/, "~")}` : `Not sent: ${result.detail}`);
         return;
@@ -2033,19 +2149,20 @@
     lastHeard = Date.now();
     pingSentAt = 0;
     framesSeen = 0;
-    sendChain = Promise.resolve();
+    link = newLink();
+    sendChain = keyPromise ? link.promise : Promise.resolve();
     recvChain = Promise.resolve();
     socket.onopen = () => {
-      // A WebSocket upgrade is not an authenticated Kaku session.
-      // Through the relay, Kaku starts the session only after this first
-      // message opens with the key.
+      // A WebSocket upgrade is not an authenticated Kaku session. Through
+      // the relay these wait for the challenge, and Kaku starts the session
+      // once the first of them opens with the key.
       send({ type: "hello", frame_ack: true });
       // Re-attach after a reconnect; the server keeps no per-browser state.
       if (paneId !== null) send({ type: "attach", pane_id: paneId });
     };
     socket.onmessage = (ev) => {
       if (ws !== socket) return;
-      receive(ev.data, (msg) => {
+      receive(socket, ev.data, (msg) => {
         if (ws !== socket) return;
         lastHeard = Date.now();
         if (msg.type === "config" || msg.type === "tabs" || msg.type === "frame" || msg.type === "pong") {
@@ -2066,6 +2183,11 @@
         linkRejected = true;
         forgetLink();
         setNotice("This link no longer works", "Copy the current link from Kaku on the Mac.", { stale: true });
+        return;
+      }
+      if (ev.code === 4426) {
+        linkRejected = true;
+        setNotice("Kaku on the Mac was updated", "Reload this page.", { stale: true });
         return;
       }
       // A quick blip reconnects before anyone notices; say something only if

@@ -85,14 +85,22 @@ test('malformed link fails visibly without caching a bad key or throwing', async
   }
 });
 
-// Use a real sealed host message: opening the socket alone must not remember a key.
+// Act as the Mac does on a new relay connection: send the challenge, then a
+// real sealed message bound to it. Opening the socket alone must not
+// remember a key.
 async function authenticate(p, keyText) {
   await p.evaluate(async keyText => {
     const raw = Uint8Array.from(atob(keyText.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
     const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt']);
+    const challenge = crypto.getRandomValues(new Uint8Array(16));
+    const hello = new Uint8Array(20); hello.set(new TextEncoder().encode('KCH1')); hello.set(challenge, 4);
+    connections.at(-1).onmessage({ data: hello.buffer });
+    const label = new TextEncoder().encode('kaku-web h2c');
+    const additionalData = new Uint8Array(label.length + 24);
+    additionalData.set(label); additionalData.set(challenge, label.length);
+    new DataView(additionalData.buffer).setBigUint64(label.length + 16, 0n);
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const data = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv,
-      additionalData: new TextEncoder().encode('kaku-web h2c') }, key,
+    const data = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData }, key,
       new TextEncoder().encode(JSON.stringify({ type: 'pong' }))));
     const frame = new Uint8Array(12 + data.length); frame.set(iv); frame.set(data, 12);
     connections.at(-1).onmessage({ data: frame.buffer });
@@ -243,6 +251,46 @@ test('returning to a cached tab attaches before claiming its new size', async t 
   assert.ok(commands.some(m => m.type === 'resize'));
 });
 
+test('renaming from a menu opened before the tab bar was rebuilt still edits the tab', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.locator('#bar .tab').first().click({ button: 'right' });
+  // A title update rebuilds every tab button while the menu is open.
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one*', active: true }, { tab_id: 2, pane_id: 2, panes: [], title: 'two' }] }));
+  await p.locator('#menu button', { hasText: 'Rename Tab' }).click();
+  await p.keyboard.press('Meta+a');
+  await p.keyboard.type('renamed');
+  await p.keyboard.press('Enter');
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'rename_tab').map(m => [m.tab_id, m.title])), [[1, 'renamed']]);
+  // The bar is not stuck: the next update shows.
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'renamed', active: true }, { tab_id: 2, pane_id: 2, panes: [], title: 'three' }] }));
+  assert.match(await p.locator('#bar').innerText(), /three/);
+});
+
+test('presses on controls over the terminal are not clicks for the program', async t => {
+  // Narrow enough that the grid runs under the find bar.
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 700, height: 600 } });
+  await screen(p);
+  await p.keyboard.press(process.platform === 'darwin' ? 'Meta+f' : 'Control+Shift+F');
+  await p.locator('#find button[data-dir="older"]').click();
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'click').length), 0);
+});
+
+test('a late history reply from before the view reopened is dropped', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.evaluate(() => {
+    probe.openPast();
+    const stale = messages.filter(m => m.type === 'history').at(-1).request;
+    // The view closes and reopens before that reply arrives.
+    probe.term.focus();
+    probe.handle({ type: 'frame', seq: 2, pane_id: 1, cols: 81, rows: 24, local_scroll: true, data: '' });
+    probe.openPast();
+    probe.onHistory({ request: stale, pane_id: 1, first: 0, top: 0, rows: ['\x1b[0mstale-row'] });
+  });
+  assert.equal(await p.evaluate(() => document.getElementById('past').classList.contains('show')), false);
+});
+
 test('oversized UTF-8 paste is rejected visibly and a normal paste is preserved', async t => {
   const { p } = await page(t);
   await screen(p);
@@ -265,7 +313,7 @@ test('history retains rows while limiting rendered DOM', async t => {
     const times = [];
     for (let n = 0; n < 25; n++) {
       const start = performance.now();
-      probe.onHistory({ pane_id: 1, first: 0, top: 10000 - (n + 1) * 400,
+      probe.onHistory({ request: messages.filter(m => m.type === 'history').at(-1)?.request, pane_id: 1, first: 0, top: 10000 - (n + 1) * 400,
         rows: Array.from({ length: 400 }, (_, i) => '\x1b[0mhistory-' + (10000 - (n + 1) * 400 + i)) });
       probe.pastScroll(1e7);
       times.push(performance.now() - start);
@@ -284,7 +332,7 @@ test('history selection survives scrolling and older-page insertion', async t =>
   await screen(p);
   const result = await p.evaluate(() => {
     probe.openPast();
-    probe.onHistory({ pane_id: 1, first: 0, top: 400, rows: Array.from({ length: 400 }, (_, i) => '\x1b[0mrow-' + (400 + i)) });
+    probe.onHistory({ request: messages.filter(m => m.type === 'history').at(-1)?.request, pane_id: 1, first: 0, top: 400, rows: Array.from({ length: 400 }, (_, i) => '\x1b[0mrow-' + (400 + i)) });
     probe.pastScroll(1e7);
     const node = document.querySelector('#past .row span span').firstChild;
     const range = document.createRange(); range.selectNodeContents(node);
@@ -292,7 +340,7 @@ test('history selection survives scrolling and older-page insertion', async t =>
     const before = selection.toString();
     probe.pastScroll(-20);
     const afterScroll = selection.toString();
-    probe.onHistory({ pane_id: 1, first: 0, top: 0, rows: Array.from({ length: 400 }, (_, i) => '\x1b[0mrow-' + i) });
+    probe.onHistory({ request: messages.filter(m => m.type === 'history').at(-1)?.request, pane_id: 1, first: 0, top: 0, rows: Array.from({ length: 400 }, (_, i) => '\x1b[0mrow-' + i) });
     return { before, afterScroll, afterPrepend: selection.toString() };
   });
   assert.ok(result.before.length > 0);
@@ -411,7 +459,7 @@ test('history auto-copy and manual copy preserve Unicode, newlines and virtual g
   await captureClipboard(p);
   const result = await p.evaluate(() => {
     probe.openPast();
-    probe.onHistory({ pane_id: 1, first: 0, top: 0,
+    probe.onHistory({ request: messages.filter(m => m.type === 'history').at(-1)?.request, pane_id: 1, first: 0, top: 0,
       rows: Array.from({ length: 400 }, (_, i) => '\x1b[0;38;2;10;20;30m中文-' + i) });
     const last = document.querySelector('#past .row:last-child span span').firstChild;
     // Keep an endpoint at the end while materializing the top; the middle
@@ -453,7 +501,7 @@ test('touch history selection changes copy locally without copying page labels',
   await captureClipboard(p);
   await p.evaluate(() => {
     probe.openPast();
-    probe.onHistory({ pane_id: 1, first: 0, top: 0, rows: ['\x1b[0m中文 history'] });
+    probe.onHistory({ request: messages.filter(m => m.type === 'history').at(-1)?.request, pane_id: 1, first: 0, top: 0, rows: ['\x1b[0m中文 history'] });
     const range = document.createRange();
     range.selectNodeContents(document.querySelector('#past .row span span'));
     getSelection().removeAllRanges(); getSelection().addRange(range);

@@ -221,6 +221,10 @@ struct ConfigInfo {
     font_size: f64,
     line_height: f64,
     copy_on_select: bool,
+    /// Which Option key types composed characters (é, @ on some layouts)
+    /// rather than acting as Alt, as Kaku does on the Mac.
+    compose_left_option: bool,
+    compose_right_option: bool,
     /// Where Kaku draws its tab bar, so the page puts its tabs there too.
     tab_bar_at_bottom: bool,
     /// Kaku's tab bar colors, so the page's tabs look like the window's.
@@ -445,6 +449,8 @@ fn config_info() -> ConfigInfo {
         font_size: cfg.font_size,
         line_height: cfg.line_height,
         copy_on_select: cfg.copy_on_select,
+        compose_left_option: cfg.send_composed_key_when_left_alt_is_pressed,
+        compose_right_option: cfg.send_composed_key_when_right_alt_is_pressed,
         tab_bar_at_bottom: cfg.tab_bar_at_bottom,
         tab_bar: palette.tab_bar.as_ref().map(|bar| TabBarInfo {
             background: opt_hex(bar.background.as_ref()),
@@ -497,12 +503,75 @@ async fn route_panes(Query(query): Query<WsQuery>, headers: axum::http::HeaderMa
 
 fn check_token(query: &WsQuery, headers: &axum::http::HeaderMap) -> bool {
     let expected = get_or_init_token();
-    headers
-        .get("x-kaku-token")
+    let header = headers.get("x-kaku-token").and_then(|v| v.to_str().ok());
+    header.is_some_and(|t| same_secret(t, expected))
+        || query.token.as_deref().is_some_and(|t| same_secret(t, expected))
+}
+
+/// Compare a presented secret without leaking, through timing, how much of
+/// it matched.
+fn same_secret(presented: &str, expected: &str) -> bool {
+    let (a, b) = (presented.as_bytes(), expected.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Whether a request's Host names this server. A web page on another site
+/// can rebind its own name to 127.0.0.1 and then read same-origin responses
+/// from this port; checking Host shuts that out, since the page's requests
+/// still carry its own name.
+fn host_allowed(host: &str, port: u16, lan_ip: Option<&str>) -> bool {
+    let allowed = |name: &str| host == format!("{name}:{port}");
+    allowed("127.0.0.1")
+        || allowed("localhost")
+        || allowed("[::1]")
+        || lan_ip.is_some_and(allowed)
+}
+
+async fn require_own_host(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    static LAN_IP: OnceLock<Option<String>> = OnceLock::new();
+    let cfg = configuration();
+    let port = cfg.remote.port;
+    let lan = LAN_IP.get_or_init(|| {
+        let local = cfg.remote.bind == "127.0.0.1" || cfg.remote.bind == "localhost";
+        if local {
+            None
+        } else {
+            lan_ip()
+        }
+    });
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
-        .map(|t| t == expected)
-        .unwrap_or(false)
-        || query.token.as_deref() == Some(expected)
+        .unwrap_or("");
+    if !host_allowed(host, port, lan.as_deref()) {
+        return (StatusCode::FORBIDDEN, "unexpected host").into_response();
+    }
+    next.run(req).await
+}
+
+/// Write a file only this user can read, in full or not at all: it is
+/// created with mode 0600 (never briefly world-readable) under a temporary
+/// name, then renamed over the target.
+pub(crate) fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
 }
 
 // ── QR code endpoint ──────────────────────────────────────────────────────────
@@ -770,15 +839,8 @@ fn write_state(port: u16, token: &str, tunnel_relay: Option<&str>) {
         val["tunnel_relay"] = serde_json::Value::String(relay.to_string());
     }
     if let Ok(json) = serde_json::to_string(&val) {
-        let path = state_path();
-        if let Err(e) = std::fs::write(&path, json) {
-            log::warn!("kaku-remote: failed to write state file: {}", e);
-        } else {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
+        if let Err(e) = write_private(&state_path(), json.as_bytes()) {
+            log::warn!("kaku-remote: failed to write state file: {e}");
         }
     }
 }
@@ -886,7 +948,6 @@ pub fn start() {
 
                 let web_routes = Router::new()
                     .route("/", get(web::route_index))
-                    .route("/link", get(web::route_link))
                     .route("/assets/{name}", get(web::route_asset))
                     .route("/web/ws", get(web::route_ws))
                     .with_state(web_dirty);
@@ -897,7 +958,8 @@ pub fn start() {
                     .route("/qr", get(route_qr))
                     .route("/ws/{pane_id}", get(route_ws))
                     .with_state(state)
-                    .merge(web_routes);
+                    .merge(web_routes)
+                    .layer(axum::middleware::from_fn(require_own_host));
 
                 // The relay link does not depend on the local listener, so a
                 // busy port must not take it down with this task.
@@ -930,4 +992,31 @@ pub fn start() {
             });
         })
         .expect("spawn kaku-remote thread");
+}
+
+#[cfg(test)]
+mod host_guard_tests {
+    use super::*;
+
+    #[test]
+    fn only_this_servers_own_names_are_accepted() {
+        assert!(host_allowed("127.0.0.1:9988", 9988, None));
+        assert!(host_allowed("localhost:9988", 9988, None));
+        assert!(host_allowed("[::1]:9988", 9988, None));
+        assert!(host_allowed("192.168.1.5:9988", 9988, Some("192.168.1.5")));
+        // A rebound name, another port, the LAN address while bound to
+        // loopback only, a missing header.
+        assert!(!host_allowed("evil.example:9988", 9988, None));
+        assert!(!host_allowed("127.0.0.1:9989", 9988, None));
+        assert!(!host_allowed("192.168.1.5:9988", 9988, None));
+        assert!(!host_allowed("", 9988, None));
+    }
+
+    #[test]
+    fn secrets_compare_whole() {
+        assert!(same_secret("abc123", "abc123"));
+        assert!(!same_secret("abc124", "abc123"));
+        assert!(!same_secret("abc12", "abc123"));
+        assert!(!same_secret("", "abc123"));
+    }
 }

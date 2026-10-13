@@ -116,16 +116,7 @@ fn write_identity(identity: &ShareIdentity) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir).context("create data dir")?;
     }
     let json = serde_json::to_string(identity)?;
-    // Write to a sibling and rename, so a reader never sees half a file.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).context("write share identity")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, &path).context("save share identity")?;
-    Ok(())
+    crate::write_private(&path, json.as_bytes()).context("save share identity")
 }
 
 /// This Kaku's share identity, created on first use.
@@ -148,33 +139,54 @@ pub fn reset_identity() -> anyhow::Result<ShareIdentity> {
 
 // ── Sealing ───────────────────────────────────────────────────────────────────
 
-fn seal(key: &LessSafeKey, rng: &SystemRandom, plain: &[u8]) -> Option<Vec<u8>> {
+/// Sent in the clear to each browser as it connects: `CHALLENGE_TAG` and 16
+/// random bytes. Every message of that connection, both ways, is then sealed
+/// with the challenge and its position in the stream as associated data, so
+/// the relay cannot replay a recorded connection (a new one gets a new
+/// challenge), repeat or reorder messages within one, or move them to
+/// another browser.
+const CHALLENGE_TAG: &[u8; 4] = b"KCH1";
+type Challenge = [u8; 16];
+
+/// What a message is bound to besides the key: its direction, its browser
+/// connection and its position. `None` is the old fixed label alone, kept
+/// only to recognize a page from before this scheme.
+fn aad(label: &[u8], binding: Option<(&Challenge, u64)>) -> Vec<u8> {
+    let mut aad = label.to_vec();
+    if let Some((challenge, seq)) = binding {
+        aad.extend_from_slice(challenge);
+        aad.extend_from_slice(&seq.to_be_bytes());
+    }
+    aad
+}
+
+fn seal(key: &LessSafeKey, rng: &SystemRandom, aad: &[u8], plain: &[u8]) -> Option<Vec<u8>> {
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill(&mut nonce).ok()?;
     let mut buf = plain.to_vec();
-    key.seal_in_place_append_tag(
-        Nonce::assume_unique_for_key(nonce),
-        Aad::from(FROM_HOST),
-        &mut buf,
-    )
-    .ok()?;
+    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut buf)
+        .ok()?;
     let mut out = Vec::with_capacity(NONCE_LEN + buf.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&buf);
     Some(out)
 }
 
-fn open(key: &LessSafeKey, sealed: &[u8]) -> Option<String> {
+fn open(key: &LessSafeKey, aad: &[u8], sealed: &[u8]) -> Option<String> {
     if sealed.len() < NONCE_LEN {
         return None;
     }
     let (nonce, body) = sealed.split_at(NONCE_LEN);
     let nonce = Nonce::try_assume_unique_for_key(nonce).ok()?;
     let mut buf = body.to_vec();
-    let plain = key
-        .open_in_place(nonce, Aad::from(TO_HOST), &mut buf)
-        .ok()?;
+    let plain = key.open_in_place(nonce, Aad::from(aad), &mut buf).ok()?;
     String::from_utf8(plain.to_vec()).ok()
+}
+
+fn new_challenge(rng: &SystemRandom) -> Option<Challenge> {
+    let mut challenge = [0u8; 16];
+    rng.fill(&mut challenge).ok()?;
+    Some(challenge)
 }
 
 // ── Relay framing ─────────────────────────────────────────────────────────────
@@ -262,10 +274,13 @@ async fn deliver_input(inbox: &mpsc::Sender<String>, text: String, limit: Durati
     )
 }
 
-enum Browser {
-    /// Connected, but has not yet sent a message that opens with the key.
-    Pending(tokio::time::Instant),
-    Active(mpsc::Sender<String>),
+struct Browser {
+    challenge: Challenge,
+    /// Position of the next message expected from this browser.
+    next_in: u64,
+    /// None until a message opens with the key.
+    inbox: Option<mpsc::Sender<String>>,
+    connected_at: tokio::time::Instant,
 }
 
 type RelaySocket =
@@ -320,6 +335,7 @@ async fn serve(
     });
 
     let key = std::sync::Arc::new(key);
+    let rng = SystemRandom::new();
     let mut browsers: HashMap<u32, Browser> = HashMap::new();
     let mut identity_check = tokio::time::interval(IDENTITY_CHECK);
     identity_check.tick().await;
@@ -340,15 +356,33 @@ async fn serve(
                 match msg {
                     Message::Text(text) => match serde_json::from_str::<RelayMsg>(text.as_str()) {
                         Ok(RelayMsg::Open { c }) => {
-                            browsers.insert(c, Browser::Pending(tokio::time::Instant::now()));
+                            let Some(challenge) = new_challenge(&rng) else { continue };
+                            let mut hello = CHALLENGE_TAG.to_vec();
+                            hello.extend_from_slice(&challenge);
+                            if to_relay.try_send(Message::Binary(frame(KIND_DATA, c, &hello).into())).is_err() {
+                                break Err(anyhow::anyhow!("relay output queue is full"));
+                            }
+                            browsers.insert(c, Browser {
+                                challenge,
+                                next_in: 0,
+                                inbox: None,
+                                connected_at: tokio::time::Instant::now(),
+                            });
                         }
                         Ok(RelayMsg::Close { c }) => {
                             browsers.remove(&c);
                         }
                         Ok(RelayMsg::Get { r, p }) => {
-                            if to_relay.try_send(Message::Binary(asset_frame(r, &p).into())).is_err() {
-                                break Err(anyhow::anyhow!("relay output queue is full"));
+                            // Anyone who knows this Mac's id can ask for the
+                            // page's files, without the key. Answer only while
+                            // half the queue is free, so those requests can
+                            // never crowd out a session's frames or drop the
+                            // link; an unanswered one times out at the relay.
+                            if to_relay.capacity() * 2 < to_relay.max_capacity() {
+                                log::debug!("kaku-share: busy, not serving {p}");
+                                continue;
                             }
+                            let _ = to_relay.try_send(Message::Binary(asset_frame(r, &p).into()));
                         }
                         Err(e) => log::debug!("kaku-share: unknown relay message: {e}"),
                     },
@@ -357,22 +391,37 @@ async fn serve(
                             continue;
                         }
                         let c = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-                        let Some(text) = open(&key, &bytes[5..]) else {
-                            // Wrong key or tampered: drop this browser.
+                        let Some(browser) = browsers.get_mut(&c) else { continue };
+                        let sealed = &bytes[5..];
+                        let opened = open(&key, &aad(TO_HOST, Some((&browser.challenge, browser.next_in))), sealed);
+                        let Some(text) = opened else {
                             browsers.remove(&c);
-                            if to_relay.try_send(close_browser(c, 4403)).is_err() {
+                            // A page from before the challenge scheme (open
+                            // across an update) seals with the bare label:
+                            // tell it to reload instead of calling its key
+                            // wrong, which would make it forget the key.
+                            let old_page = open(&key, &aad(TO_HOST, None), sealed).is_some();
+                            if old_page {
+                                let reload = br#"{"type":"error","detail":"Kaku on the Mac was updated. Reload this page."}"#;
+                                if let Some(sealed) = seal(&key, &rng, &aad(FROM_HOST, None), reload) {
+                                    let _ = to_relay.try_send(Message::Binary(frame(KIND_DATA, c, &sealed).into()));
+                                }
+                            }
+                            // Otherwise: wrong key, tampered, replayed or out
+                            // of order.
+                            if to_relay.try_send(close_browser(c, if old_page { 4426 } else { 4403 })).is_err() {
                                 break Err(anyhow::anyhow!("relay output queue is full"));
                             }
                             continue;
                         };
-                        let inbox = match browsers.get(&c) {
-                            Some(Browser::Active(inbox)) => inbox.clone(),
-                            Some(Browser::Pending(_)) => {
-                                let inbox = start_session(c, dirty.clone(), key.clone(), to_relay.clone());
-                                browsers.insert(c, Browser::Active(inbox.clone()));
+                        browser.next_in += 1;
+                        let inbox = match &browser.inbox {
+                            Some(inbox) => inbox.clone(),
+                            None => {
+                                let inbox = start_session(c, browser.challenge, dirty.clone(), key.clone(), to_relay.clone());
+                                browser.inbox = Some(inbox.clone());
                                 inbox
                             }
-                            None => continue,
                         };
                         // A burst of typing may briefly fill the mailbox while
                         // the session awaits the GUI. Preserve it, but never
@@ -398,7 +447,7 @@ async fn serve(
             }
             _ = identity_check.tick() => {
                 let expired: Vec<u32> = browsers.iter().filter_map(|(&id, browser)| {
-                    matches!(browser, Browser::Pending(at) if at.elapsed() >= AUTH_TIMEOUT).then_some(id)
+                    (browser.inbox.is_none() && browser.connected_at.elapsed() >= AUTH_TIMEOUT).then_some(id)
                 }).collect();
                 for c in expired {
                     browsers.remove(&c);
@@ -423,6 +472,7 @@ async fn serve(
 /// Start the session for browser `c`; returns where its messages go.
 fn start_session(
     c: u32,
+    challenge: Challenge,
     dirty: WebDirty,
     key: std::sync::Arc<LessSafeKey>,
     to_relay: mpsc::Sender<Message>,
@@ -432,10 +482,12 @@ fn start_session(
     tokio::spawn(web::run_session(session_in, session_out, dirty));
     tokio::spawn(async move {
         let rng = SystemRandom::new();
+        let mut seq = 0u64;
         while let Some(text) = replies.recv().await {
-            let Some(sealed) = seal(&key, &rng, text.as_bytes()) else {
+            let Some(sealed) = seal(&key, &rng, &aad(FROM_HOST, Some((&challenge, seq))), text.as_bytes()) else {
                 break;
             };
+            seq += 1;
             let msg = Message::Binary(frame(KIND_DATA, c, &sealed).into());
             if !matches!(
                 tokio::time::timeout(WRITE_TIMEOUT, to_relay.send(msg)).await,
@@ -553,29 +605,25 @@ mod tests {
     }
 
     #[test]
-    fn sealed_messages_open_only_in_the_other_direction_with_the_key() {
-        let a = identity();
-        let key = a.sealing_key().unwrap();
+    fn sealed_messages_open_only_in_their_direction_connection_and_place() {
+        let key = identity().sealing_key().unwrap();
         let rng = SystemRandom::new();
-        let from_host = seal(&key, &rng, b"hello").unwrap();
-        // The page seals with the c2h label; a host-sealed frame must not
-        // open as if it came from the page (no reflection).
-        assert!(open(&key, &from_host).is_none());
-
-        let mut nonce = [0u8; NONCE_LEN];
-        rng.fill(&mut nonce).unwrap();
-        let mut buf = b"from page".to_vec();
-        key.seal_in_place_append_tag(
-            Nonce::assume_unique_for_key(nonce),
-            Aad::from(TO_HOST),
-            &mut buf,
-        )
-        .unwrap();
-        let mut from_page = nonce.to_vec();
-        from_page.extend_from_slice(&buf);
-        assert_eq!(open(&key, &from_page).as_deref(), Some("from page"));
-
+        let ch = new_challenge(&rng).unwrap();
+        let other_ch = new_challenge(&rng).unwrap();
+        let msg = seal(&key, &rng, &aad(TO_HOST, Some((&ch, 0))), b"ls\r").unwrap();
+        assert_eq!(open(&key, &aad(TO_HOST, Some((&ch, 0))), &msg).as_deref(), Some("ls\r"));
+        // Reflected back as if the Mac sent it.
+        assert!(open(&key, &aad(FROM_HOST, Some((&ch, 0))), &msg).is_none());
+        // Replayed later in the same connection, or into another one.
+        assert!(open(&key, &aad(TO_HOST, Some((&ch, 1))), &msg).is_none());
+        assert!(open(&key, &aad(TO_HOST, Some((&other_ch, 0))), &msg).is_none());
+        // Recognizable as an old page only when it was sealed the old way.
+        assert!(open(&key, &aad(TO_HOST, None), &msg).is_none());
+        let old = seal(&key, &rng, &aad(TO_HOST, None), b"{}").unwrap();
+        assert!(open(&key, &aad(TO_HOST, None), &old).is_some());
+        assert!(open(&key, &aad(TO_HOST, Some((&ch, 0))), &old).is_none());
+        // Another key opens nothing.
         let other = identity().sealing_key().unwrap();
-        assert!(open(&other, &from_page).is_none());
+        assert!(open(&other, &aad(TO_HOST, Some((&ch, 0))), &msg).is_none());
     }
 }

@@ -57,6 +57,15 @@ async function until(fn, ms = 15000) {
     await page.keyboard.type('printf "LIVE-OK\\n"\n');
     await page.waitForFunction(() => [...document.querySelectorAll('.xterm-rows > div')].some(row => row.textContent.trim() === 'LIVE-OK'));
 
+    // A page on another site that rebinds its name to 127.0.0.1 still sends
+    // its own Host, and is refused; the old token page is gone.
+    const statusFor = host => new Promise((resolve, reject) => require('node:http')
+      .get({ host: '127.0.0.1', port: local, path: '/', headers: { Host: host } }, res => { res.resume(); resolve(res.statusCode); })
+      .on('error', reject));
+    assert.equal(await statusFor(`evil.example:${local}`), 403);
+    assert.equal(await statusFor(`127.0.0.1:${local}`), 200);
+    assert.equal((await fetch(`http://127.0.0.1:${local}/link`)).status, 404);
+
     // Raw connection measures server flow control without browser mocks.
     const ws = new WebSocket(`ws://127.0.0.1:${local}/web/ws?token=${state.token}`);
     sockets.push(ws);
@@ -197,6 +206,45 @@ async function until(fn, ms = 15000) {
     const idleClosed = new Promise(resolve => idle.once('close', code => resolve(code)));
     assert.equal(await Promise.race([idleClosed, sleep(21000).then(() => 'timeout')]), 4408);
 
+    // Each relay connection is bound to the Mac's challenge and a position:
+    // a recorded message replayed on a new connection, one out of place, or
+    // one sealed the old way never reaches a session.
+    const key = Buffer.from(identity.key, 'base64url');
+    const sealFor = (label, challenge, seq, json) => {
+      const iv = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+      const aad = challenge ? Buffer.alloc(label.length + 24) : Buffer.from(label);
+      if (challenge) { Buffer.from(label).copy(aad); challenge.copy(aad, label.length); aad.writeBigUInt64BE(BigInt(seq), label.length + 16); }
+      cipher.setAAD(aad);
+      return Buffer.concat([iv, cipher.update(json), cipher.final(), cipher.getAuthTag()]);
+    };
+    const rawBrowser = async () => {
+      const socket = new WebSocket(`ws://127.0.0.1:${relay}/${id}/ws`);
+      sockets.push(socket);
+      const inbox = [];
+      socket.on('message', (data, binary) => { if (binary) inbox.push(Buffer.from(data)); });
+      const closed = new Promise(resolve => socket.once('close', code => resolve(code)));
+      await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
+      const first = await until(() => inbox[0]);
+      assert.equal(first.subarray(0, 4).toString(), 'KCH1');
+      return { socket, closed, inbox, challenge: first.subarray(4) };
+    };
+    const hello = '{"type":"hello","frame_ack":true}';
+    const accepted = await rawBrowser();
+    const recorded = sealFor('kaku-web c2h', accepted.challenge, 0, hello);
+    accepted.socket.send(recorded);
+    await until(() => accepted.inbox.length > 1);
+    accepted.socket.close();
+    const replay = await rawBrowser();
+    replay.socket.send(recorded);
+    assert.equal(await Promise.race([replay.closed, sleep(5000).then(() => 'timeout')]), 4403);
+    const misplaced = await rawBrowser();
+    misplaced.socket.send(sealFor('kaku-web c2h', misplaced.challenge, 1, hello));
+    assert.equal(await Promise.race([misplaced.closed, sleep(5000).then(() => 'timeout')]), 4403);
+    const oldPage = await rawBrowser();
+    oldPage.socket.send(sealFor('kaku-web c2h', null, 0, hello));
+    assert.equal(await Promise.race([oldPage.closed, sleep(5000).then(() => 'timeout')]), 4426);
+
     // Replacing a host retires its browser immediately, even if old output
     // was queued. Use a separate synthetic identity, never the app's link.
     const secret = crypto.randomBytes(32).toString('hex');
@@ -241,7 +289,7 @@ async function until(fn, ms = 15000) {
     await until(async () => (await fetch(relayBase)).status === 404);
     assert.notEqual(JSON.parse(fs.readFileSync(identityPath)).key, identity.key);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ localTerminal: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', wrongKey: 'pass', idleAuthentication: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass', rememberedNewTab: 'pass', resetRevokesLink: 'pass' }));
+    console.log(JSON.stringify({ localTerminal: 'pass', foreignHostRefused: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', wrongKey: 'pass', idleAuthentication: 'pass', replayRejected: 'pass', oldPageAskedToReload: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass', rememberedNewTab: 'pass', resetRevokesLink: 'pass' }));
   } finally {
     for (const ws of sockets) ws.terminate();
     await browser?.close();

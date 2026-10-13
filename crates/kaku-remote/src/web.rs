@@ -7,9 +7,9 @@
 //! app asked Kaku for; text and pastes take the same paths Kaku's GUI uses.
 
 use crate::{check_token, WsQuery};
-use axum::extract::{ws, ConnectInfo, Path, Query, State};
+use axum::extract::{ws, Path, Query, State};
 use axum::http::{header, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use mux::pane::{CloseReason, Pane, PaneId};
 use mux::Mux;
@@ -17,7 +17,6 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
@@ -43,6 +42,11 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// title changes and resizes that do not produce `PaneOutput`.
 const IDLE_REFRESH: Duration = Duration::from_secs(1);
 const MAX_INPUT_LEN: usize = 65_536;
+/// A page pings every 20 s, and a background tab still gets a timer about
+/// once a minute. This long without a word means the browser is gone (a
+/// laptop asleep with the socket half open), and the session ends rather
+/// than holding its subscriptions and App Nap off forever.
+const SESSION_SILENCE: Duration = Duration::from_secs(180);
 /// Cap on wheel notches forwarded to an app from one browser wheel event.
 const MAX_WHEEL_STEPS: usize = 10;
 const MIN_COLS: usize = 20;
@@ -203,40 +207,6 @@ pub(crate) async fn route_asset(Path(name): Path<String>) -> Response {
     asset_response(&format!("assets/{name}"))
 }
 
-/// Loopback-only page that hands the browser on this Mac a link carrying the
-/// token in the URL fragment, which browsers never send to the server.
-pub(crate) async fn route_link(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> Response {
-    if !addr.ip().is_loopback() {
-        return (StatusCode::FORBIDDEN, "only accessible from this Mac").into_response();
-    }
-    let token = crate::get_or_init_token();
-    let cfg = config::configuration();
-    let port = cfg.remote.port;
-    let lan = if cfg.remote.bind == "127.0.0.1" || cfg.remote.bind == "localhost" {
-        None
-    } else {
-        crate::lan_ip()
-    };
-    let local = format!("http://127.0.0.1:{port}/#t={token}");
-    let mut body = format!(
-        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kaku Web</title>
-<style>body{{font:15px -apple-system,sans-serif;background:#16161a;color:#ddd;margin:40px auto;max-width:640px;padding:0 16px}}
-a{{color:#9ecbff;word-break:break-all}}p{{color:#999}}</style>
-<h2>Kaku Web</h2>
-<p>This Mac</p><a href="{local}">{local}</a>"#
-    );
-    if let Some(ip) = lan {
-        let url = format!("http://{ip}:{port}/#t={token}");
-        let _ = write!(
-            body,
-            r#"<p>Other computers on this network</p><a href="{url}">{url}</a>"#
-        );
-    }
-    body.push_str("<p>The link stops working when Kaku restarts.</p>");
-    Html(body).into_response()
-}
-
 #[derive(Serialize, PartialEq)]
 struct TabInfo {
     tab_id: usize,
@@ -269,7 +239,9 @@ fn collect_tabs() -> Vec<TabInfo> {
         return Vec::new();
     };
     let titles = TAB_TITLES.lock().clone();
-    let policy = config::configuration().tab_close_confirmation;
+    let config = config::configuration();
+    let policy = config.tab_close_confirmation;
+    let pane_policy = config.pane_close_confirmation;
     let mut tabs = Vec::new();
     for window_id in mux.iter_windows() {
         let Some(window) = mux.get_window(window_id) else {
@@ -296,11 +268,9 @@ fn collect_tabs() -> Vec<TabInfo> {
                         top: p.top,
                         width: p.width,
                         height: p.height,
-                        confirm_close: config::configuration()
-                            .pane_close_confirmation
-                            .should_prompt(true, || {
-                                p.pane.can_close_without_prompting(CloseReason::Pane)
-                            }),
+                        confirm_close: pane_policy.should_prompt(true, || {
+                            p.pane.can_close_without_prompting(CloseReason::Pane)
+                        }),
                     })
                     .collect()
             } else {
@@ -318,6 +288,10 @@ fn collect_tabs() -> Vec<TabInfo> {
             });
         }
     }
+    // Forget tabs that closed, so these maps stay the size of what is open.
+    let live: HashSet<usize> = tabs.iter().map(|t| t.tab_id).collect();
+    TAB_TITLES.lock().retain(|id, _| live.contains(id));
+    WEB_SIZED_TABS.lock().retain(|id| live.contains(id));
     tabs
 }
 
@@ -326,7 +300,9 @@ fn collect_tabs() -> Vec<TabInfo> {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WebClientMsg {
-    /// First message through the relay; proves the page holds the key.
+    /// First message of a session. It says whether the page acknowledges
+    /// frames (flow control); through the relay, whatever first opens with
+    /// the key starts the session.
     Hello {
         #[serde(default)]
         frame_ack: bool,
@@ -444,6 +420,10 @@ enum WebClientMsg {
     History {
         #[serde(default)]
         end: Option<isize>,
+        /// Echoed in the reply, so the page can drop one that arrives after
+        /// it moved on.
+        #[serde(default)]
+        request: u32,
     },
     /// The text of every row the page shows, once it has applied `frames`
     /// frames. Kaku compares it with what it believes the page shows; a
@@ -513,6 +493,7 @@ enum WebServerMsg<'a> {
     /// row is SGR runs with `CSI n G` pinning columns after wide glyphs.
     History {
         pane_id: usize,
+        request: u32,
         first: isize,
         top: isize,
         rows: &'a [String],
@@ -1169,8 +1150,6 @@ impl Shown {
         }
         if moved != 0 {
             self.last_move = moved;
-        }
-        if moved != 0 {
             let _ = write!(
                 data,
                 "\x1b[0m\x1b[{}{}",
@@ -1447,18 +1426,12 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
         WebClientMsg::Text { data } => {
             view.pinned_top = None;
             view.found_at = None;
-            if data.len() > MAX_INPUT_LEN {
-                return;
-            }
             pane.writer()
                 .write_all(data.as_bytes())
                 .map_err(anyhow::Error::from)
         }
         WebClientMsg::Paste { data } => {
             view.pinned_top = None;
-            if data.len() > MAX_INPUT_LEN {
-                return;
-            }
             pane.send_paste(&data)
         }
         WebClientMsg::Key {
@@ -1682,6 +1655,7 @@ pub(crate) async fn run_session(
     let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle = tokio::time::interval(IDLE_REFRESH);
+    let mut last_heard = std::time::Instant::now();
 
     loop {
         let pane_update = async {
@@ -1693,6 +1667,7 @@ pub(crate) async fn run_session(
         tokio::select! {
             msg = inbox.recv() => {
                 let Some(text) = msg else { break };
+                last_heard = std::time::Instant::now();
                 let msg = match serde_json::from_str::<WebClientMsg>(&text) {
                     Ok(msg) => msg,
                     Err(e) => {
@@ -1733,7 +1708,7 @@ pub(crate) async fn run_session(
                     WebClientMsg::UploadStart { .. }
                         | WebClientMsg::UploadChunk { .. }
                         | WebClientMsg::UploadCancel { .. }
-        | WebClientMsg::UploadEnd { .. }
+                        | WebClientMsg::UploadEnd { .. }
                 ) {
                     continue;
                 }
@@ -1767,11 +1742,11 @@ pub(crate) async fn run_session(
                     dirty_frame = attached.is_some();
                     continue;
                 }
-                if let WebClientMsg::History { end } = msg {
+                if let WebClientMsg::History { end, request } = msg {
                     let Some(pane_id) = attached else { continue };
                     let Some(pane) = lookup_pane(pane_id) else { continue };
                     let (first, top, rows) = history_rows(&pane, end);
-                    let reply = WebServerMsg::History { pane_id, first, top, rows: &rows };
+                    let reply = WebServerMsg::History { pane_id, request, first, top, rows: &rows };
                     let Some(json) = encode(&reply) else { continue };
                     if outbox.send(json).await.is_err() {
                         break;
@@ -1800,6 +1775,15 @@ pub(crate) async fn run_session(
                     continue;
                 }
                 if let WebClientMsg::Attach { pane_id, focus } = msg {
+                    // A pane that is already gone gets the same answer as one
+                    // that closes while viewed, and no entry in `dirty`.
+                    if lookup_pane(pane_id).is_none() {
+                        let Some(json) = encode(&WebServerMsg::Closed { pane_id }) else { continue };
+                        if outbox.send(json).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     if focus {
                         dispatch_tab_action(TabAction::Activate { pane_id });
                     }
@@ -1833,6 +1817,10 @@ pub(crate) async fn run_session(
             }
             _ = idle.tick() => {
                 if flow_control && frames_sent > frames_acked && last_frame_at.elapsed() > Duration::from_secs(90) { break; }
+                if last_heard.elapsed() > SESSION_SILENCE {
+                    log::info!("kaku-remote web: no word from the browser for {}s, ending its session", SESSION_SILENCE.as_secs());
+                    break;
+                }
                 dirty_frame = attached.is_some();
                 // Tab state lives on the GUI thread; the close-confirmation
                 // check reads the Lua config, which only that thread may touch.
