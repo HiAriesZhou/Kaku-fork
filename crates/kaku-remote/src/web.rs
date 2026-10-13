@@ -74,6 +74,21 @@ pub fn release_web_size(tab_id: usize) {
     WEB_SIZED_TABS.lock().remove(&tab_id);
 }
 
+/// Whether a relayout of the Mac window should resize this tab. A tab a
+/// browser sized keeps that size through relayouts the Mac does on its own
+/// (a display or scale change, focus, a theme switch, the tab bar showing):
+/// shrinking it under the browser made Claude Code and Codex redraw for the
+/// Mac's rows, and their whole screen jumped up in the page until the next
+/// key. Someone dragging the window edge is using the Mac, which takes the
+/// tab back, as its own typing and clicks do.
+pub fn window_relayout_resizes_tab(tab_id: usize, live_resize: bool) -> bool {
+    if live_resize {
+        release_web_size(tab_id);
+        return true;
+    }
+    !tab_is_web_sized(tab_id)
+}
+
 /// Tab changes the page asks for. The GUI performs them through the same
 /// key assignments as its own Cmd+T and Close Tab, so cwd inheritance and
 /// the closed-tab history behave as they do on the Mac.
@@ -1712,6 +1727,17 @@ mod tests {
         let mut out = String::new();
         Sgr::from_attrs(&attrs).write(&mut out);
         assert_eq!(out, "\x1b[0;1;7;38;5;2;48;2;255;0;127m");
+    }
+
+    #[test]
+    fn web_sized_tabs_keep_their_size_until_the_mac_window_is_dragged() {
+        let tab = usize::MAX - 7;
+        assert!(window_relayout_resizes_tab(tab, false));
+        WEB_SIZED_TABS.lock().insert(tab);
+        assert!(!window_relayout_resizes_tab(tab, false));
+        assert!(tab_is_web_sized(tab));
+        assert!(window_relayout_resizes_tab(tab, true));
+        assert!(!tab_is_web_sized(tab));
     }
 
     #[test]

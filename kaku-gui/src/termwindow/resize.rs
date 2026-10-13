@@ -749,6 +749,13 @@ impl super::TermWindow {
         let mux = Mux::get();
         if let Some(window) = mux.get_window(self.mux_window_id) {
             for tab in window.iter() {
+                // A tab a browser is driving keeps the browser's size
+                // through relayouts the Mac does on its own; the window
+                // draws the rows that fit.
+                #[cfg(feature = "remote")]
+                if !kaku_remote::window_relayout_resizes_tab(tab.tab_id().into(), live) {
+                    continue;
+                }
                 if live || defer_font_scale_pty_resize {
                     tab.resize_visual(size);
                 } else {

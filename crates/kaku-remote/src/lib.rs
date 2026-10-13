@@ -25,8 +25,8 @@ mod web;
 
 pub use share::{load_or_create_identity, reset_identity, ShareIdentity};
 pub use web::{
-    publish_tab_title, release_web_size, set_tab_action_handler, tab_is_web_sized, TabAction,
-    TabActionHandler,
+    publish_tab_title, release_web_size, set_tab_action_handler, tab_is_web_sized,
+    window_relayout_resizes_tab, TabAction, TabActionHandler,
 };
 
 // ── Token ─────────────────────────────────────────────────────────────────────
