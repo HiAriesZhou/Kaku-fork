@@ -7,17 +7,23 @@ use wezterm_term::color::ColorAttribute;
 use window::color::LinearRgba;
 
 impl crate::TermWindow {
-    pub fn paint_tab_bar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
+    /// Top edge of the tab bar row. Also valid while the bar is hidden, so
+    /// the keyboard tab rename editor can open where the bar would sit.
+    pub fn tab_bar_y(&self, tab_bar_height: f32) -> f32 {
         let border = self.get_os_border();
-        let tab_bar_height = self.tab_bar_pixel_height()?;
-        let tab_bar_y = if self.config.tab_bar_at_bottom {
+        if self.config.tab_bar_at_bottom {
             ((self.dimensions.pixel_height as f32) - tab_bar_height - border.bottom.get() as f32)
                 .max(0.)
         } else {
             // Offset below the OS top inset so cells aren't clipped by the
             // macOS rounded corner / integrated buttons window mask.
             border.top.get() as f32
-        };
+        }
+    }
+
+    pub fn paint_tab_bar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
+        let tab_bar_height = self.tab_bar_pixel_height()?;
+        let tab_bar_y = self.tab_bar_y(tab_bar_height);
         if self.touch_mode {
             return self.paint_touch_bar();
         }

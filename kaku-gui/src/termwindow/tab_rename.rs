@@ -639,6 +639,50 @@ impl TabRenameModal {
         Element::with_line(font, &line, palette)
     }
 
+    /// Selected text uses the terminal's selection colors, so a pending
+    /// replace (Cmd+A, Shift+arrows) is visible. A fully transparent
+    /// `selection_fg` keeps the title color, as the terminal does. Kaku
+    /// Light paints the active tab in exactly its selection colors, so when
+    /// the selection would not stand out from the editor, use reverse video.
+    fn selected_text_attrs(
+        attrs: &CellAttributes,
+        palette: &ColorPalette,
+        editor_bg: LinearRgba,
+        editor_fg: LinearRgba,
+    ) -> CellAttributes {
+        const MIN_SELECTION_CONTRAST: f32 = 1.1;
+
+        let mut attrs = attrs.clone();
+        let (sr, sg, sb, alpha) = palette.selection_bg.to_linear().tuple();
+        let (er, eg, eb, _) = editor_bg.tuple();
+        let editor_bg = LinearRgba::with_components(er, eg, eb, 1.0);
+        let shown = LinearRgba::with_components(
+            er + (sr - er) * alpha,
+            eg + (sg - eg) * alpha,
+            eb + (sb - eb) * alpha,
+            1.0,
+        );
+        if shown.contrast_ratio(&editor_bg) < MIN_SELECTION_CONTRAST {
+            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
+                editor_bg.to_srgb(),
+            ));
+            attrs.set_background(ColorAttribute::TrueColorWithDefaultFallback(
+                editor_fg.to_srgb(),
+            ));
+            return attrs;
+        }
+
+        if palette.selection_fg.3 != 0.0 {
+            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
+                palette.selection_fg,
+            ));
+        }
+        attrs.set_background(ColorAttribute::TrueColorWithDefaultFallback(
+            palette.selection_bg,
+        ));
+        attrs
+    }
+
     fn cursor_segment(
         font: &std::rc::Rc<wezterm_font::LoadedFont>,
         metrics: &RenderMetrics,
@@ -743,6 +787,15 @@ impl TabRenameModal {
         }
     }
 
+    fn center_floating_editor(computed: &mut ComputedElement, window_width: f32, floating: bool) {
+        // The layout can shrink below its requested width; position the
+        // floating editor using the box that will actually be painted.
+        if floating {
+            let x = ((window_width - computed.bounds.width()) / 2.0).max(0.0);
+            computed.translate(euclid::vec2(x - computed.bounds.min_x(), 0.0));
+        }
+    }
+
     fn compute(&self, term_window: &mut TermWindow) -> anyhow::Result<Vec<ComputedElement>> {
         let font = term_window
             .fonts
@@ -844,7 +897,13 @@ impl TabRenameModal {
                 row.push(Self::text_segment(&font, &palette, left, &text_attrs));
             }
 
-            row.push(Self::text_segment(&font, &palette, selected, &text_attrs));
+            let selected_attrs = Self::selected_text_attrs(&text_attrs, &palette, bg, text);
+            row.push(Self::text_segment(
+                &font,
+                &palette,
+                selected,
+                &selected_attrs,
+            ));
             cursor_element_idx = row.len();
             row.push(Self::cursor_segment(
                 &font,
@@ -938,7 +997,7 @@ impl TabRenameModal {
             .display(DisplayType::Block);
 
         let dimensions = term_window.dimensions;
-        let computed = term_window.compute_element(
+        let mut computed = term_window.compute_element(
             &LayoutContext {
                 height: DimensionContext {
                     dpi: dimensions.dpi as f32,
@@ -958,6 +1017,7 @@ impl TabRenameModal {
             &element,
         )?;
 
+        Self::center_floating_editor(&mut computed, window_width, self.anchor.width == 0);
         Self::update_text_cursor_position(term_window, &computed, cursor_element_idx);
 
         Ok(vec![computed])
@@ -1107,5 +1167,119 @@ mod tests {
     #[test]
     fn clearing_the_value_is_applied_to_restore_the_auto_title() {
         assert!(TabRenameModal::should_apply("pinned", ""));
+    }
+
+    #[test]
+    fn floating_editor_centers_the_painted_box_and_its_cursor() {
+        use crate::termwindow::box_model::*;
+
+        let rect = euclid::rect(240.0, 500.0, 100.0, 30.0);
+        let cursor_rect = euclid::rect(326.0, 504.0, 2.0, 22.0);
+        let box_at = |bounds| ComputedElement {
+            item_type: None,
+            zindex: 120,
+            bounds,
+            border_rect: bounds,
+            border: PixelDimension::default(),
+            border_corners: None,
+            colors: ElementColors::default(),
+            hover_colors: None,
+            padding: bounds,
+            content_rect: bounds,
+            baseline: 0.0,
+            content: ComputedElementContent::Children(vec![]),
+        };
+        // A requested 120px box starts at x=240 in a 600px window,
+        // but the painted text box shrinks to 100px. Its actual center
+        // must be 300px, with the IME cursor moving by the same amount.
+        let mut computed = box_at(rect);
+        computed.content = ComputedElementContent::Children(vec![box_at(cursor_rect)]);
+        TabRenameModal::center_floating_editor(&mut computed, 600.0, true);
+        assert_eq!(computed.bounds.center().x, 300.0);
+        assert_eq!(computed.bounds.min_y(), 500.0);
+        assert_eq!(computed.content_rect.min_x(), 250.0);
+        let ComputedElementContent::Children(children) = &computed.content else {
+            panic!("missing cursor");
+        };
+        assert_eq!(children[0].bounds.min_x(), 336.0);
+
+        // The double-click path keeps the original tab anchor.
+        let mut anchored = box_at(rect);
+        TabRenameModal::center_floating_editor(&mut anchored, 600.0, false);
+        assert_eq!(anchored.bounds, rect);
+
+        for width in [320.0, 768.0, 1280.0] {
+            let mut computed = box_at(rect);
+            TabRenameModal::center_floating_editor(&mut computed, width, true);
+            assert_eq!(computed.bounds.center().x, width / 2.0);
+        }
+    }
+
+    #[test]
+    fn selected_text_is_drawn_with_the_selection_colors() {
+        use termwiz::cell::CellAttributes;
+        use termwiz::color::SrgbaTuple;
+        use wezterm_term::color::{ColorAttribute, ColorPalette};
+
+        let hex = |s: &str| s.parse::<SrgbaTuple>().unwrap();
+        let attrs = |fg: SrgbaTuple, bg: SrgbaTuple| {
+            let mut attrs = CellAttributes::default();
+            attrs
+                .set_foreground(ColorAttribute::TrueColorWithDefaultFallback(fg))
+                .set_background(ColorAttribute::TrueColorWithDefaultFallback(bg));
+            attrs
+        };
+
+        // Cmd+A must look different from the plain title, or typing over a
+        // selection replaces text the user could not see was selected.
+        // Kaku Dark: translucent purple over the active tab surface, title
+        // color kept because the palette sets an opaque selection_fg.
+        let (tab_bg, tab_fg) = (hex("#29263c"), hex("#d5d4d6"));
+        let mut palette = ColorPalette::default();
+        palette.selection_bg = hex("rgba(142,106,217,0.55)");
+        palette.selection_fg = SrgbaTuple(0., 0., 0., 0.);
+        let title = attrs(tab_fg, tab_bg);
+        let selected = TabRenameModal::selected_text_attrs(
+            &title,
+            &palette,
+            tab_bg.to_linear(),
+            tab_fg.to_linear(),
+        );
+        assert_eq!(
+            selected.background(),
+            ColorAttribute::TrueColorWithDefaultFallback(palette.selection_bg)
+        );
+        assert_eq!(selected.foreground(), title.foreground());
+
+        palette.selection_fg = hex("#d5d4d6");
+        let selected = TabRenameModal::selected_text_attrs(
+            &title,
+            &palette,
+            tab_bg.to_linear(),
+            tab_fg.to_linear(),
+        );
+        assert_eq!(
+            selected.foreground(),
+            ColorAttribute::TrueColorWithDefaultFallback(palette.selection_fg)
+        );
+
+        // Kaku Light: the active tab uses the selection colors themselves,
+        // so the editor falls back to reverse video.
+        let (tab_bg, tab_fg) = (hex("#E8E6DB"), hex("#100F0F"));
+        palette.selection_bg = tab_bg;
+        palette.selection_fg = tab_fg;
+        let title = attrs(tab_fg, tab_bg);
+        let selected = TabRenameModal::selected_text_attrs(
+            &title,
+            &palette,
+            tab_bg.to_linear(),
+            tab_fg.to_linear(),
+        );
+        assert_ne!(selected.background(), title.background());
+        assert_ne!(selected.foreground(), title.foreground());
+        assert_eq!(
+            selected.background(),
+            ColorAttribute::TrueColorWithDefaultFallback(tab_fg.to_linear().to_srgb())
+        );
     }
 }

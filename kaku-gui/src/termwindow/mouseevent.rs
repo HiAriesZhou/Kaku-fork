@@ -572,6 +572,42 @@ impl super::TermWindow {
         Ok(())
     }
 
+    /// Keyboard entry to the same inline editor as double-clicking a tab.
+    /// With no tab item to anchor to (bar hidden for a single tab, or
+    /// disabled), the editor is centered on the row the bar would occupy.
+    /// `ui_items` come from the last paint, so a slot not drawn as the
+    /// active tab (a move or close ran since) uses that fallback too rather
+    /// than opening over another tab's rectangle.
+    pub(crate) fn begin_active_tab_rename(&mut self) -> anyhow::Result<()> {
+        let tab_idx = Mux::get()
+            .get_window(self.mux_window_id)
+            .ok_or_else(|| anyhow::anyhow!("no such window"))?
+            .get_active_idx();
+        let painted_active = self.tab_ui_item(tab_idx).filter(|item| {
+            matches!(
+                item.item_type,
+                UIItemType::TabBar(TabBarItem::Tab { active: true, .. })
+            )
+        });
+        let item = match painted_active {
+            Some(item) => item,
+            None => {
+                let height = self.tab_bar_pixel_height()?;
+                UIItem {
+                    x: self.dimensions.pixel_width / 2,
+                    y: self.tab_bar_y(height) as usize,
+                    width: 0,
+                    height: height as usize,
+                    item_type: UIItemType::TabBar(TabBarItem::Tab {
+                        tab_idx,
+                        active: true,
+                    }),
+                }
+            }
+        };
+        self.begin_tab_rename(tab_idx, item)
+    }
+
     fn drag_tab(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
         let Some(mut state) = self.tab_drag_state.take() else {
             return false;
