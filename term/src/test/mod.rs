@@ -1753,6 +1753,23 @@ fn test_cursor_hidden_before_alt_screen_stays_hidden() {
 }
 
 #[test]
+fn full_reset_turns_off_modify_other_keys() {
+    use crate::input::{KeyCode, KeyModifiers};
+
+    let writer = SharedWriter::default();
+    let mut term = TestTerm::new_with_writer(5, 10, 100, Box::new(writer.clone()));
+    // A TUI turns on modifyOtherKeys and exits without turning it off.
+    term.print("\x1b[>4;2m");
+    term.key_down(KeyCode::Char('i'), KeyModifiers::CTRL).unwrap();
+    wait_for_writer_output(&writer, b"\x1b[27;5;105~");
+    writer.clear();
+    // `reset` sends RIS; Ctrl+I is a plain Tab again.
+    term.print("\x1bc");
+    term.key_down(KeyCode::Char('i'), KeyModifiers::CTRL).unwrap();
+    wait_for_writer_output(&writer, b"\t");
+}
+
+#[test]
 fn rectangle_checksum_requests_get_no_reply() {
     let writer = SharedWriter::default();
     let mut term = TestTerm::new_with_writer(5, 10, 100, Box::new(writer.clone()));

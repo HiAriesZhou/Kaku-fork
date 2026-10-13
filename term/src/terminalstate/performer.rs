@@ -782,6 +782,7 @@ impl<'a> Performer<'a> {
                 self.alternate_scroll = false;
                 self.mouse_encoding = MouseEncoding::X10;
                 self.keyboard_encoding = KeyboardEncoding::Xterm;
+                self.modify_other_keys = None;
                 self.sixel_scrolls_right = false;
                 self.any_event_mouse = false;
                 self.button_event_mouse = false;
@@ -795,6 +796,9 @@ impl<'a> Performer<'a> {
                 self.palette.take();
                 self.top_and_bottom_margins = 0..self.screen().physical_rows as VisibleRowIndex;
                 self.left_and_right_margins = 0..self.screen().physical_cols;
+                self.left_and_right_margin_mode = false;
+                self.bidi_enabled.take();
+                self.bidi_hint.take();
                 self.unicode_version = self.config.unicode_version();
                 self.unicode_version_stack.clear();
                 self.suppress_initial_title_change = false;
