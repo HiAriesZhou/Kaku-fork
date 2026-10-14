@@ -264,6 +264,10 @@ pub fn render_qr_terminal(url: &str) -> String {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// The relay when `remote.tunnel_url` is empty. It lives here, not in the
+/// config crate, so builds without the web terminal do not carry it.
+const DEFAULT_RELAY: &str = "wss://r.kaku.fun";
+
 pub fn start() {
     // install_default() returns Err if a provider is already installed; that is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -276,7 +280,10 @@ pub fn start() {
     let port = cfg.remote.port;
     let bind = cfg.remote.bind.clone();
     let tunnel = cfg.remote.tunnel;
-    let tunnel_url = cfg.remote.tunnel_url.clone();
+    let tunnel_url = match cfg.remote.tunnel_url.trim() {
+        "" => DEFAULT_RELAY.to_string(),
+        url => url.to_string(),
+    };
     let token = get_or_init_token();
 
     log::info!("kaku-remote: starting on {}:{}", bind, port);

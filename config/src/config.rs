@@ -1085,7 +1085,9 @@ pub struct RemoteConfig {
     #[dynamic(default = "default_remote_tunnel")]
     pub tunnel: bool,
 
-    /// Relay server WebSocket URL.
+    /// Relay server WebSocket URL. Empty means the web terminal's own
+    /// default, which lives in that private crate so public builds do not
+    /// carry the relay's address.
     #[dynamic(default = "default_tunnel_url")]
     pub tunnel_url: String,
 }
@@ -1104,7 +1106,7 @@ fn default_remote_bind() -> String {
 }
 
 fn default_tunnel_url() -> String {
-    "wss://r.kaku.fun".to_string()
+    String::new()
 }
 
 fn default_remote_tunnel() -> bool {
