@@ -92,3 +92,7 @@
 36	标签栏默认显示 + 按钮，右键标签可以新建或关闭标签
 36	Kaku no longer prints before the first prompt, so Powerlevel10k instant prompt stays quiet
 36	Kaku 不再在第一个提示符前输出内容，Powerlevel10k 的 instant prompt 不再报警告
+37	The global hotkey opens a drawer from the top of the screen, and long-pressing opens the right-click menu
+37	全局快捷键会从屏幕顶部拉出终端，长按可以打开右键菜单
+37	Starship branch and git status icons are back for installs that kept the blank ones
+37	之前留下空白图标的安装也会恢复 Starship 的分支和 git 状态图标
