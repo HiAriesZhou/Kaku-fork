@@ -149,12 +149,6 @@ pub fn get_copilot_token(client: &reqwest::blocking::Client) -> Result<String> {
     Ok(auth.copilot_token.clone())
 }
 
-/// Returns true when copilot_auth.json exists and has a GitHub token.
-#[allow(dead_code)]
-pub fn copilot_is_authenticated() -> bool {
-    load_copilot_auth().is_some_and(|auth| !auth.github_token.trim().is_empty())
-}
-
 /// RFC 3339 / ISO 8601 timestamp -> Unix seconds. Used for the GitHub Copilot
 /// token expiry. Returns None if the string is malformed or pre-1970.
 fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
@@ -249,14 +243,6 @@ fn decode_jwt_claims(jwt: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Reads the Codex CLI access token (and ChatGPT account id) from
-/// ~/.codex/auth.json. Codex writes these after `codex` login; Kaku reads them
-/// to call the Codex backend on the user's behalf.
-pub fn read_codex_auth() -> Option<CodexAuth> {
-    let v = read_codex_auth_json()?;
-    codex_auth_from_value(&v)
-}
-
 pub(crate) fn codex_auth_from_value(v: &serde_json::Value) -> Option<CodexAuth> {
     let access_token = codex_access_token_from(v)?;
     let account_id = codex_account_id_from(v);
@@ -264,11 +250,6 @@ pub(crate) fn codex_auth_from_value(v: &serde_json::Value) -> Option<CodexAuth> 
         access_token,
         account_id,
     })
-}
-
-/// Backward-compatible accessor for just the access token.
-pub fn read_codex_access_token() -> Option<String> {
-    read_codex_auth().map(|a| a.access_token)
 }
 
 fn codex_refresh_token_from(v: &serde_json::Value) -> Option<&str> {
@@ -393,18 +374,6 @@ pub fn refresh_codex_auth(client: &reqwest::blocking::Client) -> Result<CodexAut
         log::warn!("Failed to persist refreshed Codex token: {e}");
     }
     Ok(auth)
-}
-
-/// Backward-compatible accessor for just the refreshed access token.
-#[allow(dead_code)]
-pub fn refresh_codex_access_token(client: &reqwest::blocking::Client) -> Result<String> {
-    refresh_codex_auth(client).map(|auth| auth.access_token)
-}
-
-/// Returns true when the Codex CLI auth file exists and has a token.
-#[allow(dead_code)]
-pub fn codex_is_authenticated() -> bool {
-    read_codex_access_token().is_some()
 }
 
 #[cfg(test)]

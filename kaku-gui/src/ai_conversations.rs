@@ -197,14 +197,6 @@ pub fn load_index() -> Vec<ConversationMeta> {
     }
 }
 
-/// Return the current active_id (None if index is missing or unparseable).
-#[allow(dead_code)]
-pub fn get_active_id() -> Option<String> {
-    conversations_dir()
-        .ok()
-        .and_then(|dir| load_index_from(&dir).active_id)
-}
-
 /// Ensure there is a valid active conversation. Creates one if none exists.
 /// Returns `(active_id, messages)`.
 pub fn ensure_active() -> Result<(String, Vec<PersistedMessage>)> {

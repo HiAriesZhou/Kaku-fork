@@ -52,14 +52,6 @@ pub struct GlConnection {
     egl: EglWrapper,
     display: ffi::types::EGLDisplay,
     is_opengl: bool,
-    extensions: String,
-}
-
-impl GlConnection {
-    #[allow(dead_code)]
-    pub fn has_extension(&self, wanted: &str) -> bool {
-        self.extensions.split(' ').any(|ext| ext == wanted)
-    }
 }
 
 impl std::ops::Deref for GlConnection {
@@ -503,7 +495,6 @@ impl GlState {
                 display: egl_display,
                 egl,
                 is_opengl,
-                extensions,
             });
 
             Self::create_with_existing_connection(&connection, window)

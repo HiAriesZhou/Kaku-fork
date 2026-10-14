@@ -169,9 +169,7 @@ impl OwnedHandle {
 
     #[inline]
     pub(crate) unsafe fn dup2_impl<F: AsRawFileDescriptor>(fd: &F, dest_fd: RawFd) -> Result<Self> {
-        let fd = fd.as_raw_file_descriptor();
-
-        return Self::non_atomic_dup2(fd, dest_fd);
+        Self::non_atomic_dup2(fd.as_raw_file_descriptor(), dest_fd)
     }
 
     pub(crate) fn probe_handle_type(_handle: RawFileDescriptor) -> HandleType {}
