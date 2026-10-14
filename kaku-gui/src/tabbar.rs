@@ -20,6 +20,10 @@ use window::{IntegratedTitleButton, IntegratedTitleButtonAlignment, IntegratedTi
 pub struct TabBarState {
     line: Line,
     items: Vec<TabEntry>,
+    /// Column where the right status text starts, and the blank cell used
+    /// to pad around it, so a gap can open in front of the status.
+    right_status_start: usize,
+    pad_cell: Cell,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -871,7 +875,13 @@ impl TabBarState {
                 x: 1,
                 width: 1,
             }],
+            right_status_start: 1,
+            pad_cell: Cell::blank(),
         }
+    }
+
+    pub fn right_status_start(&self) -> usize {
+        self.right_status_start
     }
 
     pub fn line(&self) -> &Line {
@@ -1290,10 +1300,12 @@ impl TabBarState {
             right_status_line = right_status_line.split_off(excess, SEQ_ZERO);
         }
 
+        let right_status_len = right_status_line.len();
         line.append_line(right_status_line, SEQ_ZERO);
         while line.len() < title_width {
             line.insert_cell(x, black_cell.clone(), title_width, SEQ_ZERO);
         }
+        let right_status_start = title_width.saturating_sub(right_status_len);
 
         if use_integrated_title_buttons
             && config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
@@ -1303,7 +1315,31 @@ impl TabBarState {
             Self::integrated_title_buttons(mouse_x, &mut x, config, &mut items, &mut line, &colors);
         }
 
-        Self { line, items }
+        Self {
+            line,
+            items,
+            right_status_start,
+            pad_cell: black_cell,
+        }
+    }
+
+    /// Opens `cols` blank columns in front of the right status, keeping the
+    /// status flush with the right edge, and returns the gap's first column.
+    /// Build the bar `cols` narrower first so tabs never reach the gap.
+    pub fn open_gap_before_right_status(&mut self, cols: usize) -> usize {
+        let start = self.right_status_start;
+        let width = self.line.len() + cols;
+        for _ in 0..cols {
+            self.line
+                .insert_cell(start, self.pad_cell.clone(), width, SEQ_ZERO);
+        }
+        for entry in self.items.iter_mut() {
+            if entry.x >= start && entry.item != TabBarItem::RightStatus {
+                entry.x += cols;
+            }
+        }
+        self.right_status_start += cols;
+        start
     }
 
     pub fn compute_ui_items(&self, y: usize, cell_height: usize, cell_width: usize) -> Vec<UIItem> {
@@ -1869,5 +1905,22 @@ return {{ use_fancy_tab_bar = false, show_new_tab_button_in_tab_bar = false,
 
         assert_eq!(plain_text(&hover), "HOVER");
         Ok(())
+    }
+
+    /// The Touch toggle is painted in a gap in front of the right status, so
+    /// the status (the fullscreen clock) keeps the right corner.
+    #[test]
+    fn right_status_keeps_the_corner_after_the_toggle_gap() {
+        config::designate_this_as_the_main_thread();
+        let config = ConfigHandle::default_config();
+        let tabs = vec![make_tab(0, 0, true, "tab-0")];
+        let mut bar = TabBarState::new(76, None, &tabs, &[], true, None, &config, "", "12:34");
+        assert_eq!(bar.line().len(), 76);
+        let gap = bar.open_gap_before_right_status(4);
+        assert_eq!(gap, 71);
+        assert_eq!(bar.line().len(), 80);
+        assert_eq!(bar.right_status_start(), 75);
+        let text = bar.line().as_str();
+        assert!(text.ends_with("    12:34"), "{:?}", text);
     }
 }

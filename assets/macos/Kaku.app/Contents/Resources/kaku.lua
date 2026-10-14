@@ -3826,20 +3826,9 @@ wezterm.on('update-right-status', function(window, pane)
     return
   end
 
-  local clock_icon = wezterm.nerdfonts.md_clock_time_four_outline
-    or wezterm.nerdfonts.md_clock_outline
-    or ''
-  local text = wezterm.strftime('%H:%M')
-  if clock_icon ~= '' then
-    window:set_right_status(wezterm.format({
-      { Foreground = { Color = KAKU.GRAY } },
-      { Text = ' ' .. clock_icon .. ' ' .. text .. ' ' },
-    }))
-    return
-  end
   window:set_right_status(wezterm.format({
     { Foreground = { Color = KAKU.GRAY } },
-    { Text = ' ' .. text .. ' ' },
+    { Text = ' ' .. wezterm.strftime('%H:%M') .. ' ' },
   }))
 end)
 

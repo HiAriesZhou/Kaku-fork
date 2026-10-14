@@ -3835,11 +3835,12 @@ impl TermWindow {
             None => false,
         };
 
-        let new_tab_bar = TabBarState::new(
-            self.dimensions
-                .pixel_width
-                .saturating_sub(self.touch_toggle_width() as usize)
-                / self.render_metrics.cell_size.width as usize,
+        let cell_width = self.render_metrics.cell_size.width.max(1) as usize;
+        // The Touch toggle sits just left of the right status so the status
+        // (the clock in fullscreen) keeps the corner.
+        let toggle_cols = self.touch_toggle_cols();
+        let mut new_tab_bar = TabBarState::new(
+            (self.dimensions.pixel_width / cell_width).saturating_sub(toggle_cols),
             if hovering_in_tab_bar {
                 Some(self.mouse.last_mouse_coords.0)
             } else {
@@ -3853,6 +3854,7 @@ impl TermWindow {
             &self.left_status,
             &self.right_status,
         );
+        new_tab_bar.open_gap_before_right_status(toggle_cols);
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();

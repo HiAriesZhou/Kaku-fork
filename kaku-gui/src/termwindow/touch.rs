@@ -13,7 +13,9 @@ use window::{MouseEvent, MouseEventKind, MousePress, WindowOps};
 
 const CONTROL_PT: f32 = 40.;
 const BAR_PT: f32 = 40.;
-const TOGGLE_PT: f32 = 56.;
+const TOGGLE_PT: f32 = 44.;
+/// Nerd Font md-gesture_tap: a pointing hand, for the Touch Mode toggle.
+const TOUCH_GLYPH: &str = "\u{f0741}";
 const CLOSE_ICON: &[Poly] = &[
     Poly {
         path: &[
@@ -119,7 +121,12 @@ impl TermWindow {
         self.dimensions.dpi as f32 / 72.
     }
     pub(super) fn touch_toggle_width(&self) -> f32 {
-        (TOGGLE_PT * self.touch_scale()).max(self.render_metrics.cell_size.width as f32 * 6.)
+        (TOGGLE_PT * self.touch_scale()).max(self.render_metrics.cell_size.width as f32 * 4.)
+    }
+    /// Tab bar columns kept free for the toggle, in front of the right status.
+    pub(super) fn touch_toggle_cols(&self) -> usize {
+        let cell = self.render_metrics.cell_size.width.max(1) as f32;
+        (self.touch_toggle_width() / cell).ceil() as usize
     }
     pub(super) fn touch_bar_height(&self) -> f32 {
         (BAR_PT * self.touch_scale())
@@ -178,10 +185,7 @@ impl TermWindow {
         };
         let foreground = if matches!(
             action,
-            TouchAction::Toggle
-                | TouchAction::NewTab
-                | TouchAction::Menu(..)
-                | TouchAction::Tabs(_)
+            TouchAction::NewTab | TouchAction::Menu(..) | TouchAction::Tabs(_)
         ) {
             self.config
                 .resolved_palette
@@ -292,16 +296,26 @@ impl TermWindow {
     }
 
     pub(super) fn paint_touch_toggle(&mut self, y: f32) -> anyhow::Result<()> {
-        let width = self
-            .touch_toggle_width()
-            .min(self.dimensions.pixel_width as f32);
-        let rect = euclid::rect(
-            self.dimensions.pixel_width as f32 - width,
-            y,
-            width,
-            self.tab_bar_pixel_height()?,
-        );
-        self.touch_component("Touch", TouchAction::Toggle, rect, self.touch_mode, false)
+        let pixel_width = self.dimensions.pixel_width as f32;
+        let (x, width) = if self.touch_mode || self.config.use_fancy_tab_bar {
+            let width = self.touch_toggle_width().min(pixel_width);
+            (pixel_width - width, width)
+        } else {
+            // The retro bar left a gap of whole cells in front of the right
+            // status for the toggle.
+            let cell = self.render_metrics.cell_size.width as f32;
+            let cols = self.touch_toggle_cols();
+            let start = self.tab_bar.right_status_start().saturating_sub(cols);
+            (start as f32 * cell, (cols as f32 * cell).min(pixel_width))
+        };
+        let rect = euclid::rect(x, y, width, self.tab_bar_pixel_height()?);
+        self.touch_component(
+            TOUCH_GLYPH,
+            TouchAction::Toggle,
+            rect,
+            self.touch_mode,
+            false,
+        )
     }
 
     pub(super) fn paint_hidden_touch_entry(&mut self) -> anyhow::Result<()> {
@@ -316,7 +330,7 @@ impl TermWindow {
                 .touch_toggle_width()
                 .min(self.dimensions.pixel_width as f32);
             self.touch_component(
-                "Touch",
+                TOUCH_GLYPH,
                 TouchAction::Toggle,
                 euclid::rect(
                     self.dimensions.pixel_width as f32 - width,
