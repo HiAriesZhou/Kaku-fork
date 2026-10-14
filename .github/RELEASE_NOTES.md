@@ -9,7 +9,7 @@
 ### Changelog
 
 1. **Hotkey Drawer**: Cmd+Opt+Ctrl+K now drops a terminal from the top of the screen over any app, and `config.macos_global_hotkey_mode = 'Ordinary'` brings back the old show and hide.
-2. **Remote Desktop**: Hold for a second to open the right-click menu anywhere, and Window > Touch Mode adds a close button to every tab.
+2. **Remote Desktop**: Press and hold anywhere to open the right-click menu, and Window > Touch Mode adds a close button to every tab.
 3. **Rename Tabs**: Cmd+Shift+I renames the current tab, and the editor shows its selection and stays centered when the tab bar is hidden.
 4. **Fonts and Zoom**: Zooming is smoother, bitmap fallback fonts pick the right size at every step, and font, size and line height changes reach open windows on reload.
 5. **Prompt Icons**: The Starship branch and git status icons are back, including for installs that kept the blank ones from earlier versions.
@@ -22,7 +22,7 @@
 ### 更新日志
 
 1. **快捷键抽屉**：Cmd+Opt+Ctrl+K 改为从屏幕顶部拉出终端，盖在当前应用之上，设置 `config.macos_global_hotkey_mode = 'Ordinary'` 可恢复原来的显示隐藏。
-2. **远程桌面**：在任意位置按住一秒即可打开右键菜单，开启 Window > Touch Mode 后每个标签都有关闭按钮。
+2. **远程桌面**：在任意位置长按即可打开右键菜单，开启 Window > Touch Mode 后每个标签都有关闭按钮。
 3. **重命名标签**：Cmd+Shift+I 可直接重命名当前标签，编辑框会显示选中的文字，隐藏标签栏时也保持居中。
 4. **字体与缩放**：缩放更顺滑，位图回退字体在每一级都选对尺寸，修改字体、字号和行高后已打开的窗口会同步更新。
 5. **提示符图标**：Starship 的分支和 git 状态图标恢复显示，之前版本留下空白图标的安装也会一并修好。
