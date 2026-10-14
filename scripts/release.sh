@@ -348,6 +348,9 @@ run_checks() {
 build_release() {
     log_info "Building release (PROFILE=$PROFILE, ARCH=$BUILD_ARCH)..."
 
+    # A CARGO_FEATURES left in the shell by a local remote build must never
+    # reach a stable release; build.sh passes it straight to cargo.
+    unset CARGO_FEATURES
     export KAKU_SIGNING_IDENTITY
     export KAKU_REQUIRE_SIGNED_RELEASE=1
     export PROFILE
@@ -638,6 +641,8 @@ main() {
     fi
 
     if [[ "$SKIP_UPLOAD" -eq 0 ]]; then
+        ./scripts/check_no_web_terminal.sh "$OUT_DIR/Kaku.app" "$OUT_DIR/Kaku.dmg" \
+            || die "The release build carries the private web terminal; not publishing it."
         time_stage "tag" create_tag "$version"
         time_stage "upload" create_github_release "$version"
     else

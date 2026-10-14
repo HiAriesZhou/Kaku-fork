@@ -59,7 +59,7 @@ if [[ "$PRIVATE" -eq 1 ]]; then
     FEATURES="${FEATURES:+$FEATURES,}remote"
     OUT_DIR="${PRIVATE_OUT_DIR:-$REPO_ROOT/dist/private}"
     DMG_PATH="$OUT_DIR/Kaku.dmg"
-elif [[ ",$FEATURES," == *",remote,"* ]]; then
+elif [[ ",$FEATURES," =~ ,([a-z_-]+/)?remote, ]]; then
     echo "The remote feature stays out of public builds until it launches; use --private." >&2
     exit 1
 fi
@@ -147,20 +147,8 @@ fi
 
 # Last guard before anything goes public: the packaged app must not carry the
 # web terminal, whichever way it was built.
-if grep -aq 'kaku-remote: starting on' "$OUT_DIR/Kaku.app/Contents/MacOS/kaku-gui" 2>/dev/null; then
-    die "$OUT_DIR/Kaku.app contains the web terminal; refusing to publish it."
-fi
-MOUNT_DIR=$(mktemp -d /tmp/kaku-nightly-dmg.XXXXXX)
-if hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_DIR" "$DMG_PATH" >/dev/null; then
-    if grep -aq 'kaku-remote: starting on' "$MOUNT_DIR/Kaku.app/Contents/MacOS/kaku-gui"; then
-        hdiutil detach "$MOUNT_DIR" >/dev/null
-        die "$DMG_PATH contains the web terminal; refusing to publish it."
-    fi
-    hdiutil detach "$MOUNT_DIR" >/dev/null
-else
-    die "Could not mount $DMG_PATH to check it before publishing."
-fi
-rmdir "$MOUNT_DIR" 2>/dev/null || true
+"$REPO_ROOT/scripts/check_no_web_terminal.sh" "$OUT_DIR/Kaku.app" "$DMG_PATH" \
+    || die "This build carries the web terminal; refusing to publish it."
 
 # Rename for download clarity; cp preserves the stapled notarization ticket.
 cp -f "$DMG_PATH" "$DMG_ASSET_PATH"
