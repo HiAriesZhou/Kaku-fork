@@ -7,18 +7,19 @@
 //! keeps its normal height and look.
 
 use super::box_model::*;
-use super::{TermWindow, TermWindowNotif, UIItem, UIItemType};
+use super::{TermWindow, UIItem, UIItemType};
 use crate::customglyph::{BlockAlpha, BlockCoord, Poly, PolyCommand, PolyStyle};
 use crate::tabbar::TabBarItem;
 use config::{Dimension, DimensionContext};
 use std::time::{Duration, Instant};
 use window::{MouseButtons, MouseEvent, MouseEventKind, MousePress, WindowOps};
 
-/// Clicks from UU measured 0.07 to 0.13s, long presses 2.9s and up. A full
-/// second keeps a slow or hesitant desktop click from opening a menu.
-const LONG_PRESS: Duration = Duration::from_millis(1000);
-/// Finger jitter allowed before a press counts as a drag.
-const LONG_PRESS_SLOP_PT: f32 = 8.;
+/// Clicks from UU measured 0.07 to 0.13s. A full second felt slow over UU
+/// (a 0.9s press missed), so 600ms, still well above a hesitant click.
+const LONG_PRESS: Duration = Duration::from_millis(600);
+/// Finger jitter allowed before a press counts as a drag. 8pt cancelled
+/// ordinary long presses over UU, where a resting finger drifts further.
+const LONG_PRESS_SLOP_PT: f32 = 24.;
 const CLOSE_ICON: &[Poly] = &[
     Poly {
         path: &[
@@ -80,7 +81,7 @@ impl TermWindow {
     }
 
     /// Follows plain left presses and, when one is released after being held
-    /// still, replays it as a right click once this event is done. The press
+    /// still, queues it as a right click for `replay_long_press`. The press
     /// and release themselves are handled as usual. Panes that grab the mouse
     /// (vim, htop) get no synthetic right click.
     pub(super) fn track_long_press(&mut self, event: &MouseEvent) {
@@ -95,13 +96,17 @@ impl TermWindow {
             }
             MouseEventKind::Move => {
                 let slop = LONG_PRESS_SLOP_PT * self.touch_scale();
-                if self
-                    .mouse
-                    .long_press
-                    .as_ref()
-                    .is_some_and(|press| press.moved_beyond(event.coords.x, event.coords.y, slop))
-                {
-                    self.mouse.long_press = None;
+                if let Some(press) = self.mouse.long_press.as_ref() {
+                    if press.moved_beyond(event.coords.x, event.coords.y, slop) {
+                        if self.config.debug_key_events {
+                            log::info!(
+                                "long_press cancelled after moving {}x{} px",
+                                event.coords.x - press.x,
+                                event.coords.y - press.y
+                            );
+                        }
+                        self.mouse.long_press = None;
+                    }
                 }
             }
             MouseEventKind::Release(MousePress::Left) => {
@@ -147,9 +152,6 @@ impl TermWindow {
                 if !replay {
                     return;
                 }
-                let Some(window) = self.window.clone() else {
-                    return;
-                };
                 let mut right = event.clone();
                 // The band only takes plain left presses, so aim a band tab's
                 // right click at the tab's own row.
@@ -158,20 +160,26 @@ impl TermWindow {
                 }
                 right.kind = MouseEventKind::Press(MousePress::Right);
                 right.mouse_buttons = MouseButtons::RIGHT;
-                window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
-                    let Some(window) = tw.window.clone() else {
-                        return;
-                    };
-                    let mut release = right.clone();
-                    tw.mouse_event_impl(right, &window);
-                    release.kind = MouseEventKind::Release(MousePress::Right);
-                    release.mouse_buttons = MouseButtons::NONE;
-                    tw.mouse_event_impl(release, &window);
-                })));
+                self.mouse.long_press_replay = Some(right);
             }
             MouseEventKind::Press(_) => self.mouse.long_press = None,
             _ => {}
         }
+    }
+
+    /// Delivers a queued long press as a right click, in the same window event
+    /// dispatch as the release that ended it. A deferred `TermWindowNotif`
+    /// does not work: the window is borrowed while notifications run, so the
+    /// menu could not reach its NSWindow and silently never opened.
+    pub(super) fn replay_long_press(&mut self, context: &dyn WindowOps) {
+        let Some(right) = self.mouse.long_press_replay.take() else {
+            return;
+        };
+        let mut release = right.clone();
+        self.mouse_event_impl(right, context);
+        release.kind = MouseEventKind::Release(MousePress::Right);
+        release.mouse_buttons = MouseButtons::NONE;
+        self.mouse_event_impl(release, context);
     }
 
     /// Records the tab a press reached through the bottom bar's touch band.
@@ -267,9 +275,15 @@ mod tests {
     fn only_a_held_press_off_grabbing_panes_becomes_a_right_click() {
         let click = Duration::from_millis(130);
         let hold = Duration::from_millis(2900);
-        // A hesitant desktop click is not a long press.
+        // A hesitant desktop click is not a long press, a 0.9s hold over UU is.
+        assert!(long_press_as_right_click(
+            Duration::from_millis(900),
+            false,
+            false,
+            false
+        ));
         assert!(!long_press_as_right_click(
-            Duration::from_millis(700),
+            Duration::from_millis(400),
             false,
             false,
             false

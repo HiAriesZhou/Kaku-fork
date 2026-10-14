@@ -2127,6 +2127,7 @@ impl TermWindow {
             }
             WindowEvent::MouseEvent(event) => {
                 self.mouse_event_impl(event, window);
+                self.replay_long_press(window);
                 Ok(true)
             }
             WindowEvent::MouseLeave => {

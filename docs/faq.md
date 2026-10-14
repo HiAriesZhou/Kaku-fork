@@ -249,6 +249,6 @@ Kaku is compatible with yabai and AeroSpace. If you see continuous flickering, i
 
 ## How do I use Kaku through a phone or tablet remote desktop?
 
-Hold anywhere for a second, then lift, to open the menu a right click would: on a tab you get New Tab, Tab Navigator and Close Tab, and on the terminal you get Copy, Paste, Split and the rest. This works in every window, as long as the remote client forwards a held press as a held left button, which UU does. In panes where a program such as vim or tmux takes mouse input, the hold stays with that program.
+Hold anywhere for about half a second, then lift, to open the menu a right click would: on a tab you get New Tab, Tab Navigator and Close Tab, and on the terminal you get Copy, Paste, Split and the rest. This works in every window, as long as the remote client forwards a held press as a held left button, which UU does. In panes where a program such as vim or tmux takes mouse input, the hold stays with that program.
 
 **Window > Touch Mode** adds a close button to every tab, since a finger has no hover. The tab bar keeps its height and look, and the terminal font and line height do not change.
