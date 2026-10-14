@@ -41,6 +41,10 @@ struct ConfigInfo {
     background: Option<String>,
     foreground: Option<String>,
     cursor_fg: Option<String>,
+    /// Kaku's selection colors. Without them the page fell back to
+    /// xterm.js's translucent white, under which white text vanished.
+    selection_bg: Option<String>,
+    selection_fg: Option<String>,
     cursor_bg: Option<String>,
     ansi: Vec<String>,
     brights: Vec<String>,
@@ -106,6 +110,8 @@ fn config_info() -> ConfigInfo {
         background: opt_hex(palette.background.as_ref()),
         foreground: opt_hex(palette.foreground.as_ref()),
         cursor_fg: opt_hex(palette.cursor_fg.as_ref()),
+        selection_bg: opt_hex(palette.selection_bg.as_ref()),
+        selection_fg: opt_hex(palette.selection_fg.as_ref()),
         cursor_bg: opt_hex(palette.cursor_bg.as_ref()),
         ansi: ansi_colors,
         brights: bright_colors,

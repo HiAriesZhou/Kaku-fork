@@ -671,7 +671,19 @@ test('inline images from the Mac sit over their cells and leave with the pane', 
   assert.deepEqual(errors, []);
 });
 
-test('the close confirmation answers to N, Y and clicks outside it, like Kaku', async t => {
+// Selection and find (which selects its match) use Kaku's selection colors,
+// text included; xterm.js's default kept white text on a light highlight.
+test('selection uses Kaku\'s selection colors so highlighted text stays readable', async t => {
+  const { p } = await page(t); await screen(p);
+  const theme = await p.evaluate(() => {
+    probe.handle({ type: 'config', background: '#16161a', foreground: '#d4d4d8', selection_bg: 'rgba(142,106,217,0.55)', selection_fg: '#ffffff' });
+    const t = probe.term.options.theme;
+    return [t.selectionBackground, t.selectionInactiveBackground, t.selectionForeground];
+  });
+  assert.deepEqual(theme, ['rgba(142,106,217,0.55)', 'rgba(142,106,217,0.55)', '#ffffff']);
+});
+
+test('the close confirmation answers to N, Y and clicks outside it', async t => {
   const { p } = await page(t); await screen(p);
   await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'tabs', tabs: [
     { tab_id: 1, pane_id: 1, title: 'one', active: true },
@@ -681,7 +693,7 @@ test('the close confirmation answers to N, Y and clicks outside it, like Kaku', 
   const ask = () => p.locator('#bar .tab').nth(1).click({ button: 'middle' });
   await ask();
   assert.equal(await p.locator('#dialog .title').innerText(), 'Close this tab?');
-  assert.equal(await p.locator('#dialog [data-act="ok"]').innerText(), '[Y] Confirm');
+  assert.equal(await p.locator('#dialog [data-act="ok"]').innerText(), 'Close');
   await p.keyboard.press('n');
   assert.equal(await p.locator('#dialog.show').count(), 0);
   await ask();

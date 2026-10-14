@@ -139,13 +139,17 @@
   /* Close confirmation drawn like Kaku's own: it takes over the terminal
      area, a rounded box in the terminal font, text buttons that invert on
      hover or focus. */
-  #dialog { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: var(--bg); z-index: 10; outline: none; }
+  /* Close confirmation: one bar at the bottom, the terminal stays in view.
+     The layer covers the stage, so a click anywhere else cancels. */
+  #dialog { position: absolute; inset: 0; display: none; align-items: flex-end; justify-content: center; padding-bottom: 16px; box-sizing: border-box; z-index: 10; outline: none; }
   #dialog.show { display: flex; }
-  #dialog .card { max-width: calc(100% - 4ch); padding: 1em 2ch; border: 1px solid var(--muted); border-radius: 6px; color: var(--fg); line-height: 1.4; }
-  #dialog .actions { display: flex; justify-content: center; gap: 3ch; margin-top: 1em; }
-  #dialog button { padding: 0; border: 0; background: transparent; color: var(--fg); font: inherit; cursor: pointer; white-space: pre; }
-  #dialog button:hover, #dialog button:focus-visible { background: var(--fg); color: var(--bg); font-weight: bold; outline: none; }
-  body.touch #dialog button { padding: 8px 6px; }
+  #dialog .card { display: flex; align-items: center; gap: 16px; max-width: calc(100% - 32px); padding: 8px 8px 8px 14px; border: 1px solid var(--line); border-radius: 10px; background: linear-gradient(var(--tab-active-bg), var(--tab-active-bg)), var(--bg); box-shadow: 0 4px 16px rgba(0,0,0,0.25); color: var(--fg); font-size: 13px; }
+  #dialog .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #dialog .actions { display: flex; gap: 8px; flex: none; }
+  #dialog button { height: 28px; padding: 0 12px; border: 0; border-radius: 6px; background: var(--line); color: var(--fg); font: inherit; cursor: pointer; }
+  #dialog button[data-act="ok"] { background: var(--fg); color: var(--bg); }
+  #dialog button:hover, #dialog button:focus-visible { opacity: 0.85; outline: none; }
+  body.touch #dialog button { height: 34px; padding: 0 16px; }
   #help { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.25); z-index: 10; }
   #help.show { display: flex; }
   #help .card { padding: 16px; border-radius: 10px; background: var(--bar-bg); border: 1px solid var(--line); }
@@ -187,7 +191,7 @@
 <body>
 <div id="bar"><div id="tabs"></div><div id="tools"></div></div>
 <div id="stage">
-  <div id="dialog" role="dialog" aria-modal="true" tabindex="-1"><div class="card"><div class="title"></div><div class="detail"></div><div class="actions"><button type="button" data-act="cancel" tabindex="-1">[N] Cancel</button><button type="button" data-act="ok" tabindex="-1">[Y] Confirm</button></div></div></div>
+  <div id="dialog" role="dialog" aria-modal="true" tabindex="-1"><div class="card"><div class="title"></div><div class="actions"><button type="button" data-act="cancel" tabindex="-1">Cancel</button><button type="button" data-act="ok" tabindex="-1">Close</button></div></div></div>
   <div id="term"></div>
   <div id="past"></div>
   <button id="history" type="button">Back to live</button>
@@ -1354,18 +1358,10 @@
   const dialogEl = document.getElementById("dialog");
   let dialogDone = null;
   // Kaku's own wording (overlay/confirm_close_pane.rs).
-  const CLOSE_TEXT = {
-    tab: ["Close this tab?", "All panes in this tab will be terminated."],
-    pane: ["Close this pane?", "The running process in this pane will be terminated."],
-  };
+  const CLOSE_TEXT = { tab: "Close this tab?", pane: "Close this pane?" };
   const askClose = (_title, kind = "tab") => new Promise((resolve) => {
     if (dialogDone) dialogDone(false);
-    const [title, detail] = CLOSE_TEXT[kind] || CLOSE_TEXT.tab;
-    dialogEl.querySelector(".title").textContent = title;
-    dialogEl.querySelector(".detail").textContent = detail;
-    const card = dialogEl.querySelector(".card");
-    card.style.fontFamily = term.options.fontFamily;
-    card.style.fontSize = fontSize + "px";
+    dialogEl.querySelector(".title").textContent = CLOSE_TEXT[kind] || CLOSE_TEXT.tab;
     dialogEl.classList.add("show");
     dialogDone = (ok) => {
       dialogDone = null;
@@ -1378,7 +1374,7 @@
   dialogEl.addEventListener("click", (ev) => {
     if (!dialogDone) return;
     const act = ev.target.closest("[data-act]");
-    // As in Kaku, a click anywhere but Confirm cancels.
+    // A click anywhere but Close cancels.
     dialogDone(!!act && act.dataset.act === "ok");
   });
   dialogEl.addEventListener("keydown", (ev) => {
@@ -1802,6 +1798,10 @@
     if (cfg.foreground) { theme.foreground = cfg.foreground; document.documentElement.style.setProperty("--fg", cfg.foreground); }
     if (cfg.cursor_bg) theme.cursor = cfg.cursor_bg;
     if (cfg.cursor_fg) theme.cursorAccent = cfg.cursor_fg;
+    // Selection (and find, which selects its match) in Kaku's colors, text
+    // included, so a highlighted row stays readable.
+    if (cfg.selection_bg) { theme.selectionBackground = cfg.selection_bg; theme.selectionInactiveBackground = cfg.selection_bg; }
+    if (cfg.selection_fg) theme.selectionForeground = cfg.selection_fg;
     (cfg.ansi || []).slice(0, 8).forEach((c, i) => { theme[themeName(i)] = c; });
     (cfg.brights || []).slice(0, 8).forEach((c, i) => { theme[themeName(i + 8)] = c; });
     term.options.theme = theme;
