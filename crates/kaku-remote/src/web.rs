@@ -1898,22 +1898,59 @@ async fn handle_local_ws(socket: ws::WebSocket, dirty: WebDirty) {
             }
         }
     });
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        match msg {
-            ws::Message::Text(text) if in_tx.send(text.to_string()).await.is_err() => break,
-            ws::Message::Close(_) => break,
-            _ => {}
+    forward_until_session_ends(&mut ws_rx, in_tx, session).await;
+    writer.abort();
+}
+
+/// Passes the browser's text messages to its session until either side is
+/// done. The session ends on its own after `SESSION_SILENCE`; a half-open
+/// socket (a laptop that went to sleep) never delivers another message, so
+/// waiting on the socket alone kept the task and its descriptor until TCP
+/// gave up.
+async fn forward_until_session_ends<S, E>(
+    incoming: &mut S,
+    in_tx: mpsc::Sender<String>,
+    mut session: tokio::task::JoinHandle<()>,
+) where
+    S: futures_util::Stream<Item = Result<ws::Message, E>> + Unpin,
+{
+    loop {
+        tokio::select! {
+            _ = &mut session => return,
+            msg = incoming.next() => match msg {
+                Some(Ok(ws::Message::Text(text))) => {
+                    if in_tx.send(text.to_string()).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(ws::Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
         }
     }
     drop(in_tx);
     let _ = session.await;
-    writer.abort();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use termwiz::color::SrgbaTuple;
+
+    /// A browser that went silent behind a half-open socket: the session gives
+    /// up, and the socket must be let go with it instead of waiting forever.
+    #[tokio::test]
+    async fn a_finished_session_releases_a_silent_socket() {
+        let mut silent = futures_util::stream::pending::<Result<ws::Message, ()>>();
+        let (in_tx, _in_rx) = mpsc::channel::<String>(1);
+        let session = tokio::spawn(async {});
+        let done = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_until_session_ends(&mut silent, in_tx, session),
+        )
+        .await;
+        assert!(done.is_ok());
+    }
 
     #[test]
     fn sgr_encodes_palette_truecolor_and_flags() {
