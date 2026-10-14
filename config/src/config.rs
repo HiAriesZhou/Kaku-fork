@@ -4204,13 +4204,21 @@ pub enum ImePreeditRendering {
     System,
 }
 
+/// When an OSC 9 / OSC 777 notification becomes a system notification.
+/// The names come from WezTerm; since `1e73d7bf` a notification you would be
+/// looking at as it arrives is never shown, so `AlwaysShow`, the default,
+/// behaves like `SuppressFromFocusedWindow`.
 #[derive(Debug, FromDynamic, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NotificationHandling {
+    /// Shown while the window is in the background.
     #[default]
     AlwaysShow,
     NeverShow,
+    /// Also shown for a pane that is not the focused one.
     SuppressFromFocusedPane,
+    /// Also shown for a tab that is not the active one.
     SuppressFromFocusedTab,
+    /// Shown while the window is in the background.
     SuppressFromFocusedWindow,
 }
 
