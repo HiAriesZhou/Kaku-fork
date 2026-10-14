@@ -6,6 +6,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
+# Run inside Kaku, these point at the real config, whose theme then decides
+# the flavor instead of the test fixtures.
+unset KAKU_CONFIG_FILE KAKU_CONFIG_DIR
+
 fail() {
 	echo "yazi_theme: $*" >&2
 	exit 1
