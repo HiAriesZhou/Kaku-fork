@@ -645,6 +645,31 @@ test('notifications from the Mac reach a background page, and a click returns to
   assert.deepEqual(errors, []);
 });
 
+test('inline images from the Mac sit over their cells and leave with the pane', async t => {
+  const { p, errors } = await page(t); await screen(p);
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  await p.evaluate(png => {
+    probe.handle({ type: 'image', id: 'ab12', mime: 'image/png', data: png });
+    probe.handle({ type: 'frame', seq: 2, pane_id: 1, cols: 80, rows: 24, local_scroll: true, data: '',
+      images: [{ id: 'ab12', col: 3, row: 2, cols: 4, rows: 2 }] });
+  }, png);
+  const box = await p.evaluate(() => {
+    const img = document.querySelector('#images img');
+    const cell = document.querySelector('.xterm-screen').getBoundingClientRect();
+    return img && { left: parseFloat(img.style.left), top: parseFloat(img.style.top), width: parseFloat(img.style.width),
+      cellW: cell.width / 80, cellH: cell.height / 24, height: parseFloat(img.style.height) };
+  });
+  assert.ok(box, 'image placed');
+  assert.ok(Math.abs(box.left - 3 * box.cellW) < 1 && Math.abs(box.top - 2 * box.cellH) < 1, JSON.stringify(box));
+  assert.ok(Math.abs(box.width - 4 * box.cellW) < 1 && Math.abs(box.height - 2 * box.cellH) < 1, JSON.stringify(box));
+  // A frame without an images field keeps them; switching panes clears them.
+  await p.evaluate(() => probe.handle({ type: 'frame', seq: 3, pane_id: 1, cols: 80, rows: 24, local_scroll: true, data: '\x1b[1;1Hx' }));
+  assert.equal(await p.locator('#images img').count(), 1);
+  await p.evaluate(() => probe.attach({ tab_id: 2, pane_id: 2 }, true));
+  assert.equal(await p.locator('#images img').count(), 0);
+  assert.deepEqual(errors, []);
+});
+
 test('the close confirmation answers to N, Y and clicks outside it, like Kaku', async t => {
   const { p } = await page(t); await screen(p);
   await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'tabs', tabs: [

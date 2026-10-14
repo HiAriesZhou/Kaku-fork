@@ -24,6 +24,8 @@ use termwiz::color::ColorAttribute;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 use tokio::sync::{broadcast, mpsc};
+use base64::Engine as _;
+use wezterm_term::image::{ImageData, ImageDataType};
 use wezterm_term::{MouseButton, MouseEvent, MouseEventKind, TerminalSize};
 
 const INDEX_HTML: &str = include_str!("../assets/web/index.html");
@@ -496,6 +498,15 @@ enum WebServerMsg<'a> {
         /// A plain shell: scrolling moves through Kaku's history, which the
         /// page scrolls locally. Otherwise the program gets the wheel.
         local_scroll: bool,
+        data: &'a str,
+        /// Inline images now on screen; absent when they did not change.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        images: Option<&'a [ImagePlacement]>,
+    },
+    /// An image's file, sent once per session before a frame places it.
+    Image {
+        id: &'a str,
+        mime: &'a str,
         data: &'a str,
     },
     /// The attached pane is gone; the page picks another tab. It names the
@@ -1050,6 +1061,96 @@ struct Frame {
     lines: Vec<String>,
     /// Cursor position, shape and visibility, applied after the rows.
     cursor: String,
+    /// Inline images on these rows (imgcat, kitty, sixel), and their data.
+    images: Vec<ImagePlacement>,
+    image_data: HashMap<String, Arc<ImageData>>,
+    /// Set by `Shown::update` when `images` differ from what the page has.
+    images_changed: bool,
+}
+
+/// Where an image sits, in cells from the top left of the rows sent. It can
+/// start above the first row or left of the first column when only part of
+/// it is on screen.
+#[derive(Serialize, Clone, PartialEq, Debug)]
+struct ImagePlacement {
+    id: String,
+    col: f32,
+    row: f32,
+    cols: f32,
+    rows: f32,
+}
+
+/// Images too large to be worth sending stay on the Mac.
+const MAX_IMAGE_BYTES: usize = 8 << 20;
+
+/// Each image cell holds the slice of its image it shows, as texture
+/// coordinates; from any one cell, the slice size gives the image's size in
+/// cells and the offset gives where its top left is.
+fn image_placements(lines: &[Line]) -> (Vec<ImagePlacement>, HashMap<String, Arc<ImageData>>) {
+    let mut placements: Vec<ImagePlacement> = Vec::new();
+    let mut data = HashMap::new();
+    let round = |v: f32| (v * 1000.0).round() / 1000.0;
+    for (row, line) in lines.iter().enumerate() {
+        for cell in line.visible_cells() {
+            let Some(images) = cell.attrs().images() else { continue };
+            for image in images {
+                let (tl, br) = (image.top_left(), image.bottom_right());
+                let du = *br.x - *tl.x;
+                let dv = *br.y - *tl.y;
+                if du <= 0.0 || dv <= 0.0 {
+                    continue;
+                }
+                let id: String = image.image_data().hash()[..8]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let placement = ImagePlacement {
+                    col: round(cell.cell_index() as f32 - *tl.x / du),
+                    row: round(row as f32 - *tl.y / dv),
+                    cols: round(1.0 / du),
+                    rows: round(1.0 / dv),
+                    id: id.clone(),
+                };
+                if !placements.contains(&placement) {
+                    placements.push(placement);
+                }
+                data.entry(id).or_insert_with(|| image.image_data().clone());
+            }
+        }
+    }
+    (placements, data)
+}
+
+/// The image as a file a browser can show: encoded files as they are, raw
+/// pixels as PNG, an animation by its first frame.
+fn image_file(image: &ImageData) -> Option<(&'static str, Vec<u8>)> {
+    let sniff = |bytes: Vec<u8>| -> Option<(&'static str, Vec<u8>)> {
+        let mime = if bytes.starts_with(b"\x89PNG") {
+            "image/png"
+        } else if bytes.starts_with(&[0xff, 0xd8]) {
+            "image/jpeg"
+        } else if bytes.starts_with(b"GIF8") {
+            "image/gif"
+        } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            "image/webp"
+        } else {
+            return None;
+        };
+        Some((mime, bytes))
+    };
+    let png = |width: u32, height: u32, pixels: &[u8]| -> Option<(&'static str, Vec<u8>)> {
+        let buffer = image::RgbaImage::from_raw(width, height, pixels.to_vec())?;
+        let mut out = std::io::Cursor::new(Vec::new());
+        buffer.write_to(&mut out, image::ImageFormat::Png).ok()?;
+        Some(("image/png", out.into_inner()))
+    };
+    let file = match &*image.data() {
+        ImageDataType::EncodedFile(bytes) => sniff(bytes.clone()),
+        ImageDataType::EncodedLease(lease) => sniff(lease.get_data().ok()?),
+        ImageDataType::Rgba8 { data, width, height, .. } => png(*width, *height, data),
+        ImageDataType::AnimRgba8 { width, height, frames, .. } => png(*width, *height, frames.first()?),
+    }?;
+    (file.1.len() <= MAX_IMAGE_BYTES).then_some(file)
 }
 
 fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
@@ -1095,6 +1196,7 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
         }
     }
 
+    let (images, image_data) = image_placements(&lines);
     Frame {
         cols: dims.cols,
         rows,
@@ -1103,6 +1205,9 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
         local_scroll: !pane.is_alt_screen_active() && !pane.is_mouse_grabbed(),
         lines: rendered,
         cursor: cursor_out,
+        images,
+        image_data,
+        images_changed: false,
     }
 }
 
@@ -1166,6 +1271,7 @@ struct Shown {
     local_scroll: bool,
     lines: Vec<String>,
     cursor: String,
+    images: Vec<ImagePlacement>,
     /// For drift reports: the last row move sent, and frames since a full one.
     last_move: isize,
     since_full: usize,
@@ -1173,8 +1279,9 @@ struct Shown {
 
 impl Shown {
     /// The bytes that bring the browser from what it shows to `frame`, or
-    /// None when nothing changed.
-    fn update(&mut self, frame: Frame) -> Option<(Frame, String)> {
+    /// None when nothing changed. The frame's images are left in it only when
+    /// they changed.
+    fn update(&mut self, mut frame: Frame) -> Option<(Frame, String)> {
         let full = self.cols != frame.cols
             || self.lines.len() != frame.lines.len()
             || self.scrolled != frame.scrolled;
@@ -1215,13 +1322,19 @@ impl Shown {
                 changed = true;
             }
         }
+        let images_changed = self.images != frame.images;
         if !changed
+            && !images_changed
             && self.cursor == frame.cursor
             && self.title == frame.title
             && self.local_scroll == frame.local_scroll
         {
             return None;
         }
+        if images_changed {
+            self.images.clone_from(&frame.images);
+        }
+        frame.images_changed = images_changed;
         data.push_str(&frame.cursor);
         self.cols = frame.cols;
         self.title.clone_from(&frame.title);
@@ -1703,6 +1816,8 @@ pub(crate) async fn run_session(
     let mut last_frame_at = std::time::Instant::now();
     let mut clipboard = CLIPBOARD.subscribe();
     let mut notifications = NOTIFICATIONS.subscribe();
+    // Image files this browser already has.
+    let mut sent_images: HashSet<String> = HashSet::new();
     let mut uploads = Uploads::default();
     let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1912,6 +2027,24 @@ pub(crate) async fn run_session(
                 let Some((frame, data)) = shown.update(render_frame(&pane, &mut view)) else {
                     continue;
                 };
+                let images_changed = frame.images_changed;
+                let mut placed = Vec::new();
+                if images_changed {
+                    for placement in &frame.images {
+                        if !sent_images.contains(&placement.id) {
+                            let Some(image) = frame.image_data.get(&placement.id) else { continue };
+                            let Some((mime, bytes)) = image_file(image) else { continue };
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                            let msg = WebServerMsg::Image { id: &placement.id, mime, data: &encoded };
+                            let Some(json) = encode(&msg) else { continue };
+                            if outbox.send(json).await.is_err() {
+                                return;
+                            }
+                            sent_images.insert(placement.id.clone());
+                        }
+                        placed.push(placement.clone());
+                    }
+                }
                 let msg = WebServerMsg::Frame {
                     seq: frames_sent + 1,
                     pane_id,
@@ -1921,6 +2054,7 @@ pub(crate) async fn run_session(
                     scrolled: frame.scrolled,
                     local_scroll: frame.local_scroll,
                     data: &data,
+                    images: images_changed.then_some(placed.as_slice()),
                 };
                 let Some(json) = encode(&msg) else { continue };
                 if outbox.send(json).await.is_err() {
@@ -1997,6 +2131,38 @@ async fn forward_until_session_ends<S, E>(
 mod tests {
     use super::*;
     use termwiz::color::SrgbaTuple;
+
+    /// A 2x2 image placed at column 3 is found from any of its cells, and
+    /// one scrolled half off the top starts above the first row. Its raw
+    /// pixels reach the browser as a PNG.
+    #[test]
+    fn inline_images_are_placed_in_cells_and_sent_as_files() {
+        use wezterm_term::image::{ImageCell, TextureCoordinate};
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            2,
+            2,
+            vec![255; 16],
+        )));
+        let line_with = |tl: (f32, f32), br: (f32, f32)| {
+            let mut line = Line::with_width(8, 0);
+            let mut attrs = CellAttributes::default();
+            attrs.attach_image(ImageCell::new(
+                TextureCoordinate::new_f32(tl.0, tl.1),
+                TextureCoordinate::new_f32(br.0, br.1),
+                data.clone(),
+            ));
+            line.set_cell(3, termwiz::cell::Cell::new(' ', attrs), 0);
+            line
+        };
+        let (whole, files) = image_placements(&[line_with((0.0, 0.0), (0.5, 0.5))]);
+        assert_eq!(whole.len(), 1);
+        assert_eq!((whole[0].col, whole[0].row, whole[0].cols, whole[0].rows), (3.0, 0.0, 2.0, 2.0));
+        let (scrolled, _) = image_placements(&[line_with((0.0, 0.5), (0.5, 1.0))]);
+        assert_eq!((scrolled[0].col, scrolled[0].row), (3.0, -1.0));
+        let (mime, png) = image_file(&files[&whole[0].id]).unwrap();
+        assert_eq!(mime, "image/png");
+        assert!(png.starts_with(b"\x89PNG"));
+    }
 
     /// Notification text is capped by characters, never mid-character.
     #[test]
@@ -2089,6 +2255,9 @@ mod tests {
             local_scroll: true,
             lines: lines.iter().map(|l| l.to_string()).collect(),
             cursor: cursor.into(),
+            images: Vec::new(),
+            image_data: HashMap::new(),
+            images_changed: false,
         }
     }
 

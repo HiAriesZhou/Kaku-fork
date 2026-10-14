@@ -128,6 +128,8 @@
   /* History, scrolled here rather than on the Mac, so it follows the finger
      or the wheel with no round trip. It sits exactly over the terminal and
      draws rows the way it does: each run placed at Kaku's column. */
+  #images { position: absolute; left: 0; top: 0; overflow: hidden; pointer-events: none; z-index: 0; }
+  #images img { position: absolute; image-rendering: auto; }
   #past { position: absolute; top: 8px; left: 8px; display: none; overflow: hidden; background: var(--bg); color: var(--fg); white-space: pre; cursor: text; z-index: 1; -webkit-user-select: text; user-select: text; }
   #past.show { display: block; }
   #past .row { position: relative; }
@@ -232,6 +234,12 @@
   const toolsEl = document.getElementById("tools");
   const stage = document.getElementById("stage");
   const termEl = document.getElementById("term");
+  // Inline image state (see onImage): declared early because fit() and
+  // attach() reach it.
+  const imageFiles = new Map();
+  let imagePlacements = [];
+  const imagesEl = document.createElement("div");
+  imagesEl.id = "images";
   const historyBtn = document.getElementById("history");
 
   const showMessage = (text) => {
@@ -562,6 +570,7 @@
       px = Math.max(6, Math.min(px - 0.25, Math.floor(px * scale * 4) / 4));
       setFont(px);
     }
+    if (imagePlacements.length) renderImages();
   };
   let resizeTimer = 0;
   new ResizeObserver(() => {
@@ -1329,6 +1338,8 @@
     paneId = tab.pane_id;
     tabId = tab.tab_id;
     claimed = "";
+    imagePlacements = [];
+    imagesEl.textContent = "";
     size = { cols: 0, rows: 0 };
     send({ type: "attach", pane_id: paneId, focus });
     const saved = snapshots.get(paneId);
@@ -1837,6 +1848,40 @@
     });
   };
 
+  // Inline images (imgcat, kitty, sixel) Kaku shows in the pane: their files
+  // arrive once, and each frame that moves them says where they sit, in cells.
+  const onImage = (msg) => {
+    const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
+    imageFiles.set(msg.id, URL.createObjectURL(new Blob([bytes], { type: msg.mime })));
+    // Keep memory bounded: drop the oldest files nothing places any more.
+    for (const [id, url] of imageFiles) {
+      if (imageFiles.size <= 64) break;
+      if (imagePlacements.some((p) => p.id === id)) continue;
+      URL.revokeObjectURL(url);
+      imageFiles.delete(id);
+    }
+  };
+  const renderImages = () => {
+    if (!imagesEl.isConnected) termEl.append(imagesEl);
+    imagesEl.textContent = "";
+    const cell = cellSize();
+    if (!cell || !size.cols) return;
+    imagesEl.style.width = size.cols * cell.width + "px";
+    imagesEl.style.height = size.rows * cell.height + "px";
+    for (const p of imagePlacements) {
+      const url = imageFiles.get(p.id);
+      if (!url) continue;
+      const img = document.createElement("img");
+      img.src = url;
+      img.alt = "";
+      img.style.left = p.col * cell.width + "px";
+      img.style.top = p.row * cell.height + "px";
+      img.style.width = p.cols * cell.width + "px";
+      img.style.height = p.rows * cell.height + "px";
+      imagesEl.append(img);
+    }
+  };
+
   const onFrame = (msg) => {
     const socket = ws;
     if (msg.pane_id !== paneId) {
@@ -1862,6 +1907,8 @@
       if (msg.pane_id === paneId) markFound();
       if (msg.seq) send({ type: "frame_ack", seq: msg.seq });
     });
+    if (msg.images) imagePlacements = msg.images;
+    if (msg.images || imagePlacements.length) renderImages();
     serverScrolled = !!msg.scrolled;
     showHistoryButton();
     // A title that already names Kaku (a cwd called kaku) is not repeated.
@@ -2193,6 +2240,7 @@
     else if (msg.type === "frame") { framesSeen++; onFrame(msg); }
     else if (msg.type === "clipboard") copyToClipboard(msg.text);
     else if (msg.type === "notify") onNotify(msg);
+    else if (msg.type === "image") onImage(msg);
     else if (msg.type === "found") onFound(msg);
     else if (msg.type === "history") onHistory(msg);
     else if (msg.type === "upload_ack") { const a = uploadAcks.get(msg.id); if (a) a(msg.received); }
