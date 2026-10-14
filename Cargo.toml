@@ -131,7 +131,6 @@ fixedbitset = {version="0.4", default-features=false}
 flume = "0.11"
 fnv = "1.0"
 frecency = { path = "crates/frecency" }
-fontconfig = { path = "deps/fontconfig" }
 freetype = { path = "deps/freetype" }
 futures = "0.3"
 futures-util = "0.3"

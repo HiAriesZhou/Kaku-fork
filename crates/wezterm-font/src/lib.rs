@@ -57,9 +57,6 @@ pub mod rasterizer;
 pub mod shaper;
 pub mod units;
 
-#[cfg(all(unix, not(target_os = "macos")))]
-pub mod fcwrap;
-
 pub use crate::rasterizer::RasterizedGlyph;
 pub use crate::shaper::{FallbackIdx, FontMetrics, GlyphInfo};
 

@@ -673,24 +673,16 @@ impl Default for AllowSquareGlyphOverflow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic, Default)]
 pub enum FontLocatorSelection {
-    /// Use fontconfig APIs to resolve fonts (!macos, posix systems)
+    /// fontconfig is not available on macOS. Kept so configs shared with a
+    /// Linux WezTerm setup still load; it behaves as CoreText.
     FontConfig,
     /// Use CoreText on macOS
+    #[default]
     CoreText,
     /// Use only the font_dirs configuration to locate fonts
     ConfigDirsOnly,
-}
-
-impl Default for FontLocatorSelection {
-    fn default() -> Self {
-        if cfg!(target_os = "macos") {
-            FontLocatorSelection::CoreText
-        } else {
-            FontLocatorSelection::FontConfig
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, FromDynamic, ToDynamic, Default)]

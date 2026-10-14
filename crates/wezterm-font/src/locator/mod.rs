@@ -8,20 +8,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub mod core_text;
-#[cfg(all(unix, not(target_os = "macos")))]
-pub mod font_config;
 
 #[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub enum FontOrigin {
-    FontConfig,
-    FontConfigMatch(String),
     CoreText,
     FontDirs,
     BuiltIn,
 }
 
-// derived impl would just use the inner string instead of
-// 'FontConfigMatch("..")', so use Debug
 impl Display for FontOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
@@ -218,19 +212,15 @@ pub trait FontLocator {
 
 pub fn new_locator(locator: FontLocatorSelection) -> Arc<dyn FontLocator + Send + Sync> {
     match locator {
-        FontLocatorSelection::FontConfig => {
-            #[cfg(all(unix, not(target_os = "macos")))]
-            return Arc::new(font_config::FontConfigFontLocator {});
-            #[cfg(not(all(unix, not(target_os = "macos"))))]
-            panic!("fontconfig not compiled in");
-        }
-        FontLocatorSelection::CoreText => {
-            #[cfg(target_os = "macos")]
-            return Arc::new(core_text::CoreTextFontLocator {
+        // fontconfig is not on macOS; a config shared with a Linux WezTerm
+        // setup may still ask for it, which used to panic.
+        FontLocatorSelection::FontConfig | FontLocatorSelection::CoreText => {
+            if locator == FontLocatorSelection::FontConfig {
+                log::warn!("font_locator = \"FontConfig\" is not available on macOS; using CoreText");
+            }
+            Arc::new(core_text::CoreTextFontLocator {
                 parsed_cache: Default::default(),
-            });
-            #[cfg(not(target_os = "macos"))]
-            panic!("CoreText not compiled in");
+            })
         }
         FontLocatorSelection::ConfigDirsOnly => Arc::new(NopSystemSource {}),
     }
@@ -266,6 +256,14 @@ impl FontLocator for NopSystemSource {
 mod test {
     use super::*;
 
+    /// A kaku.lua shared with a Linux WezTerm setup may still pick fontconfig,
+    /// which used to panic on macOS.
+    #[test]
+    fn fontconfig_selection_falls_back_to_core_text() {
+        let locator = new_locator(FontLocatorSelection::FontConfig);
+        assert!(locator.locate_fallback_for_codepoints(&['A']).is_ok());
+    }
+
     #[test]
     fn test_memory_datasource() {
         // This is currently only used on Windows, so make sure
@@ -279,3 +277,4 @@ mod test {
         eprintln!("{:?}", source);
     }
 }
+
