@@ -7,15 +7,16 @@
 //! keeps its normal height and look.
 
 use super::box_model::*;
-use super::{TermWindow, TermWindowNotif, UIItemType};
+use super::{TermWindow, TermWindowNotif, UIItem, UIItemType};
 use crate::customglyph::{BlockAlpha, BlockCoord, Poly, PolyCommand, PolyStyle};
 use crate::tabbar::TabBarItem;
 use config::{Dimension, DimensionContext};
 use std::time::{Duration, Instant};
 use window::{MouseButtons, MouseEvent, MouseEventKind, MousePress, WindowOps};
 
-/// Clicks from UU measured 0.07 to 0.13s, long presses 2.9s and up.
-const LONG_PRESS: Duration = Duration::from_millis(500);
+/// Clicks from UU measured 0.07 to 0.13s, long presses 2.9s and up. A full
+/// second keeps a slow or hesitant desktop click from opening a menu.
+const LONG_PRESS: Duration = Duration::from_millis(1000);
 /// Finger jitter allowed before a press counts as a drag.
 const LONG_PRESS_SLOP_PT: f32 = 8.;
 const CLOSE_ICON: &[Poly] = &[
@@ -37,11 +38,13 @@ const CLOSE_ICON: &[Poly] = &[
     },
 ];
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct LongPress {
     started: Instant,
     x: isize,
     y: isize,
+    /// A tab reached through the bottom bar's touch band above it.
+    band_item: Option<UIItem>,
 }
 
 impl LongPress {
@@ -87,6 +90,7 @@ impl TermWindow {
                     started: Instant::now(),
                     x: event.coords.x,
                     y: event.coords.y,
+                    band_item: None,
                 });
             }
             MouseEventKind::Move => {
@@ -94,6 +98,7 @@ impl TermWindow {
                 if self
                     .mouse
                     .long_press
+                    .as_ref()
                     .is_some_and(|press| press.moved_beyond(event.coords.x, event.coords.y, slop))
                 {
                     self.mouse.long_press = None;
@@ -103,7 +108,22 @@ impl TermWindow {
                 let Some(press) = self.mouse.long_press.take() else {
                     return;
                 };
-                let item = self.resolve_ui_item(event).map(|item| item.item_type);
+                // Remote clients may send no motion at all, so check the
+                // release point too.
+                if press.moved_beyond(
+                    event.coords.x,
+                    event.coords.y,
+                    LONG_PRESS_SLOP_PT * self.touch_scale(),
+                ) {
+                    return;
+                }
+                let band_tab = press.band_item.filter(|item| {
+                    matches!(item.item_type, UIItemType::TabBar(TabBarItem::Tab { .. }))
+                });
+                let item = band_tab
+                    .clone()
+                    .or_else(|| self.resolve_ui_item(event))
+                    .map(|item| item.item_type);
                 let on_tab = matches!(item, Some(UIItemType::TabBar(TabBarItem::Tab { .. })));
                 let grabbed = self
                     .get_active_pane_or_overlay()
@@ -120,6 +140,11 @@ impl TermWindow {
                     return;
                 };
                 let mut right = event.clone();
+                // The band only takes plain left presses, so aim a band tab's
+                // right click at the tab's own row.
+                if let Some(tab) = &band_tab {
+                    right.coords.y = tab.y as isize;
+                }
                 right.kind = MouseEventKind::Press(MousePress::Right);
                 right.mouse_buttons = MouseButtons::RIGHT;
                 window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
@@ -135,6 +160,13 @@ impl TermWindow {
             }
             MouseEventKind::Press(_) => self.mouse.long_press = None,
             _ => {}
+        }
+    }
+
+    /// Records the tab a press reached through the bottom bar's touch band.
+    pub(super) fn note_long_press_band_item(&mut self, item: &UIItem) {
+        if let Some(press) = self.mouse.long_press.as_mut() {
+            press.band_item = Some(item.clone());
         }
     }
 
@@ -224,6 +256,13 @@ mod tests {
     fn only_a_held_press_off_grabbing_panes_becomes_a_right_click() {
         let click = Duration::from_millis(130);
         let hold = Duration::from_millis(2900);
+        // A hesitant desktop click is not a long press.
+        assert!(!long_press_as_right_click(
+            Duration::from_millis(700),
+            false,
+            false,
+            false
+        ));
         // UU clicks stay clicks everywhere.
         assert!(!long_press_as_right_click(click, true, true, false));
         assert!(!long_press_as_right_click(click, false, false, false));
@@ -244,6 +283,7 @@ mod tests {
             started: Instant::now(),
             x: 100,
             y: 100,
+            band_item: None,
         };
         assert!(!press.moved_beyond(108, 92, 8.));
         assert!(press.moved_beyond(109, 100, 8.));

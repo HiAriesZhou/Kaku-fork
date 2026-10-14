@@ -897,6 +897,9 @@ impl super::TermWindow {
         // Keep modal focus exclusive: forward all mouse events to it and stop
         // routing into pane/tab UI while active.
         if let Some(modal) = self.get_modal() {
+            // The modal owns this gesture; a press that opened it, or one that
+            // dismisses it, must not turn into a long press on release.
+            self.mouse.long_press = None;
             if let WMEK::Release(press) = &event.kind {
                 self.finish_mouse_release(*press);
             }
@@ -1135,8 +1138,9 @@ impl super::TermWindow {
                 Some(_) => None,
                 None => self.resolve_bottom_tab_bar_touch_item(&event, terminal_bottom),
             };
-            if let (Some(_), WMEK::Press(press)) = (&touch_band_item, &event.kind) {
+            if let (Some(item), WMEK::Press(press)) = (&touch_band_item, &event.kind) {
                 self.mouse.touch_band_press = Some(*press);
+                self.note_long_press_band_item(item);
                 // The press was counted on the last terminal row; move it off
                 // the grid so it cannot chain into a terminal double-click.
                 if let Some(click) = self.mouse.last_mouse_click.as_mut() {
