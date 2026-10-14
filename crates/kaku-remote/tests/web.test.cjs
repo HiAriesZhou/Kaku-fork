@@ -395,23 +395,31 @@ test('frame acknowledgments include discarded panes and follow xterm parsing', a
   assert.doesNotMatch(await text(p), /MUST NOT DRAW/);
 });
 
-test('phone, tablet and desktop grids stay within their viewports', async t => {
+test('phone, tablet and desktop grids stay within their viewports, the desktop bar one row tall', async t => {
   for (const [width, height, touch] of [[375, 667, true], [768, 1024, true], [844, 499, true], [844, 501, true], [1280, 720, false]]) {
     const { p, errors } = await page(t, '#t=fixture', { viewport: { width, height }, hasTouch: touch, isMobile: touch });
     await screen(p, 'terminal');
     // Apply the grid requested from the Mac, as a real size acknowledgment.
-    await p.evaluate(() => {
-      const size = messages.filter(m => m.type === 'resize').at(-1);
-      if (!size) throw new Error('no requested grid');
-      probe.handle({ type: 'frame', seq: 2, pane_id: 1, ...size, type: 'frame', data: '\x1b[1;1Hterminal' });
-    });
-    await p.waitForTimeout(120);
+    // The bar settling to one row grows the stage once, so acknowledge the
+    // follow-up request too.
+    for (const seq of [2, 3]) {
+      await p.evaluate(seq => {
+        const size = messages.filter(m => m.type === 'resize').at(-1);
+        if (!size) throw new Error('no requested grid');
+        probe.handle({ type: 'frame', seq, pane_id: 1, ...size, type: 'frame', data: '\x1b[1;1Hterminal' });
+      }, seq);
+      await p.waitForTimeout(150);
+    }
     const geometry = await p.evaluate(() => {
       const screen = document.querySelector('.xterm-screen').getBoundingClientRect();
       const stage = document.querySelector('#stage').getBoundingClientRect();
-      return { overflow: document.documentElement.scrollWidth > innerWidth, right: screen.right - stage.right, bottom: screen.bottom - stage.bottom };
+      const rows = messages.filter(m => m.type === 'resize').at(-1).rows;
+      return { overflow: document.documentElement.scrollWidth > innerWidth, right: screen.right - stage.right, bottom: screen.bottom - stage.bottom,
+        bar: document.querySelector('#bar').getBoundingClientRect().height, row: screen.height / rows };
     });
     assert.equal(geometry.overflow, false, JSON.stringify({ width, height, geometry }));
+    // Like Kaku's own tab bar the desktop bar is one terminal row; touch keeps its finger-sized bar.
+    if (!touch) assert.ok(Math.abs(geometry.bar - geometry.row) <= 1, JSON.stringify({ width, height, geometry }));
     assert.ok(geometry.right <= 1 && geometry.bottom <= 1, JSON.stringify({ width, height, geometry }));
     assert.deepEqual(errors, []);
   }

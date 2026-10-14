@@ -18,7 +18,7 @@
      filled block in Kaku's tab colors, no rule between it and the terminal. */
   :root { --mono: "Kaku Mono", monospace; --bar-bg: var(--bg); --tab-fg: var(--muted); --tab-active-bg: rgba(255,255,255,0.08); --tab-active-fg: var(--fg); --tab-hover-bg: rgba(255,255,255,0.05); --tab-hover-fg: var(--fg); }
   body.tabs-bottom #bar { order: 2; }
-  #bar { display: flex; align-items: stretch; height: 32px; padding: 0; background: var(--bar-bg); flex: none; font: var(--bar-font, 15px) var(--mono); }
+  #bar { display: flex; align-items: stretch; height: var(--bar-h, 32px); padding: 0; background: var(--bar-bg); flex: none; font: var(--bar-font, 15px) var(--mono); }
   /* Tabs scroll sideways when they do not fit; a fade at either end says
      there are more that way. */
   #tabs { display: flex; align-items: stretch; flex: 0 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
@@ -529,6 +529,9 @@
     setFont(want);
     const base = cellSize();
     if (!base) return;
+    // Kaku's tab bar is one terminal row, so on a desktop the page's bar is
+    // too; touch screens keep their finger-sized bar.
+    if (!TOUCH) document.documentElement.style.setProperty("--bar-h", Math.round(base.height) + "px");
     if (ws && ws.readyState === WebSocket.OPEN && paneId !== null) {
       const cols = Math.floor(availW / base.width);
       const rows = Math.floor(availH / base.height);
