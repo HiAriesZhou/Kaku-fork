@@ -219,6 +219,7 @@ for target in "${BUILD_TARGETS[@]}"; do
 	CARGO_TARGET_ARGS+=(--target "$target")
 done
 echo "Building targets: ${BUILD_TARGETS[*]}"
+./scripts/prune_target.sh "$TARGET_DIR"
 CARGO_TERM_PROGRESS_WHEN=auto cargo build --locked ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} ${CARGO_FEATURE_ARGS[@]+"${CARGO_FEATURE_ARGS[@]}"} "${CARGO_TARGET_ARGS[@]}" --target-dir "$TARGET_DIR" -p kaku-gui -p kaku
 
 if [[ "$BUILD_ARCH" == "universal" ]]; then

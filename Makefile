@@ -5,10 +5,12 @@ all: build
 RUST_LOG ?= info
 
 test:
+	@./scripts/prune_target.sh
 	cargo nextest run --locked -E 'not test(shapecache::test::ligatures_jetbrains)'
 	cargo nextest run --locked -p wezterm-escape-parser # no_std by default
 
 check:
+	@./scripts/prune_target.sh
 	cargo check --locked
 	cargo check --locked -p wezterm-escape-parser
 	cargo check --locked -p wezterm-cell
@@ -39,6 +41,7 @@ dev:
 		-x "run $(BUILD_OPTS) -p kaku-gui --"
 
 build:
+	@./scripts/prune_target.sh
 	cargo build --locked $(BUILD_OPTS) -p kaku -p kaku-gui -p wezterm-mux-server-impl
 
 fmt:
