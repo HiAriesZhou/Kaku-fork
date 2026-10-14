@@ -563,6 +563,17 @@ if [[ ! -f "$STARSHIP_CONFIG" ]]; then
 		cp "$VENDOR_DIR/starship.toml" "$STARSHIP_CONFIG"
 		echo -e "  ${GREEN}✓${NC} ${BOLD}Config${NC}      Initialized starship.toml ${NC}(~/.config/starship.toml)${NC}"
 	fi
+# Kaku V0.10.0 to V0.22.0 shipped starship.toml with its Nerd Font icons
+# stripped (#573). A copy still byte-identical to one of those is Kaku's own
+# file, not the user's, so replace it; an edited or symlinked file stays.
+elif [[ -f "$VENDOR_DIR/starship.toml" && ! -L "$STARSHIP_CONFIG" ]]; then
+	case "$(shasum -a 256 "$STARSHIP_CONFIG" 2>/dev/null | cut -d' ' -f1)" in
+	caa19df094ad871e773ec5746f8a2eade7d9136968e66f5145fe05126d60b987 | 4a2e314883441596c25e7fe6a37dd10a18421c774bee2217f41239a3790c0637)
+		if cp "$VENDOR_DIR/starship.toml" "$STARSHIP_CONFIG"; then
+			echo -e "  ${GREEN}✓${NC} ${BOLD}Config${NC}      Restored starship.toml icons ${NC}(~/.config/starship.toml)${NC}"
+		fi
+		;;
+	esac
 fi
 
 # Repair yazi configs written by older Kaku versions before touching them.

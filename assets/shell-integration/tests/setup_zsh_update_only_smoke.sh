@@ -154,4 +154,32 @@ else
   echo "warning: zsh not found; skipping kaku.zsh parse check" >&2
 fi
 
+# #573: an untouched V0.22.0 starship.toml (icons stripped) is Kaku's own
+# copy and gets the restored icons; an edited one is the user's and stays.
+run_update_only() {
+  HOME="$1" \
+    KAKU_INIT_INTERNAL=1 \
+    KAKU_SKIP_TOOL_BOOTSTRAP=1 \
+    KAKU_SKIP_TERMINFO_BOOTSTRAP=1 \
+    KAKU_VENDOR_DIR="$tmp_vendor" \
+    bash "$SHELL_DIR/setup_zsh.sh" --update-only >"$output_log" 2>"$error_log" \
+    || { cat "$output_log" "$error_log" >&2; fail "setup_zsh.sh --update-only failed"; }
+}
+stale_fixture="$REPO_ROOT/tests/fixtures/starship-v0.22.0.toml"
+for edited in false true; do
+  repair_home="$tmp_dir/repair-$edited"
+  mkdir -p "$repair_home/.config"
+  cp "$stale_fixture" "$repair_home/.config/starship.toml"
+  [[ "$edited" == true ]] && printf '# mine\n' >>"$repair_home/.config/starship.toml"
+  before="$(shasum -a 256 <"$repair_home/.config/starship.toml")"
+  run_update_only "$repair_home"
+  if [[ "$edited" == true ]]; then
+    [[ "$(shasum -a 256 <"$repair_home/.config/starship.toml")" == "$before" ]] \
+      || fail "an edited starship.toml was replaced"
+  else
+    cmp -s "$tmp_vendor/starship.toml" "$repair_home/.config/starship.toml" \
+      || fail "the V0.22.0 starship.toml with blank icons was not restored"
+  fi
+done
+
 echo "setup_zsh update-only smoke test passed"
