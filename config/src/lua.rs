@@ -354,6 +354,14 @@ end
             lua.create_function(add_to_config_reload_watch_list)?,
         )?;
 
+        // WSL is Windows-only and Kaku dropped it; configs shared with a
+        // Windows WezTerm setup still call this, so keep the empty answer it
+        // always gave on macOS instead of failing the whole kaku.lua.
+        wezterm_mod.set(
+            "default_wsl_domains",
+            lua.create_function(|lua, ()| lua.create_table())?,
+        )?;
+
         wezterm_mod.set("target_triple", crate::wezterm_target_triple())?;
         wezterm_mod.set("version", crate::wezterm_version())?;
         wezterm_mod.set("home_dir", crate::HOME_DIR.to_str())?;
@@ -950,6 +958,16 @@ pub fn add_to_config_reload_watch_list<'lua>(
 mod test {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn shared_windows_configs_still_call_default_wsl_domains() -> anyhow::Result<()> {
+        let lua = make_lua_context(Path::new("testing"))?;
+        let count: usize = lua
+            .load("local wezterm = require 'wezterm' return #wezterm.default_wsl_domains()")
+            .eval()?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
 
     #[test]
     fn deferred_setup_func_does_not_recurse() -> anyhow::Result<()> {
