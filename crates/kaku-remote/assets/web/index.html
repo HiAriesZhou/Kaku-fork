@@ -64,8 +64,7 @@
   #bar:hover .tool.help, #bar .tool.help:focus-visible { opacity: 1; }
   /* In full screen the system clock is hidden; Kaku shows the time at the
      right end of its tab bar there, and so does the page. */
-  #bar .clock { display: none; align-items: center; gap: 5px; padding: 0 10px; color: var(--tab-fg); white-space: nowrap; }
-  #bar .clock svg { width: 12px; height: 12px; }
+  #bar .clock { display: none; align-items: center; padding: 0 10px; color: var(--tab-fg); white-space: nowrap; }
   body.fullscreen #bar .clock { display: flex; }
   #bar .panes { width: auto; padding: 0 10px; cursor: default; }
   #bar .panes:hover { background: transparent; }
@@ -1421,7 +1420,7 @@
     sync();
     const clock = document.createElement("span");
     clock.className = "clock";
-    clock.innerHTML = '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="6" cy="6" r="4.8"/><path d="M6 3.4V6l1.8 1.1"/></svg><span></span>';
+    clock.innerHTML = "<span></span>";
     let clockTimer = 0;
     const tick = () => {
       const now = new Date();
