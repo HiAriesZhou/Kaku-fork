@@ -414,6 +414,10 @@ impl Pane for LocalPane {
         self.terminal.lock().set_config(config);
     }
 
+    fn config_palette_changed(&self) {
+        self.terminal.lock().config_palette_changed();
+    }
+
     fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
         Some(self.terminal.lock().get_config())
     }

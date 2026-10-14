@@ -430,6 +430,9 @@ pub trait Pane: Downcast + Send + Sync {
     fn set_clipboard(&self, _clipboard: &Arc<dyn Clipboard>) {}
     fn set_download_handler(&self, _handler: &Arc<dyn DownloadHandler>) {}
     fn set_config(&self, _config: Arc<dyn TerminalConfiguration>) {}
+    /// The palette behind the current config changed in place, e.g. a mux
+    /// client's palette. Unlike set_config, colors the program set survive.
+    fn config_palette_changed(&self) {}
     fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
         None
     }

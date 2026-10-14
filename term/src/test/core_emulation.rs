@@ -88,6 +88,31 @@ fn color_scheme_subscription_is_per_pane_and_can_be_cancelled_or_reset() {
     }
 }
 
+/// A mux client attaching sends its palette into the pane's config in place.
+/// The colors the program set must survive that, unlike a config reload.
+#[test]
+fn client_palette_change_keeps_program_colors() {
+    let writer = SharedWriter::default();
+    let mut term = TestTerm::new_with_writer(4, 40, 0, Box::new(writer.clone()));
+    let config = theme_config(SrgbaTuple(0., 0., 0., 1.));
+    term.set_config(config.clone());
+    term.print("\x1b]11;#ffffff\x1b\\");
+    config.0.lock().unwrap().colors.0[4] = SrgbaTuple(1., 0., 0., 1.);
+    term.config_palette_changed();
+    term.print("\x1b]11;?\x1b\\");
+    wait_for_writer_output(&writer, b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+
+    // Without program colors, a subscriber still hears the change.
+    let writer = SharedWriter::default();
+    let mut term = TestTerm::new_with_writer(4, 40, 0, Box::new(writer.clone()));
+    let config = theme_config(SrgbaTuple(0., 0., 0., 1.));
+    term.set_config(config.clone());
+    term.print("\x1b[?2031h");
+    config.0.lock().unwrap().background = SrgbaTuple(1., 1., 1., 1.);
+    term.config_palette_changed();
+    wait_for_writer_output(&writer, b"\x1b[?997;2n");
+}
+
 #[test]
 fn color_scheme_subscription_does_not_echo_application_color_updates() {
     let writer = SharedWriter::default();

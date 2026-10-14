@@ -926,7 +926,9 @@ impl SessionHandler {
                                 Some(config) => match config.downcast_ref::<TermConfig>() {
                                     Some(tc) => {
                                         tc.set_client_palette(palette);
-                                        pane.set_config(config);
+                                        // Not set_config: that would drop the
+                                        // colors the program set (OSC 4/10/11).
+                                        pane.config_palette_changed();
                                     }
                                     None => {
                                         log::error!(

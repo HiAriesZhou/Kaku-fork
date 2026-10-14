@@ -677,6 +677,13 @@ impl TerminalState {
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
         self.config = config;
         self.palette.take();
+        self.config_palette_changed();
+    }
+
+    /// The configured palette changed underneath this terminal (a mux
+    /// client sent its own). Colors the program set through OSC 4/10/11 stay;
+    /// mode 2031 subscribers hear about it only if the effective palette moved.
+    pub fn config_palette_changed(&mut self) {
         if let Some(previous) = &self.color_scheme_reported_palette {
             let palette = self.palette();
             if *previous != palette {
