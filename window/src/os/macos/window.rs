@@ -535,6 +535,9 @@ struct HotkeySlide {
     duration: Duration,
     showing: bool,
     hide_on_focus_loss: bool,
+    /// Fade in place instead of sliding: the slide would pass through another
+    /// display stacked above this one and show there.
+    fade: bool,
 }
 
 fn hotkey_offscreen_origin(frame: NSRect, screen: NSRect) -> NSPoint {
@@ -542,9 +545,48 @@ fn hotkey_offscreen_origin(frame: NSRect, screen: NSRect) -> NSPoint {
     NSPoint::new(frame.origin.x, screen.origin.y + screen.size.height)
 }
 
+/// Whether the drawer's slide, from just above `screen`'s top edge down to
+/// `frame`, would cross another display: with a monitor stacked above, the
+/// drawer briefly showed on that monitor while sliding out and in.
+fn hotkey_slide_crosses_another_screen(frame: NSRect, screen: NSRect, screens: &[NSRect]) -> bool {
+    let band_bottom = screen.origin.y + screen.size.height;
+    let band_top = band_bottom + frame.size.height;
+    let (left, right) = (frame.origin.x, frame.origin.x + frame.size.width);
+    screens.iter().any(|other| {
+        let other_top = other.origin.y + other.size.height;
+        let other_right = other.origin.x + other.size.width;
+        other.origin.x < right
+            && other_right > left
+            && other.origin.y < band_top
+            && other_top > band_bottom
+    })
+}
+
+/// The drawer's height as a share of its screen, kept from the user's last
+/// resize so the next reveal opens at that height; the config's
+/// `macos_global_hotkey_height_percent` applies until then.
+fn hotkey_height_percent_from(frame_height: f64, screen_height: f64) -> Option<f64> {
+    (screen_height > 0.).then(|| (frame_height / screen_height * 100.).clamp(10., 100.))
+}
+
 impl HotkeySlide {
     fn should_hide_when_cancelled(self, is_key: bool) -> bool {
         !(self.showing || self.hide_on_focus_loss && is_key)
+    }
+
+    /// Window opacity during the animation: 1 while sliding, ramped while
+    /// fading.
+    fn alpha_at(self, elapsed: Duration) -> f64 {
+        if !self.fade || self.duration.is_zero() {
+            return 1.;
+        }
+        let t = (elapsed.as_secs_f64() / self.duration.as_secs_f64()).min(1.);
+        let eased = t * t * (3. - 2. * t);
+        if self.showing {
+            eased
+        } else {
+            1. - eased
+        }
     }
 
     fn reverse_on_focus_gain(self, is_key: bool, current_origin: NSPoint) -> Option<Self> {
@@ -2951,10 +2993,7 @@ impl WindowInner {
                                 let simple_fullscreen = inner.is_fullscreen();
                                 let hotkey_panel = is_hotkey_panel(*inner.window);
                                 let adjusted = if hotkey_panel {
-                                    hotkey_panel_frame(
-                                        screen,
-                                        inner.config.macos_global_hotkey_height_percent,
-                                    )
+                                    hotkey_panel_frame(screen, inner.drawer_height_percent())
                                 } else {
                                     frame_after_display_topology_change(
                                         frame,
@@ -3198,6 +3237,13 @@ impl WindowInner {
     /// A nonactivating panel can take keyboard focus without activating Kaku
     /// or leaving the foreground app's fullscreen Space. Keep the same NSView
     /// (and Metal surface) when installing the terminal's native panel host.
+    /// The height the drawer opens at: the user's last drag, else the config.
+    fn drawer_height_percent(&self) -> f64 {
+        WindowView::get_this(unsafe { &**self.view })
+            .and_then(|view| view.hotkey_height_percent.get())
+            .unwrap_or(self.config.macos_global_hotkey_height_percent)
+    }
+
     pub(crate) fn show_global_hotkey_window(&mut self) {
         if self.defer_hotkey_visibility(true) {
             return;
@@ -3207,8 +3253,7 @@ impl WindowInner {
             if let Some(geometry) =
                 hotkey_screen_geometry(self.config.macos_global_hotkey_follow_mouse)
             {
-                let frame =
-                    hotkey_panel_frame(geometry, self.config.macos_global_hotkey_height_percent);
+                let frame = hotkey_panel_frame(geometry, self.drawer_height_percent());
                 self.animate_hotkey_slide(frame, geometry.frame, true);
             }
             // Cmd+H may have hidden the app independently of the hotkey.
@@ -3371,9 +3416,16 @@ impl WindowInner {
         };
         let generation = view.hotkey_slide_generation.get().wrapping_add(1);
         view.hotkey_slide_generation.set(generation);
-        let offscreen = hotkey_offscreen_origin(resting_frame, screen);
+        let fade = hotkey_slide_crosses_another_screen(resting_frame, screen, &screen_frames());
+        let offscreen = if fade {
+            resting_frame.origin
+        } else {
+            hotkey_offscreen_origin(resting_frame, screen)
+        };
         let from = if showing && !self.is_visible() {
             offscreen
+        } else if fade {
+            resting_frame.origin
         } else {
             unsafe { NSWindow::frame(*self.window).origin }
         };
@@ -3396,6 +3448,7 @@ impl WindowInner {
             ),
             showing,
             hide_on_focus_loss: false,
+            fade,
         };
         view.hotkey_slide.set(Some(slide));
         unsafe {
@@ -3405,6 +3458,9 @@ impl WindowInner {
             }
             self.window
                 .setFrame_display_(NSRect::new(from, resting_frame.size), NO);
+            if fade && showing && !self.is_visible() {
+                let _: () = msg_send![*self.window, setAlphaValue: 0.0f64];
+            }
         }
         let window_id = view.window_id.get();
         // Timed main-thread steps allow a new hotkey to reverse immediately;
@@ -3450,6 +3506,9 @@ impl WindowInner {
         }
         unsafe {
             let _: () = msg_send![*self.window, setFrameOrigin: slide.origin_at(elapsed)];
+            if slide.fade {
+                let _: () = msg_send![*self.window, setAlphaValue: slide.alpha_at(elapsed)];
+            }
         }
         true
     }
@@ -3703,8 +3762,13 @@ impl WindowInner {
                     config.macos_fullscreen_extend_behind_notch,
                 ));
 
+        let height_config_changed = self.config.macos_global_hotkey_height_percent
+            != config.macos_global_hotkey_height_percent;
         self.config = config.clone();
         if let Some(window_view) = WindowView::get_this(unsafe { &**self.view }) {
+            if height_config_changed {
+                window_view.hotkey_height_percent.set(None);
+            }
             {
                 let mut inner = window_view.inner.borrow_mut();
                 inner.config = config.clone();
@@ -3729,7 +3793,7 @@ impl WindowInner {
         if panel_layout_changed {
             self.cancel_hotkey_slide();
             if let Some(screen) = screen_geometry_for_window(*self.window) {
-                let frame = hotkey_panel_frame(screen, config.macos_global_hotkey_height_percent);
+                let frame = hotkey_panel_frame(screen, self.drawer_height_percent());
                 unsafe {
                     self.window.setFrame_display_(frame, NO);
                 }
@@ -4360,6 +4424,9 @@ struct WindowView {
     windowed_screen: Cell<WindowedScreenState>,
     hotkey_slide: Cell<Option<HotkeySlide>>,
     hotkey_slide_generation: Cell<u64>,
+    /// The drawer height the user last dragged to (see
+    /// `hotkey_height_percent_from`), until the config's value changes.
+    hotkey_height_percent: Cell<Option<f64>>,
     pending_hotkey_visibility: Cell<Option<bool>>,
     /// Tracks simple fullscreen state without requiring RefCell borrow.
     simple_fullscreen_active: Cell<bool>,
@@ -5451,6 +5518,7 @@ mod tests {
             duration: hotkey_animation_duration(500, false),
             showing: true,
             hide_on_focus_loss: false,
+            fade: false,
         };
         assert_eq!(slide.origin_at(Duration::from_millis(250)).y, 750.);
         // A new setting does not change the duration of an existing slide.
@@ -5480,6 +5548,7 @@ mod tests {
             duration: Duration::from_millis(500),
             showing: false,
             hide_on_focus_loss: true,
+            fade: false,
         };
         let current = NSPoint::new(0., 750.);
         assert!(hide
@@ -5535,6 +5604,35 @@ mod tests {
     }
 
     #[test]
+    /// The drawer opens at the height the user last dragged to, and the
+    /// config's height applies until then or after it changes; a slide that
+    /// would pass over a display stacked above fades in place instead.
+    #[test]
+    fn drawer_keeps_dragged_height_and_fades_past_a_stacked_display() {
+        let laptop = NSRect::new(NSPoint::new(0., 0.), NSSize::new(1512., 982.));
+        let drawer = NSRect::new(NSPoint::new(0., 655.), NSSize::new(1512., 327.));
+        // A monitor above the laptop, as in the report: the slide crosses it.
+        let above = NSRect::new(NSPoint::new(-200., 982.), NSSize::new(2560., 1440.));
+        assert!(hotkey_slide_crosses_another_screen(drawer, laptop, &[laptop, above]));
+        // Side by side, or alone: keep sliding.
+        let beside = NSRect::new(NSPoint::new(1512., 0.), NSSize::new(2560., 1440.));
+        assert!(!hotkey_slide_crosses_another_screen(drawer, laptop, &[laptop, beside]));
+        assert!(!hotkey_slide_crosses_another_screen(drawer, laptop, &[laptop]));
+
+        assert_eq!(hotkey_height_percent_from(491., 982.), Some(50.));
+        assert_eq!(hotkey_height_percent_from(20., 982.), Some(10.));
+        assert_eq!(hotkey_height_percent_from(500., 0.), None);
+        let source = include_str!("window.rs");
+        let height = production_method(source, "fn drawer_height_percent(");
+        assert!(height.contains("view.hotkey_height_percent.get()"));
+        assert!(height.contains(".unwrap_or(self.config.macos_global_hotkey_height_percent)"));
+        let reload = production_method(source, "fn config_did_change(&mut self,");
+        assert!(reload.contains("window_view.hotkey_height_percent.set(None)"));
+        let resize = production_method(source, "extern \"C\" fn did_resize(");
+        assert!(resize.contains("this.hotkey_height_percent.set(Some(percent))"));
+        assert!(resize.contains("this.hotkey_slide.get().is_none()"));
+    }
+
     fn hotkey_options_native_consumer_wiring() {
         let source = include_str!("window.rs");
         let reveal = production_method(source, "pub(crate) fn show_global_hotkey_window(");
@@ -5543,8 +5641,8 @@ mod tests {
         let reload = production_method(source, "fn config_did_change(&mut self,");
         let resign = production_method(source, "extern \"C\" fn did_resign_key(");
         let parameters = production_method(source, "fn get_os_parameters(");
-        assert!(reveal.contains("self.config.macos_global_hotkey_height_percent"));
-        assert!(refresh.contains("inner.config.macos_global_hotkey_height_percent"));
+        assert!(reveal.contains("hotkey_panel_frame(geometry, self.drawer_height_percent())"));
+        assert!(refresh.contains("hotkey_panel_frame(screen, inner.drawer_height_percent())"));
         assert!(animate.contains("self.config.macos_global_hotkey_animation_duration_ms"));
         assert!(resign.contains("inner.config.macos_global_hotkey_hide_on_focus_loss"));
         assert!(parameters.contains("config.macos_global_hotkey_extend_behind_notch"));
@@ -5577,6 +5675,7 @@ mod tests {
             duration: HOTKEY_SLIDE_DURATION,
             showing: false,
             hide_on_focus_loss: true,
+            fade: false,
         };
         assert!(!hide.should_hide_when_cancelled(true));
         assert!(hide.should_hide_when_cancelled(false));
@@ -6694,7 +6793,7 @@ mod tests {
         let source = include_str!("window.rs");
         let refresh = production_method(source, "pub(crate) fn refresh_after_display_change(");
         assert!(refresh.contains("hotkey_panel_frame("));
-        assert!(refresh.contains("inner.config.macos_global_hotkey_height_percent"));
+        assert!(refresh.contains("hotkey_panel_frame(screen, inner.drawer_height_percent())"));
         assert!(refresh.contains("frame_after_display_topology_change("));
         assert!(refresh.contains("!simple_fullscreen && !hotkey_panel"));
         assert!(!refresh.contains("hotkey_screen_geometry("));
@@ -6710,7 +6809,7 @@ mod tests {
         let terminate = production_method(source, "pub(crate) fn on_app_terminating(");
         assert!(terminate.contains("inner.restore_ordinary_window()"));
         let reveal = production_method(source, "pub(crate) fn show_global_hotkey_window(");
-        assert!(reveal.contains("self.config.macos_global_hotkey_height_percent"));
+        assert!(reveal.contains("hotkey_panel_frame(geometry, self.drawer_height_percent())"));
         let persist = production_method(source, "fn persist_window_state(");
         assert!(persist.contains("is_hotkey_panel(window)"));
         let remember = production_method(source, "fn remember_last_closed_window_position(");
@@ -6764,6 +6863,7 @@ mod tests {
             duration: HOTKEY_SLIDE_DURATION,
             showing: false,
             hide_on_focus_loss: true,
+            fade: false,
         };
         let current = NSPoint::new(0., 750.);
         assert!(hide.reverse_on_focus_gain(false, current).is_none());
@@ -6846,6 +6946,7 @@ mod tests {
                 duration: HOTKEY_SLIDE_DURATION,
                 showing: true,
                 hide_on_focus_loss: false,
+                fade: false,
             };
             assert_eq!(point(show.origin_at(Duration::ZERO)), point(offscreen));
             assert_eq!(
@@ -7164,6 +7265,9 @@ impl WindowView {
                 // Keep the guard set while settling, so callbacks cannot save
                 // a transient animation frame as the user's window geometry.
                 NSWindow::setFrame_display_(window, slide.resting_frame, NO);
+                if slide.fade {
+                    let _: () = msg_send![window, setAlphaValue: 1.0f64];
+                }
             }
             self.hotkey_slide.set(None);
         }
@@ -8888,6 +8992,22 @@ impl WindowView {
                 let window = window.load();
                 is_hotkey_panel(*window)
             });
+            // Remember a drawer height the user dragged to; animation steps
+            // and our own reframing keep the percent they already had.
+            if hotkey_panel && this.hotkey_slide.get().is_none() {
+                if let Some(window) = inner.window.as_ref() {
+                    let window = window.load();
+                    let frame = unsafe { NSWindow::frame(*window) };
+                    if let Some(screen) = screen_geometry_for_window(*window) {
+                        if let Some(percent) = hotkey_height_percent_from(
+                            frame.size.height,
+                            screen.frame.size.height,
+                        ) {
+                            this.hotkey_height_percent.set(Some(percent));
+                        }
+                    }
+                }
+            }
             let is_full_screen = !hotkey_panel
                 && if native_transition_active {
                     this.native_fullscreen_target.get().unwrap_or(false)
@@ -9359,6 +9479,7 @@ impl WindowView {
             windowed_screen: Cell::new(WindowedScreenState::default()),
             hotkey_slide: Cell::new(None),
             hotkey_slide_generation: Cell::new(0),
+            hotkey_height_percent: Cell::new(None),
             pending_hotkey_visibility: Cell::new(None),
             simple_fullscreen_active: Cell::new(false),
             simple_fullscreen_transition_active: Cell::new(false),
