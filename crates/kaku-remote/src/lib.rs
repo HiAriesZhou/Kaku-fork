@@ -147,17 +147,14 @@ fn same_secret(presented: &str, expected: &str) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Whether a request's Host names this server. A web page on another site
-/// can rebind its own name to 127.0.0.1 and then read same-origin responses
-/// from this port; checking Host shuts that out, since the page's requests
-/// still carry its own name.
 // ── Host guard ────────────────────────────────────────────────────────────────
 
 /// Whether `host` names this server: a loopback name, or, when it listens
-/// beyond loopback, one of this Mac's own addresses written as an IP. A page
-/// that rebinds its domain to an address arrives with that domain, never an
-/// IP literal, so it stays out. `port` is the listener's, which a config
-/// reload does not move.
+/// beyond loopback, one of this Mac's own addresses written as an IP. A web
+/// page on another site can rebind its own name to 127.0.0.1 and then read
+/// same-origin responses from this port; its requests still carry that name,
+/// never an IP literal, so they stay out. `port` is the listener's, which a
+/// config reload does not move.
 fn host_allowed(host: &str, port: u16, lan: bool, is_own_ip: impl Fn(IpAddr) -> bool) -> bool {
     let Some((name, host_port)) = host.rsplit_once(':') else {
         return false;
