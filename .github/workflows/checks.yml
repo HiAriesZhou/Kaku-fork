@@ -182,6 +182,13 @@ jobs:
             -p kaku -p kaku-gui -p mux -p config \
             -- -D warnings
 
+      # Releases build without `remote`, and Build Validation is path-filtered,
+      # so lint the shipped feature set too: an item only remote code uses is
+      # dead code there, which the remote build above never sees.
+      - name: Run clippy on the shipped feature set
+        run: |
+          cargo clippy --locked --all-targets -p kaku -p kaku-gui -p mux -p config -- -D warnings
+
   # Script-only checks that need no Rust build share one runner, so the
   # Rust jobs never queue behind them for a macOS slot.
   scripts:
