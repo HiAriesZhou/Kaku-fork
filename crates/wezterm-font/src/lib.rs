@@ -487,11 +487,6 @@ fn with_fallback_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
     objc::rc::autoreleasepool(f)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn with_fallback_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
-    f()
-}
-
 #[derive(PartialEq, Eq)]
 enum Entity {
     Title,

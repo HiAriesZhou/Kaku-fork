@@ -1194,35 +1194,6 @@ impl Config {
             }
         }
 
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
-            use std::convert::TryInto;
-
-            let (nproc_soft, nproc_hard) = getrlimit(Resource::RLIMIT_NPROC)?;
-
-            let ulimit_nproc: rlim_t = self.ulimit_nproc.try_into().with_context(|| {
-                format!(
-                    "ulimit_nproc value {} is out of range for this system",
-                    self.ulimit_nproc
-                )
-            })?;
-
-            if nproc_soft < ulimit_nproc {
-                setrlimit(
-                    Resource::RLIMIT_NPROC,
-                    ulimit_nproc.min(nproc_hard),
-                    nproc_hard,
-                )
-                .with_context(|| {
-                    format!(
-                        "raise RLIMIT_NPROC from {nproc_soft} to ulimit_nproc {}",
-                        ulimit_nproc
-                    )
-                })?;
-            }
-        }
-
         Ok(())
     }
 
@@ -3759,10 +3730,6 @@ fn default_quit_when_all_windows_are_closed() -> bool {
     #[cfg(target_os = "macos")]
     {
         false
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        true
     }
 }
 

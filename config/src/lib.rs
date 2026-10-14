@@ -527,13 +527,6 @@ pub fn is_executable_file(path: &Path) -> bool {
             .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
             .unwrap_or(false);
     }
-
-    #[cfg(not(unix))]
-    {
-        std::fs::metadata(path)
-            .map(|meta| meta.is_file())
-            .unwrap_or(false)
-    }
 }
 
 pub fn user_config_path() -> PathBuf {

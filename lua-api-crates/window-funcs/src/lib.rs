@@ -108,11 +108,6 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
                     {
                         window::query_appearance_early().to_string()
                     }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        APPEARANCE_QUERIED_BEFORE_GUI_READY.store(true, Ordering::Relaxed);
-                        window::Appearance::Light.to_string()
-                    }
                 }
             })
         })?,

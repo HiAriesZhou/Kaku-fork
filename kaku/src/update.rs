@@ -15,15 +15,6 @@ impl UpdateCommand {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-mod imp {
-    use anyhow::bail;
-
-    pub fn run(_assume_yes: bool) -> anyhow::Result<()> {
-        bail!("`kaku update` is currently supported on macOS only")
-    }
-}
-
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;

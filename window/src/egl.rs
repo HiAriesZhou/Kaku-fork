@@ -400,12 +400,7 @@ impl GlState {
     fn with_egl_lib<F: FnMut(EglWrapper) -> anyhow::Result<Self>>(
         mut func: F,
     ) -> anyhow::Result<Self> {
-        let mut paths: Vec<std::path::PathBuf> = vec![
-            #[cfg(not(target_os = "macos"))]
-            "libEGL.so.1".into(),
-            #[cfg(not(target_os = "macos"))]
-            "libEGL.so".into(),
-        ];
+        let mut paths: Vec<std::path::PathBuf> = vec![];
 
         if cfg!(target_os = "macos") {
             let exe_parent = std::env::current_exe()?

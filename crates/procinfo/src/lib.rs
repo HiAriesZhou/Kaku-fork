@@ -103,21 +103,6 @@ impl LocalProcessInfo {
         flatten(self, pgid, &mut names);
         names
     }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn with_root_pid(_pid: u32) -> Option<Self> {
-        None
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn current_working_dir(_pid: u32) -> Option<PathBuf> {
-        None
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn executable_path(_pid: u32) -> Option<PathBuf> {
-        None
-    }
 }
 
 #[cfg(test)]

@@ -619,11 +619,6 @@ fn app_is_active() -> bool {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn app_is_active() -> bool {
-    true
-}
-
 fn send_unfocused_notification(title: &str, body: &str) {
     if app_is_active() {
         return;

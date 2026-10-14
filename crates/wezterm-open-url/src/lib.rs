@@ -8,15 +8,6 @@ pub fn open_url(url: &str) {
         #[cfg(target_os = "macos")]
         let candidates: &[&[&str]] = &[&["/usr/bin/open", &url]];
 
-        #[cfg(not(target_os = "macos"))]
-        let candidates: &[&[&str]] = &[
-            &["xdg-open", &url],
-            &["gio", "open", &url] as &[_],
-            &["gnome-open", &url],
-            &["kde-open", &url],
-            &["wslview", &url],
-        ];
-
         for candidate in candidates {
             let mut cmd = std::process::Command::new(candidate[0]);
             cmd.args(&candidate[1..]);
@@ -38,9 +29,6 @@ pub fn open_with(url: &str, app: &str) {
         #[cfg(target_os = "macos")]
         let args: &[&str] = &["/usr/bin/open", "-a", &app, &url];
 
-        #[cfg(not(target_os = "macos"))]
-        let args: &[&str] = &[&app, &url];
-
         let mut cmd = std::process::Command::new(args[0]);
         cmd.args(&args[1..]);
 
@@ -49,6 +37,3 @@ pub fn open_with(url: &str, app: &str) {
         }
     });
 }
-
-
-

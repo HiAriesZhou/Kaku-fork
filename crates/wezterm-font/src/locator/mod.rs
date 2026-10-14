@@ -216,7 +216,9 @@ pub fn new_locator(locator: FontLocatorSelection) -> Arc<dyn FontLocator + Send 
         // setup may still ask for it, which used to panic.
         FontLocatorSelection::FontConfig | FontLocatorSelection::CoreText => {
             if locator == FontLocatorSelection::FontConfig {
-                log::warn!("font_locator = \"FontConfig\" is not available on macOS; using CoreText");
+                log::warn!(
+                    "font_locator = \"FontConfig\" is not available on macOS; using CoreText"
+                );
             }
             Arc::new(core_text::CoreTextFontLocator {
                 parsed_cache: Default::default(),
@@ -277,4 +279,3 @@ mod test {
         eprintln!("{:?}", source);
     }
 }
-

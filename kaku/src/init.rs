@@ -22,18 +22,6 @@ impl InitCommand {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-mod imp {
-    use anyhow::bail;
-
-    pub fn run(
-        _update_only: bool,
-        _shell: Option<crate::shell::ManagedShell>,
-    ) -> anyhow::Result<()> {
-        bail!("`kaku init` is currently supported on macOS only")
-    }
-}
-
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;

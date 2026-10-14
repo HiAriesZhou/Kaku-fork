@@ -22,15 +22,6 @@ impl ResetCommand {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-mod imp {
-    use anyhow::bail;
-
-    pub fn run(_yes: bool, _shell: Option<crate::shell::ManagedShell>) -> anyhow::Result<()> {
-        bail!("`kaku reset` is currently supported on macOS only")
-    }
-}
-
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;

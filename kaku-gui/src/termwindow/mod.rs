@@ -1247,8 +1247,6 @@ impl TermWindow {
         // LOGICALLY_CLOSED_WINDOWS and starve the session save at main.rs:940.
         #[cfg(target_os = "macos")]
         let is_app_quitting = ::window::is_app_terminating();
-        #[cfg(not(target_os = "macos"))]
-        let is_app_quitting = false;
 
         if !is_app_quitting {
             if self.config.restore_previous_session {
@@ -1265,54 +1263,6 @@ impl TermWindow {
             // conn.windows and focuses it back.
             _window.order_out();
             return;
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            let mux = Mux::get();
-            match self.config.window_close_confirmation {
-                WindowCloseConfirmation::NeverPrompt => {
-                    mux.kill_window(self.mux_window_id);
-                    _window.close();
-                    front_end().forget_known_window(_window);
-                }
-                // SmartPrompt and AlwaysPrompt share the same close path:
-                // both already skip the prompt when the window has no
-                // stateful process via can_close_without_prompting() below.
-                WindowCloseConfirmation::AlwaysPrompt | WindowCloseConfirmation::SmartPrompt => {
-                    let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
-                        Some(tab) => tab,
-                        None => {
-                            mux.kill_window(self.mux_window_id);
-                            _window.close();
-                            front_end().forget_known_window(_window);
-                            return;
-                        }
-                    };
-
-                    let mux_window_id = self.mux_window_id;
-
-                    let can_close = mux
-                        .get_window(mux_window_id)
-                        .map_or(false, |w| w.can_close_without_prompting());
-                    if can_close {
-                        mux.kill_window(self.mux_window_id);
-                        _window.close();
-                        front_end().forget_known_window(_window);
-                        return;
-                    }
-                    if let Some(window) = self.window.clone() {
-                        let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                            confirm_close_window(term, mux_window_id, window, tab_id)
-                        });
-                        self.assign_overlay(tab.tab_id(), overlay);
-                        promise::spawn::spawn(future).detach();
-                    }
-
-                    // Don't close right now; let the close happen from
-                    // the confirmation overlay
-                }
-            }
         }
     }
 
@@ -1621,8 +1571,6 @@ impl TermWindow {
         } else {
             WindowState::empty()
         };
-        #[cfg(not(target_os = "macos"))]
-        let initial_window_state = WindowState::empty();
         let config = window_configuration(initial_window_state, &Value::default());
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         crate::startup_trace::mark("  FontConfiguration#2 start");
@@ -1988,8 +1936,6 @@ impl TermWindow {
         } else {
             window.show();
         }
-        #[cfg(not(target_os = "macos"))]
-        window.show();
         crate::startup_trace::mark("  window.show() done");
 
         crate::startup_trace::mark("  GPU init start");
@@ -2882,17 +2828,6 @@ impl TermWindow {
     fn apply_icon(_window: &Window) -> anyhow::Result<()> {
         // On macOS the app bundle provides the icon via Info.plist;
         // set_icon() is a no-op there, so skip the PNG decode entirely.
-        #[cfg(not(target_os = "macos"))]
-        {
-            let image = image::load_from_memory(ICON_DATA)?.into_rgba8();
-            let (width, height) = image.dimensions();
-            _window.set_icon(Image::with_rgba32(
-                width as usize,
-                height as usize,
-                width as usize * 4,
-                image.as_raw(),
-            ));
-        }
         Ok(())
     }
 
@@ -5033,11 +4968,6 @@ impl TermWindow {
                             ::window::QuitOrigin::WindowScopeQuitApplication,
                         );
                     }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        let con = Connection::get().expect("call on gui thread");
-                        con.terminate_message_loop();
-                    }
                 }
             }
             SelectTextAtMouseCursor(mode) => self.select_text_at_mouse_cursor(*mode, pane),
@@ -5535,8 +5465,6 @@ impl TermWindow {
                                 && crate::macos::file_link::should_open_with_default_app(
                                     &target.path,
                                 );
-                            #[cfg(not(target_os = "macos"))]
-                            let use_default_app = false;
 
                             crate::thread_util::spawn_with_pool(move || {
                                 if let Err(err) = TermWindow::open_file_link_target(

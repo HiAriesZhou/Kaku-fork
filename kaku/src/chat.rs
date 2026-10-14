@@ -14,8 +14,6 @@
 //!   process-overhead (exec replaces this process in-place on Unix).
 
 use anyhow::anyhow;
-#[cfg(not(unix))]
-use anyhow::Context;
 use clap::Parser;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -42,14 +40,6 @@ impl ChatCommand {
             // overhead and no parent-process bookkeeping.
             let err = cmd.exec();
             return Err(anyhow!("failed to exec {}: {}", k_bin.display(), err));
-        }
-
-        #[cfg(not(unix))]
-        {
-            let status = cmd
-                .status()
-                .with_context(|| format!("spawn {}", k_bin.display()))?;
-            std::process::exit(status.code().unwrap_or(1));
         }
     }
 }
@@ -106,10 +96,6 @@ fn is_executable(path: &std::path::Path) -> bool {
             Ok(m) => m.is_file() && m.permissions().mode() & 0o111 != 0,
             Err(_) => false,
         }
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
     }
 }
 

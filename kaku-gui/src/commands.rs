@@ -632,9 +632,6 @@ impl CommandDef {
         result
     }
 
-    #[cfg(not(target_os = "macos"))]
-    pub fn recreate_menubar(_config: &ConfigHandle) {}
-
     /// Redirect AppKit's "Spotlight for Help" injection to an orphan menu
     /// that is never attached to the menubar. On macOS 26, AppKit's
     /// injected NSMenuItem lifetime is mis-handled, PAC-faulting during
@@ -2293,10 +2290,6 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
                 {
                     vec![(Modifiers::SUPER, "z".into())]
                 }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    vec![]
-                }
             } else {
                 vec![]
             },
@@ -2637,10 +2630,6 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ReopenLastClosedTab,
         RestorePreviousWindow,
         // ----------------- Edit
-        #[cfg(not(target_os = "macos"))]
-        PasteFrom(ClipboardPasteSource::PrimarySelection),
-        #[cfg(not(target_os = "macos"))]
-        CopyTo(ClipboardCopyDestination::PrimarySelection),
         CopyTo(ClipboardCopyDestination::Clipboard),
         PasteFrom(ClipboardPasteSource::Clipboard),
         // Cmd+Z at the shell prompt: forward Ctrl+_ (0x1f), which zsh (ZLE

@@ -763,8 +763,6 @@ impl super::TermWindow {
             .min()? as isize;
         #[cfg(target_os = "macos")]
         let base_dpi: usize = 72;
-        #[cfg(not(target_os = "macos"))]
-        let base_dpi: usize = 96;
         let extension = (BOTTOM_TAB_BAR_TOUCH_EXTENSION_PT * self.dimensions.dpi / base_dpi)
             .max(BOTTOM_TAB_BAR_TOUCH_EXTENSION_PT) as isize;
         let y = bottom_tab_bar_touch_y(event.coords.y, bar_top, terminal_bottom, extension)?;
@@ -1891,8 +1889,6 @@ impl super::TermWindow {
 
         #[cfg(target_os = "macos")]
         let base_dpi: usize = 72;
-        #[cfg(not(target_os = "macos"))]
-        let base_dpi: usize = 96;
         let resize_zone_pt: usize = 5;
         let resize_zone =
             (resize_zone_pt * self.dimensions.dpi / base_dpi).max(resize_zone_pt) as isize;

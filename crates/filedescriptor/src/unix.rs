@@ -171,33 +171,7 @@ impl OwnedHandle {
     pub(crate) unsafe fn dup2_impl<F: AsRawFileDescriptor>(fd: &F, dest_fd: RawFd) -> Result<Self> {
         let fd = fd.as_raw_file_descriptor();
 
-        #[cfg(not(target_os = "linux"))]
         return Self::non_atomic_dup2(fd, dest_fd);
-
-        #[cfg(target_os = "linux")]
-        {
-            let duped = libc::dup3(fd, dest_fd, libc::O_CLOEXEC);
-
-            if duped == -1 {
-                let err = std::io::Error::last_os_error();
-                if let Some(libc::EINVAL) = err.raw_os_error() {
-                    // We may be running on eg: WSL or an old kernel that
-                    // doesn't support O_CLOEXEC; fall back.
-                    Self::non_atomic_dup2(fd, dest_fd)
-                } else {
-                    Err(Error::Dup2 {
-                        src_fd: fd.into(),
-                        dest_fd: dest_fd.into(),
-                        source: err,
-                    })
-                }
-            } else {
-                Ok(OwnedHandle {
-                    handle: duped,
-                    handle_type: (),
-                })
-            }
-        }
     }
 
     pub(crate) fn probe_handle_type(_handle: RawFileDescriptor) -> HandleType {}
@@ -330,30 +304,6 @@ impl FileDescriptor {
 }
 
 impl Pipe {
-    #[cfg(target_os = "linux")]
-    pub fn new() -> Result<Pipe> {
-        let mut fds = [-1i32; 2];
-        let res = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-        if res == -1 {
-            Err(Error::Pipe(std::io::Error::last_os_error()))
-        } else {
-            let read = FileDescriptor {
-                handle: OwnedHandle {
-                    handle: fds[0],
-                    handle_type: (),
-                },
-            };
-            let write = FileDescriptor {
-                handle: OwnedHandle {
-                    handle: fds[1],
-                    handle_type: (),
-                },
-            };
-            Ok(Pipe { read, write })
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
     pub fn new() -> Result<Pipe> {
         let mut fds = [-1i32; 2];
         let res = unsafe { libc::pipe(fds.as_mut_ptr()) };
@@ -379,38 +329,6 @@ impl Pipe {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[doc(hidden)]
-pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
-    let mut fds = [-1i32; 2];
-    let res = unsafe {
-        libc::socketpair(
-            libc::PF_LOCAL,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        )
-    };
-    if res == -1 {
-        Err(Error::Socketpair(std::io::Error::last_os_error()))
-    } else {
-        let read = FileDescriptor {
-            handle: OwnedHandle {
-                handle: fds[0],
-                handle_type: (),
-            },
-        };
-        let write = FileDescriptor {
-            handle: OwnedHandle {
-                handle: fds[1],
-                handle_type: (),
-            },
-        };
-        Ok((read, write))
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
 #[doc(hidden)]
 pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
     let mut fds = [-1i32; 2];
@@ -438,25 +356,6 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
 
 pub use libc::{pollfd, POLLERR, POLLHUP, POLLIN, POLLOUT};
 use std::time::Duration;
-
-#[cfg(not(target_os = "macos"))]
-#[doc(hidden)]
-pub fn poll_impl(pfd: &mut [pollfd], duration: Option<Duration>) -> Result<usize> {
-    let poll_result = unsafe {
-        libc::poll(
-            pfd.as_mut_ptr(),
-            pfd.len() as _,
-            duration
-                .map(|wait| wait.as_millis() as libc::c_int)
-                .unwrap_or(-1),
-        )
-    };
-    if poll_result < 0 {
-        Err(Error::Poll(std::io::Error::last_os_error()))
-    } else {
-        Ok(poll_result as usize)
-    }
-}
 
 // macOS has a broken poll(2) implementation, so we introduce a layer to deal with that here
 #[cfg(target_os = "macos")]

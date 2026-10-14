@@ -755,24 +755,6 @@ impl GuiFrontEnd {
                         // Keep the app process alive on macOS when the last
                         // window closes, so Dock reopen is instant and consistent.
                     }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        if config::configuration().quit_when_all_windows_are_closed {
-                            promise::spawn::spawn_into_main_thread(async move {
-                                if mux::activity::Activity::count() == 0 {
-                                    log::trace!("Mux is now empty, terminate gui");
-                                    if let Some(conn) = Connection::get() {
-                                        conn.terminate_message_loop();
-                                    } else {
-                                        log::warn!(
-                                            "Cannot terminate message loop: GUI connection is not initialized"
-                                        );
-                                    }
-                                }
-                            })
-                            .detach();
-                        }
-                    }
                 }
                 MuxNotification::SaveToDownloads { name, data } => {
                     if !config::configuration().allow_download_protocols {
@@ -1107,11 +1089,6 @@ impl GuiFrontEnd {
         {
             self.hotkey_window.borrow().mux_window_id == Some(id)
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = id;
-            false
-        }
     }
 
     pub fn workspace_has_ordinary_windows(&self, workspace: &str) -> bool {
@@ -1200,16 +1177,6 @@ impl GuiFrontEnd {
                             ::window::request_terminate(
                                 ::window::QuitOrigin::AppScopeQuitApplication,
                             );
-                        }
-                        #[cfg(not(target_os = "macos"))]
-                        {
-                            if let Some(conn) = Connection::get() {
-                                conn.terminate_message_loop();
-                            } else {
-                                log::warn!(
-                                    "Cannot terminate message loop for QuitApplication: GUI connection is not initialized"
-                                );
-                            }
                         }
                     }
                     KeyAssignment::SpawnWindow => {
@@ -1433,8 +1400,6 @@ impl GuiFrontEnd {
                 .borrow_mut()
                 .remove(&removed.unwrap());
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = removed;
         if !self.is_switching_workspace() {
             self.reconcile_workspace();
         }

@@ -671,11 +671,6 @@ impl Config {
             let uid = unsafe { libc::getuid() };
             uid.to_string()
         }
-
-        #[cfg(not(unix))]
-        {
-            String::new()
-        }
     }
 
     /// Perform token substitution

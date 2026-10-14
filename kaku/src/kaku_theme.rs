@@ -332,11 +332,6 @@ fn is_macos_dark_mode() -> bool {
     is_dark
 }
 
-#[cfg(not(target_os = "macos"))]
-fn is_macos_dark_mode() -> bool {
-    false
-}
-
 fn theme_from_config(config: &ConfigHandle) -> CachedTheme {
     if let Some(theme) = builtin_kaku_theme(config) {
         return theme;

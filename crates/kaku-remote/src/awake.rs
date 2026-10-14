@@ -64,17 +64,6 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-mod platform {
-    pub(super) struct Activity;
-
-    pub(super) fn begin() -> Option<Activity> {
-        None
-    }
-
-    pub(super) fn end(_: Activity) {}
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
