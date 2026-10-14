@@ -1498,7 +1498,11 @@ impl super::TermWindow {
                     }
                     menu.add_item(&pane_action_menu_item(title, action, pane_id));
                 }
+                let started = std::time::Instant::now();
                 context.show_context_menu(menu, event.screen_coords);
+                if self.config.debug_key_events {
+                    log::info!("context_menu tab open for {:?}", started.elapsed());
+                }
                 return;
             }
         }
@@ -2372,6 +2376,15 @@ impl super::TermWindow {
                     .input_map
                     .lookup_mouse(event_trigger_type, mouse_mods);
 
+                if self.config.debug_key_events
+                    && matches!(event.kind, WMEK::Press(MousePress::Right))
+                {
+                    log::info!(
+                        "context_menu terminal check grabbed={} captured={is_already_captured} assignment={}",
+                        pane.is_mouse_grabbed(),
+                        mouse_assignment.is_some()
+                    );
+                }
                 #[cfg(target_os = "macos")]
                 if should_show_terminal_context_menu(
                     &event.kind,
@@ -2392,7 +2405,11 @@ impl super::TermWindow {
                         for (title, action) in terminal_context_menu_actions(has_selection) {
                             menu.add_item(&pane_action_menu_item(title, action, pane_id));
                         }
+                        let started = std::time::Instant::now();
                         context.show_context_menu(menu, event.screen_coords);
+                        if self.config.debug_key_events {
+                            log::info!("context_menu terminal open for {:?}", started.elapsed());
+                        }
                         return;
                     }
                 }

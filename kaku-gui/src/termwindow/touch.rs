@@ -128,12 +128,23 @@ impl TermWindow {
                 let grabbed = self
                     .get_active_pane_or_overlay()
                     .is_some_and(|pane| pane.is_mouse_grabbed());
-                if !long_press_as_right_click(
+                let replay = long_press_as_right_click(
                     press.started.elapsed(),
                     on_tab,
                     item.is_some(),
                     grabbed,
-                ) {
+                );
+                if self.config.debug_key_events {
+                    // Remote clients differ in what reaches the Mac; log the
+                    // decision so a long press that opens nothing can be
+                    // traced (see the mouse_event lines next to it).
+                    log::info!(
+                        "long_press held={:?} item={:?} grabbed={grabbed} replay={replay}",
+                        press.started.elapsed(),
+                        item
+                    );
+                }
+                if !replay {
                     return;
                 }
                 let Some(window) = self.window.clone() else {
