@@ -535,9 +535,6 @@ struct HotkeySlide {
     duration: Duration,
     showing: bool,
     hide_on_focus_loss: bool,
-    /// Fade in place instead of sliding: the slide would pass through another
-    /// display stacked above this one and show there.
-    fade: bool,
 }
 
 fn hotkey_offscreen_origin(frame: NSRect, screen: NSRect) -> NSPoint {
@@ -547,7 +544,8 @@ fn hotkey_offscreen_origin(frame: NSRect, screen: NSRect) -> NSPoint {
 
 /// Whether the drawer's slide, from just above `screen`'s top edge down to
 /// `frame`, would cross another display: with a monitor stacked above, the
-/// drawer briefly showed on that monitor while sliding out and in.
+/// drawer briefly showed on that monitor while sliding out and in. It then
+/// appears and leaves at once; a fade in place was tried and read as slow.
 fn hotkey_slide_crosses_another_screen(frame: NSRect, screen: NSRect, screens: &[NSRect]) -> bool {
     let band_bottom = screen.origin.y + screen.size.height;
     let band_top = band_bottom + frame.size.height;
@@ -572,21 +570,6 @@ fn hotkey_height_percent_from(frame_height: f64, screen_height: f64) -> Option<f
 impl HotkeySlide {
     fn should_hide_when_cancelled(self, is_key: bool) -> bool {
         !(self.showing || self.hide_on_focus_loss && is_key)
-    }
-
-    /// Window opacity during the animation: 1 while sliding, ramped while
-    /// fading.
-    fn alpha_at(self, elapsed: Duration) -> f64 {
-        if !self.fade || self.duration.is_zero() {
-            return 1.;
-        }
-        let t = (elapsed.as_secs_f64() / self.duration.as_secs_f64()).min(1.);
-        let eased = t * t * (3. - 2. * t);
-        if self.showing {
-            eased
-        } else {
-            1. - eased
-        }
     }
 
     fn reverse_on_focus_gain(self, is_key: bool, current_origin: NSPoint) -> Option<Self> {
@@ -3416,19 +3399,14 @@ impl WindowInner {
         };
         let generation = view.hotkey_slide_generation.get().wrapping_add(1);
         view.hotkey_slide_generation.set(generation);
-        let fade = hotkey_slide_crosses_another_screen(resting_frame, screen, &screen_frames());
-        let offscreen = if fade {
-            resting_frame.origin
-        } else {
-            hotkey_offscreen_origin(resting_frame, screen)
-        };
+        let offscreen = hotkey_offscreen_origin(resting_frame, screen);
         let from = if showing && !self.is_visible() {
             offscreen
-        } else if fade {
-            resting_frame.origin
         } else {
             unsafe { NSWindow::frame(*self.window).origin }
         };
+        // A display stacked above would show the drawer mid-slide.
+        let instant = hotkey_slide_crosses_another_screen(resting_frame, screen, &screen_frames());
         let reduce_motion: BOOL = unsafe {
             let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
             msg_send![workspace, accessibilityDisplayShouldReduceMotion]
@@ -3444,11 +3422,10 @@ impl WindowInner {
             started: Instant::now(),
             duration: hotkey_animation_duration(
                 self.config.macos_global_hotkey_animation_duration_ms,
-                reduce_motion == YES,
+                reduce_motion == YES || instant,
             ),
             showing,
             hide_on_focus_loss: false,
-            fade,
         };
         view.hotkey_slide.set(Some(slide));
         unsafe {
@@ -3458,9 +3435,6 @@ impl WindowInner {
             }
             self.window
                 .setFrame_display_(NSRect::new(from, resting_frame.size), NO);
-            if fade && showing && !self.is_visible() {
-                let _: () = msg_send![*self.window, setAlphaValue: 0.0f64];
-            }
         }
         let window_id = view.window_id.get();
         // Timed main-thread steps allow a new hotkey to reverse immediately;
@@ -3506,9 +3480,6 @@ impl WindowInner {
         }
         unsafe {
             let _: () = msg_send![*self.window, setFrameOrigin: slide.origin_at(elapsed)];
-            if slide.fade {
-                let _: () = msg_send![*self.window, setAlphaValue: slide.alpha_at(elapsed)];
-            }
         }
         true
     }
@@ -5518,7 +5489,6 @@ mod tests {
             duration: hotkey_animation_duration(500, false),
             showing: true,
             hide_on_focus_loss: false,
-            fade: false,
         };
         assert_eq!(slide.origin_at(Duration::from_millis(250)).y, 750.);
         // A new setting does not change the duration of an existing slide.
@@ -5548,7 +5518,6 @@ mod tests {
             duration: Duration::from_millis(500),
             showing: false,
             hide_on_focus_loss: true,
-            fade: false,
         };
         let current = NSPoint::new(0., 750.);
         assert!(hide
@@ -5606,9 +5575,9 @@ mod tests {
     #[test]
     /// The drawer opens at the height the user last dragged to, and the
     /// config's height applies until then or after it changes; a slide that
-    /// would pass over a display stacked above fades in place instead.
+    /// would pass over a display stacked above happens at once instead.
     #[test]
-    fn drawer_keeps_dragged_height_and_fades_past_a_stacked_display() {
+    fn drawer_keeps_dragged_height_and_skips_the_slide_past_a_stacked_display() {
         let laptop = NSRect::new(NSPoint::new(0., 0.), NSSize::new(1512., 982.));
         let drawer = NSRect::new(NSPoint::new(0., 655.), NSSize::new(1512., 327.));
         // A monitor above the laptop, as in the report: the slide crosses it.
@@ -5631,6 +5600,8 @@ mod tests {
         let resize = production_method(source, "extern \"C\" fn did_resize(");
         assert!(resize.contains("this.hotkey_height_percent.set(Some(percent))"));
         assert!(resize.contains("this.hotkey_slide.get().is_none()"));
+        let animate = production_method(source, "fn animate_hotkey_slide(");
+        assert!(animate.contains("reduce_motion == YES || instant"));
     }
 
     fn hotkey_options_native_consumer_wiring() {
@@ -5675,7 +5646,6 @@ mod tests {
             duration: HOTKEY_SLIDE_DURATION,
             showing: false,
             hide_on_focus_loss: true,
-            fade: false,
         };
         assert!(!hide.should_hide_when_cancelled(true));
         assert!(hide.should_hide_when_cancelled(false));
@@ -6863,7 +6833,6 @@ mod tests {
             duration: HOTKEY_SLIDE_DURATION,
             showing: false,
             hide_on_focus_loss: true,
-            fade: false,
         };
         let current = NSPoint::new(0., 750.);
         assert!(hide.reverse_on_focus_gain(false, current).is_none());
@@ -6946,7 +6915,6 @@ mod tests {
                 duration: HOTKEY_SLIDE_DURATION,
                 showing: true,
                 hide_on_focus_loss: false,
-                fade: false,
             };
             assert_eq!(point(show.origin_at(Duration::ZERO)), point(offscreen));
             assert_eq!(
@@ -7265,9 +7233,6 @@ impl WindowView {
                 // Keep the guard set while settling, so callbacks cannot save
                 // a transient animation frame as the user's window geometry.
                 NSWindow::setFrame_display_(window, slide.resting_frame, NO);
-                if slide.fade {
-                    let _: () = msg_send![window, setAlphaValue: 1.0f64];
-                }
             }
             self.hotkey_slide.set(None);
         }
