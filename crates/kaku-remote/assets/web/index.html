@@ -695,9 +695,10 @@
       if (k === "c" && (ev.shiftKey || term.hasSelection())) return false;
     }
     if (ev.metaKey) {
-      // Kaku binds Cmd+Enter to a newline without executing.
+      // Kaku binds Cmd+Enter to a newline without executing, and
+      // Cmd+Shift+Enter to zooming the pane.
       if (ev.key === "Enter") {
-        if (ev.type === "keydown") send({ type: "text", data: "\n" });
+        if (ev.type === "keydown") send(ev.shiftKey ? { type: "zoom_pane", pane_id: paneId } : { type: "text", data: "\n" });
         ev.preventDefault();
       }
       // Leave Cmd+C / Cmd+V and other browser shortcuts alone.
@@ -1429,7 +1430,7 @@
   const helpEl = document.getElementById("help");
   const HELP = IS_MAC ? [
     ["⌘1–9", "Go to a tab"], ["⌘⇧[  ⌘⇧]", "Previous or next tab"], ["⌘T  ⌘W", "New or close tab"],
-    ["⌘F", "Find in history"], ["⌘K", "Clear"], ["⇧↩", "New line without running"],
+    ["⌘F", "Find in history"], ["⌘K", "Clear"], ["⇧↩", "New line without running"], ["⌘⇧↩", "Zoom the pane"],
     ["⌘ click", "Open a link"], ["Drop or paste", "Send files to ~/Downloads/Kaku"],
     ["Double click", "Rename a tab"], ["⌘/", "These shortcuts"],
   ] : [
@@ -1757,6 +1758,10 @@
     }], ["Search", openFind], null);
     for (const direction of ["Left", "Right", "Up", "Down"]) {
       items.push(["Split " + direction, () => send({ type: "split_pane", pane_id: target, direction })]);
+    }
+    const here = tabs.find((t) => t.tab_id === tabId);
+    if (here && (here.panes || []).length > 1) {
+      items.push(null, [here.zoomed ? "Unzoom Pane" : "Zoom Pane", () => send({ type: "zoom_pane", pane_id: target })]);
     }
     items.push(null, ["Close Pane", () => closePane(target)]);
     openMenu(ev.clientX, ev.clientY, items);

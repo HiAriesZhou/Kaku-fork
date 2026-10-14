@@ -27,7 +27,8 @@ fn perform(action: TabAction) {
         | TabAction::ClosePane { pane_id }
         | TabAction::Activate { pane_id }
         | TabAction::Rename { pane_id, .. }
-        | TabAction::Move { pane_id, .. } => PaneId::from(*pane_id),
+        | TabAction::Move { pane_id, .. }
+        | TabAction::Zoom { pane_id } => PaneId::from(*pane_id),
     };
     let mux = Mux::get();
     let Some((_, window_id, tab_id)) = mux.resolve_pane_id(pane_id) else {
@@ -123,6 +124,16 @@ fn perform(action: TabAction) {
                 assignment: KeyAssignment::ActivateTab(idx as isize),
                 tx: None,
             });
+        }
+        TabAction::Zoom { .. } => {
+            // The browser shows one pane at a time; zooming the one it is on
+            // lets that pane take the whole tab, and so the whole page.
+            if let (Some(tab), Some(pane)) = (mux.get_tab(tab_id), mux.get_pane(pane_id)) {
+                if tab.get_active_pane().map(|p| p.pane_id()) != Some(pane_id) {
+                    tab.set_active_pane(&pane);
+                }
+                tab.toggle_zoom();
+            }
         }
         TabAction::Rename { title, .. } => {
             // An empty title goes back to the computed one, as clearing the

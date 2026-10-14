@@ -704,6 +704,32 @@ test('pane actions retain the menu target and close confirmation names a pane', 
   assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'close_pane')), [{ type: 'close_pane', pane_id: 1 }]);
 });
 
+test('a split pane zooms from the menu or Cmd+Shift+Enter, and the menu names the state', async t => {
+  const { p } = await page(t); await screen(p);
+  const split = zoomed => p.evaluate(zoomed => probe.handle({ type: 'tabs', tabs: [
+    { tab_id: 1, pane_id: 1, title: 'split', zoomed, panes: [
+      { pane_id: 1, left: 0, top: 0, width: 40, height: 24 },
+      { pane_id: 3, left: 40, top: 0, width: 40, height: 24 },
+    ] }, { tab_id: 2, pane_id: 2, title: 'two' },
+  ] }), zoomed);
+  await split(false);
+  await p.locator('.xterm-screen').click({ button: 'right', position: { x: 20, y: 10 } });
+  await p.locator('#menu button').getByText('Zoom Pane', { exact: true }).click();
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'zoom_pane')), [{ type: 'zoom_pane', pane_id: 1 }]);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.locator('.xterm-helper-textarea').focus();
+  await p.keyboard.press('Meta+Shift+Enter');
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'zoom_pane' || m.type === 'text')), [{ type: 'zoom_pane', pane_id: 1 }]);
+  await split(true);
+  await p.locator('.xterm-screen').click({ button: 'right', position: { x: 20, y: 10 } });
+  assert.equal(await p.locator('#menu button').getByText('Unzoom Pane', { exact: true }).count(), 1);
+  await p.keyboard.press('Escape');
+  // A tab without splits has nothing to zoom.
+  await p.evaluate(() => probe.attach({ tab_id: 2, pane_id: 2 }, true));
+  await p.locator('.xterm-screen').click({ button: 'right', position: { x: 20, y: 10 } });
+  assert.equal(await p.locator('#menu button').getByText(/Zoom Pane/).count(), 0);
+});
+
 test('terminal menu fits narrow and short viewport corners', async t => {
   const { p } = await page(t); await screen(p);
   for (const [width, height] of [[375, 240], [375, 900], [1280, 900], [1280, 240]]) {

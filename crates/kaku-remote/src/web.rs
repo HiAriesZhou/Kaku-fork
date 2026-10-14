@@ -122,6 +122,8 @@ pub enum TabAction {
     Rename { pane_id: usize, title: String },
     /// Move the tab holding this pane to `index` in its window.
     Move { pane_id: usize, index: usize },
+    /// Focus this pane and toggle its tab's zoom, as Cmd+Shift+Enter does.
+    Zoom { pane_id: usize },
 }
 
 pub type TabActionHandler = Arc<dyn Fn(TabAction) + Send + Sync + 'static>;
@@ -250,6 +252,9 @@ struct TabInfo {
     /// can draw the layout and switch between them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     panes: Vec<PaneBox>,
+    /// One pane fills the tab (Cmd+Shift+Enter).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    zoomed: bool,
 }
 
 #[derive(Serialize, PartialEq)]
@@ -314,6 +319,7 @@ fn collect_tabs() -> Vec<TabInfo> {
                 confirm_close: policy
                     .should_prompt(true, || tab.can_close_without_prompting(CloseReason::Tab)),
                 panes,
+                zoomed: tab.get_zoomed_pane().is_some(),
             });
         }
     }
@@ -423,6 +429,10 @@ enum WebClientMsg {
     SplitPane {
         pane_id: usize,
         direction: config::keyassignment::PaneDirection,
+    },
+    /// Zoom the named pane to its whole tab, or back.
+    ZoomPane {
+        pane_id: usize,
     },
     /// Close a pane; the page has already confirmed with the user.
     ClosePane {
@@ -1587,6 +1597,12 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
         WebClientMsg::ClosePane { pane_id } => {
             if lookup_pane(pane_id).is_some() {
                 dispatch_tab_action(TabAction::ClosePane { pane_id });
+            }
+            Ok(())
+        }
+        WebClientMsg::ZoomPane { pane_id } => {
+            if lookup_pane(pane_id).is_some() {
+                dispatch_tab_action(TabAction::Zoom { pane_id });
             }
             Ok(())
         }
