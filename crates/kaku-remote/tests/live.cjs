@@ -57,6 +57,12 @@ async function until(fn, ms = 15000) {
     await page.keyboard.type('printf "LIVE-OK\\n"\n');
     await page.waitForFunction(() => [...document.querySelectorAll('.xterm-rows > div')].some(row => row.textContent.trim() === 'LIVE-OK'));
 
+    // An inline image (iTerm2 protocol, as imgcat writes) reaches the page as
+    // an image over its cells, not as dropped cells.
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    await page.keyboard.type(`printf '\\033]1337;File=inline=1;width=4;height=2:${png}\\a\\n'\n`);
+    await page.waitForSelector('#images img', { timeout: 15000 });
+
     // A page on another site that rebinds its name to 127.0.0.1 still sends
     // its own Host, and is refused; the old token page is gone.
     const statusFor = host => new Promise((resolve, reject) => require('node:http')
