@@ -174,6 +174,35 @@ pub(crate) fn publish_clipboard(pane_id: usize, text: Arc<str>) {
     }
 }
 
+/// Notifications a program posted (OSC 9/777: Claude Code finishing, a long
+/// build done), by pane. Kaku shows them on the Mac as before; every browser
+/// gets them too, so a page in a background tab can raise one there.
+static NOTIFICATIONS: LazyLock<broadcast::Sender<Notification>> =
+    LazyLock::new(|| broadcast::channel(8).0);
+
+#[derive(Clone)]
+struct Notification {
+    pane_id: usize,
+    title: Arc<str>,
+    body: Arc<str>,
+}
+
+/// Long enough for any real notice; a program cannot flood browsers with more.
+fn clip(text: &str, max: usize) -> Arc<str> {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => Arc::from(&text[..end]),
+        None => Arc::from(text),
+    }
+}
+
+pub(crate) fn publish_notification(pane_id: usize, title: Option<&str>, body: &str) {
+    let _ = NOTIFICATIONS.send(Notification {
+        pane_id,
+        title: clip(title.unwrap_or(""), 120),
+        body: clip(body, 500),
+    });
+}
+
 // ── Static assets ─────────────────────────────────────────────────────────────
 
 /// The page and its files, by path relative to the page. Served locally and,
@@ -487,6 +516,12 @@ enum WebServerMsg<'a> {
     /// Text a program in the attached pane copied, for the browser clipboard.
     Clipboard {
         text: &'a str,
+    },
+    /// A notification a program in any pane posted.
+    Notify {
+        pane_id: usize,
+        title: &'a str,
+        body: &'a str,
     },
     /// History rows for the page's local scroll view: `rows` start at stable
     /// row `top`, and `first` is the oldest row the pane still holds. Each
@@ -1651,6 +1686,7 @@ pub(crate) async fn run_session(
     let mut flow_control = false;
     let mut last_frame_at = std::time::Instant::now();
     let mut clipboard = CLIPBOARD.subscribe();
+    let mut notifications = NOTIFICATIONS.subscribe();
     let mut uploads = Uploads::default();
     let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1805,6 +1841,15 @@ pub(crate) async fn run_session(
                 Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => dirty_frame = true,
                 Err(broadcast::error::RecvError::Closed) => updates = None,
             },
+            posted = notifications.recv() => {
+                if let Ok(n) = posted {
+                    let msg = WebServerMsg::Notify { pane_id: n.pane_id, title: &n.title, body: &n.body };
+                    let Some(json) = encode(&msg) else { continue };
+                    if outbox.send(json).await.is_err() {
+                        break;
+                    }
+                }
+            }
             copied = clipboard.recv() => {
                 if let Ok((pane_id, text)) = copied {
                     if attached == Some(pane_id) {
@@ -1936,6 +1981,14 @@ async fn forward_until_session_ends<S, E>(
 mod tests {
     use super::*;
     use termwiz::color::SrgbaTuple;
+
+    /// Notification text is capped by characters, never mid-character.
+    #[test]
+    fn notification_text_is_clipped_on_character_boundaries() {
+        assert_eq!(&*clip("Done", 120), "Done");
+        assert_eq!(&*clip("构建完成了", 2), "构建");
+        assert_eq!(clip(&"a".repeat(600), 500).len(), 500);
+    }
 
     /// A browser that went silent behind a half-open socket: the session gives
     /// up, and the socket must be let go with it instead of waiting forever.

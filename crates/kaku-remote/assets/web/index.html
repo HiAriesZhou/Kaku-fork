@@ -103,6 +103,7 @@
   #find button { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; }
   #find button:hover { background: var(--tab-hover-bg); color: var(--fg); }
   #find svg { width: 10px; height: 10px; }
+  #toast.action { cursor: pointer; pointer-events: auto; }
   #toast { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); display: none; max-width: calc(100% - 32px); padding: 7px 12px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); color: var(--fg); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; z-index: 5; }
   #toast.show { display: block; }
   body.dropping #stage { box-shadow: inset 0 0 0 2px var(--muted); }
@@ -2014,11 +2015,60 @@
   // ~/Downloads/Kaku, and its path is pasted into the pane.
   const toastEl = document.getElementById("toast");
   let toastTimer = 0;
+  // What clicking the current toast does, if anything; a new toast clears it.
+  let toastAction = null;
+  toastEl.addEventListener("click", () => {
+    const action = toastAction;
+    if (!action) return;
+    toastAction = null;
+    toastEl.classList.remove("action", "show");
+    action();
+  });
   const toast = (text, stay = false) => {
     clearTimeout(toastTimer);
+    toastAction = null;
+    toastEl.classList.remove("action");
     toastEl.textContent = text;
     toastEl.classList.add("show");
     if (!stay) toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2500);
+  };
+  // Notifications a program posted on the Mac (Claude Code finishing, a
+  // build done). In a background tab they become the browser's own, which a
+  // click brings back to that pane; in front, another tab's shows as a toast.
+  // Browsers only ask for permission from a click, so the first one offers
+  // it once.
+  const tabOfPane = (id) => tabs.find((t) => t.pane_id === id || (t.panes || []).some((p) => p.pane_id === id));
+  const onNotify = (msg) => {
+    const text = [msg.title, msg.body].filter(Boolean).join(": ");
+    if (!text) return;
+    const tab = tabOfPane(msg.pane_id);
+    const supported = "Notification" in window;
+    if (!document.hidden && document.hasFocus()) {
+      if (msg.pane_id !== paneId) toast(text);
+      return;
+    }
+    if (!supported || Notification.permission !== "granted") {
+      if (supported && Notification.permission === "default") offerNotifications();
+      return;
+    }
+    const shown = new Notification(msg.title || "Kaku", { body: msg.body, tag: "kaku-" + msg.pane_id });
+    shown.onclick = () => {
+      window.focus();
+      shown.close();
+      if (tab && tab.tab_id !== tabId) attach({ tab_id: tab.tab_id, pane_id: msg.pane_id }, true);
+    };
+  };
+  let notificationsOffered = false;
+  const offerNotifications = () => {
+    if (notificationsOffered) return;
+    try { if (localStorage.getItem("kaku.notify.asked")) return; } catch (_) {}
+    notificationsOffered = true;
+    toast("Click here to get notifications when a task finishes", true);
+    toastEl.classList.add("action");
+    toastAction = () => {
+      try { localStorage.setItem("kaku.notify.asked", "1"); } catch (_) {}
+      Notification.requestPermission().catch(() => {});
+    };
   };
   let uploadSeq = 0;
   const uploadWaiters = new Map();
@@ -2137,6 +2187,7 @@
     else if (msg.type === "tabs") onTabs(msg.tabs);
     else if (msg.type === "frame") { framesSeen++; onFrame(msg); }
     else if (msg.type === "clipboard") copyToClipboard(msg.text);
+    else if (msg.type === "notify") onNotify(msg);
     else if (msg.type === "found") onFound(msg);
     else if (msg.type === "history") onHistory(msg);
     else if (msg.type === "upload_ack") { const a = uploadAcks.get(msg.id); if (a) a(msg.received); }

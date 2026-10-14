@@ -606,6 +606,45 @@ test('middle click closes the clicked tab through the same confirmation path', a
   assert.equal(await p.evaluate(() => messages.some(m => m.type === 'attach' && m.pane_id === 2)), false);
 });
 
+test('notifications from the Mac reach a background page, and a click returns to their pane', async t => {
+  const { p, errors } = await page(t); await screen(p);
+  await p.evaluate(() => {
+    window.shown = [];
+    window.permissionAsked = 0;
+    window.Notification = class {
+      constructor(title, options) { this.title = title; this.body = options.body; shown.push(this); }
+      close() {}
+    };
+    Notification.permission = 'default';
+    Notification.requestPermission = async () => { permissionAsked++; Notification.permission = 'granted'; return 'granted'; };
+    window.pageHidden = false;
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => pageHidden });
+    document.hasFocus = () => !pageHidden;
+  });
+  // In front: another tab's notice is a toast, the attached pane's is already on screen.
+  await p.evaluate(() => probe.handle({ type: 'notify', pane_id: 1, title: 'Claude Code', body: 'Done' }));
+  assert.equal(await p.locator('#toast.show').count(), 0);
+  await p.evaluate(() => probe.handle({ type: 'notify', pane_id: 2, title: 'Claude Code', body: 'Done' }));
+  assert.match(await p.locator('#toast').innerText(), /Claude Code: Done/);
+  // In the background, without permission yet: offer it once, ask only on a click.
+  await p.evaluate(() => { pageHidden = true; probe.handle({ type: 'notify', pane_id: 2, title: 'Build', body: 'ok' }); });
+  assert.match(await p.locator('#toast').innerText(), /notifications/);
+  assert.equal(await p.evaluate(() => permissionAsked), 0);
+  await p.evaluate(() => { pageHidden = false; });
+  await p.locator('#toast').click();
+  assert.equal(await p.evaluate(() => permissionAsked), 1);
+  // Granted: a background notice is the browser's own, and its click goes to that pane.
+  await p.evaluate(() => { pageHidden = true; messages.length = 0; probe.handle({ type: 'notify', pane_id: 2, title: 'Build', body: 'ok' }); });
+  assert.deepEqual(await p.evaluate(() => shown.map(n => [n.title, n.body])), [['Build', 'ok']]);
+  await p.evaluate(() => shown[0].onclick());
+  assert.equal(await p.evaluate(() => messages.some(m => m.type === 'attach' && m.pane_id === 2)), true);
+  // An unrelated toast later is not a permission prompt.
+  await p.evaluate(() => { pageHidden = false; probe.handle({ type: 'error', detail: 'something else' }); });
+  await p.locator('#toast').click();
+  assert.equal(await p.evaluate(() => permissionAsked), 1);
+  assert.deepEqual(errors, []);
+});
+
 test('the close confirmation answers to N, Y and clicks outside it, like Kaku', async t => {
   const { p } = await page(t); await screen(p);
   await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'tabs', tabs: [

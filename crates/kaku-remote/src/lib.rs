@@ -300,6 +300,12 @@ pub fn start() {
                 } => {
                     web::publish_clipboard((*pane_id).into(), text.clone());
                 }
+                MuxNotification::Alert {
+                    pane_id,
+                    alert: wezterm_term::Alert::ToastNotification { title, body, .. },
+                } => {
+                    web::publish_notification((*pane_id).into(), title.as_deref(), body);
+                }
                 MuxNotification::PaneRemoved(pane_id) => {
                     web::pane_removed(&web_dirty_for_sub, (*pane_id).into());
                 }
