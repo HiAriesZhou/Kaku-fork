@@ -90,8 +90,6 @@ mod ai_auth;
 mod ai_chat_engine;
 mod ai_client;
 mod ai_conversations;
-#[cfg(feature = "remote")]
-mod ai_remote;
 mod ai_state;
 mod ai_tools;
 mod codex_connection;
@@ -369,7 +367,6 @@ async fn async_run_terminal_gui(
 
     #[cfg(feature = "remote")]
     {
-        ai_remote::register_if_configured();
         remote_tabs::register();
         kaku_remote::start();
     }
