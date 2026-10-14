@@ -445,7 +445,9 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 45;
+/// 46: search Pattern gained CaseSmartString, which Cmd+F always sends and an
+/// older server cannot decode, so it would drop the whole connection.
+pub const CODEC_VERSION: usize = 46;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
