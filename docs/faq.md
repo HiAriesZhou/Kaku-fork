@@ -249,8 +249,6 @@ Kaku is compatible with yabai and AeroSpace. If you see continuous flickering, i
 
 ## How do I use Kaku through a phone or tablet remote desktop?
 
-Click **Touch** to switch the current window to larger controls. Click it again to return to the desktop layout. With one tab, the button stays at the right of the integrated titlebar. **Window > Touch Mode** also works when the tab bar or titlebar is disabled.
+Hold anywhere for half a second, then lift, to open the menu a right click would: on a tab you get New Tab, Tab Navigator and Close Tab, and on the terminal you get Copy, Paste, Split and the rest. This works in every window, as long as the remote client forwards a held press as a held left button, which UU does. In panes where a program such as vim or tmux takes mouse input, the hold stays with that program.
 
-Touch mode shows a close button on each visible tab, **+** for a new tab, and **Menu** for copy, paste, text size and pane zoom. Drag the tab strip sideways or scroll over it to reach more tabs. **Menu > Tabs** also opens the full list. Closing a tab follows your existing confirmation setting.
-
-Hold a tab title for half a second to open its menu. This works when the remote client forwards a held left press to the Mac. If the client handles long presses itself, tap **Menu** instead. Terminal mouse input stays with applications such as vim and tmux. The terminal font and line height stay unchanged when switching layouts.
+**Window > Touch Mode** adds a close button to every tab, since a finger has no hover. The tab bar keeps its height and look, and the terminal font and line height do not change.

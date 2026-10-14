@@ -176,6 +176,8 @@ pub(crate) struct MouseInputState {
     /// above it. The rest of that gesture belongs to the tab bar, so its
     /// motion and release must not fall through to terminal selection.
     pub touch_band_press: Option<MousePress>,
+    /// A plain left press that may still become a long press (touch.rs).
+    pub long_press: Option<super::touch::LongPress>,
 }
 
 impl Default for MouseInputState {
@@ -189,6 +191,7 @@ impl Default for MouseInputState {
             selection_drag_active: false,
             last_mouse_click: None,
             touch_band_press: None,
+            long_press: None,
         }
     }
 }
@@ -725,7 +728,7 @@ impl super::TermWindow {
             .insert(tab_idx, (current_offset, ease));
     }
 
-    fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
+    pub(super) fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
         let x = event.coords.x;
         let y = event.coords.y;
         self.ui_items
@@ -781,8 +784,7 @@ impl super::TermWindow {
             UIItemType::TabBar(_) => {
                 self.update_title_post_status();
             }
-            UIItemType::Touch(_)
-            | UIItemType::CloseTab(_)
+            UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -793,8 +795,7 @@ impl super::TermWindow {
     fn enter_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
             UIItemType::TabBar(_) => {}
-            UIItemType::Touch(_)
-            | UIItemType::CloseTab(_)
+            UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -916,9 +917,7 @@ impl super::TermWindow {
             return;
         }
 
-        if self.touch_mouse_event(&event, context) {
-            return;
-        }
+        self.track_long_press(&event);
 
         let mut capture_mouse = false;
         let release_button = match &event.kind {
@@ -1255,9 +1254,7 @@ impl super::TermWindow {
     }
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
-        if let Some(press) = self.touch_press.as_mut() {
-            press.cancelled = true;
-        }
+        self.mouse.long_press = None;
         self.mouse.current_mouse_event = None;
         self.scrollbar.hovering = false;
         self.update_title();
@@ -1438,7 +1435,6 @@ impl super::TermWindow {
     ) {
         self.mouse.last_ui_item.replace(item.clone());
         match item.item_type.clone() {
-            UIItemType::Touch(_) => {}
             UIItemType::TabBar(tab_bar_item) => {
                 self.mouse_event_tab_bar(tab_bar_item, item, event, context);
             }

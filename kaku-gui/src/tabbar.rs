@@ -20,10 +20,9 @@ use window::{IntegratedTitleButton, IntegratedTitleButtonAlignment, IntegratedTi
 pub struct TabBarState {
     line: Line,
     items: Vec<TabEntry>,
-    /// Column where the right status text starts, and the blank cell used
-    /// to pad around it, so a gap can open in front of the status.
-    right_status_start: usize,
-    pad_cell: Cell,
+    /// Touch Mode close buttons: (tab index, active, first cell, cells),
+    /// drawn over blank cells kept at the end of each tab.
+    close_slots: Vec<(usize, bool, usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -843,6 +842,9 @@ fn is_tab_hover(mouse_x: Option<usize>, x: usize, tab_title_len: usize) -> bool 
 /// budget that governs the "tab gets cut off / squeezed to nothing" class of
 /// layout bugs. Returns `usize::MAX` when no per-tab cap applies (the fancy
 /// bar lays itself out and is never truncated here).
+/// Cells kept at the end of each tab for the Touch Mode close button.
+const CLOSE_BUTTON_CELLS: usize = 2;
+
 fn tab_width_budget(
     title_width: usize,
     controls_width: usize,
@@ -875,13 +877,8 @@ impl TabBarState {
                 x: 1,
                 width: 1,
             }],
-            right_status_start: 1,
-            pad_cell: Cell::blank(),
+            close_slots: vec![],
         }
-    }
-
-    pub fn right_status_start(&self) -> usize {
-        self.right_status_start
     }
 
     pub fn line(&self) -> &Line {
@@ -994,6 +991,7 @@ impl TabBarState {
         config: &ConfigHandle,
         left_status: &str,
         right_status: &str,
+        close_buttons: bool,
     ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
 
@@ -1051,9 +1049,16 @@ impl TabBarState {
         } else {
             0
         };
+        // Touch Mode keeps cells at the end of every tab for a drawn close
+        // button; the retro bar has no hover to reveal one.
+        let close_cells = if close_buttons && !config.use_fancy_tab_bar {
+            CLOSE_BUTTON_CELLS
+        } else {
+            0
+        };
         let tab_width_max = tab_width_budget(
             title_width,
-            controls_width,
+            controls_width + close_cells * number_of_tabs,
             number_of_tabs,
             config.tab_max_width,
             config.use_fancy_tab_bar,
@@ -1068,6 +1073,7 @@ impl TabBarState {
 
         let mut x = 0;
         let mut items = vec![];
+        let mut close_slots = vec![];
 
         let black_cell = Cell::blank_with_attrs(
             CellAttributes::default()
@@ -1200,6 +1206,19 @@ impl TabBarState {
                 width = tab_line.len();
             }
             let title = tab_line.clone();
+            if close_cells > 0 {
+                close_slots.push((tab_idx, active, tab_start_idx + width, close_cells));
+                for _ in 0..close_cells {
+                    let end = tab_line.len();
+                    tab_line.insert_cell(
+                        end,
+                        Cell::blank_with_attrs(cell_attrs.clone()),
+                        end + 1,
+                        SEQ_ZERO,
+                    );
+                }
+                width += close_cells;
+            }
 
             items.push(TabEntry {
                 item: TabBarItem::Tab { tab_idx, active },
@@ -1300,12 +1319,10 @@ impl TabBarState {
             right_status_line = right_status_line.split_off(excess, SEQ_ZERO);
         }
 
-        let right_status_len = right_status_line.len();
         line.append_line(right_status_line, SEQ_ZERO);
         while line.len() < title_width {
             line.insert_cell(x, black_cell.clone(), title_width, SEQ_ZERO);
         }
-        let right_status_start = title_width.saturating_sub(right_status_len);
 
         if use_integrated_title_buttons
             && config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
@@ -1318,28 +1335,8 @@ impl TabBarState {
         Self {
             line,
             items,
-            right_status_start,
-            pad_cell: black_cell,
+            close_slots,
         }
-    }
-
-    /// Opens `cols` blank columns in front of the right status, keeping the
-    /// status flush with the right edge, and returns the gap's first column.
-    /// Build the bar `cols` narrower first so tabs never reach the gap.
-    pub fn open_gap_before_right_status(&mut self, cols: usize) -> usize {
-        let start = self.right_status_start;
-        let width = self.line.len() + cols;
-        for _ in 0..cols {
-            self.line
-                .insert_cell(start, self.pad_cell.clone(), width, SEQ_ZERO);
-        }
-        for entry in self.items.iter_mut() {
-            if entry.x >= start && entry.item != TabBarItem::RightStatus {
-                entry.x += cols;
-            }
-        }
-        self.right_status_start += cols;
-        start
     }
 
     pub fn compute_ui_items(&self, y: usize, cell_height: usize, cell_width: usize) -> Vec<UIItem> {
@@ -1354,8 +1351,24 @@ impl TabBarState {
                 item_type: UIItemType::TabBar(entry.item),
             });
         }
+        // Last, so hit testing (which searches from the end) finds the close
+        // button before the tab under it.
+        for &(tab_idx, _, x, cells) in self.close_slots.iter() {
+            items.push(UIItem {
+                x: x * cell_width,
+                width: cells * cell_width,
+                y,
+                height: cell_height,
+                item_type: UIItemType::CloseTab(tab_idx),
+            });
+        }
 
         items
+    }
+
+    /// Touch Mode close buttons as (tab index, active, first cell, cells).
+    pub fn close_slots(&self) -> &[(usize, bool, usize, usize)] {
+        &self.close_slots
     }
 }
 
@@ -1519,7 +1532,7 @@ return {{ use_fancy_tab_bar = false, show_new_tab_button_in_tab_bar = false,
                 let tabs = [tab.clone()];
                 let panes = [pane.clone()];
                 let normal =
-                    TabBarState::new(80, None, &tabs, &panes, false, None, &config, "", "");
+                    TabBarState::new(80, None, &tabs, &panes, false, None, &config, "", "", false);
                 let normal_tab = normal
                     .items
                     .iter()
@@ -1535,6 +1548,7 @@ return {{ use_fancy_tab_bar = false, show_new_tab_button_in_tab_bar = false,
                     &config,
                     "",
                     "",
+                    false,
                 );
                 let hovered_tab = hovered
                     .items
@@ -1907,20 +1921,52 @@ return {{ use_fancy_tab_bar = false, show_new_tab_button_in_tab_bar = false,
         Ok(())
     }
 
-    /// The Touch toggle is painted in a gap in front of the right status, so
-    /// the status (the fullscreen clock) keeps the right corner.
+    /// Touch Mode keeps two cells at the end of every retro tab for a drawn
+    /// close button, and its hit target wins over the tab beneath it.
     #[test]
-    fn right_status_keeps_the_corner_after_the_toggle_gap() {
+    fn touch_mode_keeps_a_close_slot_at_the_end_of_each_tab() -> anyhow::Result<()> {
         config::designate_this_as_the_main_thread();
-        let config = ConfigHandle::default_config();
-        let tabs = vec![make_tab(0, 0, true, "tab-0")];
-        let mut bar = TabBarState::new(76, None, &tabs, &[], true, None, &config, "", "12:34");
-        assert_eq!(bar.line().len(), 76);
-        let gap = bar.open_gap_before_right_status(4);
-        assert_eq!(gap, 71);
-        assert_eq!(bar.line().len(), 80);
-        assert_eq!(bar.right_status_start(), 75);
-        let text = bar.line().as_str();
-        assert!(text.ends_with("    12:34"), "{:?}", text);
+        let config_file = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            config_file.path(),
+            "return { use_fancy_tab_bar = false, show_new_tab_button_in_tab_bar = false }",
+        )?;
+        config::set_config_file_override(config_file.path());
+        config::reload();
+        let config = config::configuration_result()?;
+        assert!(!config.use_fancy_tab_bar);
+        let tabs = [make_tab(0, 0, true, "one"), make_tab(1, 1, false, "two")];
+
+        let plain = TabBarState::new(80, None, &tabs, &[], false, None, &config, "", "", false);
+        assert!(plain.close_slots().is_empty());
+        let touch = TabBarState::new(80, None, &tabs, &[], false, None, &config, "", "", true);
+        let tab_entries = |bar: &TabBarState| -> Vec<(usize, usize)> {
+            bar.items
+                .iter()
+                .filter(|e| matches!(e.item, TabBarItem::Tab { .. }))
+                .map(|e| (e.x, e.width))
+                .collect()
+        };
+        let plain_tabs = tab_entries(&plain);
+        let touch_tabs = tab_entries(&touch);
+        assert_eq!(touch.close_slots().len(), 2);
+        for (i, &(tab_idx, active, x, cells)) in touch.close_slots().iter().enumerate() {
+            assert_eq!(tab_idx, i);
+            assert_eq!(active, i == 0);
+            assert_eq!(cells, CLOSE_BUTTON_CELLS);
+            // The slot follows the same title the plain bar shows.
+            assert_eq!(touch_tabs[i].1, plain_tabs[i].1 + CLOSE_BUTTON_CELLS);
+            assert_eq!(x + cells, touch_tabs[i].0 + touch_tabs[i].1);
+        }
+        let items = touch.compute_ui_items(0, 20, 10);
+        let hit = items.iter().rev().find(|item| {
+            let (_, _, x, _) = touch.close_slots()[1];
+            item.hit_test((x * 10 + 5) as isize, 5)
+        });
+        assert_eq!(
+            hit.map(|i| i.item_type.clone()),
+            Some(UIItemType::CloseTab(1))
+        );
+        Ok(())
     }
 }

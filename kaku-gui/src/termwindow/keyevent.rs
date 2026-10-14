@@ -1053,14 +1053,6 @@ impl super::TermWindow {
     }
 
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
-        if self.touch_panel.is_some() {
-            self.touch_panel = None;
-            self.touch_press = None;
-            context.invalidate();
-            if window_key.key == KeyCode::Char('\u{1b}') {
-                return;
-            }
-        }
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,

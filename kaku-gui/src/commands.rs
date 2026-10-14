@@ -2173,7 +2173,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         },
         ToggleTouchMode => CommandDef {
             brief: "Touch Mode".into(),
-            doc: "Toggle larger controls for remote touch input in this window".into(),
+            doc: "Show a close button on every tab for remote touch input in this window".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &["Window"],

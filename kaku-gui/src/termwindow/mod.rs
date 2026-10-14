@@ -754,7 +754,6 @@ pub enum TermWindowNotif {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UIItemType {
-    Touch(touch::TouchAction),
     TabBar(TabBarItem),
     CloseTab(usize),
     AboveScrollThumb,
@@ -1070,11 +1069,6 @@ pub struct TermWindow {
     keyboard: KeyboardInputState,
     show_tab_bar: bool,
     touch_mode: bool,
-    touch_scroll_offset: f32,
-    touch_scroll_max: f32,
-    touch_last_active_tab: Option<TabId>,
-    touch_panel: Option<touch::TouchPanel>,
-    touch_press: Option<touch::TouchPress>,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
     fancy_tab_bar: Option<box_model::ComputedElement>,
@@ -1324,10 +1318,6 @@ impl TermWindow {
 
     fn focus_changed(&mut self, focused: bool, window: &Window) {
         log::trace!("Setting focus to {:?}", focused);
-        if !focused {
-            self.touch_press = None;
-            self.touch_panel = None;
-        }
         if focused {
             // On macOS a closed window is only hidden (see close_requested) and a
             // Dock click brings it back via makeKeyAndOrderFront, which lands here.
@@ -1831,11 +1821,6 @@ impl TermWindow {
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
             touch_mode: false,
-            touch_scroll_offset: 0.,
-            touch_scroll_max: 0.,
-            touch_last_active_tab: None,
-            touch_panel: None,
-            touch_press: None,
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -3835,12 +3820,8 @@ impl TermWindow {
             None => false,
         };
 
-        let cell_width = self.render_metrics.cell_size.width.max(1) as usize;
-        // The Touch toggle sits just left of the right status so the status
-        // (the clock in fullscreen) keeps the corner.
-        let toggle_cols = self.touch_toggle_cols();
-        let mut new_tab_bar = TabBarState::new(
-            (self.dimensions.pixel_width / cell_width).saturating_sub(toggle_cols),
+        let new_tab_bar = TabBarState::new(
+            self.dimensions.pixel_width / self.render_metrics.cell_size.width.max(1) as usize,
             if hovering_in_tab_bar {
                 Some(self.mouse.last_mouse_coords.0)
             } else {
@@ -3853,8 +3834,8 @@ impl TermWindow {
             &self.config,
             &self.left_status,
             &self.right_status,
+            self.touch_mode,
         );
-        new_tab_bar.open_gap_before_right_status(toggle_cols);
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();
