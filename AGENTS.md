@@ -132,6 +132,8 @@ For TUI display corruption after interactive CLIs re-render prompts or selection
 
 For GUI or rendering issues, read `kaku-gui/AGENTS.md` first and verify with `make app`, not only `make dev`.
 
+Standing authorization (2026-10-14): when the maintainer says to restart Kaku (重启 Kaku), run `scripts/restart_kaku.sh` without asking again. It restarts `/Applications/Kaku.app` the way an in-app update does (TERM, then reopen; tabs return from the periodic session snapshot) and detaches first. An agent session running inside Kaku ends with it, so write the reply first, tell the maintainer to reopen the session with `claude -c` (or the equivalent), and make the script the last action. Its log is `~/Library/Logs/kaku-restart.log`.
+
 When a check needs clicks on the built app, hand the maintainer an isolated launch command (`open -na dist/Kaku.app --env HOME=<scratch home with a copy of their kaku.lua>`) and numbered taps with the expected result for each, instead of driving synthetic mouse events: the maintainer's own Kaku takes focus back and the test window may sit on another Space. Static screenshots with `screencapture -l` are still fine when the window is on screen.
 
 ## Current Risk Areas
