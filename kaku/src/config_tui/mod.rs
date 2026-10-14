@@ -362,6 +362,15 @@ impl App {
             },
             ConfigField {
                 section: "Window",
+                key: "Tab Numbers",
+                lua_key: "show_tab_index_in_tab_bar",
+                value: String::new(),
+                default: "Off".into(),
+                options: vec!["On", "Off"],
+                skip_write: false,
+            },
+            ConfigField {
+                section: "Window",
                 key: "New Tab Button",
                 lua_key: "show_new_tab_button_in_tab_bar",
                 value: String::new(),
@@ -863,6 +872,7 @@ impl App {
             | "remember_last_cwd"
             | "tab_title_show_basename_only"
             | "tab_title_show_foreground_process"
+            | "show_tab_index_in_tab_bar"
             | "restore_previous_session" => {
                 if raw == "true" {
                     Some("On".into())
@@ -1361,6 +1371,7 @@ impl App {
             | "remember_last_cwd"
             | "tab_title_show_basename_only"
             | "tab_title_show_foreground_process"
+            | "show_tab_index_in_tab_bar"
             | "restore_previous_session" => {
                 if field.value == "On" {
                     "true".into()
@@ -1752,6 +1763,30 @@ return config
 
         assert_eq!(field.default, "Off");
         assert_eq!(app.to_lua_value(field), "false");
+    }
+
+    #[test]
+    fn tab_numbers_default_to_off_and_round_trip() {
+        let mut app = test_app();
+        let idx = app
+            .fields
+            .iter()
+            .position(|f| f.lua_key == "show_tab_index_in_tab_bar")
+            .expect("show_tab_index_in_tab_bar field to exist");
+
+        assert_eq!(app.fields[idx].default, "Off");
+        assert_eq!(app.to_lua_value(&app.fields[idx]), "false");
+        app.fields[idx].value = "On".into();
+        assert_eq!(app.to_lua_value(&app.fields[idx]), "true");
+
+        // A config that already turned it on by hand opens with the toggle On.
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("kaku.lua");
+        std::fs::write(&config_path, "config.show_tab_index_in_tab_bar = true\n")
+            .expect("write config");
+        let mut app = App::new(config_path);
+        app.load_config();
+        assert_eq!(app.fields[idx].value, "On");
     }
 
     #[test]

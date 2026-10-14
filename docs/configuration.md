@@ -212,7 +212,10 @@ config.tab_bar_at_bottom = false                   -- move to top
 config.tab_title_show_basename_only = true         -- show "dirname" instead of "parent/dirname"
 config.tab_title_show_foreground_process = true    -- show "dirname·codex" while commands run
 config.tab_title_use_pane_title = true             -- show application titles set via OSC 0/2
+config.show_tab_index_in_tab_bar = true            -- number tabs: "1:dirname", "2:dirname"
 ```
+
+`show_tab_index_in_tab_bar` (Settings: Tab Numbers) prefixes each tab with its position, so `Cmd + 1` through `Cmd + 8` select the tabs numbered 1 to 8. `Cmd + 9` always selects the last tab, whatever its number.
 
 With `tab_title_use_pane_title`, the active pane's title also supplies the window title and the title of a split tab. Explicit tab renames still take precedence. Shell prompt hooks may overwrite application titles after a command exits; this is independent of OSC support.
 
