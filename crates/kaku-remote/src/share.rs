@@ -140,24 +140,37 @@ pub fn reset_identity() -> anyhow::Result<ShareIdentity> {
 // ── Sealing ───────────────────────────────────────────────────────────────────
 
 /// Sent in the clear to each browser as it connects: `CHALLENGE_TAG` and 16
-/// random bytes. Every message of that connection, both ways, is then sealed
-/// with the challenge and its position in the stream as associated data, so
-/// the relay cannot replay a recorded connection (a new one gets a new
-/// challenge), repeat or reorder messages within one, or move them to
-/// another browser.
+/// random bytes. The page answers in the clear with `PAGE_CHALLENGE_TAG` and
+/// 16 random bytes of its own. Every message after that, both ways, is sealed
+/// with both challenges and its position in the stream as associated data, so
+/// the relay cannot replay a recorded connection in either direction (each
+/// side picks a fresh challenge), repeat or reorder messages within one, or
+/// move them to another browser. Altering either challenge only breaks that
+/// connection.
 const CHALLENGE_TAG: &[u8; 4] = b"KCH1";
+const PAGE_CHALLENGE_TAG: &[u8; 4] = b"KCB2";
 type Challenge = [u8; 16];
 
-/// What a message is bound to besides the key: its direction, its browser
-/// connection and its position. `None` is the old fixed label alone, kept
-/// only to recognize a page from before this scheme.
-fn aad(label: &[u8], binding: Option<(&Challenge, u64)>) -> Vec<u8> {
+/// What a message is bound to besides the key: its direction, the
+/// challenges of its browser connection and its position. Pages from before
+/// the page challenge bind only the Mac's (`KCH1`), and pages older still
+/// nothing (`None`); both are kept only to recognize such a page and ask it
+/// to reload, never to run a session.
+fn aad(label: &[u8], binding: Option<(&[u8], u64)>) -> Vec<u8> {
     let mut aad = label.to_vec();
-    if let Some((challenge, seq)) = binding {
-        aad.extend_from_slice(challenge);
+    if let Some((challenges, seq)) = binding {
+        aad.extend_from_slice(challenges);
         aad.extend_from_slice(&seq.to_be_bytes());
     }
     aad
+}
+
+/// The Mac's challenge followed by the page's: what a session binds to.
+fn bound_challenges(mac: &Challenge, page: &Challenge) -> [u8; 32] {
+    let mut both = [0u8; 32];
+    both[..16].copy_from_slice(mac);
+    both[16..].copy_from_slice(page);
+    both
 }
 
 fn seal(key: &LessSafeKey, rng: &SystemRandom, aad: &[u8], plain: &[u8]) -> Option<Vec<u8>> {
@@ -276,6 +289,8 @@ async fn deliver_input(inbox: &mpsc::Sender<String>, text: String, limit: Durati
 
 struct Browser {
     challenge: Challenge,
+    /// The page's own challenge, from its first frame.
+    page_challenge: Option<Challenge>,
     /// Position of the next message expected from this browser.
     next_in: u64,
     /// None until a message opens with the key.
@@ -364,6 +379,7 @@ async fn serve(
                             }
                             browsers.insert(c, Browser {
                                 challenge,
+                                page_challenge: None,
                                 next_in: 0,
                                 inbox: None,
                                 connected_at: tokio::time::Instant::now(),
@@ -393,23 +409,45 @@ async fn serve(
                         let c = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
                         let Some(browser) = browsers.get_mut(&c) else { continue };
                         let sealed = &bytes[5..];
-                        let opened = open(&key, &aad(TO_HOST, Some((&browser.challenge, browser.next_in))), sealed);
-                        let Some(text) = opened else {
-                            browsers.remove(&c);
-                            // A page from before the challenge scheme (open
-                            // across an update) seals with the bare label:
-                            // tell it to reload instead of calling its key
-                            // wrong, which would make it forget the key.
-                            let old_page = open(&key, &aad(TO_HOST, None), sealed).is_some();
-                            if old_page {
-                                let reload = br#"{"type":"error","detail":"Kaku on the Mac was updated. Reload this page."}"#;
-                                if let Some(sealed) = seal(&key, &rng, &aad(FROM_HOST, None), reload) {
-                                    let _ = to_relay.try_send(Message::Binary(frame(KIND_DATA, c, &sealed).into()));
+                        let Some(page_challenge) = browser.page_challenge else {
+                            if let Some(page) = sealed.strip_prefix(PAGE_CHALLENGE_TAG.as_slice()) {
+                                if let Ok(page) = Challenge::try_from(page) {
+                                    browser.page_challenge = Some(page);
+                                    continue;
                                 }
                             }
-                            // Otherwise: wrong key, tampered, replayed or out
-                            // of order.
-                            if to_relay.try_send(close_browser(c, if old_page { 4426 } else { 4403 })).is_err() {
+                            // No page challenge: a page from before it, open
+                            // across an update. Tell it to reload, sealed the
+                            // way it can read, instead of calling its key
+                            // wrong, which would make it forget the key. Such
+                            // a page never gets a session, so stripping a new
+                            // page's challenge gains the relay nothing.
+                            let mac = browser.challenge;
+                            browsers.remove(&c);
+                            let legacy = [Some((mac.as_slice(), 0u64)), None]
+                                .into_iter()
+                                .find(|binding| open(&key, &aad(TO_HOST, *binding), sealed).is_some());
+                            let code = match legacy {
+                                Some(binding) => {
+                                    let reload = br#"{"type":"error","detail":"Kaku on the Mac was updated. Reload this page."}"#;
+                                    if let Some(sealed) = seal(&key, &rng, &aad(FROM_HOST, binding), reload) {
+                                        let _ = to_relay.try_send(Message::Binary(frame(KIND_DATA, c, &sealed).into()));
+                                    }
+                                    4426
+                                }
+                                None => 4403,
+                            };
+                            if to_relay.try_send(close_browser(c, code)).is_err() {
+                                break Err(anyhow::anyhow!("relay output queue is full"));
+                            }
+                            continue;
+                        };
+                        let both = bound_challenges(&browser.challenge, &page_challenge);
+                        let opened = open(&key, &aad(TO_HOST, Some((&both, browser.next_in))), sealed);
+                        let Some(text) = opened else {
+                            browsers.remove(&c);
+                            // Wrong key, tampered, replayed or out of order.
+                            if to_relay.try_send(close_browser(c, 4403)).is_err() {
                                 break Err(anyhow::anyhow!("relay output queue is full"));
                             }
                             continue;
@@ -418,7 +456,7 @@ async fn serve(
                         let inbox = match &browser.inbox {
                             Some(inbox) => inbox.clone(),
                             None => {
-                                let inbox = start_session(c, browser.challenge, dirty.clone(), key.clone(), to_relay.clone());
+                                let inbox = start_session(c, both, dirty.clone(), key.clone(), to_relay.clone());
                                 browser.inbox = Some(inbox.clone());
                                 inbox
                             }
@@ -472,7 +510,7 @@ async fn serve(
 /// Start the session for browser `c`; returns where its messages go.
 fn start_session(
     c: u32,
-    challenge: Challenge,
+    challenges: [u8; 32],
     dirty: WebDirty,
     key: std::sync::Arc<LessSafeKey>,
     to_relay: mpsc::Sender<Message>,
@@ -484,7 +522,7 @@ fn start_session(
         let rng = SystemRandom::new();
         let mut seq = 0u64;
         while let Some(text) = replies.recv().await {
-            let Some(sealed) = seal(&key, &rng, &aad(FROM_HOST, Some((&challenge, seq))), text.as_bytes()) else {
+            let Some(sealed) = seal(&key, &rng, &aad(FROM_HOST, Some((&challenges, seq))), text.as_bytes()) else {
                 break;
             };
             seq += 1;
@@ -608,8 +646,10 @@ mod tests {
     fn sealed_messages_open_only_in_their_direction_connection_and_place() {
         let key = identity().sealing_key().unwrap();
         let rng = SystemRandom::new();
-        let ch = new_challenge(&rng).unwrap();
-        let other_ch = new_challenge(&rng).unwrap();
+        let mac = new_challenge(&rng).unwrap();
+        let page = new_challenge(&rng).unwrap();
+        let ch = bound_challenges(&mac, &page);
+        let other_ch = bound_challenges(&new_challenge(&rng).unwrap(), &page);
         let msg = seal(&key, &rng, &aad(TO_HOST, Some((&ch, 0))), b"ls\r").unwrap();
         assert_eq!(open(&key, &aad(TO_HOST, Some((&ch, 0))), &msg).as_deref(), Some("ls\r"));
         // Reflected back as if the Mac sent it.
@@ -619,11 +659,27 @@ mod tests {
         assert!(open(&key, &aad(TO_HOST, Some((&other_ch, 0))), &msg).is_none());
         // Recognizable as an old page only when it was sealed the old way.
         assert!(open(&key, &aad(TO_HOST, None), &msg).is_none());
+        assert!(open(&key, &aad(TO_HOST, Some((&mac, 0))), &msg).is_none());
         let old = seal(&key, &rng, &aad(TO_HOST, None), b"{}").unwrap();
         assert!(open(&key, &aad(TO_HOST, None), &old).is_some());
         assert!(open(&key, &aad(TO_HOST, Some((&ch, 0))), &old).is_none());
         // Another key opens nothing.
         let other = identity().sealing_key().unwrap();
         assert!(open(&other, &aad(TO_HOST, Some((&ch, 0))), &msg).is_none());
+    }
+
+    /// The relay records a whole connection, then replays the Mac's side to a
+    /// new page: the page picked a fresh challenge, so nothing opens. Before
+    /// the page challenge only the Mac's was bound, and this replay opened.
+    #[test]
+    fn a_recorded_mac_stream_does_not_open_for_a_new_page() {
+        let key = identity().sealing_key().unwrap();
+        let rng = SystemRandom::new();
+        let mac = new_challenge(&rng).unwrap();
+        let recorded = bound_challenges(&mac, &new_challenge(&rng).unwrap());
+        let frame = seal(&key, &rng, &aad(FROM_HOST, Some((&recorded, 0))), b"{}").unwrap();
+        let replayed_to = bound_challenges(&mac, &new_challenge(&rng).unwrap());
+        assert!(open(&key, &aad(FROM_HOST, Some((&replayed_to, 0))), &frame).is_none());
+        assert!(open(&key, &aad(FROM_HOST, Some((&recorded, 0))), &frame).is_some());
     }
 }

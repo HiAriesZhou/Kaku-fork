@@ -206,19 +206,19 @@ async function until(fn, ms = 15000) {
     const idleClosed = new Promise(resolve => idle.once('close', code => resolve(code)));
     assert.equal(await Promise.race([idleClosed, sleep(21000).then(() => 'timeout')]), 4408);
 
-    // Each relay connection is bound to the Mac's challenge and a position:
-    // a recorded message replayed on a new connection, one out of place, or
-    // one sealed the old way never reaches a session.
+    // Each relay connection is bound to the Mac's challenge, the page's own
+    // and a position: a recorded message replayed on a new connection, one
+    // out of place, or one sealed the old way never reaches a session.
     const key = Buffer.from(identity.key, 'base64url');
     const sealFor = (label, challenge, seq, json) => {
       const iv = crypto.randomBytes(12);
       const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-      const aad = challenge ? Buffer.alloc(label.length + 24) : Buffer.from(label);
-      if (challenge) { Buffer.from(label).copy(aad); challenge.copy(aad, label.length); aad.writeBigUInt64BE(BigInt(seq), label.length + 16); }
+      const aad = challenge ? Buffer.alloc(label.length + challenge.length + 8) : Buffer.from(label);
+      if (challenge) { Buffer.from(label).copy(aad); challenge.copy(aad, label.length); aad.writeBigUInt64BE(BigInt(seq), label.length + challenge.length); }
       cipher.setAAD(aad);
       return Buffer.concat([iv, cipher.update(json), cipher.final(), cipher.getAuthTag()]);
     };
-    const rawBrowser = async () => {
+    const rawBrowser = async ({ answer = true } = {}) => {
       const socket = new WebSocket(`ws://127.0.0.1:${relay}/${id}/ws`);
       sockets.push(socket);
       const inbox = [];
@@ -227,7 +227,11 @@ async function until(fn, ms = 15000) {
       await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
       const first = await until(() => inbox[0]);
       assert.equal(first.subarray(0, 4).toString(), 'KCH1');
-      return { socket, closed, inbox, challenge: first.subarray(4) };
+      const mac = first.subarray(4);
+      if (!answer) return { socket, closed, inbox, challenge: mac };
+      const page = crypto.randomBytes(16);
+      socket.send(Buffer.concat([Buffer.from('KCB2'), page]));
+      return { socket, closed, inbox, challenge: Buffer.concat([mac, page]) };
     };
     const hello = '{"type":"hello","frame_ack":true}';
     const accepted = await rawBrowser();
@@ -241,7 +245,12 @@ async function until(fn, ms = 15000) {
     const misplaced = await rawBrowser();
     misplaced.socket.send(sealFor('kaku-web c2h', misplaced.challenge, 1, hello));
     assert.equal(await Promise.race([misplaced.closed, sleep(5000).then(() => 'timeout')]), 4403);
-    const oldPage = await rawBrowser();
+    // Pages from before the page challenge, or before any challenge, are
+    // asked to reload rather than told their key is wrong.
+    const macOnlyPage = await rawBrowser({ answer: false });
+    macOnlyPage.socket.send(sealFor('kaku-web c2h', macOnlyPage.challenge, 0, hello));
+    assert.equal(await Promise.race([macOnlyPage.closed, sleep(5000).then(() => 'timeout')]), 4426);
+    const oldPage = await rawBrowser({ answer: false });
     oldPage.socket.send(sealFor('kaku-web c2h', null, 0, hello));
     assert.equal(await Promise.race([oldPage.closed, sleep(5000).then(() => 'timeout')]), 4426);
 

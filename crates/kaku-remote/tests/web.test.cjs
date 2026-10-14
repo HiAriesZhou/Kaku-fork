@@ -23,7 +23,7 @@ async function page(t, hash = '#t=fixture', options = {}, context = browser) {
     class Socket extends EventTarget {
       static OPEN = 1; static CLOSED = 3; static CLOSING = 2;
       constructor() { super(); this.readyState = 1; connections.push(this); setTimeout(() => this.onopen?.(), 0); }
-      send(data) { if (typeof data === 'string') messages.push(JSON.parse(data)); }
+      send(data) { if (typeof data === 'string') messages.push(JSON.parse(data)); else (this.binary ||= []).push(new Uint8Array(data)); }
       close(code = 1006) {
         this.readyState = 3;
         const event = new CloseEvent('close', { code });
@@ -85,20 +85,25 @@ test('malformed link fails visibly without caching a bad key or throwing', async
   }
 });
 
-// Act as the Mac does on a new relay connection: send the challenge, then a
-// real sealed message bound to it. Opening the socket alone must not
-// remember a key.
+// Act as the Mac does on a new relay connection: send the challenge, read
+// the page's own challenge back, then a real sealed message bound to both.
+// Opening the socket alone must not remember a key.
 async function authenticate(p, keyText) {
   await p.evaluate(async keyText => {
     const raw = Uint8Array.from(atob(keyText.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
     const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt']);
     const challenge = crypto.getRandomValues(new Uint8Array(16));
     const hello = new Uint8Array(20); hello.set(new TextEncoder().encode('KCH1')); hello.set(challenge, 4);
-    connections.at(-1).onmessage({ data: hello.buffer });
+    const socket = connections.at(-1);
+    socket.onmessage({ data: hello.buffer });
+    while (!socket.binary?.length) await new Promise(r => setTimeout(r, 5));
+    const answer = socket.binary[0];
+    if (new TextDecoder().decode(answer.slice(0, 4)) !== 'KCB2' || answer.length !== 20) throw new Error('no page challenge');
+    const both = new Uint8Array(32); both.set(challenge); both.set(answer.slice(4), 16);
     const label = new TextEncoder().encode('kaku-web h2c');
-    const additionalData = new Uint8Array(label.length + 24);
-    additionalData.set(label); additionalData.set(challenge, label.length);
-    new DataView(additionalData.buffer).setBigUint64(label.length + 16, 0n);
+    const additionalData = new Uint8Array(label.length + 40);
+    additionalData.set(label); additionalData.set(both, label.length);
+    new DataView(additionalData.buffer).setBigUint64(label.length + 32, 0n);
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const data = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData }, key,
       new TextEncoder().encode(JSON.stringify({ type: 'pong' }))));
@@ -107,6 +112,37 @@ async function authenticate(p, keyText) {
   }, keyText);
   await p.waitForTimeout(100);
 }
+
+// The relay replays a recorded Mac stream to a new page: it was sealed for
+// another page challenge, so the page drops the connection instead of
+// showing it.
+test('a replayed Mac stream does not open for a new page', async t => {
+  const key = Buffer.alloc(32, 9).toString('base64url');
+  const { p } = await page(t, '#k=' + key);
+  const closed = await p.evaluate(async keyText => {
+    const raw = Uint8Array.from(atob(keyText.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt']);
+    const challenge = crypto.getRandomValues(new Uint8Array(16));
+    const hello = new Uint8Array(20); hello.set(new TextEncoder().encode('KCH1')); hello.set(challenge, 4);
+    const socket = connections.at(-1);
+    let closed = false; socket.close = () => { closed = true; };
+    socket.onmessage({ data: hello.buffer });
+    await new Promise(r => setTimeout(r, 20));
+    // A recording replays the Mac's hello too, so its frames carry this Mac
+    // challenge; what they cannot carry is this page's challenge.
+    const label = new TextEncoder().encode('kaku-web h2c');
+    const additionalData = new Uint8Array(label.length + 24);
+    additionalData.set(label); additionalData.set(challenge, label.length);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData }, key,
+      new TextEncoder().encode(JSON.stringify({ type: 'pong' }))));
+    const frame = new Uint8Array(12 + data.length); frame.set(iv); frame.set(data, 12);
+    socket.onmessage({ data: frame.buffer });
+    await new Promise(r => setTimeout(r, 100));
+    return closed;
+  }, key);
+  assert.equal(closed, true);
+});
 
 test('verified relay link survives a fresh browser session and rejection forgets it', async t => {
   const key = Buffer.alloc(32, 7).toString('base64url');

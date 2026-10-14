@@ -301,11 +301,13 @@
 
   let ws = null;
   // Through the relay, Kaku opens each connection with a random challenge
-  // in the clear. Every message after it, both ways, is sealed with that
-  // challenge and its position in the stream, so the relay cannot replay a
-  // recorded connection, repeat or reorder messages, or move them between
-  // browsers. Nothing is sent before the challenge arrives.
+  // in the clear, and the page answers in the clear with one of its own.
+  // Every message after that, both ways, is sealed with both challenges and
+  // its position in the stream, so the relay cannot replay a recorded
+  // connection in either direction, repeat or reorder messages, or move them
+  // between browsers. Nothing sealed is sent before the challenges.
   const CHALLENGE_TAG = "KCH1";
+  const PAGE_CHALLENGE_TAG = "KCB2";
   let link = null;
   const newLink = () => {
     let ready;
@@ -313,10 +315,10 @@
     return { challenge: null, sendSeq: 0, recvSeq: 0, ready, promise };
   };
   const aad = (label, challenge, seq) => {
-    const out = new Uint8Array(label.length + 24);
+    const out = new Uint8Array(label.length + challenge.length + 8);
     out.set(label);
     out.set(challenge, label.length);
-    new DataView(out.buffer).setBigUint64(label.length + 16, BigInt(seq));
+    new DataView(out.buffer).setBigUint64(label.length + challenge.length, BigInt(seq));
     return out;
   };
   // Sealing and opening are async; chain them so messages keep their order.
@@ -351,7 +353,14 @@
       if (!conn.challenge) {
         const tag = dec.decode(bytes.slice(0, 4));
         if (bytes.length !== 20 || tag !== CHALLENGE_TAG) throw new Error("no challenge");
-        conn.challenge = bytes.slice(4);
+        const page = crypto.getRandomValues(new Uint8Array(16));
+        const answer = new Uint8Array(20);
+        answer.set(enc.encode(PAGE_CHALLENGE_TAG));
+        answer.set(page, 4);
+        if (socket.readyState === WebSocket.OPEN) socket.send(answer);
+        conn.challenge = new Uint8Array(32);
+        conn.challenge.set(bytes.slice(4));
+        conn.challenge.set(page, 16);
         conn.ready();
         return;
       }
