@@ -46,6 +46,12 @@ const HOST_SILENCE: Duration = Duration::from_secs(75);
 const BROWSER_SILENCE: Duration = Duration::from_secs(150);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const ASSET_TIMEOUT: Duration = Duration::from_secs(10);
+/// The page's files (xterm.js, fonts) are kept in memory per registration,
+/// so visitors, or someone requesting them in a loop with only the id, do not
+/// make the Mac upload them again. A new registration (a Kaku update
+/// reconnects) starts empty; the page itself always comes fresh.
+const ASSET_CACHE_BUDGET: usize = 128 << 20;
+const ASSET_CACHE_MAX_FILE: usize = 4 << 20;
 const KIND_DATA: u8 = 0;
 const KIND_ASSET: u8 = 1;
 
@@ -74,6 +80,17 @@ struct Host {
     browsers: Mutex<HashMap<u32, BrowserLink>>,
     assets: Mutex<HashMap<u32, oneshot::Sender<Asset>>>,
     next_id: AtomicU32,
+    /// Page files already fetched from this Mac: path to type and body.
+    cache: Mutex<HashMap<String, (String, Bytes)>>,
+    /// Bytes cached across every registration, shared with `AppState`.
+    cache_bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        let held: usize = self.cache.lock().values().map(|(_, body)| body.len()).sum();
+        self.cache_bytes.fetch_sub(held, Ordering::Relaxed);
+    }
 }
 
 fn message_len(msg: &ws::Message) -> usize {
@@ -85,6 +102,29 @@ fn message_len(msg: &ws::Message) -> usize {
 }
 
 impl Host {
+    fn cached(&self, path: &str) -> Option<(String, Bytes)> {
+        self.cache.lock().get(path).cloned()
+    }
+
+    /// Keep a fetched page file, within the relay-wide budget.
+    fn keep(&self, path: &str, content_type: &str, body: &Bytes) {
+        if path == "index.html" || body.len() > ASSET_CACHE_MAX_FILE {
+            return;
+        }
+        let len = body.len();
+        if self.cache_bytes.fetch_add(len, Ordering::Relaxed) + len > ASSET_CACHE_BUDGET {
+            self.cache_bytes.fetch_sub(len, Ordering::Relaxed);
+            return;
+        }
+        let replaced = self
+            .cache
+            .lock()
+            .insert(path.to_string(), (content_type.to_string(), body.clone()));
+        if let Some((_, old)) = replaced {
+            self.cache_bytes.fetch_sub(old.len(), Ordering::Relaxed);
+        }
+    }
+
     /// Queue a message for the Mac within the byte budget.
     fn send(&self, msg: ws::Message) -> bool {
         let len = message_len(&msg);
@@ -108,6 +148,7 @@ struct AppState {
     /// instead of the link reading offline while a Kaku is running.
     hosts: Arc<Mutex<HashMap<String, Vec<Arc<Host>>>>>,
     generation: Arc<AtomicU64>,
+    cache_bytes: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -259,6 +300,8 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
         browsers: Mutex::new(HashMap::new()),
         assets: Mutex::new(HashMap::new()),
         next_id: AtomicU32::new(1),
+        cache: Mutex::new(HashMap::new()),
+        cache_bytes: state.cache_bytes.clone(),
     });
     // The newest registration serves; the previous one stays connected as a
     // standby, and its browsers reconnect to this one.
@@ -412,6 +455,9 @@ async fn fetch_asset(state: &AppState, id: &str, path: &str) -> Response {
         )
             .into_response();
     };
+    if let Some((content_type, body)) = host.cached(path) {
+        return asset_response(path, content_type, body);
+    }
     let request = host.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel();
     host.assets.lock().insert(request, tx);
@@ -421,31 +467,38 @@ async fn fetch_asset(state: &AppState, id: &str, path: &str) -> Response {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     match tokio::time::timeout(ASSET_TIMEOUT, rx).await {
-        Ok(Ok(asset)) if asset.status == 200 => (
-            [
-                (header::CONTENT_TYPE, asset.content_type),
-                // The page always comes fresh from the Mac; xterm.js and the
-                // fonts are ~1 MB that rarely change, so a reload skips them.
-                (
-                    header::CACHE_CONTROL,
-                    if path == "index.html" {
-                        "no-cache"
-                    } else {
-                        "max-age=3600"
-                    }
-                    .to_string(),
-                ),
-                (header::REFERRER_POLICY, "no-referrer".to_string()),
-            ],
-            asset.body,
-        )
-            .into_response(),
+        Ok(Ok(asset)) if asset.status == 200 => {
+            host.keep(path, &asset.content_type, &asset.body);
+            asset_response(path, asset.content_type, asset.body)
+        }
         Ok(Ok(_)) => StatusCode::NOT_FOUND.into_response(),
         _ => {
             host.assets.lock().remove(&request);
             StatusCode::GATEWAY_TIMEOUT.into_response()
         }
     }
+}
+
+fn asset_response(path: &str, content_type: String, body: Bytes) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            // The page always comes fresh from the Mac; xterm.js and the
+            // fonts are ~1 MB that rarely change, so a reload skips them.
+            (
+                header::CACHE_CONTROL,
+                if path == "index.html" {
+                    "no-cache"
+                } else {
+                    "max-age=3600"
+                }
+                .to_string(),
+            ),
+            (header::REFERRER_POLICY, "no-referrer".to_string()),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 async fn page_redirect(Path(id): Path<String>) -> Response {
@@ -688,6 +741,28 @@ mod tests {
         assert_eq!(frame.code, 4413);
     }
 
+    /// Page files come from the Mac once per registration; the page itself
+    /// never caches, the budget bounds memory, and a dropped registration
+    /// gives its bytes back.
+    #[test]
+    fn page_files_are_cached_per_registration_within_the_budget() {
+        let state = AppState::default();
+        let host = test_host(&state);
+        let font = Bytes::from(vec![0u8; 1000]);
+        host.keep("assets/font.ttf", "font/ttf", &font);
+        host.keep("index.html", "text/html", &Bytes::from_static(b"<html>"));
+        assert_eq!(host.cached("assets/font.ttf").map(|(_, b)| b.len()), Some(1000));
+        assert!(host.cached("index.html").is_none());
+        assert_eq!(state.cache_bytes.load(Ordering::Relaxed), 1000);
+        // Past the budget nothing more is kept.
+        state.cache_bytes.fetch_add(ASSET_CACHE_BUDGET, Ordering::Relaxed);
+        host.keep("assets/xterm.js", "text/javascript", &font);
+        assert!(host.cached("assets/xterm.js").is_none());
+        state.cache_bytes.fetch_sub(ASSET_CACHE_BUDGET, Ordering::Relaxed);
+        drop(host);
+        assert_eq!(state.cache_bytes.load(Ordering::Relaxed), 0);
+    }
+
     fn test_host(state: &AppState) -> Arc<Host> {
         let (to_host, rx) = mpsc::channel(QUEUE);
         // Keep the receiver alive so sends are judged by the budget alone.
@@ -700,6 +775,8 @@ mod tests {
             browsers: Mutex::new(HashMap::new()),
             assets: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
+            cache: Mutex::new(HashMap::new()),
+            cache_bytes: state.cache_bytes.clone(),
         })
     }
 
