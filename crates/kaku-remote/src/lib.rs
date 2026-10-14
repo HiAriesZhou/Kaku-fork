@@ -9,8 +9,8 @@ use parking_lot::Mutex;
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 mod awake;
 mod share;
@@ -34,7 +34,7 @@ fn get_or_init_token() -> &'static str {
     })
 }
 
-// ── Shared state ──────────────────────────────────────────────────────────────
+// ── Page config ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
 struct ConfigInfo {
@@ -80,8 +80,6 @@ fn rgba_to_hex(c: &RgbaColor) -> String {
 fn opt_hex(c: Option<&RgbaColor>) -> Option<String> {
     c.map(rgba_to_hex)
 }
-
-// ── Screen capture ────────────────────────────────────────────────────────────
 
 fn config_info() -> ConfigInfo {
     let cfg = configuration();
@@ -153,35 +151,44 @@ fn same_secret(presented: &str, expected: &str) -> bool {
 /// can rebind its own name to 127.0.0.1 and then read same-origin responses
 /// from this port; checking Host shuts that out, since the page's requests
 /// still carry its own name.
-fn host_allowed(host: &str, port: u16, lan_ip: Option<&str>) -> bool {
-    let allowed = |name: &str| host == format!("{name}:{port}");
-    allowed("127.0.0.1")
-        || allowed("localhost")
-        || allowed("[::1]")
-        || lan_ip.is_some_and(allowed)
+// ── Host guard ────────────────────────────────────────────────────────────────
+
+/// Whether `host` names this server: a loopback name, or, when it listens
+/// beyond loopback, one of this Mac's own addresses written as an IP. A page
+/// that rebinds its domain to an address arrives with that domain, never an
+/// IP literal, so it stays out. `port` is the listener's, which a config
+/// reload does not move.
+fn host_allowed(host: &str, port: u16, lan: bool, is_own_ip: impl Fn(IpAddr) -> bool) -> bool {
+    let Some((name, host_port)) = host.rsplit_once(':') else {
+        return false;
+    };
+    if host_port != port.to_string() {
+        return false;
+    }
+    if matches!(name, "127.0.0.1" | "localhost" | "[::1]") {
+        return true;
+    }
+    let literal = name.trim_start_matches('[').trim_end_matches(']');
+    lan && literal.parse::<IpAddr>().is_ok_and(is_own_ip)
+}
+
+/// Binding succeeds only for an address on one of this Mac's interfaces right
+/// now, so a Wi-Fi change is followed without caching anything.
+fn is_own_ip(ip: IpAddr) -> bool {
+    !ip.is_unspecified() && std::net::UdpSocket::bind((ip, 0)).is_ok()
 }
 
 async fn require_own_host(
+    axum::extract::State((port, lan)): axum::extract::State<(u16, bool)>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    static LAN_IP: OnceLock<Option<String>> = OnceLock::new();
-    let cfg = configuration();
-    let port = cfg.remote.port;
-    let lan = LAN_IP.get_or_init(|| {
-        let local = cfg.remote.bind == "127.0.0.1" || cfg.remote.bind == "localhost";
-        if local {
-            None
-        } else {
-            lan_ip()
-        }
-    });
     let host = req
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !host_allowed(host, port, lan.as_deref()) {
+    if !host_allowed(host, port, lan, is_own_ip) {
         return (StatusCode::FORBIDDEN, "unexpected host").into_response();
     }
     next.run(req).await
@@ -208,20 +215,7 @@ pub(crate) fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Res
     std::fs::rename(&tmp, path)
 }
 
-// ── QR code endpoint ──────────────────────────────────────────────────────────
-
-/// Best-effort: return the first non-loopback IPv4 address.
-fn lan_ip() -> Option<String> {
-    use std::net::UdpSocket;
-    // Connect to a public address without sending data, just to discover
-    // the local interface IP the OS would route through.
-    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:80").ok()?;
-    let local = sock.local_addr().ok()?;
-    Some(local.ip().to_string())
-}
-
-// ── WebSocket handler ─────────────────────────────────────────────────────────
+// ── State file ────────────────────────────────────────────────────────────────
 
 fn state_path() -> std::path::PathBuf {
     std::env::temp_dir().join("kaku-remote.json")
@@ -335,7 +329,10 @@ pub fn start() {
                     .route("/assets/{name}", get(web::route_asset))
                     .route("/web/ws", get(web::route_ws))
                     .with_state(web_dirty)
-                    .layer(axum::middleware::from_fn(require_own_host));
+                    .layer(axum::middleware::from_fn_with_state(
+                        (port, bind != "127.0.0.1" && bind != "localhost"),
+                        require_own_host,
+                    ));
 
                 // The relay link does not depend on the local listener, so a
                 // busy port must not take it down with this task.
@@ -376,16 +373,30 @@ mod host_guard_tests {
 
     #[test]
     fn only_this_servers_own_names_are_accepted() {
-        assert!(host_allowed("127.0.0.1:9988", 9988, None));
-        assert!(host_allowed("localhost:9988", 9988, None));
-        assert!(host_allowed("[::1]:9988", 9988, None));
-        assert!(host_allowed("192.168.1.5:9988", 9988, Some("192.168.1.5")));
+        let own = |ip: IpAddr| ip.to_string() == "192.168.1.5" || ip.to_string() == "fe80::1";
+        let ok = |host: &str, lan: bool| host_allowed(host, 9988, lan, own);
+        assert!(ok("127.0.0.1:9988", false));
+        assert!(ok("localhost:9988", false));
+        assert!(ok("[::1]:9988", false));
+        assert!(ok("192.168.1.5:9988", true));
+        assert!(ok("[fe80::1]:9988", true));
         // A rebound name, another port, the LAN address while bound to
-        // loopback only, a missing header.
-        assert!(!host_allowed("evil.example:9988", 9988, None));
-        assert!(!host_allowed("127.0.0.1:9989", 9988, None));
-        assert!(!host_allowed("192.168.1.5:9988", 9988, None));
-        assert!(!host_allowed("", 9988, None));
+        // loopback only, an address that is not this Mac's, a missing header.
+        assert!(!ok("evil.example:9988", true));
+        assert!(!ok("127.0.0.1:9989", false));
+        assert!(!ok("192.168.1.5:9988", false));
+        assert!(!ok("192.168.1.9:9988", true));
+        assert!(!ok("", true));
+    }
+
+    /// After a Wi-Fi change the new address must be accepted without a
+    /// restart: ownership is checked per request, against the live
+    /// interfaces, and loopback always binds.
+    #[test]
+    fn own_addresses_are_checked_live() {
+        assert!(is_own_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_own_ip("0.0.0.0".parse().unwrap()));
+        assert!(!is_own_ip("203.0.113.7".parse().unwrap()));
     }
 
     #[test]
