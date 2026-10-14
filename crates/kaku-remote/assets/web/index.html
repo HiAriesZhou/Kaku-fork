@@ -55,13 +55,10 @@
   #bar .tab.drop-before { box-shadow: inset 2px 0 0 var(--tab-active-fg); }
   #bar .tab.drop-after { box-shadow: inset -2px 0 0 var(--tab-active-fg); }
   #bar .tab input { width: 12ch; min-width: 4ch; padding: 0; border: 0; outline: none; background: transparent; color: var(--tab-active-fg); font: inherit; }
-  /* Right side: the split map, help and full screen, one size and one icon
+  /* Right side: the split map and full screen, one size and one icon
      weight, like the + button. */
   #bar .tool { display: flex; align-items: center; justify-content: center; width: 38px; padding: 0; }
   #bar .tool svg { width: 14px; height: 14px; }
-  /* Help shows only while the pointer is over the bar (Cmd+/ always works). */
-  #bar .tool.help { opacity: 0; transition: opacity 0.15s; }
-  #bar:hover .tool.help, #bar .tool.help:focus-visible { opacity: 1; }
   /* In full screen the system clock is hidden; Kaku shows the time at the
      right end of its tab bar there, and so does the page. */
   #bar .clock { display: none; align-items: center; padding: 0 10px; color: var(--tab-fg); white-space: nowrap; }
@@ -1484,16 +1481,6 @@
     if (isHelp) { ev.preventDefault(); ev.stopPropagation(); toggleHelp(); }
     else if (ev.key === "Escape" && helpEl.classList.contains("show")) { ev.preventDefault(); ev.stopPropagation(); toggleHelp(false); }
   }, true);
-  if (!TOUCH) {
-    const helpBtn = document.createElement("button");
-    helpBtn.type = "button";
-    helpBtn.className = "tool help";
-    helpBtn.title = IS_MAC ? "Shortcuts (⌘/)" : "Shortcuts (Ctrl+Shift+/)";
-    helpBtn.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="6.5"/><path d="M6.2 6.2a1.9 1.9 0 1 1 2.6 1.8c-.5.2-.8.6-.8 1.1v.4"/><circle cx="8" cy="11.6" r=".4" fill="currentColor"/></svg>';
-    helpBtn.addEventListener("click", () => toggleHelp());
-    toolsEl.prepend(helpBtn);
-  }
-
   const closeTab = (t) => {
     const go = () => send({ type: "close_tab", tab_id: t.tab_id });
     if (t.confirm_close) askClose(t.title || "Tab").then((ok) => { if (ok) go(); });

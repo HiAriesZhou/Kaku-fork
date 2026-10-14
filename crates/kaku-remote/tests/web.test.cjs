@@ -250,7 +250,8 @@ test('connection help and first-use notice fit narrow and short viewports', asyn
   await authenticate(p, key);
   for (const width of [375, 1280]) for (const height of [240, 900]) {
     await p.setViewportSize({ width, height });
-    await p.locator('button[title^="Shortcuts"]').click();
+    await p.locator('.xterm-helper-textarea').focus();
+    await p.keyboard.press('Meta+Slash');
     const box = await p.locator('#help .card').boundingBox();
     assert.ok(box.x >= 15 && box.x + box.width <= width - 15);
     assert.ok(box.y >= 15 && box.y + box.height <= height - 15);
