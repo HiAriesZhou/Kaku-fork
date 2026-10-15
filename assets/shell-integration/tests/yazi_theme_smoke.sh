@@ -237,6 +237,68 @@ output="$(
 assert_file_contains '#:schema https://yazi-rs.github.io/schemas/keymap.json' "$home_light/.config/yazi/keymap.toml"
 assert_file_not_contains '$schema' "$home_light/.config/yazi/keymap.toml"
 
+# the wrapper's theme sync keeps a symlinked theme.toml a symlink
+home_linked="$tmp_dir/home-linked"
+mkdir -p "$home_linked/.config/kaku" "$tmp_dir/linked-dotfiles"
+cp "$home_light/.config/kaku/kaku.lua" "$home_linked/.config/kaku/kaku.lua"
+run_setup "$home_linked"
+theme_linked="$home_linked/.config/yazi/theme.toml"
+theme_linked_target="$tmp_dir/linked-dotfiles/theme.toml"
+cat <<'EOF' >"$theme_linked_target"
+[mgr]
+border_symbol = "x"
+
+# ===== Kaku Yazi Flavor (managed) =====
+[flavor]
+dark = "old-flavor"
+light = "old-flavor"
+# ===== End Kaku Yazi Flavor (managed) =====
+EOF
+chmod 0644 "$theme_linked_target"
+rm -f "$theme_linked"
+ln -s "$theme_linked_target" "$theme_linked"
+output="$(
+  HOME="$home_linked" \
+  PATH="$home_linked/.config/kaku/zsh/bin:$tmp_dir/realbin:$PATH" \
+  "$home_linked/.config/kaku/zsh/bin/yazi" --version
+)"
+[[ "$output" == "real-yazi --version" ]] || fail "wrapper did not launch yazi with a linked theme.toml"
+[[ -L "$theme_linked" ]] || fail "wrapper replaced the theme.toml symlink with a regular file"
+assert_file_contains 'dark = "kaku-light"' "$theme_linked_target"
+assert_file_not_contains 'old-flavor' "$theme_linked_target"
+assert_file_contains 'border_symbol = "x"' "$theme_linked_target"
+
+# the wrapper's theme sync replaces a regular theme.toml by rename: new inode
+home_regular="$tmp_dir/home-regular"
+mkdir -p "$home_regular/.config/kaku"
+cp "$home_light/.config/kaku/kaku.lua" "$home_regular/.config/kaku/kaku.lua"
+run_setup "$home_regular"
+theme_regular="$home_regular/.config/yazi/theme.toml"
+rm -f "$theme_regular"
+cat <<'EOF' >"$theme_regular"
+[mgr]
+border_symbol = "x"
+
+# ===== Kaku Yazi Flavor (managed) =====
+[flavor]
+dark = "old-flavor"
+light = "old-flavor"
+# ===== End Kaku Yazi Flavor (managed) =====
+EOF
+theme_regular_inode="$(stat -f %i "$theme_regular")"
+output="$(
+  HOME="$home_regular" \
+  PATH="$home_regular/.config/kaku/zsh/bin:$tmp_dir/realbin:$PATH" \
+  "$home_regular/.config/kaku/zsh/bin/yazi" --version
+)"
+[[ "$output" == "real-yazi --version" ]] || fail "wrapper did not launch yazi with a regular theme.toml"
+[[ ! -L "$theme_regular" && -f "$theme_regular" ]] || fail "wrapper left theme.toml something other than a regular file"
+assert_file_contains 'dark = "kaku-light"' "$theme_regular"
+assert_file_not_contains 'old-flavor' "$theme_regular"
+assert_file_contains 'border_symbol = "x"' "$theme_regular"
+[[ "$(stat -f %i "$theme_regular")" != "$theme_regular_inode" ]] \
+	|| fail "wrapper rewrote the regular theme.toml in place (inode $theme_regular_inode kept) instead of replacing it"
+
 # When a real yazi is installed, gate the generated configs through its parser.
 real_yazi=""
 for candidate in /opt/homebrew/bin/yazi /usr/local/bin/yazi /opt/local/bin/yazi; do

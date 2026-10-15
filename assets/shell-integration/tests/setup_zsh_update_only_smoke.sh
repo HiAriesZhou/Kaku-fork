@@ -12,7 +12,7 @@ fail() {
 }
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/kaku-setup-zsh-smoke.XXXXXX")"
-trap 'rm -rf "$tmp_dir"' EXIT
+trap 'chmod -R u+w "$tmp_dir" 2>/dev/null; rm -rf "$tmp_dir"' EXIT
 
 tmp_home="$tmp_dir/home"
 tmp_vendor="$tmp_dir/vendor"
@@ -181,5 +181,140 @@ for edited in false true; do
       || fail "the V0.22.0 starship.toml with blank icons was not restored"
   fi
 done
+
+# Dotfile managers link ~/.zshrc, ~/.tmux.conf and the yazi theme into a repo;
+# rewriting them must write through the link, not replace it.
+link_failures=0
+expect() {
+  local message="$1"
+  shift
+  if ! "$@"; then
+    echo "FAIL: $message" >&2
+    link_failures=$((link_failures + 1))
+  fi
+}
+file_mode() { stat -f '%Lp' "$1"; }
+
+tmux_stub_dir="$tmp_dir/tmux-bin"
+mkdir -p "$tmux_stub_dir"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$tmux_stub_dir/tmux"
+chmod +x "$tmux_stub_dir/tmux"
+
+run_linked_update_only() {
+  HOME="$1" \
+    ZDOTDIR="$1" \
+    PATH="$tmux_stub_dir:$PATH" \
+    KAKU_INIT_INTERNAL=1 \
+    KAKU_SKIP_TOOL_BOOTSTRAP=1 \
+    KAKU_SKIP_TERMINFO_BOOTSTRAP=1 \
+    KAKU_VENDOR_DIR="$tmp_vendor" \
+    bash "$SHELL_DIR/setup_zsh.sh" --update-only </dev/null >"$output_log" 2>"$error_log"
+}
+
+kaku_source_line='[[ -f "$HOME/.config/kaku/zsh/kaku.zsh" ]] && source "$HOME/.config/kaku/zsh/kaku.zsh" # Kaku Shell Integration'
+kaku_tmux_line='source-file "$HOME/.config/kaku/tmux/kaku.tmux.conf" # Kaku tmux Integration'
+stale_zshrc='export FOO=1
+[[ ":$PATH:" != *":$HOME/.config/kaku/zsh/bin:"* ]] && export PATH="$HOME/.config/kaku/zsh/bin:$PATH"
+[[ -f "$HOME/.config/kaku/zsh/kaku.zsh" ]] && source "$HOME/.config/kaku/zsh/kaku.zsh"
+'
+
+linked_home="$tmp_dir/linked-home"
+dotfiles="$tmp_dir/dotfiles"
+mkdir -p "$linked_home/.config/yazi" "$linked_home/.config/kaku" "$dotfiles"
+printf "config.color_scheme = 'Kaku Light'\n" >"$linked_home/.config/kaku/kaku.lua"
+printf '%s' "$stale_zshrc" >"$dotfiles/zshrc"
+printf 'set -g mouse on\nsource-file ~/.config/kaku/tmux/kaku.tmux.conf\n' >"$dotfiles/tmux.conf"
+cat >"$dotfiles/theme.toml" <<'EOF'
+[mgr]
+border_symbol = "x"
+
+# ===== Kaku Yazi Flavor (managed) =====
+[flavor]
+dark = "old-flavor"
+light = "old-flavor"
+# ===== End Kaku Yazi Flavor (managed) =====
+EOF
+chmod 0644 "$dotfiles/zshrc" "$dotfiles/tmux.conf" "$dotfiles/theme.toml"
+ln -s "$dotfiles/zshrc" "$linked_home/.zshrc"
+ln -s "$dotfiles/tmux.conf" "$linked_home/.tmux.conf"
+ln -s "$dotfiles/theme.toml" "$linked_home/.config/yazi/theme.toml"
+
+run_linked_update_only "$linked_home" \
+  || { cat "$output_log" "$error_log" >&2; fail "setup_zsh.sh --update-only failed with linked dotfiles"; }
+
+# each rewritten dotfile is still a symlink
+expect ".zshrc is no longer a symlink" test -L "$linked_home/.zshrc"
+expect ".tmux.conf is no longer a symlink" test -L "$linked_home/.tmux.conf"
+expect "yazi theme.toml is no longer a symlink" test -L "$linked_home/.config/yazi/theme.toml"
+
+# each link target holds the updated content with its mode unchanged
+expect "linked .zshrc target lacks the current source line" grep -Fqx "$kaku_source_line" "$dotfiles/zshrc"
+expect "linked .zshrc target lost the user's own line" grep -Fqx 'export FOO=1' "$dotfiles/zshrc"
+expect "linked .tmux.conf target lacks the current source line" grep -Fqx "$kaku_tmux_line" "$dotfiles/tmux.conf"
+expect "linked .tmux.conf target lost the user's own line" grep -Fqx 'set -g mouse on' "$dotfiles/tmux.conf"
+expect "linked theme.toml target lacks the current flavor" grep -Fqx 'dark = "kaku-light"' "$dotfiles/theme.toml"
+expect "linked theme.toml target still holds the old flavor" bash -c '! grep -Fq old-flavor "$1"' _ "$dotfiles/theme.toml"
+expect "linked theme.toml target lost the user's own section" grep -Fqx 'border_symbol = "x"' "$dotfiles/theme.toml"
+for target in zshrc tmux.conf theme.toml; do
+  expect "linked $target target mode changed from 644 to $(file_mode "$dotfiles/$target")" \
+    test "$(file_mode "$dotfiles/$target")" = 644
+done
+
+# a .zshrc linked to a read-only file is left alone and the run completes
+readonly_home="$tmp_dir/readonly-home"
+readonly_dotfiles="$tmp_dir/readonly-dotfiles"
+mkdir -p "$readonly_home" "$readonly_dotfiles"
+printf '%s' "$stale_zshrc" >"$readonly_dotfiles/zshrc"
+chmod 0444 "$readonly_dotfiles/zshrc"
+chmod 0555 "$readonly_dotfiles"
+ln -s "$readonly_dotfiles/zshrc" "$readonly_home/.zshrc"
+readonly_before="$(shasum -a 256 <"$readonly_dotfiles/zshrc")"
+readonly_status=0
+run_linked_update_only "$readonly_home" || readonly_status=$?
+expect "setup_zsh.sh --update-only exited $readonly_status with a read-only linked .zshrc" \
+  test "$readonly_status" -eq 0
+expect "read-only linked .zshrc is no longer a symlink" test -L "$readonly_home/.zshrc"
+expect "read-only linked .zshrc points somewhere else" \
+  test "$(readlink "$readonly_home/.zshrc" 2>/dev/null)" = "$readonly_dotfiles/zshrc"
+expect "read-only .zshrc target content changed" \
+  test "$(shasum -a 256 <"$readonly_dotfiles/zshrc")" = "$readonly_before"
+expect "read-only .zshrc target mode changed" test "$(file_mode "$readonly_dotfiles/zshrc")" = 444
+
+# A regular .zshrc is replaced by rename, so a reader never sees it half written.
+regular_home="$tmp_dir/regular-home"
+mkdir -p "$regular_home"
+printf '%s' "$stale_zshrc" >"$regular_home/.zshrc"
+regular_inode_before="$(stat -f %i "$regular_home/.zshrc")"
+run_linked_update_only "$regular_home" \
+  || { cat "$output_log" "$error_log" >&2; fail "setup_zsh.sh --update-only failed with a regular .zshrc"; }
+# a regular .zshrc is replaced by rename: still a regular file, new inode
+expect "regular .zshrc became a symlink" test ! -L "$regular_home/.zshrc"
+expect "regular .zshrc is no longer a regular file" test -f "$regular_home/.zshrc"
+regular_inode_after="$(stat -f %i "$regular_home/.zshrc" 2>/dev/null || echo missing)"
+expect "regular .zshrc was truncated in place (inode $regular_inode_before kept)" \
+  test "$regular_inode_after" != "$regular_inode_before"
+expect "regular .zshrc lacks the current source line" grep -Fqx "$kaku_source_line" "$regular_home/.zshrc"
+expect "regular .zshrc lost the user's own line" grep -Fqx 'export FOO=1' "$regular_home/.zshrc"
+
+# The installers and the yazi wrappers they generate share one write_through.
+write_through_body() {
+  awk -v nth="$2" '
+    /^write_through\(\) \{$/ { seen++; if (seen == nth) grab = 1 }
+    grab { print }
+    grab && /^}$/ { exit }
+  ' "$1"
+}
+reference_body="$(write_through_body "$SHELL_DIR/setup_zsh.sh" 1)"
+expect "setup_zsh.sh has no write_through definition" test -n "$reference_body"
+for site in "setup_zsh.sh 2" "setup_fish.sh 1" "setup_fish.sh 2"; do
+  read -r site_file site_nth <<<"$site"
+  expect "write_through #$site_nth in $site_file differs from setup_zsh.sh's" \
+    test "$(write_through_body "$SHELL_DIR/$site_file" "$site_nth")" = "$reference_body"
+done
+
+if [[ "$link_failures" != 0 ]]; then
+  cat "$output_log" "$error_log" >&2
+  fail "$link_failures linked dotfile check(s) failed"
+fi
 
 echo "setup_zsh update-only smoke test passed"

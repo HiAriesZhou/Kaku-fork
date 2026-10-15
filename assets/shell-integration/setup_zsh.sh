@@ -106,6 +106,16 @@ backup_tmuxrc_once() {
 	fi
 }
 
+# Write through a symlinked dotfile so it stays a link; replace a regular file
+# with mv so a reader never sees it half-written.
+write_through() {
+	if [[ -L "$2" ]]; then
+		cat "$1" >"$2" && rm -f "$1"
+	else
+		mv "$1" "$2"
+	fi
+}
+
 default_kaku_config_path() {
 	if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
 		printf '%s\n' "${XDG_CONFIG_HOME}/kaku/kaku.lua"
@@ -214,7 +224,7 @@ migrate_yazi_schema_headers() {
 			-e 's|^[[:space:]]*"?\$schema"?[[:space:]]*=[[:space:]]*"([^"]+)".*$|#:schema \1|' \
 			-e '/^[[:space:]]*"?\$schema"?[[:space:]]*=/d' \
 			"$file" >"$tmp_file"; then
-			mv "$tmp_file" "$file"
+			write_through "$tmp_file" "$file"
 			echo -e "  ${GREEN}✓${NC} ${BOLD}Config${NC}      Migrated yazi \$schema key to #:schema comment ${NC}($(basename "$file"))${NC}"
 		else
 			rm -f "$tmp_file"
@@ -254,6 +264,10 @@ sync_kaku_yazi_flavors() {
 
 ensure_kaku_yazi_theme() {
 	mkdir -p "$YAZI_CONFIG_DIR"
+	if [[ -e "$YAZI_THEME_FILE" && ! -w "$YAZI_THEME_FILE" ]]; then
+		echo -e "  ${YELLOW}!${NC} ${BOLD}Config${NC}      Skipped yazi theme ${NC}($YAZI_THEME_FILE is read-only)${NC}"
+		return
+	fi
 	local managed_flavor
 	managed_flavor="$(current_kaku_yazi_flavor)"
 
@@ -294,8 +308,12 @@ EOF
 		printf '\n'
 	} >"${tmp_theme}.next"
 
-	mv "${tmp_theme}.next" "$YAZI_THEME_FILE"
 	rm -f "$tmp_theme"
+	if cmp -s "${tmp_theme}.next" "$YAZI_THEME_FILE"; then
+		rm -f "${tmp_theme}.next"
+		return
+	fi
+	write_through "${tmp_theme}.next" "$YAZI_THEME_FILE"
 	echo -e "  ${GREEN}✓${NC} ${BOLD}Config${NC}      Updated yazi theme ${NC}(managed Kaku flavor: $managed_flavor)${NC}"
 }
 
@@ -380,6 +398,16 @@ current_flavor() {
 	resolve_kaku_flavor_from_config "$(active_kaku_config_path)"
 }
 
+# Write through a symlinked dotfile so it stays a link; replace a regular file
+# with mv so a reader never sees it half-written.
+write_through() {
+	if [[ -L "$2" ]]; then
+		cat "$1" >"$2" && rm -f "$1"
+	else
+		mv "$1" "$2"
+	fi
+}
+
 managed_block() {
 	local flavor="$1"
 	cat <<BLOCK
@@ -394,6 +422,9 @@ BLOCK
 ensure_theme() {
 	local flavor="$1"
 	mkdir -p "$(dirname "$YAZI_THEME_FILE")"
+	if [[ -e "$YAZI_THEME_FILE" && ! -w "$YAZI_THEME_FILE" ]]; then
+		return
+	fi
 
 	if [[ ! -f "$YAZI_THEME_FILE" ]]; then
 		cat <<BLOCK >"$YAZI_THEME_FILE"
@@ -428,8 +459,12 @@ BLOCK
 		printf '\n'
 	} >"${tmp_theme}.next"
 
-	mv "${tmp_theme}.next" "$YAZI_THEME_FILE"
 	rm -f "$tmp_theme"
+	if cmp -s "${tmp_theme}.next" "$YAZI_THEME_FILE"; then
+		rm -f "${tmp_theme}.next"
+		return
+	fi
+	write_through "${tmp_theme}.next" "$YAZI_THEME_FILE"
 }
 
 # yazi >= 26.5.6 rejects a `$schema` key in its config files; older Kaku
@@ -444,7 +479,7 @@ migrate_schema_headers() {
 			-e 's|^[[:space:]]*"?\$schema"?[[:space:]]*=[[:space:]]*"([^"]+)".*$|#:schema \1|' \
 			-e '/^[[:space:]]*"?\$schema"?[[:space:]]*=/d' \
 			"$file" >"$tmp_file"; then
-			mv "$tmp_file" "$file"
+			write_through "$tmp_file" "$file"
 		else
 			rm -f "$tmp_file"
 		fi
@@ -662,6 +697,10 @@ ensure_yazi_preview_size_defaults() {
 		in_preview { print }
 	' "$YAZI_CONFIG_FILE")"
 
+	if [[ -e "$YAZI_CONFIG_FILE" && ! -w "$YAZI_CONFIG_FILE" ]]; then
+		return
+	fi
+
 	local has_preview_section=false
 	local has_max_width=false
 	local has_max_height=false
@@ -708,7 +747,7 @@ EOF
 		{ print }
 	' "$YAZI_CONFIG_FILE" >"$tmp_yazi"
 
-	mv "$tmp_yazi" "$YAZI_CONFIG_FILE"
+	write_through "$tmp_yazi" "$YAZI_CONFIG_FILE"
 	echo -e "  ${GREEN}✓${NC} ${BOLD}Config${NC}      Completed Yazi preview size defaults ${NC}(2000x2400)${NC}"
 }
 
@@ -721,6 +760,10 @@ ensure_yazi_edit_opener() {
 
 	# Only skip if the user already has an edit opener defined.
 	if grep -Eq '^[[:space:]]*edit[[:space:]]*=' "$YAZI_CONFIG_FILE"; then
+		return
+	fi
+	if [[ -e "$YAZI_CONFIG_FILE" && ! -w "$YAZI_CONFIG_FILE" ]]; then
+		echo -e "  ${YELLOW}!${NC} ${BOLD}Config${NC}      Skipped yazi edit opener ${NC}($YAZI_CONFIG_FILE is read-only)${NC}"
 		return
 	fi
 
@@ -736,7 +779,7 @@ ensure_yazi_edit_opener() {
 			next
 		}
 		{ print }' "$YAZI_CONFIG_FILE" >"$tmp_yazi"
-		mv "$tmp_yazi" "$YAZI_CONFIG_FILE"
+		write_through "$tmp_yazi" "$YAZI_CONFIG_FILE"
 		echo -e "  ${GREEN}✓${NC} ${BOLD}Config${NC}      Added default Yazi edit opener under existing [opener] section"
 		return
 	fi
@@ -1781,6 +1824,9 @@ normalize_kaku_tmux_source_line() {
 	if [[ ! -f "$TMUXRC" ]]; then
 		return
 	fi
+	if [[ -e "$TMUXRC" && ! -w "$TMUXRC" ]]; then
+		return
+	fi
 
 	local tmp_file
 	tmp_file="$(mktemp "${TMPDIR:-/tmp}/kaku-tmuxrc.XXXXXX")"
@@ -1817,7 +1863,7 @@ END {
 ' "$TMUXRC" >"$tmp_file"; then
 		if ! cmp -s "$TMUXRC" "$tmp_file"; then
 			backup_tmuxrc_once
-			mv "$tmp_file" "$TMUXRC"
+			write_through "$tmp_file" "$TMUXRC"
 			echo -e "  ${GREEN}✓${NC} ${BOLD}Integrate${NC}   Updated Kaku source line in .tmux.conf"
 		else
 			rm -f "$tmp_file"
@@ -1827,7 +1873,7 @@ END {
 		if [[ "$awk_status" == "2" ]]; then
 			if ! cmp -s "$TMUXRC" "$tmp_file"; then
 				backup_tmuxrc_once
-				mv "$tmp_file" "$TMUXRC"
+				write_through "$tmp_file" "$TMUXRC"
 				echo -e "  ${GREEN}✓${NC} ${BOLD}Integrate${NC}   Removed duplicate Kaku source line(s) from .tmux.conf"
 			else
 				rm -f "$tmp_file"
@@ -1877,6 +1923,9 @@ ensure_kaku_tmux_integration() {
 
 	if has_kaku_tmux_source_line; then
 		echo -e "  ${GREEN}✓${NC} ${BOLD}Integrate${NC}   Already linked in .tmux.conf"
+	elif [[ -e "$TMUXRC" && ! -w "$TMUXRC" ]]; then
+		echo -e "  ${YELLOW}!${NC} ${BOLD}Integrate${NC}   .tmux.conf is read-only (symlink or permission). Add manually:"
+		echo -e "              $TMUX_SOURCE_LINE"
 	else
 		backup_tmuxrc_once
 		if [[ -f "$TMUXRC" && -s "$TMUXRC" ]]; then
@@ -2049,6 +2098,9 @@ cleanup_legacy_inline_block() {
 	if [[ ! -f "$ZSHRC" ]]; then
 		return
 	fi
+	if [[ -e "$ZSHRC" && ! -w "$ZSHRC" ]]; then
+		return
+	fi
 
 	if ! grep -q "^# Kaku Shell Integration$" "$ZSHRC"; then
 		return
@@ -2125,7 +2177,7 @@ cleanup_legacy_inline_block() {
 
 	if ! cmp -s "$ZSHRC" "$tmp_file"; then
 		backup_zshrc_once
-		mv "$tmp_file" "$ZSHRC"
+		write_through "$tmp_file" "$ZSHRC"
 		if [[ "$removed_block" == "1" ]]; then
 			echo -e "  ${GREEN}✓${NC} ${BOLD}Migrate${NC}     Removed legacy inline Kaku block from .zshrc"
 		fi
@@ -2146,6 +2198,9 @@ cleanup_legacy_inline_block
 
 normalize_kaku_path_line() {
 	if [[ ! -f "$ZSHRC" ]]; then
+		return
+	fi
+	if [[ -e "$ZSHRC" && ! -w "$ZSHRC" ]]; then
 		return
 	fi
 
@@ -2188,7 +2243,7 @@ END {
 ' "$ZSHRC" >"$tmp_file"; then
 		if ! cmp -s "$ZSHRC" "$tmp_file"; then
 			backup_zshrc_once
-			mv "$tmp_file" "$ZSHRC"
+			write_through "$tmp_file" "$ZSHRC"
 			echo -e "  ${GREEN}✓${NC} ${BOLD}Integrate${NC}   Updated Kaku PATH line in .zshrc"
 		else
 			rm -f "$tmp_file"
@@ -2198,7 +2253,7 @@ END {
 		if [[ "$awk_status" == "2" ]]; then
 			if ! cmp -s "$ZSHRC" "$tmp_file"; then
 				backup_zshrc_once
-				mv "$tmp_file" "$ZSHRC"
+				write_through "$tmp_file" "$ZSHRC"
 				echo -e "  ${GREEN}✓${NC} ${BOLD}Integrate${NC}   Removed duplicate Kaku PATH line(s) from .zshrc"
 			else
 				rm -f "$tmp_file"
@@ -2216,6 +2271,9 @@ normalize_kaku_path_line
 
 normalize_kaku_source_line() {
 	if [[ ! -f "$ZSHRC" ]]; then
+		return
+	fi
+	if [[ -e "$ZSHRC" && ! -w "$ZSHRC" ]]; then
 		return
 	fi
 
@@ -2256,7 +2314,7 @@ END {
 ' "$ZSHRC" >"$tmp_file"; then
 		if ! cmp -s "$ZSHRC" "$tmp_file"; then
 			backup_zshrc_once
-			mv "$tmp_file" "$ZSHRC"
+			write_through "$tmp_file" "$ZSHRC"
 			echo -e "  ${GREEN}✓${NC} ${BOLD}Integrate${NC}   Updated Kaku source line in .zshrc"
 		else
 			rm -f "$tmp_file"
@@ -2267,7 +2325,7 @@ END {
 		if [[ "$awk_status" == "2" ]]; then
 			if ! cmp -s "$ZSHRC" "$tmp_file"; then
 				backup_zshrc_once
-				mv "$tmp_file" "$ZSHRC"
+				write_through "$tmp_file" "$ZSHRC"
 				echo -e "  ${GREEN}✓${NC} ${BOLD}Integrate${NC}   Removed duplicate Kaku source line(s) from .zshrc"
 			else
 				rm -f "$tmp_file"
