@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Restarts the running Kaku the way an in-app update does: TERM its GUI
-# processes, force-kill any left after 20s, then open the app again. Tabs and
+# Restarts Kaku the way an in-app update does: TERM every running Kaku GUI
+# process, force-kill any left after 20s, then open the given app. Tabs and
 # working directories come back from the session snapshot Kaku saves while it
 # runs. A normal quit is not used because it stops at the quit confirmation
 # whenever a program such as Claude Code is running.
@@ -38,9 +38,20 @@ fi
 
 note() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 
-# The GUI processes of this bundle only; pattern-free, since paths may hold
-# characters pgrep would read as a regex.
+# Every running Kaku GUI, whichever bundle it came from: a copy opened from
+# dist/ is still the Kaku being restarted, and leaving it running would end
+# with two of them. Matched on the executable alone, never the arguments, so
+# a shell whose command line mentions the path is not taken for Kaku.
 gui_pids() {
+	ps -axww -o pid= -o comm= | while read -r pid exe; do
+		case "$exe" in
+		*/Contents/MacOS/kaku-gui) printf '%s\n' "$pid" ;;
+		esac
+	done
+}
+
+# Only the target bundle, to confirm it came back.
+target_pids() {
 	ps -axww -o pid= -o args= | while read -r pid args; do
 		case "$args" in
 		"$gui" | "$gui "*) printf '%s\n' "$pid" ;;
@@ -49,13 +60,30 @@ gui_pids() {
 }
 
 sleep "$delay"
-before="$(gui_pids | tr '\n' ' ')"
-note "restart $app; running: ${before:-none}"
+before="$(ps -o pid=,args= -p "$(gui_pids | paste -sd, -)" 2>/dev/null | awk '{print $1, $2}' | paste -sd ';' -)"
+note "restart into $app; running: ${before:-none}"
 
+# Every Kaku under this HOME saves the same session file when it quits, so
+# only the one that owns the snapshot (its pid names the snapshot's content
+# directory) gets TERM and saves; the others are killed after it, unsaved,
+# so a stray copy cannot replace the tabs. Without an owner, all get TERM.
+session="${XDG_CONFIG_HOME:-$HOME/.config}/kaku/last_session.json"
+owner="$(sed -n 's/.*"content_dir"[[:space:]]*:[[:space:]]*"session-\([0-9][0-9]*\)-.*/\1/p' "$session" 2>/dev/null | head -1)"
+running="$(gui_pids)"
+# Not `gui_pids | grep -q`: grep stops at the first match, gui_pids then dies
+# of SIGPIPE, and pipefail would read the match as a failure.
+if [[ -n "$owner" ]] && grep -qx "$owner" <<<"$running"; then
+	quit_first="$owner"
+else
+	quit_first="$running"
+fi
 for _ in $(seq 1 20); do
-	pids="$(gui_pids)"
-	[[ -z "$pids" ]] && break
-	for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+	alive=""
+	for pid in $quit_first; do
+		kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
+	done
+	[[ -z "$alive" ]] && break
+	for pid in $alive; do kill -TERM "$pid" 2>/dev/null || true; done
 	sleep 1
 done
 for pid in $(gui_pids); do
@@ -66,7 +94,7 @@ done
 sleep 1
 /usr/bin/open "$app"
 for _ in $(seq 1 30); do
-	after="$(gui_pids | tr '\n' ' ')"
+	after="$(target_pids | tr '\n' ' ')"
 	if [[ -n "$after" ]]; then
 		note "running again: $after"
 		exit 0
