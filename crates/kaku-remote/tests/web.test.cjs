@@ -808,6 +808,19 @@ test('the grid draws with WebGL where the browser has it, and with the DOM other
   await p.waitForFunction(() => probe.term.buffer.active.getLine(0).translateToString(true) === 'GPU-GRID');
   // The WebGL renderer replaces the DOM rows.
   assert.equal(await p.locator('.xterm-rows').count(), 0);
+  // And it really draws the text: a canvas with only the background passes
+  // every buffer check above.
+  const shot = (await p.locator('.xterm-screen').screenshot()).toString('base64');
+  const lit = await p.evaluate(async png => {
+    const img = await createImageBitmap(await (await fetch('data:image/png;base64,' + png)).blob());
+    const c = new OffscreenCanvas(img.width, img.height).getContext('2d');
+    c.drawImage(img, 0, 0);
+    const d = c.getImageData(0, 0, img.width, img.height).data;
+    let n = 0;
+    for (let i = 0; i < d.length; i += 4) if (d[i] + d[i + 1] + d[i + 2] > 450) n++;
+    return n;
+  }, shot);
+  assert.ok(lit > 50, `WebGL drew ${lit} text pixels`);
   // History still opens over the grid in the terminal's font.
   const past = await p.evaluate(() => {
     probe.openPast();
