@@ -209,6 +209,9 @@ jobs:
       - name: Download vendor dependencies
         run: bash scripts/download_vendor.sh
 
+      - name: Signing and notarization retry tests
+        run: python3 scripts/test_notarize_retry.py
+
       - name: Shell integration smoke tests
         run: |
           set -euo pipefail

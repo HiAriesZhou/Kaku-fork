@@ -115,7 +115,7 @@ detect_signing_identity() {
 CODESIGN_TIMESTAMP_ERROR_PATTERN="timestamp service is not available|A timestamp was expected but was not found"
 
 codesign_with_retry() {
-	local max_attempts=3
+	local max_attempts=2
 	local delay_seconds=15
 	local attempt=1
 	local output rc

@@ -556,6 +556,9 @@ update_homebrew_tap() {
     if [[ "$REQUIRE_HOMEBREW_TAP_UPDATE" == "1" ]]; then
         local expected_version="$version"
         local remote_version=""
+        local cask_output=""
+        local network_failures=0
+        local network_error_pattern="error connecting to|dial tcp|TLS handshake timeout|i/o timeout|connection reset|no such host|context deadline exceeded"
         local attempt=0
         local max_attempts="${HOMEBREW_TAP_VERIFY_ATTEMPTS:-12}"
         local sleep_seconds="${HOMEBREW_TAP_VERIFY_SLEEP_SECONDS:-15}"
@@ -565,9 +568,20 @@ update_homebrew_tap() {
             # download_url points at raw.githubusercontent.com behind Fastly
             # (cache-control max-age=300), which serves the previous version for
             # the whole polling window and causes false-negative timeouts.
-            remote_version=$(gh api "repos/${HOMEBREW_TAP_REPO}/contents/Casks/kakuku.rb?ref=main" \
-                -H "Accept: application/vnd.github.raw" 2>/dev/null \
-                | sed -n 's/^  version "\([^"]*\)"$/\1/p' | head -n1 || true)
+            while ! cask_output=$(gh api "repos/${HOMEBREW_TAP_REPO}/contents/Casks/kakuku.rb?ref=main" \
+                -H "Accept: application/vnd.github.raw" 2>&1); do
+                log_warn "$cask_output"
+                if ! grep -Eqi "$network_error_pattern" <<<"$cask_output"; then
+                    die "Homebrew tap API request failed; resolve the API error before resuming"
+                fi
+                network_failures=$((network_failures + 1))
+                if (( network_failures >= 2 )); then
+                    die "Homebrew tap network failure persisted; resolve the network before resuming"
+                fi
+                log_warn "Homebrew tap network request failed; retrying once in ${sleep_seconds}s"
+                sleep "$sleep_seconds"
+            done
+            remote_version=$(sed -n 's/^  version "\([^"]*\)"$/\1/p' <<<"$cask_output" | head -n1)
             if [[ "$remote_version" == "$expected_version" ]]; then
                 log_info "Homebrew tap verified at version ${remote_version}"
                 break

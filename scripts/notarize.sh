@@ -20,12 +20,16 @@ APP_NAME="Kaku"
 OUT_DIR="${OUT_DIR:-dist}"
 APP_BUNDLE="${OUT_DIR}/${APP_NAME}.app"
 DMG_PATH="${OUT_DIR}/${APP_NAME}.dmg"
-NOTARY_SUBMIT_MAX_ATTEMPTS="${NOTARY_SUBMIT_MAX_ATTEMPTS:-3}"
+NOTARY_SUBMIT_MAX_ATTEMPTS="${NOTARY_SUBMIT_MAX_ATTEMPTS:-2}"
 NOTARY_SUBMIT_RETRY_DELAY="${NOTARY_SUBMIT_RETRY_DELAY:-20}"
 
 if ! [[ "$NOTARY_SUBMIT_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
 	echo "Error: NOTARY_SUBMIT_MAX_ATTEMPTS must be a positive integer." >&2
 	exit 1
+fi
+# Network failures allow one retry, even when an older environment requests more.
+if (( NOTARY_SUBMIT_MAX_ATTEMPTS > 2 )); then
+	NOTARY_SUBMIT_MAX_ATTEMPTS=2
 fi
 if ! [[ "$NOTARY_SUBMIT_RETRY_DELAY" =~ ^[0-9]+$ ]]; then
 	echo "Error: NOTARY_SUBMIT_RETRY_DELAY must be a non-negative integer." >&2
@@ -148,9 +152,9 @@ if [[ -n "$ASC_API_KEY_PATH" && -f "$ASC_API_KEY_PATH" ]] && command -v rcodesig
 	# still returned failure here and fell through to the notarytool path.
 	#
 	# The S3 upload stalls intermittently on proxied networks (the AWS SDK
-	# ignores *_proxy and gives up at 0 B/s). That is the same failure the
-	# notarytool path already retries, so give rcodesign the same bounded
-	# retry; anything else fails straight through to the fallback.
+	# ignores *_proxy and gives up at 0 B/s). Retry once on the same backend,
+	# then stop for network diagnosis. Non-network failures may still use
+	# the compatibility fallback.
 	RCODESIGN_UPLOAD_ERROR_PATTERN="ThroughputBelowMinimum|connect timeout|dispatch failure|timed out"
 	rcodesign_ok=0
 	attempt=1
@@ -167,6 +171,10 @@ if [[ -n "$ASC_API_KEY_PATH" && -f "$ASC_API_KEY_PATH" ]] && command -v rcodesig
 		echo "$RCODESIGN_OUTPUT"
 		if ! grep -Eq "$RCODESIGN_UPLOAD_ERROR_PATTERN" <<<"$RCODESIGN_OUTPUT"; then
 			break
+		fi
+		if (( attempt == NOTARY_SUBMIT_MAX_ATTEMPTS )); then
+			echo "Error: rcodesign network failure persisted; stop and resolve the network before resuming." >&2
+			exit 1
 		fi
 		if (( attempt < NOTARY_SUBMIT_MAX_ATTEMPTS )); then
 			echo "rcodesign upload stalled. Retrying in ${NOTARY_SUBMIT_RETRY_DELAY}s..."
@@ -219,20 +227,13 @@ NOTARYTOOL_ARGS=(
 	--wait
 )
 
-# connectTimeout: swift-nio transport error seen when the S3 acceleration
-# endpoint is unreachable on restricted networks; retrying reaches the final
-# attempt which disables acceleration.
+# Transport failures retry on the same backend and route, then stop.
 NOTARYTOOL_UPLOAD_ERROR_PATTERN="abortedUpload|deadlineExceeded|ThroughputBelowMinimum|connectTimeout"
 SUBMIT_OUTPUT=""
 attempt=1
 while (( attempt <= NOTARY_SUBMIT_MAX_ATTEMPTS )); do
 	SUBMIT_ARGS=("${NOTARYTOOL_ARGS[@]}")
-	if (( attempt == NOTARY_SUBMIT_MAX_ATTEMPTS && NOTARY_SUBMIT_MAX_ATTEMPTS > 1 )); then
-		SUBMIT_ARGS+=(--no-s3-acceleration)
-		echo "notarytool attempt ${attempt}/${NOTARY_SUBMIT_MAX_ATTEMPTS} with S3 acceleration disabled..."
-	else
-		echo "notarytool attempt ${attempt}/${NOTARY_SUBMIT_MAX_ATTEMPTS}..."
-	fi
+	echo "notarytool attempt ${attempt}/${NOTARY_SUBMIT_MAX_ATTEMPTS}..."
 
 	if SUBMIT_OUTPUT=$(xcrun notarytool submit "${SUBMIT_ARGS[@]}" 2>&1); then
 		break
@@ -245,7 +246,7 @@ while (( attempt <= NOTARY_SUBMIT_MAX_ATTEMPTS )); do
 	fi
 
 	if (( attempt == NOTARY_SUBMIT_MAX_ATTEMPTS )); then
-		echo "Notarization submission failed after ${NOTARY_SUBMIT_MAX_ATTEMPTS} upload attempts:"
+		echo "Notarization network failure persisted after ${NOTARY_SUBMIT_MAX_ATTEMPTS} attempts; resolve the network before resuming:"
 		echo "$SUBMIT_OUTPUT"
 		exit 1
 	fi
