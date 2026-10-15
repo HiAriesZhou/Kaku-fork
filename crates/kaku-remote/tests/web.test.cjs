@@ -79,178 +79,218 @@ test('only authoritative output is visible, including secret and offline input',
   assert.deepEqual(errors, []);
 });
 
-test('malformed link fails visibly without caching a bad key or throwing', async t => {
-  for (const hash of ['#k=bad%25key', '#k=YQ']) {
+// A Mac for relay tests: its signing key, made here as Kaku makes its own.
+const { webcrypto } = require('node:crypto');
+async function newMac() {
+  const keys = await webcrypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  return {
+    pkcs8: Buffer.from(await webcrypto.subtle.exportKey('pkcs8', keys.privateKey)).toString('base64'),
+    pub: Buffer.from(await webcrypto.subtle.exportKey('raw', keys.publicKey)),
+  };
+}
+const pairingLink = (mac, secret) => `#p=${secret.toString('base64url')}&m=${mac.pub.toString('base64url')}`;
+
+// Act as Kaku on the page's newest relay connection: exchange keys, sign the
+// exchange as `signer`, read the page's proof, and (if `admit`) answer it
+// as Kaku does once a device is in. Returns the proof and whether its
+// signature, and its pairing proof for `secret`, check out.
+async function handshake(p, signer, { admit = true, secret = null } = {}) {
+  return p.evaluate(async ({ pkcs8, secret, admit }) => {
+    const sub = crypto.subtle, enc = new TextEncoder(), dec = new TextDecoder();
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const unb64 = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const socket = connections.at(-1);
+    const sent = () => socket.binary?.length || 0;
+    const eph = await sub.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+    const macEph = new Uint8Array(await sub.exportKey('raw', eph.publicKey));
+    const hello = new Uint8Array(69); hello.set(enc.encode('KCH3')); hello.set(macEph, 4);
+    socket.onmessage({ data: hello.buffer });
+    while (sent() < 1) await sleep(5);
+    const answer = socket.binary[0];
+    if (answer.length !== 69 || dec.decode(answer.slice(0, 4)) !== 'KCB3') throw new Error('no page hello');
+    const host = location.pathname.split('/').find(x => /^[0-9a-f]{32}$/.test(x)) || '';
+    const label = enc.encode('kaku-remote v3'), id = enc.encode(host);
+    const all = new Uint8Array(label.length + id.length + 130);
+    all.set(label); all.set(id, label.length); all.set(macEph, label.length + id.length); all.set(answer.slice(4), label.length + id.length + 65);
+    const transcript = new Uint8Array(await sub.digest('SHA-256', all));
+    const peer = await sub.importKey('raw', answer.slice(4), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+    const shared = await sub.deriveBits({ name: 'ECDH', public: peer }, eph.privateKey, 256);
+    const hkdf = await sub.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+    const derive = info => sub.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: transcript, info: enc.encode(info) },
+      hkdf, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const toHost = await derive('kaku c2h'), fromHost = await derive('kaku h2c');
+    const aad = (dir, seq) => { const l = enc.encode(dir); const out = new Uint8Array(l.length + 8); out.set(l); new DataView(out.buffer).setBigUint64(l.length, BigInt(seq)); return out; };
+    const deliver = async (msg, seq) => {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const data = new Uint8Array(await sub.encrypt({ name: 'AES-GCM', iv, additionalData: aad('kaku-web h2c', seq) }, fromHost, enc.encode(JSON.stringify(msg))));
+      const frame = new Uint8Array(12 + data.length); frame.set(iv); frame.set(data, 12);
+      socket.onmessage({ data: frame.buffer });
+    };
+    const signing = await sub.importKey('pkcs8', unb64(pkcs8.replace(/\+/g, '-').replace(/\//g, '_')), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+    await deliver({ type: 'mac_auth', sig: b64(await sub.sign({ name: 'ECDSA', hash: 'SHA-256' }, signing, transcript)) }, 0);
+    for (let i = 0; i < 100 && sent() < 2; i++) await sleep(5);
+    if (sent() < 2) return { proof: null };
+    const frame = socket.binary[1];
+    const plain = await sub.decrypt({ name: 'AES-GCM', iv: frame.slice(0, 12), additionalData: aad('kaku-web c2h', 0) }, toHost, frame.slice(12));
+    const proof = JSON.parse(dec.decode(plain));
+    const device = await sub.importKey('raw', unb64(proof.device), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+    const signed = await sub.verify({ name: 'ECDSA', hash: 'SHA-256' }, device, unb64(proof.sig), transcript);
+    let paired = null;
+    if (secret) {
+      const key = await sub.importKey('raw', unb64(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+      paired = await sub.verify('HMAC', key, unb64(proof.proof || ''), transcript);
+    }
+    if (admit) await deliver({ type: 'pong' }, 1);
+    await sleep(50);
+    return { proof, signed, paired };
+  }, { pkcs8: signer.pkcs8, secret: secret && secret.toString('base64url'), admit });
+}
+const storedDevice = p => p.evaluate(() => new Promise(resolve => {
+  const open = indexedDB.open('kaku', 1);
+  open.onupgradeneeded = () => open.result.createObjectStore('devices');
+  open.onsuccess = () => {
+    const req = open.result.transaction('devices').objectStore('devices').get(location.pathname);
+    req.onsuccess = () => { open.result.close(); resolve(req.result ? Array.from(req.result.publicKey) : null); };
+  };
+}));
+
+test('incomplete, old or missing pairing fails visibly without throwing', async t => {
+  for (const [hash, message] of [['#p=bad&m=YQ', /incomplete/], ['#k=' + Buffer.alloc(32, 1).toString('base64url'), /earlier Kaku/], ['', /Pair this browser first/]]) {
     const { p, errors } = await page(t, hash);
-    assert.match(await p.locator('#stage').innerText(), /link.*invalid|invalid.*link/i);
+    assert.match(await p.locator('#stage').innerText(), message);
+    assert.equal(await p.evaluate(() => location.hash), '');
+    assert.equal(await p.evaluate(() => connections.length), 0);
     assert.deepEqual(errors, []);
-    assert.equal(await p.evaluate(() => sessionStorage.getItem('kaku.link:/')), null);
   }
 });
 
-// Act as the Mac does on a new relay connection: send the challenge, read
-// the page's own challenge back, then a real sealed message bound to both.
-// Opening the socket alone must not remember a key.
-async function authenticate(p, keyText) {
-  await p.evaluate(async keyText => {
-    const raw = Uint8Array.from(atob(keyText.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-    const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt']);
-    const challenge = crypto.getRandomValues(new Uint8Array(16));
-    const hello = new Uint8Array(20); hello.set(new TextEncoder().encode('KCH1')); hello.set(challenge, 4);
-    const socket = connections.at(-1);
-    socket.onmessage({ data: hello.buffer });
-    while (!socket.binary?.length) await new Promise(r => setTimeout(r, 5));
-    const answer = socket.binary[0];
-    if (new TextDecoder().decode(answer.slice(0, 4)) !== 'KCB2' || answer.length !== 20) throw new Error('no page challenge');
-    const both = new Uint8Array(32); both.set(challenge); both.set(answer.slice(4), 16);
-    const label = new TextEncoder().encode('kaku-web h2c');
-    const additionalData = new Uint8Array(label.length + 40);
-    additionalData.set(label); additionalData.set(both, label.length);
-    new DataView(additionalData.buffer).setBigUint64(label.length + 32, 0n);
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const data = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData }, key,
-      new TextEncoder().encode(JSON.stringify({ type: 'pong' }))));
-    const frame = new Uint8Array(12 + data.length); frame.set(iv); frame.set(data, 12);
-    connections.at(-1).onmessage({ data: frame.buffer });
-  }, keyText);
-  await p.waitForTimeout(100);
-}
+test('a pairing link proves itself once and the device signs in afterwards', async t => {
+  const mac = await newMac();
+  const secret = Buffer.alloc(16, 3);
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  const { p, errors } = await page(t, pairingLink(mac, secret), {}, context);
+  assert.equal(await p.evaluate(() => location.hash), '');
+  // Nothing is kept before Kaku admits the browser.
+  assert.equal(await storedDevice(p), null);
+  const first = await handshake(p, mac, { secret });
+  assert.equal(first.proof.type, 'pair');
+  assert.equal(first.signed, true);
+  assert.equal(first.paired, true);
+  assert.match(first.proof.name, /on /);
+  assert.match(await p.locator('#toast').innerText(), /Paired/);
+  const kept = await storedDevice(p);
+  assert.ok(kept);
+  // Back later with no link: the same device signs in, with no pairing proof.
+  const next = await page(t, '', {}, context);
+  assert.equal(await next.p.evaluate(() => connections.length), 1);
+  const again = await handshake(next.p, mac);
+  assert.equal(again.proof.type, 'auth');
+  assert.equal(again.signed, true);
+  assert.equal(again.proof.proof, undefined);
+  assert.deepEqual(await storedDevice(next.p), kept);
+  assert.deepEqual([...errors, ...next.errors], []);
+});
 
-// The relay replays a recorded Mac stream to a new page: it was sealed for
-// another page challenge, so the page drops the connection instead of
-// showing it.
-test('a replayed Mac stream does not open for a new page', async t => {
-  const key = Buffer.alloc(32, 9).toString('base64url');
-  const { p } = await page(t, '#k=' + key);
-  const closed = await p.evaluate(async keyText => {
-    const raw = Uint8Array.from(atob(keyText.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-    const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt']);
-    const challenge = crypto.getRandomValues(new Uint8Array(16));
-    const hello = new Uint8Array(20); hello.set(new TextEncoder().encode('KCH1')); hello.set(challenge, 4);
+test('a page proves nothing to a Mac that is not the one it paired with', async t => {
+  const mac = await newMac();
+  const impostor = await newMac();
+  const { p, errors } = await page(t, pairingLink(mac, Buffer.alloc(16, 4)));
+  const result = await handshake(p, impostor);
+  // The page sent its hello and nothing else: no proof, no input.
+  assert.equal(result.proof, null);
+  assert.equal(await p.evaluate(() => connections.at(-1).readyState), 3);
+  assert.match(await p.locator('#notice').innerText(), /Could not verify the Mac/);
+  await p.waitForTimeout(700);
+  assert.equal(await p.evaluate(() => connections.length), 1);
+  assert.equal(await storedDevice(p), null);
+  assert.deepEqual(errors, []);
+});
+
+test('a message sealed for another connection closes the connection', async t => {
+  const mac = await newMac();
+  const { p } = await page(t, pairingLink(mac, Buffer.alloc(16, 5)));
+  const closed = await p.evaluate(async () => {
     const socket = connections.at(-1);
     let closed = false; socket.close = () => { closed = true; };
+    const eph = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+    const hello = new Uint8Array(69); hello.set(new TextEncoder().encode('KCH3'));
+    hello.set(new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey)), 4);
     socket.onmessage({ data: hello.buffer });
-    await new Promise(r => setTimeout(r, 20));
-    // A recording replays the Mac's hello too, so its frames carry this Mac
-    // challenge; what they cannot carry is this page's challenge.
-    const label = new TextEncoder().encode('kaku-web h2c');
-    const additionalData = new Uint8Array(label.length + 24);
-    additionalData.set(label); additionalData.set(challenge, label.length);
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const data = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData }, key,
-      new TextEncoder().encode(JSON.stringify({ type: 'pong' }))));
-    const frame = new Uint8Array(12 + data.length); frame.set(iv); frame.set(data, 12);
+    await new Promise(r => setTimeout(r, 50));
+    // A recorded frame from another connection: other keys, so it cannot open.
+    const frame = crypto.getRandomValues(new Uint8Array(60));
     socket.onmessage({ data: frame.buffer });
     await new Promise(r => setTimeout(r, 100));
     return closed;
-  }, key);
+  });
   assert.equal(closed, true);
 });
 
-test('verified relay link survives a fresh browser session and rejection forgets it', async t => {
-  const key = Buffer.alloc(32, 7).toString('base64url');
-  const { p, errors } = await page(t, '#k=' + key);
-  assert.equal(await p.evaluate(() => location.hash), '');
-  assert.equal(await p.evaluate(() => localStorage.getItem('kaku.link:/')), null);
-  await authenticate(p, key);
-  assert.equal(await p.evaluate(() => JSON.parse(localStorage.getItem('kaku.link:/')).k), key);
-  assert.match(await p.locator('#toast').innerText(), /Bookmark/);
-  // Drop all tab storage, as when every tab closes, retaining only persistent storage.
-  await p.evaluate(() => sessionStorage.clear());
-  await p.reload();
-  await p.waitForTimeout(100);
-  assert.equal(await p.evaluate(() => connections.length), 1);
-  await authenticate(p, key);
-  assert.deepEqual(errors, []);
-  await p.evaluate(() => connections.at(-1).close(4403));
-  assert.equal(await p.evaluate(() => localStorage.getItem('kaku.link:/')), null);
-  await p.reload();
-  assert.match(await p.locator('#stage').innerText(), /complete link/i);
-});
-
-test('remembered relay link opens in a new tab and a restarted browser context', async t => {
-  const key = Buffer.alloc(32, 9).toString('base64url');
+test('a removed device forgets its pairing and an expired link keeps nothing', async t => {
+  const mac = await newMac();
+  const secret = Buffer.alloc(16, 6);
   const context = await browser.newContext();
   t.after(() => context.close());
-  const { p } = await page(t, '#k=' + key, {}, context);
-  await authenticate(p, key);
+  const { p } = await page(t, pairingLink(mac, secret), {}, context);
+  await handshake(p, mac, { secret });
   const next = await page(t, '', {}, context);
-  assert.equal(await next.p.evaluate(() => connections.length), 1);
-  const state = await context.storageState();
-  const restarted = await browser.newContext({ storageState: state });
-  t.after(() => restarted.close());
-  const restored = await page(t, '', {}, restarted);
-  assert.equal(await restored.p.evaluate(() => connections.length), 1);
-  await authenticate(restored.p, key);
-  assert.deepEqual(restored.errors, []);
+  await handshake(next.p, mac);
+  await next.p.evaluate(() => connections.at(-1).close(4403));
+  assert.match(await next.p.locator('#notice').innerText(), /not paired/);
+  await next.p.waitForTimeout(100);
+  assert.equal(await storedDevice(next.p), null);
+  // An expired or used link: its own message, and nothing saved.
+  const late = await page(t, pairingLink(mac, Buffer.alloc(16, 7)));
+  await handshake(late.p, mac, { admit: false });
+  await late.p.evaluate(() => connections.at(-1).close(4401));
+  assert.match(await late.p.locator('#notice').innerText(), /expired/);
+  assert.equal(await storedDevice(late.p), null);
+  await late.p.waitForTimeout(700);
+  assert.equal(await late.p.evaluate(() => connections.length), 1);
 });
 
-test('remembered connection survives closing and relaunching the browser process', async t => {
+test('a paired device survives closing and relaunching the browser process', async t => {
   const profile = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'kaku-browser-'));
   const options = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
     ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {};
   let context;
   t.after(async () => { await context?.close(); fs.rmSync(profile, { recursive: true, force: true }); });
   context = await chromium.launchPersistentContext(profile, options);
-  const key = Buffer.alloc(32, 14).toString('base64url');
-  const first = await page(t, '#k=' + key, {}, context);
-  await authenticate(first.p, key);
+  const mac = await newMac();
+  const secret = Buffer.alloc(16, 8);
+  const first = await page(t, pairingLink(mac, secret), {}, context);
+  await handshake(first.p, mac, { secret });
   await context.close();
   context = await chromium.launchPersistentContext(profile, options);
   const next = await page(t, '', {}, context);
   assert.equal(await next.p.evaluate(() => connections.length), 1);
-  await authenticate(next.p, key);
+  assert.equal((await handshake(next.p, mac)).proof.type, 'auth');
   assert.deepEqual(next.errors, []);
 });
 
-test('blocked persistent storage keeps a usable tab connection and explains the limit', async t => {
+test('blocked site storage still pairs this tab and says it will not last', async t => {
   const context = await browser.newContext();
   t.after(() => context.close());
   await context.addInitScript(() => {
-    Object.defineProperty(window, 'localStorage', { get() { throw new DOMException('blocked', 'SecurityError'); } });
+    const failing = { open() { const req = {}; setTimeout(() => { req.error = new DOMException('blocked', 'SecurityError'); req.onerror?.(); }); return req; } };
+    Object.defineProperty(window, 'indexedDB', { get() { return failing; } });
   });
-  const key = Buffer.alloc(32, 10).toString('base64url');
-  const { p, errors } = await page(t, '#k=' + key, {}, context);
-  await authenticate(p, key);
-  assert.match(await p.locator('#toast').innerText(), /Not saved/);
-  await p.reload();
-  await p.waitForTimeout(100);
-  assert.equal(await p.evaluate(() => connections.length), 1);
+  const mac = await newMac();
+  const secret = Buffer.alloc(16, 9);
+  const { p, errors } = await page(t, pairingLink(mac, secret), {}, context);
+  const result = await handshake(p, mac, { secret });
+  assert.equal(result.paired, true);
+  assert.match(await p.locator('#toast').innerText(), /this tab only/);
   assert.deepEqual(errors, []);
-});
-
-test('blocked browser storage preserves the complete link across reloads', async t => {
-  const context = await browser.newContext();
-  t.after(() => context.close());
-  await context.addInitScript(() => {
-    for (const name of ['localStorage', 'sessionStorage']) {
-      Object.defineProperty(window, name, { get() { throw new DOMException('blocked', 'SecurityError'); } });
-    }
-  });
-  const key = Buffer.alloc(32, 11).toString('base64url');
-  const { p, errors } = await page(t, '#k=' + key, {}, context);
-  await authenticate(p, key);
-  assert.equal(await p.evaluate(() => location.hash), '#k=' + key);
-  await p.reload();
-  await p.waitForTimeout(100);
-  assert.equal(await p.evaluate(() => connections.length), 1);
-  assert.deepEqual(errors, []);
-});
-
-test('existing tab credentials become remembered after a verified response', async t => {
-  const context = await browser.newContext();
-  t.after(() => context.close());
-  const key = Buffer.alloc(32, 12).toString('base64url');
-  await context.addInitScript(key => sessionStorage.setItem('kaku.link:/', JSON.stringify({ k: key })), key);
-  const { p } = await page(t, '', {}, context);
-  await authenticate(p, key);
-  assert.equal(await p.evaluate(() => JSON.parse(localStorage.getItem('kaku.link:/')).k), key);
 });
 
 test('connection help and first-use notice fit narrow and short viewports', async t => {
-  const key = Buffer.alloc(32, 13).toString('base64url');
-  const { p } = await page(t, '#k=' + key);
-  await authenticate(p, key);
+  const mac = await newMac();
+  const secret = Buffer.alloc(16, 10);
+  const { p } = await page(t, pairingLink(mac, secret));
+  await handshake(p, mac, { secret });
   for (const width of [375, 1280]) for (const height of [240, 900]) {
     await p.setViewportSize({ width, height });
     await p.locator('.xterm-helper-textarea').focus();

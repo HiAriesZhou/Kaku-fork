@@ -2986,6 +2986,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "wezterm-term",
+ "wezterm-toast-notification",
 ]
 
 [[package]]

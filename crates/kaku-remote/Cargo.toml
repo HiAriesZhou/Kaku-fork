@@ -25,6 +25,7 @@ termwiz.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
 tokio-tungstenite.workspace = true
 wezterm-term.workspace = true
+wezterm-toast-notification.workspace = true
 rustls.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

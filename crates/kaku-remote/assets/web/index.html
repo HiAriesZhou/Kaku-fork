@@ -205,30 +205,30 @@
 <script src="assets/xterm.js"></script>
 <script src="assets/xterm-webgl.js"></script>
 <script>
-(() => {
+(async () => {
   const params = new URLSearchParams(location.hash.slice(1));
   // #t=<token>: this Mac or the LAN, plain WebSocket to Kaku.
-  // #k=<key>: through the relay, every message sealed with this key, which
-  // never leaves the browser because fragments are not sent to servers.
-  // Remember verified relay keys across tabs and browser restarts. LAN tokens
-  // remain tab-only because they change on every Mac app launch.
-  const SECRET_SLOT = "kaku.link:" + location.pathname;
-  const readLink = (persistent) => {
-    try { return JSON.parse((persistent ? localStorage : sessionStorage).getItem(SECRET_SLOT) || "null"); }
-    catch (_) { return null; }
-  };
-  let stored = readLink(false) || readLink(true);
-  const forgetLink = () => {
-    for (const persistent of [false, true]) {
-      try { (persistent ? localStorage : sessionStorage).removeItem(SECRET_SLOT); } catch (_) {}
-    }
-  };
-  const originalFragment = location.hash;
-  const supplied = params.has("t") || params.has("k");
-  const token = supplied ? params.get("t") : (stored && stored.t) || null;
-  const keyText = supplied ? params.get("k") : (stored && stored.k) || null;
-  // Erase fragments even when invalid, but never persist an invalid key.
+  // Through the relay a browser is paired: #p=<one-time secret>&m=<the Mac's
+  // public key> from `kaku remote` pairs it once, and the browser keeps its
+  // own signing key, which it cannot export, in IndexedDB. Fragments are
+  // never sent to servers, and are erased from the address at once.
+  const supplied = params.has("t") || params.has("p") || params.has("k");
+  // A LAN token lives in this tab only (it changes with every Kaku launch),
+  // so a reload finds it there. Relay links from before pairing kept a key
+  // in the same slot; it no longer opens anything, so it is dropped.
+  const LINK_SLOT = "kaku.link:" + location.pathname;
+  let tabLink = null;
+  try { tabLink = JSON.parse(sessionStorage.getItem(LINK_SLOT) || "null"); } catch (_) {}
+  try { localStorage.removeItem(LINK_SLOT); } catch (_) {}
+  const token = params.get("t") || (!supplied && tabLink && tabLink.t) || null;
   if (supplied) history.replaceState(null, "", location.pathname + location.search);
+  try {
+    if (params.has("t")) sessionStorage.setItem(LINK_SLOT, JSON.stringify({ t: token }));
+    else if (tabLink && !tabLink.t) sessionStorage.removeItem(LINK_SLOT);
+  } catch (_) {
+    // If storage is blocked, keep the only usable copy for reloads.
+    if (params.has("t")) history.replaceState(null, "", location.pathname + location.search + "#t=" + encodeURIComponent(token));
+  }
   const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
   const bar = document.getElementById("bar");
   const tabsEl = document.getElementById("tabs");
@@ -247,62 +247,97 @@
     stage.innerHTML = '<div id="message"><img src="assets/icon.png" alt=""><div></div></div>';
     stage.querySelector("#message div").textContent = text;
   };
-  if (!token && !keyText) {
-    showMessage("Open the complete link from Kaku on your Mac once, then bookmark this page in this browser.");
-    return;
-  }
-  if (keyText && !(window.crypto && crypto.subtle)) {
-    showMessage("This browser cannot open an encrypted Kaku link.");
+  const relay = !token;
+  if (relay && !(window.crypto && crypto.subtle && window.indexedDB)) {
+    showMessage("This browser cannot open an encrypted Kaku connection.");
     return;
   }
 
-  // ── Transport ──────────────────────────────────────────────────────────
+  // ── Pairing ────────────────────────────────────────────────────────────
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   const fromBase64Url = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
-  let rawKey = null;
-  if (keyText) {
-    try {
-      if (typeof keyText !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(keyText)) throw new Error();
-      rawKey = fromBase64Url(keyText);
-      if (rawKey.length !== 32) throw new Error();
-    } catch (_) {
-      forgetLink();
-      showMessage("This link is invalid. Copy the complete link from Kaku on the Mac.");
+  const sameBytes = (a, b) => !!a && !!b && a.length === b.length && a.every((v, i) => v === b[i]);
+  const toBase64Url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  // This Mac's relay id, which both sides sign over.
+  const hostId = location.pathname.split("/").find((part) => /^[0-9a-f]{32}$/.test(part)) || "";
+  const DEVICE_SLOT = location.pathname;
+  const deviceStore = (mode, work) => new Promise((resolve, reject) => {
+    const open = indexedDB.open("kaku", 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("devices");
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const tx = open.result.transaction("devices", mode);
+      const req = work(tx.objectStore("devices"));
+      tx.oncomplete = () => { open.result.close(); resolve(req.result); };
+      tx.onerror = () => { open.result.close(); reject(tx.error); };
+    };
+  });
+  const loadDevice = () => deviceStore("readonly", (s) => s.get(DEVICE_SLOT)).catch(() => null);
+  const saveDevice = (device) => deviceStore("readwrite", (s) => s.put(device, DEVICE_SLOT));
+  const forgetDevice = () => deviceStore("readwrite", (s) => s.delete(DEVICE_SLOT)).catch(() => {});
+  const deviceName = () => {
+    const ua = navigator.userAgent;
+    const browser = /Edg\//.test(ua) ? "Edge" : /Firefox\//.test(ua) ? "Firefox"
+      : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "Browser";
+    const os = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android"
+      : /Mac OS X/.test(ua) ? "macOS" : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "";
+    return os ? `${browser} on ${os}` : browser;
+  };
+
+  // The browser's identity with this Mac: the Mac's public key and the
+  // browser's own key pair. `pairing` holds a link's secret until the Mac
+  // has admitted this browser, which is when the identity is saved.
+  let device = null;
+  let pairing = null;
+  if (relay) {
+    if (params.has("p") && params.has("m")) {
+      let macPub, secret;
+      try {
+        macPub = fromBase64Url(params.get("m"));
+        secret = fromBase64Url(params.get("p"));
+        if (macPub.length !== 65 || secret.length !== 16) throw new Error();
+      } catch (_) {
+        showMessage("This pairing link is incomplete. Run kaku remote on the Mac for a new one.");
+        return;
+      }
+      const known = await loadDevice();
+      // The same browser opening a new link keeps its key.
+      const keys = known && known.keys && sameBytes(known.macPub, macPub) ? known.keys
+        : await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
+      device = { macPub, keys, publicKey: new Uint8Array(await crypto.subtle.exportKey("raw", keys.publicKey)) };
+      pairing = { secret };
+    } else if (params.has("k")) {
+      showMessage("This link is from an earlier Kaku. Run kaku remote on the Mac to pair this browser.");
+      return;
+    } else {
+      const known = await loadDevice();
+      if (known && known.keys && known.macPub) device = known;
+    }
+    if (!device) {
+      showMessage("Pair this browser first: run kaku remote on the Mac and open the link it shows.");
       return;
     }
   }
-  if (supplied) {
-    try { sessionStorage.setItem(SECRET_SLOT, JSON.stringify({ t: token, k: keyText })); }
-    catch (_) {
-      // If storage is blocked, preserve the only usable copy for reloads.
-      history.replaceState(null, "", location.pathname + location.search + originalFragment);
-    }
-  }
-  let remembered = false;
-  let rememberAttempted = false;
-  const rememberLink = () => {
-    if (!keyText || rememberAttempted) return;
-    rememberAttempted = true;
-    try {
-      const previous = readLink(true);
-      localStorage.setItem(SECRET_SLOT, JSON.stringify({ k: keyText }));
-      remembered = true;
-      history.replaceState(null, "", location.pathname + location.search);
-      if (!previous || previous.k !== keyText) toast("Browser remembered. Bookmark this page.");
-    } catch (_) {
-      toast("Not saved. Keep the complete link.");
-    }
+  let paired = !pairing;
+  const finishPairing = () => {
+    if (!pairing) return;
+    pairing = null;
+    paired = true;
+    saveDevice({ macPub: device.macPub, keys: device.keys, publicKey: device.publicKey })
+      .then(() => toast("Paired. Bookmark this page to come back."))
+      .catch(() => toast("Paired for this tab only: this browser does not keep site data."));
   };
-  const keyPromise = rawKey
-    ? crypto.subtle.importKey("raw", rawKey, "AES-GCM", false, ["encrypt", "decrypt"])
-    : null;
+
+  // ── Transport ──────────────────────────────────────────────────────────
   const TO_HOST = enc.encode("kaku-web c2h");
   const FROM_HOST = enc.encode("kaku-web h2c");
+  const MAC_HELLO = "KCH3";
+  const PAGE_HELLO = "KCB3";
 
   const wsUrl = () => {
     const scheme = location.protocol === "https:" ? "wss://" : "ws://";
-    if (keyText) {
+    if (relay) {
       const base = location.pathname.endsWith("/") ? location.pathname : location.pathname + "/";
       return scheme + location.host + base + "ws";
     }
@@ -310,26 +345,77 @@
   };
 
   let ws = null;
-  // Through the relay, Kaku opens each connection with a random challenge
-  // in the clear, and the page answers in the clear with one of its own.
-  // Every message after that, both ways, is sealed with both challenges and
-  // its position in the stream, so the relay cannot replay a recorded
-  // connection in either direction, repeat or reorder messages, or move them
-  // between browsers. Nothing sealed is sent before the challenges.
-  const CHALLENGE_TAG = "KCH1";
-  const PAGE_CHALLENGE_TAG = "KCB2";
+  // Through the relay, each connection starts with a fresh ECDH exchange:
+  // Kaku sends its ephemeral key in the clear, the page answers with its
+  // own, and both derive one AES-GCM key per direction. Kaku then signs the
+  // exchange with the key this browser paired with, so the page only talks
+  // to that Mac, and the page signs it with its device key (adding the
+  // pairing link's proof the first time), so Kaku only talks to a paired
+  // browser. Every message is bound to its direction and position, and
+  // nothing the page queues is sent before both signatures.
   let link = null;
   const newLink = () => {
     let ready;
     const promise = new Promise((resolve) => { ready = resolve; });
-    return { challenge: null, sendSeq: 0, recvSeq: 0, ready, promise };
+    return { keys: null, transcript: null, verified: false, sendSeq: 0, recvSeq: 0, ready, promise };
   };
-  const aad = (label, challenge, seq) => {
-    const out = new Uint8Array(label.length + challenge.length + 8);
+  const aad = (label, seq) => {
+    const out = new Uint8Array(label.length + 8);
     out.set(label);
-    out.set(challenge, label.length);
-    new DataView(out.buffer).setBigUint64(label.length + challenge.length, BigInt(seq));
+    new DataView(out.buffer).setBigUint64(label.length, BigInt(seq));
     return out;
+  };
+  const seal = async (conn, json) => {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const additionalData = aad(TO_HOST, conn.sendSeq++);
+    const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData }, conn.keys.toHost, enc.encode(json)));
+    const out = new Uint8Array(12 + sealed.length);
+    out.set(iv);
+    out.set(sealed, 12);
+    return out;
+  };
+  const exchange = async (socket, conn, bytes) => {
+    if (bytes.length !== 69 || dec.decode(bytes.slice(0, 4)) !== MAC_HELLO) throw new Error("no hello");
+    const macEph = bytes.slice(4);
+    const mine = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+    const pageEph = new Uint8Array(await crypto.subtle.exportKey("raw", mine.publicKey));
+    const hello = new Uint8Array(69);
+    hello.set(enc.encode(PAGE_HELLO));
+    hello.set(pageEph, 4);
+    if (socket.readyState === WebSocket.OPEN) socket.send(hello);
+    const label = enc.encode("kaku-remote v3");
+    const id = enc.encode(hostId);
+    const all = new Uint8Array(label.length + id.length + 130);
+    all.set(label);
+    all.set(id, label.length);
+    all.set(macEph, label.length + id.length);
+    all.set(pageEph, label.length + id.length + 65);
+    conn.transcript = new Uint8Array(await crypto.subtle.digest("SHA-256", all));
+    const peer = await crypto.subtle.importKey("raw", macEph, { name: "ECDH", namedCurve: "P-256" }, false, []);
+    const shared = await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, mine.privateKey, 256);
+    const hkdf = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveKey"]);
+    const derive = (info) => crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: conn.transcript, info: enc.encode(info) },
+      hkdf, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    conn.keys = { toHost: await derive("kaku c2h"), fromHost: await derive("kaku h2c") };
+  };
+  // Kaku's signature checks out: prove this browser, then let queued
+  // messages go.
+  const prove = async (socket, conn, sig) => {
+    const macKey = await crypto.subtle.importKey("raw", device.macPub, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    const genuine = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, macKey, fromBase64Url(sig), conn.transcript);
+    if (!genuine) throw new Error("not this Mac");
+    const signed = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, device.keys.privateKey, conn.transcript);
+    const proof = { type: "auth", device: toBase64Url(device.publicKey), sig: toBase64Url(signed) };
+    if (pairing) {
+      const secret = await crypto.subtle.importKey("raw", pairing.secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      proof.type = "pair";
+      proof.proof = toBase64Url(await crypto.subtle.sign("HMAC", secret, conn.transcript));
+      proof.name = deviceName();
+    }
+    const sealed = await seal(conn, JSON.stringify(proof));
+    if (socket.readyState === WebSocket.OPEN) socket.send(sealed);
+    conn.verified = true;
+    conn.ready();
   };
   // Sealing and opening are async; chain them so messages keep their order.
   let sendChain = Promise.resolve();
@@ -342,51 +428,38 @@
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     if (INPUT_TYPES.has(msg.type)) closePast();
     const json = JSON.stringify(msg);
-    if (!keyPromise) { socket.send(json); return; }
+    if (!relay) { socket.send(json); return; }
     const conn = link;
     sendChain = sendChain.then(async () => {
-      const key = await keyPromise;
-      const iv = crypto.getRandomValues(new Uint8Array(12));
-      const additionalData = aad(TO_HOST, conn.challenge, conn.sendSeq++);
-      const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData }, key, enc.encode(json)));
-      const out = new Uint8Array(12 + sealed.length);
-      out.set(iv);
-      out.set(sealed, 12);
+      const out = await seal(conn, json);
       if (socket.readyState === WebSocket.OPEN) socket.send(out);
     }).catch(() => {});
   };
+  let notThisMac = null;
   const receive = (socket, data, handle) => {
-    if (!keyPromise) { handle(JSON.parse(data)); return; }
+    if (!relay) { handle(JSON.parse(data)); return; }
     const conn = link;
     recvChain = recvChain.then(async () => {
       const bytes = new Uint8Array(data);
-      if (!conn.challenge) {
-        const tag = dec.decode(bytes.slice(0, 4));
-        if (bytes.length !== 20 || tag !== CHALLENGE_TAG) throw new Error("no challenge");
-        const page = crypto.getRandomValues(new Uint8Array(16));
-        const answer = new Uint8Array(20);
-        answer.set(enc.encode(PAGE_CHALLENGE_TAG));
-        answer.set(page, 4);
-        if (socket.readyState === WebSocket.OPEN) socket.send(answer);
-        conn.challenge = new Uint8Array(32);
-        conn.challenge.set(bytes.slice(4));
-        conn.challenge.set(page, 16);
-        conn.ready();
-        return;
-      }
-      const key = await keyPromise;
+      if (!conn.keys) { await exchange(socket, conn, bytes); return; }
       let plain;
       try {
-        plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12), additionalData: aad(FROM_HOST, conn.challenge, conn.recvSeq++) }, key, bytes.slice(12));
+        plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12), additionalData: aad(FROM_HOST, conn.recvSeq++) }, conn.keys.fromHost, bytes.slice(12));
       } catch (_) {
-        // A wrong key is reported by Kaku itself (close code 4403); a
-        // message that does not open here was altered or replayed on the
-        // way, so start over on a fresh connection.
+        // Altered or replayed on the way: start over on a fresh connection.
         throw new Error("sealed message did not open");
       }
-      handle(JSON.parse(dec.decode(plain)));
+      const msg = JSON.parse(dec.decode(plain));
+      if (!conn.verified) {
+        if (msg.type !== "mac_auth") throw new Error("not this Mac");
+        await prove(socket, conn, msg.sig);
+        return;
+      }
+      handle(msg);
     }).catch((err) => {
-      if (/did not open|no challenge/.test(err && err.message)) { if (ws === socket) socket.close(); return; }
+      const why = err && err.message;
+      if (why === "not this Mac" && notThisMac) { notThisMac(socket); return; }
+      if (/did not open|no hello/.test(why)) { if (ws === socket) socket.close(); return; }
       console.error("kaku web:", err);
     });
   };
@@ -410,7 +483,7 @@
   let everConnected = false;
   // Connecting and offline pages carry the Kaku mark, and on a relay link
   // say that what passes through it is sealed end to end.
-  noticeEl.querySelector(".trust").classList.toggle("on", !!keyText);
+  noticeEl.querySelector(".trust").classList.toggle("on", relay);
   // "link": about the connection, cleared as soon as Kaku answers.
   // "tabs": about what Kaku has open, cleared only when that changes.
   let noticeKind = "link";
@@ -1504,7 +1577,7 @@
   }
   const toggleHelp = (on = !helpEl.classList.contains("show")) => {
     helpEl.classList.toggle("show", on);
-    if (keyText && on) {
+    if (relay && on) {
       let note = helpList.querySelector(".connection-note");
       if (!note) {
         note = document.createElement("dd");
@@ -1512,9 +1585,9 @@
         note.style.gridColumn = "1 / -1";
         helpList.append(note);
       }
-      note.textContent = remembered
-        ? "Bookmark this address to return in this browser. On a new browser, open the complete link from your Mac."
-        : "Keep the complete link from your Mac until this browser remembers the connection.";
+      note.textContent = paired
+        ? "Bookmark this address to return in this browser. To add another browser, run kaku remote on the Mac."
+        : "Pairing this browser with the Mac.";
     }
     if (!on) term.focus();
   };
@@ -2309,7 +2382,7 @@
   // Through the relay the page's own address answers 404 while the Mac's
   // Kaku is not connected, and fails outright without a network.
   const explainOffline = () => {
-    if (!keyPromise) {
+    if (!relay) {
       setNotice("Kaku is not running", "This page reconnects when it is back.", { stale: true, brand: true });
       return;
     }
@@ -2337,7 +2410,7 @@
     pingSentAt = 0;
     framesSeen = 0;
     link = newLink();
-    sendChain = keyPromise ? link.promise : Promise.resolve();
+    sendChain = relay ? link.promise : Promise.resolve();
     recvChain = Promise.resolve();
     socket.onopen = () => {
       // A WebSocket upgrade is not an authenticated Kaku session. Through
@@ -2357,7 +2430,7 @@
           retry = 0;
           everConnected = true;
           clearNotice();
-          rememberLink();
+          finishPairing();
         }
         handle(msg);
       });
@@ -2368,8 +2441,17 @@
       closePast();
       if (ev.code === 4403 || ev.code === 1008) {
         linkRejected = true;
-        forgetLink();
-        setNotice("This link no longer works", "Copy the current link from Kaku on the Mac.", { stale: true });
+        if (!relay) {
+          setNotice("This link no longer works", "Run kaku remote on the Mac for the current link.", { stale: true });
+          return;
+        }
+        if (paired) forgetDevice();
+        setNotice("This browser is not paired", "Run kaku remote on the Mac and open the link it shows.", { stale: true });
+        return;
+      }
+      if (ev.code === 4401) {
+        linkRejected = true;
+        setNotice("This pairing link has expired", "Run kaku remote on the Mac for a new one. Each link works once.", { stale: true });
         return;
       }
       if (ev.code === 4426) {
@@ -2421,6 +2503,13 @@
       if (ws === socket && pingSentAt > lastHeard) socket.close();
     }, 3000);
   });
+  // A signature that does not match the paired Mac: someone in between, or
+  // the Mac was reset. Stop rather than retry.
+  notThisMac = (socket) => {
+    linkRejected = true;
+    if (ws === socket) socket.close();
+    setNotice("Could not verify the Mac", "If you reset Kaku's remote access, run kaku remote to pair again.", { stale: true });
+  };
 })();
 </script>
 </body>

@@ -1,22 +1,23 @@
-//! One shareable web link per Kaku, reached through the relay.
+//! This Kaku, reached through the relay by the browsers paired with it.
 //!
 //! Kaku keeps a share identity on disk: a secret that registers this Mac with
-//! the relay and a key that seals every message end to end. The relay knows
-//! the Mac only by the SHA-256 of the secret, so holding the link (which
-//! carries that id and the key) does not let anyone register as this Mac,
-//! and the relay only ever forwards sealed bytes. Resetting the identity
-//! retires the old link at once: the running Kaku notices the new file and
-//! re-registers under the new id.
+//! the relay and a key that signs each connection's exchange (see
+//! `pairing`). The relay knows the Mac only by the SHA-256 of the secret, so
+//! nobody else can register as this Mac, and it only ever forwards sealed
+//! bytes. Resetting the identity forgets every paired browser: the running
+//! Kaku notices the new file and re-registers under the new id.
 
+use crate::pairing::{self, Exchange, MacKey, PageAuth, SessionKeys};
 use crate::web::{self, WebDirty};
 use anyhow::Context;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
+use ring::aead::{Aad, LessSafeKey, Nonce, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -49,19 +50,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct ShareIdentity {
     /// Registers this Mac with the relay. Never leaves the Mac.
     secret: String,
-    /// AES-256-GCM key, base64url. Travels only in the link's fragment.
-    key: String,
+    /// This Mac's ECDSA P-256 signing key, PKCS#8 base64url. Never leaves the
+    /// Mac; pairing links carry its public half. Identities from before
+    /// pairing have none (and a `key` field that is no longer read) and get
+    /// one on load.
+    #[serde(default)]
+    mac_key: String,
 }
 
 impl ShareIdentity {
     fn generate() -> anyhow::Result<Self> {
         let mut secret = [0u8; 32];
-        let mut key = [0u8; 32];
         getrandom::fill(&mut secret).context("random secret")?;
-        getrandom::fill(&mut key).context("random key")?;
         Ok(Self {
             secret: hex(&secret),
-            key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key),
+            mac_key: pairing::generate_mac_key()?,
         })
     }
 
@@ -71,18 +74,26 @@ impl ShareIdentity {
         hex(&digest.as_ref()[..16])
     }
 
-    fn sealing_key(&self) -> anyhow::Result<LessSafeKey> {
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&self.key)
-            .context("decode share key")?;
-        let key = UnboundKey::new(&AES_256_GCM, &raw)
-            .map_err(|_| anyhow::anyhow!("share key has the wrong length"))?;
-        Ok(LessSafeKey::new(key))
+    fn mac_key(&self) -> anyhow::Result<MacKey> {
+        MacKey::from_text(&self.mac_key)
     }
 
-    /// The page link for a relay at `relay_url` (ws:// or wss://).
-    pub fn link(&self, relay_url: &str) -> String {
-        format!("{}/{}/#k={}", http_base(relay_url), self.id(), self.key)
+    /// This Mac's page through the relay at `relay_url` (ws:// or wss://).
+    /// Opening it pairs nothing; a paired browser bookmarks it.
+    pub fn page_url(&self, relay_url: &str) -> String {
+        format!("{}/{}/", http_base(relay_url), self.id())
+    }
+
+    /// A link that pairs one more browser, once, within
+    /// `pairing::OFFER_LIFETIME`; it replaces any earlier unused one.
+    pub fn pairing_link(&self, relay_url: &str) -> anyhow::Result<String> {
+        let secret = pairing::new_offer()?;
+        let mac = self.mac_key()?;
+        Ok(format!(
+            "{}{}",
+            self.page_url(relay_url),
+            pairing::pairing_fragment(mac.public_key(), &secret)
+        ))
     }
 }
 
@@ -121,7 +132,11 @@ fn write_identity(identity: &ShareIdentity) -> anyhow::Result<()> {
 
 /// This Kaku's share identity, created on first use.
 pub fn load_or_create_identity() -> anyhow::Result<ShareIdentity> {
-    if let Some(identity) = read_identity() {
+    if let Some(mut identity) = read_identity() {
+        if identity.mac_key.is_empty() {
+            identity.mac_key = pairing::generate_mac_key()?;
+            write_identity(&identity)?;
+        }
         return Ok(identity);
     }
     let identity = ShareIdentity::generate()?;
@@ -129,56 +144,36 @@ pub fn load_or_create_identity() -> anyhow::Result<ShareIdentity> {
     Ok(identity)
 }
 
-/// Replace the identity; the old link stops working once the running Kaku
-/// re-registers, within a few seconds.
+/// Replace the identity and forget every paired browser; their sessions end
+/// once the running Kaku re-registers, within a few seconds.
 pub fn reset_identity() -> anyhow::Result<ShareIdentity> {
     let identity = ShareIdentity::generate()?;
     write_identity(&identity)?;
+    pairing::forget_all_devices()?;
     Ok(identity)
 }
 
 // ── Sealing ───────────────────────────────────────────────────────────────────
 
-/// Sent in the clear to each browser as it connects: `CHALLENGE_TAG` and 16
-/// random bytes. The page answers in the clear with `PAGE_CHALLENGE_TAG` and
-/// 16 random bytes of its own. Every message after that, both ways, is sealed
-/// with both challenges and its position in the stream as associated data, so
-/// the relay cannot replay a recorded connection in either direction (each
-/// side picks a fresh challenge), repeat or reorder messages within one, or
-/// move them to another browser. Altering either challenge only breaks that
-/// connection.
-const CHALLENGE_TAG: &[u8; 4] = b"KCH1";
-const PAGE_CHALLENGE_TAG: &[u8; 4] = b"KCB2";
-type Challenge = [u8; 16];
-
-/// What a message is bound to besides the key: its direction, the
-/// challenges of its browser connection and its position. Pages from before
-/// the page challenge bind only the Mac's (`KCH1`), and pages older still
-/// nothing (`None`); both are kept only to recognize such a page and ask it
-/// to reload, never to run a session.
-fn aad(label: &[u8], binding: Option<(&[u8], u64)>) -> Vec<u8> {
+/// What a message is bound to besides its connection's key: its direction
+/// and its position, so the relay cannot reflect, repeat or reorder messages.
+/// Each connection has its own keys, so nothing moves between connections.
+fn aad(label: &[u8], seq: u64) -> Vec<u8> {
     let mut aad = label.to_vec();
-    if let Some((challenges, seq)) = binding {
-        aad.extend_from_slice(challenges);
-        aad.extend_from_slice(&seq.to_be_bytes());
-    }
+    aad.extend_from_slice(&seq.to_be_bytes());
     aad
-}
-
-/// The Mac's challenge followed by the page's: what a session binds to.
-fn bound_challenges(mac: &Challenge, page: &Challenge) -> [u8; 32] {
-    let mut both = [0u8; 32];
-    both[..16].copy_from_slice(mac);
-    both[16..].copy_from_slice(page);
-    both
 }
 
 fn seal(key: &LessSafeKey, rng: &SystemRandom, aad: &[u8], plain: &[u8]) -> Option<Vec<u8>> {
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill(&mut nonce).ok()?;
     let mut buf = plain.to_vec();
-    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut buf)
-        .ok()?;
+    key.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce),
+        Aad::from(aad),
+        &mut buf,
+    )
+    .ok()?;
     let mut out = Vec::with_capacity(NONCE_LEN + buf.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&buf);
@@ -196,10 +191,131 @@ fn open(key: &LessSafeKey, aad: &[u8], sealed: &[u8]) -> Option<String> {
     String::from_utf8(plain.to_vec()).ok()
 }
 
-fn new_challenge(rng: &SystemRandom) -> Option<Challenge> {
-    let mut challenge = [0u8; 16];
-    rng.fill(&mut challenge).ok()?;
-    Some(challenge)
+// ── One browser's connection ──────────────────────────────────────────────────
+
+/// Where a browser's connection is. Kaku sends its hello when the browser
+/// connects; the page answers with its own, Kaku signs the exchange, the page
+/// proves it is a paired device (or pairs with a link), and only then does a
+/// session start. Nothing reaches the terminal before that.
+enum Stage {
+    Hello(Exchange),
+    Proof {
+        transcript: [u8; 32],
+        keys: Arc<SessionKeys>,
+    },
+    Session {
+        keys: Arc<SessionKeys>,
+        device: String,
+        inbox: Option<mpsc::Sender<String>>,
+    },
+    Gone,
+}
+
+struct Browser {
+    stage: Stage,
+    /// Position of the next message expected from this browser.
+    next_in: u64,
+    connected_at: tokio::time::Instant,
+}
+
+/// What to do with a browser after its latest message.
+enum Step {
+    Nothing,
+    /// Send it these bytes.
+    Send(Vec<u8>),
+    /// Turn it away with this close code.
+    Close(u16),
+    /// It proved it is `device` (`new`: paired just now); start its session.
+    Admitted {
+        device: pairing::Device,
+        new: bool,
+    },
+    /// A message for its session.
+    Input(String),
+}
+
+/// The page's first message is its hello; one that is not (a `KCB2`
+/// challenge, or a sealed message straight away) is a page from before
+/// pairing, open across an update. It is told to reload, which shows the
+/// new page and its pairing prompt.
+const OLD_PAGE: u16 = 4426;
+
+fn advance(
+    browser: &mut Browser,
+    data: &[u8],
+    host_id: &str,
+    mac_key: &MacKey,
+    rng: &SystemRandom,
+    store: &mut dyn pairing::DeviceStore,
+) -> Step {
+    match std::mem::replace(&mut browser.stage, Stage::Gone) {
+        Stage::Hello(exchange) => {
+            if !data.starts_with(pairing::PAGE_HELLO) {
+                return Step::Close(OLD_PAGE);
+            }
+            let Some((transcript, keys)) = exchange.finish(host_id, data) else {
+                return Step::Close(4403);
+            };
+            let Some(sig) = mac_key.sign(&transcript) else {
+                return Step::Close(4403);
+            };
+            let auth = serde_json::json!({
+                "type": "mac_auth",
+                "sig": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig),
+            })
+            .to_string();
+            let Some(sealed) = seal(&keys.from_host, rng, &aad(FROM_HOST, 0), auth.as_bytes())
+            else {
+                return Step::Close(4403);
+            };
+            browser.stage = Stage::Proof {
+                transcript,
+                keys: Arc::new(keys),
+            };
+            Step::Send(sealed)
+        }
+        Stage::Proof { transcript, keys } => {
+            let Some(text) = open(&keys.to_host, &aad(TO_HOST, browser.next_in), data) else {
+                return Step::Close(4403);
+            };
+            browser.next_in += 1;
+            let Ok(auth) = serde_json::from_str::<PageAuth>(&text) else {
+                return Step::Close(4403);
+            };
+            match pairing::admit(&auth, &transcript, store) {
+                Ok((device, new)) => {
+                    browser.stage = Stage::Session {
+                        keys,
+                        device: device.id.clone(),
+                        inbox: None,
+                    };
+                    Step::Admitted { device, new }
+                }
+                Err(refusal) => Step::Close(refusal.close_code()),
+            }
+        }
+        Stage::Session {
+            keys,
+            device,
+            inbox,
+        } => {
+            let opened = open(&keys.to_host, &aad(TO_HOST, browser.next_in), data);
+            browser.stage = Stage::Session {
+                keys,
+                device,
+                inbox,
+            };
+            match opened {
+                Some(text) => {
+                    browser.next_in += 1;
+                    Step::Input(text)
+                }
+                // Tampered, replayed or out of order.
+                None => Step::Close(4403),
+            }
+        }
+        Stage::Gone => Step::Nothing,
+    }
 }
 
 // ── Relay framing ─────────────────────────────────────────────────────────────
@@ -287,17 +403,6 @@ async fn deliver_input(inbox: &mpsc::Sender<String>, text: String, limit: Durati
     )
 }
 
-struct Browser {
-    challenge: Challenge,
-    /// The page's own challenge, from its first frame.
-    page_challenge: Option<Challenge>,
-    /// Position of the next message expected from this browser.
-    next_in: u64,
-    /// None until a message opens with the key.
-    inbox: Option<mpsc::Sender<String>>,
-    connected_at: tokio::time::Instant,
-}
-
 type RelaySocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -322,7 +427,7 @@ async fn serve(
     dirty: &WebDirty,
     connected_at: &mut Option<tokio::time::Instant>,
 ) -> anyhow::Result<()> {
-    let key = identity.sealing_key()?;
+    let mac_key = identity.mac_key()?;
     let id = identity.id();
     let mut request = format!("{}/host/{id}", relay_url.trim_end_matches('/'))
         .into_client_request()
@@ -349,7 +454,6 @@ async fn serve(
         }
     });
 
-    let key = std::sync::Arc::new(key);
     let rng = SystemRandom::new();
     let mut browsers: HashMap<u32, Browser> = HashMap::new();
     let mut identity_check = tokio::time::interval(IDENTITY_CHECK);
@@ -371,17 +475,14 @@ async fn serve(
                 match msg {
                     Message::Text(text) => match serde_json::from_str::<RelayMsg>(text.as_str()) {
                         Ok(RelayMsg::Open { c }) => {
-                            let Some(challenge) = new_challenge(&rng) else { continue };
-                            let mut hello = CHALLENGE_TAG.to_vec();
-                            hello.extend_from_slice(&challenge);
+                            let Some(exchange) = Exchange::new(&rng) else { continue };
+                            let hello = exchange.hello();
                             if to_relay.try_send(Message::Binary(frame(KIND_DATA, c, &hello).into())).is_err() {
                                 break Err(anyhow::anyhow!("relay output queue is full"));
                             }
                             browsers.insert(c, Browser {
-                                challenge,
-                                page_challenge: None,
+                                stage: Stage::Hello(exchange),
                                 next_in: 0,
-                                inbox: None,
                                 connected_at: tokio::time::Instant::now(),
                             });
                         }
@@ -408,59 +509,37 @@ async fn serve(
                         }
                         let c = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
                         let Some(browser) = browsers.get_mut(&c) else { continue };
-                        let sealed = &bytes[5..];
-                        let Some(page_challenge) = browser.page_challenge else {
-                            if let Some(page) = sealed.strip_prefix(PAGE_CHALLENGE_TAG.as_slice()) {
-                                if let Ok(page) = Challenge::try_from(page) {
-                                    browser.page_challenge = Some(page);
-                                    continue;
+                        let step = advance(browser, &bytes[5..], &id, &mac_key, &rng, &mut pairing::DiskStore);
+                        let text = match step {
+                            Step::Nothing => continue,
+                            Step::Send(bytes) => {
+                                if to_relay.try_send(Message::Binary(frame(KIND_DATA, c, &bytes).into())).is_err() {
+                                    break Err(anyhow::anyhow!("relay output queue is full"));
                                 }
+                                continue;
                             }
-                            // No page challenge: a page from before it, open
-                            // across an update. Tell it to reload, sealed the
-                            // way it can read, instead of calling its key
-                            // wrong, which would make it forget the key. Such
-                            // a page never gets a session, so stripping a new
-                            // page's challenge gains the relay nothing.
-                            let mac = browser.challenge;
-                            browsers.remove(&c);
-                            let legacy = [Some((mac.as_slice(), 0u64)), None]
-                                .into_iter()
-                                .find(|binding| open(&key, &aad(TO_HOST, *binding), sealed).is_some());
-                            let code = match legacy {
-                                Some(binding) => {
-                                    let reload = br#"{"type":"error","detail":"Kaku on the Mac was updated. Reload this page."}"#;
-                                    if let Some(sealed) = seal(&key, &rng, &aad(FROM_HOST, binding), reload) {
-                                        let _ = to_relay.try_send(Message::Binary(frame(KIND_DATA, c, &sealed).into()));
-                                    }
-                                    4426
+                            Step::Close(code) => {
+                                browsers.remove(&c);
+                                if to_relay.try_send(close_browser(c, code)).is_err() {
+                                    break Err(anyhow::anyhow!("relay output queue is full"));
                                 }
-                                None => 4403,
-                            };
-                            if to_relay.try_send(close_browser(c, code)).is_err() {
-                                break Err(anyhow::anyhow!("relay output queue is full"));
+                                continue;
                             }
-                            continue;
-                        };
-                        let both = bound_challenges(&browser.challenge, &page_challenge);
-                        let opened = open(&key, &aad(TO_HOST, Some((&both, browser.next_in))), sealed);
-                        let Some(text) = opened else {
-                            browsers.remove(&c);
-                            // Wrong key, tampered, replayed or out of order.
-                            if to_relay.try_send(close_browser(c, 4403)).is_err() {
-                                break Err(anyhow::anyhow!("relay output queue is full"));
+                            Step::Admitted { device, new } => {
+                                if new {
+                                    log::info!("kaku-share: paired {} ({})", device.name, device.id);
+                                    pairing::announce(&device);
+                                }
+                                if let Stage::Session { keys, inbox, .. } = &mut browser.stage {
+                                    // Kaku's own signature was message 0.
+                                    *inbox = Some(start_session(c, keys.clone(), 1, dirty.clone(), to_relay.clone()));
+                                }
+                                continue;
                             }
-                            continue;
+                            Step::Input(text) => text,
                         };
-                        browser.next_in += 1;
-                        let inbox = match &browser.inbox {
-                            Some(inbox) => inbox.clone(),
-                            None => {
-                                let inbox = start_session(c, both, dirty.clone(), key.clone(), to_relay.clone());
-                                browser.inbox = Some(inbox.clone());
-                                inbox
-                            }
-                        };
+                        let Stage::Session { inbox: Some(inbox), .. } = &browser.stage else { continue };
+                        let inbox = inbox.clone();
                         // A burst of typing may briefly fill the mailbox while
                         // the session awaits the GUI. Preserve it, but never
                         // wait indefinitely and starve heartbeat/reset work.
@@ -484,12 +563,17 @@ async fn serve(
                 }
             }
             _ = identity_check.tick() => {
-                let expired: Vec<u32> = browsers.iter().filter_map(|(&id, browser)| {
-                    (browser.inbox.is_none() && browser.connected_at.elapsed() >= AUTH_TIMEOUT).then_some(id)
+                let paired = pairing::paired_ids();
+                let ended: Vec<(u32, u16)> = browsers.iter().filter_map(|(&c, browser)| match &browser.stage {
+                    // Removed with `kaku remote revoke`: end its session.
+                    Stage::Session { device, .. } if !paired.contains(device) => Some((c, 4403)),
+                    Stage::Session { .. } => None,
+                    _ if browser.connected_at.elapsed() >= AUTH_TIMEOUT => Some((c, 4408)),
+                    _ => None,
                 }).collect();
-                for c in expired {
+                for (c, code) in ended {
                     browsers.remove(&c);
-                    if to_relay.try_send(close_browser(c, 4408)).is_err() {
+                    if to_relay.try_send(close_browser(c, code)).is_err() {
                         break 'connection Err(anyhow::anyhow!("relay output queue is full"));
                     }
                 }
@@ -507,12 +591,13 @@ async fn serve(
     result
 }
 
-/// Start the session for browser `c`; returns where its messages go.
+/// Start the session for browser `c`; returns where its messages go. Kaku's
+/// messages to it are numbered from `first_seq`.
 fn start_session(
     c: u32,
-    challenges: [u8; 32],
+    keys: Arc<SessionKeys>,
+    first_seq: u64,
     dirty: WebDirty,
-    key: std::sync::Arc<LessSafeKey>,
     to_relay: mpsc::Sender<Message>,
 ) -> mpsc::Sender<String> {
     let (inbox, session_in) = mpsc::channel::<String>(64);
@@ -520,9 +605,10 @@ fn start_session(
     tokio::spawn(web::run_session(session_in, session_out, dirty));
     tokio::spawn(async move {
         let rng = SystemRandom::new();
-        let mut seq = 0u64;
+        let mut seq = first_seq;
         while let Some(text) = replies.recv().await {
-            let Some(sealed) = seal(&key, &rng, &aad(FROM_HOST, Some((&challenges, seq))), text.as_bytes()) else {
+            let Some(sealed) = seal(&keys.from_host, &rng, &aad(FROM_HOST, seq), text.as_bytes())
+            else {
                 break;
             };
             seq += 1;
@@ -632,54 +718,271 @@ mod tests {
     }
 
     #[test]
-    fn link_carries_id_and_key_in_fragment() {
+    fn the_pairing_fragment_carries_the_mac_key_but_no_secret_of_the_mac() {
         let a = identity();
-        let link = a.link("wss://relay.example.com/");
+        let mac = a.mac_key().unwrap();
         assert_eq!(
-            link,
-            format!("https://relay.example.com/{}/#k={}", a.id(), a.key)
+            a.page_url("wss://relay.example.com/"),
+            format!("https://relay.example.com/{}/", a.id())
         );
-        assert!(!link.contains(&a.secret));
+        let fragment = pairing::pairing_fragment(mac.public_key(), "c2VjcmV0");
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        assert_eq!(fragment, format!("#p=c2VjcmV0&m={}", b64(mac.public_key())));
+        assert!(!fragment.contains(&a.secret) && !fragment.contains(&a.mac_key));
     }
 
     #[test]
-    fn sealed_messages_open_only_in_their_direction_connection_and_place() {
-        let key = identity().sealing_key().unwrap();
+    fn sealed_messages_open_only_in_their_direction_and_place() {
         let rng = SystemRandom::new();
-        let mac = new_challenge(&rng).unwrap();
-        let page = new_challenge(&rng).unwrap();
-        let ch = bound_challenges(&mac, &page);
-        let other_ch = bound_challenges(&new_challenge(&rng).unwrap(), &page);
-        let msg = seal(&key, &rng, &aad(TO_HOST, Some((&ch, 0))), b"ls\r").unwrap();
-        assert_eq!(open(&key, &aad(TO_HOST, Some((&ch, 0))), &msg).as_deref(), Some("ls\r"));
-        // Reflected back as if the Mac sent it.
-        assert!(open(&key, &aad(FROM_HOST, Some((&ch, 0))), &msg).is_none());
-        // Replayed later in the same connection, or into another one.
-        assert!(open(&key, &aad(TO_HOST, Some((&ch, 1))), &msg).is_none());
-        assert!(open(&key, &aad(TO_HOST, Some((&other_ch, 0))), &msg).is_none());
-        // Recognizable as an old page only when it was sealed the old way.
-        assert!(open(&key, &aad(TO_HOST, None), &msg).is_none());
-        assert!(open(&key, &aad(TO_HOST, Some((&mac, 0))), &msg).is_none());
-        let old = seal(&key, &rng, &aad(TO_HOST, None), b"{}").unwrap();
-        assert!(open(&key, &aad(TO_HOST, None), &old).is_some());
-        assert!(open(&key, &aad(TO_HOST, Some((&ch, 0))), &old).is_none());
-        // Another key opens nothing.
-        let other = identity().sealing_key().unwrap();
-        assert!(open(&other, &aad(TO_HOST, Some((&ch, 0))), &msg).is_none());
+        let keys = exchanged().1;
+        let msg = seal(&keys.to_host, &rng, &aad(TO_HOST, 0), b"ls\r").unwrap();
+        assert_eq!(
+            open(&keys.to_host, &aad(TO_HOST, 0), &msg).as_deref(),
+            Some("ls\r")
+        );
+        // Reflected back as if the Mac sent it, or replayed later.
+        assert!(open(&keys.from_host, &aad(FROM_HOST, 0), &msg).is_none());
+        assert!(open(&keys.to_host, &aad(TO_HOST, 1), &msg).is_none());
+        // Another connection's keys open nothing.
+        assert!(open(&exchanged().1.to_host, &aad(TO_HOST, 0), &msg).is_none());
     }
 
-    /// The relay records a whole connection, then replays the Mac's side to a
-    /// new page: the page picked a fresh challenge, so nothing opens. Before
-    /// the page challenge only the Mac's was bound, and this replay opened.
-    #[test]
-    fn a_recorded_mac_stream_does_not_open_for_a_new_page() {
-        let key = identity().sealing_key().unwrap();
+    use crate::pairing::tests::{MemoryStore, TestPage};
+    use crate::pairing::DeviceStore;
+
+    fn exchanged() -> ([u8; 32], SessionKeys) {
         let rng = SystemRandom::new();
-        let mac = new_challenge(&rng).unwrap();
-        let recorded = bound_challenges(&mac, &new_challenge(&rng).unwrap());
-        let frame = seal(&key, &rng, &aad(FROM_HOST, Some((&recorded, 0))), b"{}").unwrap();
-        let replayed_to = bound_challenges(&mac, &new_challenge(&rng).unwrap());
-        assert!(open(&key, &aad(FROM_HOST, Some((&replayed_to, 0))), &frame).is_none());
-        assert!(open(&key, &aad(FROM_HOST, Some((&recorded, 0))), &frame).is_some());
+        let mac = Exchange::new(&rng).unwrap();
+        let page = TestPage::new();
+        mac.finish("host", &page.hello()).unwrap()
+    }
+
+    struct Fixture {
+        identity: ShareIdentity,
+        mac_key: MacKey,
+        store: MemoryStore,
+        rng: SystemRandom,
+    }
+
+    /// A browser connected to Kaku, holding the keys its page derived.
+    struct Connected {
+        browser: Browser,
+        keys: SessionKeys,
+        transcript: [u8; 32],
+        device: MacKey,
+        sent: u64,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let identity = identity();
+            let mac_key = identity.mac_key().unwrap();
+            Self {
+                identity,
+                mac_key,
+                store: MemoryStore::default(),
+                rng: SystemRandom::new(),
+            }
+        }
+
+        fn step(&mut self, browser: &mut Browser, data: &[u8]) -> Step {
+            let id = self.identity.id();
+            advance(
+                browser,
+                data,
+                &id,
+                &self.mac_key,
+                &self.rng,
+                &mut self.store,
+            )
+        }
+
+        /// Connect a page and check Kaku's signature the way the page does.
+        fn connect(&mut self) -> Connected {
+            let exchange = Exchange::new(&self.rng).unwrap();
+            let mac_hello = exchange.hello();
+            let mut browser = Browser {
+                stage: Stage::Hello(exchange),
+                next_in: 0,
+                connected_at: tokio::time::Instant::now(),
+            };
+            let page = TestPage::new();
+            let Step::Send(signed) = self.step(&mut browser, &page.hello()) else {
+                panic!("Kaku answers the page's hello with its signature");
+            };
+            let (transcript, keys, device) = page.finish(&self.identity.id(), &mac_hello);
+            let auth = open(&keys.from_host, &aad(FROM_HOST, 0), &signed).unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            assert_eq!(auth["type"], "mac_auth");
+            let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(auth["sig"].as_str().unwrap())
+                .unwrap();
+            assert!(pairing::verify(
+                self.mac_key.public_key(),
+                &transcript,
+                &sig
+            ));
+            Connected {
+                browser,
+                keys,
+                transcript,
+                device,
+                sent: 0,
+            }
+        }
+
+        fn send(&mut self, conn: &mut Connected, text: &str) -> Step {
+            let sealed = seal(
+                &conn.keys.to_host,
+                &self.rng,
+                &aad(TO_HOST, conn.sent),
+                text.as_bytes(),
+            )
+            .unwrap();
+            conn.sent += 1;
+            self.step(&mut conn.browser, &sealed)
+        }
+
+        fn pair(&mut self, conn: &Connected) -> String {
+            let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            let id = pairing::device_id(conn.device.public_key());
+            self.store.add(pairing::Device {
+                id: id.clone(),
+                public_key: b64(conn.device.public_key()),
+                name: String::new(),
+                paired_at: 0,
+                last_seen: 0,
+            });
+            id
+        }
+    }
+
+    fn sign_in(conn: &Connected) -> String {
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        serde_json::json!({
+            "type": "auth",
+            "device": b64(conn.device.public_key()),
+            "sig": b64(&conn.device.sign(&conn.transcript).unwrap()),
+        })
+        .to_string()
+    }
+
+    fn join(conn: &Connected, secret: &[u8]) -> String {
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let proof = ring::hmac::sign(
+            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret),
+            &conn.transcript,
+        );
+        serde_json::json!({
+            "type": "pair",
+            "device": b64(conn.device.public_key()),
+            "sig": b64(&conn.device.sign(&conn.transcript).unwrap()),
+            "proof": b64(proof.as_ref()),
+            "name": "Safari on iPhone",
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_paired_browser_reaches_its_session_and_nothing_replays() {
+        let mut fx = Fixture::new();
+        let mut conn = fx.connect();
+        let id = fx.pair(&conn);
+        let Step::Admitted { device, new } = ({
+            let m = sign_in(&conn);
+            fx.send(&mut conn, &m)
+        }) else {
+            panic!("a paired device signs in");
+        };
+        assert_eq!((device.id, new), (id, false));
+        // Its session takes input in order; a replayed message ends it.
+        assert!(matches!(
+            fx.send(&mut conn, r#"{"type":"ping"}"#),
+            Step::Input(_)
+        ));
+        conn.sent -= 1;
+        assert!(matches!(
+            fx.send(&mut conn, r#"{"type":"ping"}"#),
+            Step::Close(4403)
+        ));
+    }
+
+    #[test]
+    fn a_pairing_link_admits_a_new_browser_which_then_signs_in_without_it() {
+        let mut fx = Fixture::new();
+        fx.store.offer = Some((vec![1u8; 16], false));
+        let mut conn = fx.connect();
+        let Step::Admitted { device, new } = ({
+            let m = join(&conn, &[1u8; 16]);
+            fx.send(&mut conn, &m)
+        }) else {
+            panic!("a pairing link admits the browser");
+        };
+        assert!(new);
+        assert_eq!(device.name, "Safari on iPhone");
+        let mut again = fx.connect();
+        again.device = conn.device;
+        let Step::Admitted { device: same, new } = ({
+            let m = sign_in(&again);
+            fx.send(&mut again, &m)
+        }) else {
+            panic!("the paired browser signs in later");
+        };
+        assert_eq!((same.id, new), (device.id, false));
+    }
+
+    #[test]
+    fn an_unpaired_browser_never_reaches_a_session() {
+        let mut fx = Fixture::new();
+        let mut conn = fx.connect();
+        assert!(matches!(
+            {
+                let m = sign_in(&conn);
+                fx.send(&mut conn, &m)
+            },
+            Step::Close(4403)
+        ));
+        // Skipping the proof and going straight to the terminal is refused too.
+        let mut conn = fx.connect();
+        assert!(matches!(
+            fx.send(&mut conn, r#"{"type":"hello","frame_ack":true}"#),
+            Step::Close(4403)
+        ));
+    }
+
+    #[test]
+    fn a_used_or_wrong_pairing_link_gets_its_own_close_code() {
+        let mut fx = Fixture::new();
+        let mut conn = fx.connect();
+        assert!(matches!(
+            {
+                let m = join(&conn, &[1u8; 16]);
+                fx.send(&mut conn, &m)
+            },
+            Step::Close(4401)
+        ));
+        fx.store.offer = Some((vec![1u8; 16], true));
+        let mut conn = fx.connect();
+        assert!(matches!(
+            {
+                let m = join(&conn, &[1u8; 16]);
+                fx.send(&mut conn, &m)
+            },
+            Step::Close(4401)
+        ));
+    }
+
+    #[test]
+    fn a_page_from_before_pairing_is_told_to_reload() {
+        let mut fx = Fixture::new();
+        let exchange = Exchange::new(&fx.rng).unwrap();
+        let mut browser = Browser {
+            stage: Stage::Hello(exchange),
+            next_in: 0,
+            connected_at: tokio::time::Instant::now(),
+        };
+        let mut old = b"KCB2".to_vec();
+        old.extend_from_slice(&[0u8; 16]);
+        assert!(matches!(fx.step(&mut browser, &old), Step::Close(OLD_PAGE)));
     }
 }

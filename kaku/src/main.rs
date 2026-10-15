@@ -108,6 +108,18 @@ impl CompletionGenerator for Shell {
     }
 }
 
+#[cfg(feature = "remote")]
+#[derive(Debug, Parser, Clone)]
+enum RemoteAction {
+    /// List the browsers paired with this Kaku
+    Devices,
+    /// Remove a paired browser; its open sessions end within seconds
+    Revoke {
+        /// The id `kaku remote devices` shows
+        id: String,
+    },
+}
+
 #[derive(Debug, Parser, Clone)]
 enum SubCommand {
     #[command(
@@ -185,12 +197,14 @@ enum SubCommand {
     #[command(
         name = "remote",
         hide = true,
-        about = "Show this Kaku's web link, to open its terminals from another device"
+        about = "Pair a browser with this Kaku, to open its terminals from another device"
     )]
     Remote {
-        /// Replace the link; the old one stops working within seconds
+        /// Start over: a new identity, and every paired browser removed
         #[arg(long)]
         reset: bool,
+        #[command(subcommand)]
+        action: Option<RemoteAction>,
     },
 
     /// Generate shell completion information
@@ -299,6 +313,53 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
     terminate_with_error_message(&format!("{:#}", err));
 }
 
+#[cfg(feature = "remote")]
+fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
+    match action {
+        Some(RemoteAction::Devices) => {
+            let devices = kaku_remote::list_devices();
+            if devices.is_empty() {
+                println!("No paired browsers. Run `kaku remote` to pair one.");
+            }
+            for device in devices {
+                println!("{}  {}", device.id, device.name);
+            }
+            return Ok(());
+        }
+        Some(RemoteAction::Revoke { id }) => {
+            if !kaku_remote::revoke_device(&id)? {
+                anyhow::bail!("no paired browser {id}; see `kaku remote devices`");
+            }
+            println!("Removed {id}. Its open sessions end within a few seconds.");
+            return Ok(());
+        }
+        None => {}
+    }
+    let identity = if reset {
+        kaku_remote::reset_identity()?
+    } else {
+        kaku_remote::load_or_create_identity()?
+    };
+    let state = kaku_remote::read_state()?;
+    let Some(relay) = &state.tunnel_relay else {
+        // Without the relay the page is only reachable on this Mac, and its
+        // token changes with every Kaku launch.
+        let url = format!("http://127.0.0.1:{}/#t={}", state.port, state.token);
+        println!("{}", kaku_remote::render_qr_terminal(&url));
+        return Ok(());
+    };
+    if reset {
+        println!("Every paired browser was removed.");
+    }
+    let url = identity.pairing_link(relay)?;
+    println!("{}", kaku_remote::render_qr_terminal(&url));
+    println!(
+        "Open this link in the browser to pair. It works once, for {} minutes.",
+        kaku_remote::OFFER_LIFETIME.as_secs() / 60
+    );
+    Ok(())
+}
+
 fn main() {
     config::designate_this_as_the_main_thread();
     config::assign_error_callback(mux::connui::show_configuration_error_message);
@@ -357,28 +418,7 @@ fn run() -> anyhow::Result<()> {
             cli::run_cli(&opts, cli)
         }
         #[cfg(feature = "remote")]
-        SubCommand::Remote { reset } => {
-            let identity = if reset {
-                kaku_remote::reset_identity()?
-            } else {
-                kaku_remote::load_or_create_identity()?
-            };
-            let state = kaku_remote::read_state()?;
-            let url = match &state.tunnel_relay {
-                Some(relay) => identity.link(relay),
-                // Without the relay the page is only reachable on this Mac,
-                // and its token changes with every Kaku launch.
-                None => format!("http://127.0.0.1:{}/#t={}", state.port, state.token),
-            };
-            println!("{}", kaku_remote::render_qr_terminal(&url));
-            if state.tunnel_relay.is_some() {
-                println!("Open this complete link once, then bookmark the short address in that browser.");
-            }
-            if reset {
-                println!("The previous link stops working within a few seconds.");
-            }
-            Ok(())
-        }
+        SubCommand::Remote { reset, action } => run_remote(reset, action),
         SubCommand::SetCwd(cmd) => cmd.run(),
         SubCommand::ShellCompletion { shell } => {
             use clap::CommandFactory;

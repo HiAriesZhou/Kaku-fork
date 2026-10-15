@@ -141,9 +141,20 @@ async function until(fn, ms = 15000) {
     const legacyBase = `http://127.0.0.1:${relay}/t/${id}/`;
     await until(async () => (await fetch(legacyBase)).ok);
     await until(async () => (await fetch(relayBase)).ok);
-    const bad = await browser.newPage();
-    await bad.goto(relayBase + '#k=' + crypto.randomBytes(32).toString('base64url'));
-    await bad.waitForFunction(() => document.querySelector('#notice .title')?.textContent === 'This link no longer works');
+    const cli = (...args) => new Promise((resolve, reject) => {
+      const child = spawn(path.join(app, 'Contents/MacOS/kaku'), args, {
+        env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), TMPDIR: path.join(home, 'tmp/') },
+      });
+      let out = '';
+      child.stdout.on('data', d => { out += d; });
+      child.once('error', reject);
+      child.once('exit', code => code === 0 ? resolve(out) : reject(new Error(`kaku ${args.join(' ')} exited ${code}: ${out}`)));
+    });
+    const pairingLink = async () => (await cli('remote')).split('\n').find(line => line.includes('#p='));
+    // Without pairing, the page says how to pair and opens no socket.
+    const unpaired = await browser.newPage();
+    await unpaired.goto(relayBase);
+    assert.match(await unpaired.locator('#stage').innerText(), /Pair this browser first/);
     const encryptedContext = await browser.newContext();
     const encrypted = await encryptedContext.newPage();
     await encrypted.addInitScript(() => {
@@ -153,10 +164,17 @@ async function until(fn, ms = 15000) {
         constructor(...args) { super(...args); window.__testSockets.push(this); }
       };
     });
-    await encrypted.goto(relayBase + '#k=' + identity.key);
+    const link = await pairingLink();
+    assert.ok(link.startsWith(relayBase + '#p='), link);
+    await encrypted.goto(link);
     await encrypted.waitForSelector('body.drawn');
-    await encrypted.waitForFunction(() => localStorage.getItem('kaku.link:' + location.pathname));
     assert.equal(new URL(encrypted.url()).hash, '');
+    await until(async () => (await cli('remote', 'devices')).includes(' on '));
+    const deviceId = (await cli('remote', 'devices')).trim().split(/\s+/)[0];
+    // The link worked once: another browser opening it is turned away.
+    const latecomer = await (await browser.newContext()).newPage();
+    await latecomer.goto(link);
+    await latecomer.waitForFunction(() => document.querySelector('#notice .title')?.textContent === 'This pairing link has expired');
     const returning = await encrypted.context().newPage();
     await returning.goto(relayBase);
     await returning.waitForSelector('body.drawn');
@@ -164,10 +182,7 @@ async function until(fn, ms = 15000) {
     if (process.env.KAKU_TEST_SCREENSHOTS) {
       fs.mkdirSync(process.env.KAKU_TEST_SCREENSHOTS, { recursive: true });
       await encrypted.setViewportSize({ width: 375, height: 700 });
-      await encrypted.screenshot({ path: path.join(process.env.KAKU_TEST_SCREENSHOTS, 'remembered-phone.png') });
-      await encrypted.locator('button[title^="Shortcuts"]').click();
-      await encrypted.screenshot({ path: path.join(process.env.KAKU_TEST_SCREENSHOTS, 'connection-help-phone.png') });
-      await encrypted.keyboard.press('Escape');
+      await encrypted.screenshot({ path: path.join(process.env.KAKU_TEST_SCREENSHOTS, 'paired-phone.png') });
       await encrypted.setViewportSize({ width: 1280, height: 900 });
     }
     await encrypted.locator('.xterm-helper-textarea').focus();
@@ -212,17 +227,24 @@ async function until(fn, ms = 15000) {
     const idleClosed = new Promise(resolve => idle.once('close', code => resolve(code)));
     assert.equal(await Promise.race([idleClosed, sleep(21000).then(() => 'timeout')]), 4408);
 
-    // Each relay connection is bound to the Mac's challenge, the page's own
-    // and a position: a recorded message replayed on a new connection, one
-    // out of place, or one sealed the old way never reaches a session.
-    const key = Buffer.from(identity.key, 'base64url');
-    const sealFor = (label, challenge, seq, json) => {
+    // A raw browser speaking the pairing protocol with node's crypto, the
+    // way the page does with WebCrypto: Kaku's signature checks out against
+    // the key the pairing link carries, a device Kaku never paired is
+    // refused, and nothing recorded or out of place reaches a session.
+    const macPub = Buffer.from(new URLSearchParams(new URL(link).hash.slice(1)).get('m'), 'base64url');
+    const rawPub = key => { const jwk = key.export({ format: 'jwk' }); return Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]); };
+    const aadFor = (label, seq) => { const out = Buffer.alloc(label.length + 8); Buffer.from(label).copy(out); out.writeBigUInt64BE(BigInt(seq), label.length); return out; };
+    const sealWith = (key, label, seq, json) => {
       const iv = crypto.randomBytes(12);
       const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-      const aad = challenge ? Buffer.alloc(label.length + challenge.length + 8) : Buffer.from(label);
-      if (challenge) { Buffer.from(label).copy(aad); challenge.copy(aad, label.length); aad.writeBigUInt64BE(BigInt(seq), label.length + challenge.length); }
-      cipher.setAAD(aad);
+      cipher.setAAD(aadFor(label, seq));
       return Buffer.concat([iv, cipher.update(json), cipher.final(), cipher.getAuthTag()]);
+    };
+    const openWith = (key, label, seq, frame) => {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, frame.subarray(0, 12));
+      decipher.setAAD(aadFor(label, seq));
+      decipher.setAuthTag(frame.subarray(frame.length - 16));
+      return Buffer.concat([decipher.update(frame.subarray(12, frame.length - 16)), decipher.final()]).toString();
     };
     const rawBrowser = async ({ answer = true } = {}) => {
       const socket = new WebSocket(`ws://127.0.0.1:${relay}/${id}/ws`);
@@ -232,33 +254,43 @@ async function until(fn, ms = 15000) {
       const closed = new Promise(resolve => socket.once('close', code => resolve(code)));
       await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
       const first = await until(() => inbox[0]);
-      assert.equal(first.subarray(0, 4).toString(), 'KCH1');
-      const mac = first.subarray(4);
-      if (!answer) return { socket, closed, inbox, challenge: mac };
-      const page = crypto.randomBytes(16);
-      socket.send(Buffer.concat([Buffer.from('KCB2'), page]));
-      return { socket, closed, inbox, challenge: Buffer.concat([mac, page]) };
+      assert.equal(first.subarray(0, 4).toString(), 'KCH3');
+      if (!answer) return { socket, closed, inbox };
+      const macEph = first.subarray(4);
+      const ecdh = crypto.createECDH('prime256v1');
+      const pageEph = ecdh.generateKeys();
+      socket.send(Buffer.concat([Buffer.from('KCB3'), pageEph]));
+      const transcript = crypto.createHash('sha256').update('kaku-remote v3').update(id).update(macEph).update(pageEph).digest();
+      const shared = ecdh.computeSecret(macEph);
+      const derive = info => Buffer.from(crypto.hkdfSync('sha256', shared, transcript, info, 32));
+      const keys = { toHost: derive('kaku c2h'), fromHost: derive('kaku h2c') };
+      const auth = JSON.parse(openWith(keys.fromHost, 'kaku-web h2c', 0, await until(() => inbox[1])));
+      const macKey = crypto.createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: macPub.subarray(1, 33).toString('base64url'), y: macPub.subarray(33).toString('base64url') }, format: 'jwk' });
+      assert.equal(auth.type, 'mac_auth');
+      assert.ok(crypto.verify('sha256', transcript, { key: macKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(auth.sig, 'base64url')), 'Kaku signs the exchange with the paired key');
+      return { socket, closed, inbox, keys, transcript };
     };
-    const hello = '{"type":"hello","frame_ack":true}';
-    const accepted = await rawBrowser();
-    const recorded = sealFor('kaku-web c2h', accepted.challenge, 0, hello);
-    accepted.socket.send(recorded);
-    await until(() => accepted.inbox.length > 1);
-    accepted.socket.close();
+    const stranger = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const signIn = (conn, device) => JSON.stringify({ type: 'auth', device: rawPub(device.publicKey).toString('base64url'),
+      sig: crypto.sign('sha256', conn.transcript, { key: device.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url') });
+    const unknown = await rawBrowser();
+    unknown.socket.send(sealWith(unknown.keys.toHost, 'kaku-web c2h', 0, signIn(unknown, stranger)));
+    assert.equal(await Promise.race([unknown.closed, sleep(5000).then(() => 'timeout')]), 4403);
+    const recorded = sealWith(unknown.keys.toHost, 'kaku-web c2h', 0, signIn(unknown, stranger));
     const replay = await rawBrowser();
     replay.socket.send(recorded);
     assert.equal(await Promise.race([replay.closed, sleep(5000).then(() => 'timeout')]), 4403);
     const misplaced = await rawBrowser();
-    misplaced.socket.send(sealFor('kaku-web c2h', misplaced.challenge, 1, hello));
+    misplaced.socket.send(sealWith(misplaced.keys.toHost, 'kaku-web c2h', 1, signIn(misplaced, stranger)));
     assert.equal(await Promise.race([misplaced.closed, sleep(5000).then(() => 'timeout')]), 4403);
-    // Pages from before the page challenge, or before any challenge, are
-    // asked to reload rather than told their key is wrong.
-    const macOnlyPage = await rawBrowser({ answer: false });
-    macOnlyPage.socket.send(sealFor('kaku-web c2h', macOnlyPage.challenge, 0, hello));
-    assert.equal(await Promise.race([macOnlyPage.closed, sleep(5000).then(() => 'timeout')]), 4426);
+    // A page from before pairing, open across the update, is asked to reload.
     const oldPage = await rawBrowser({ answer: false });
-    oldPage.socket.send(sealFor('kaku-web c2h', null, 0, hello));
+    oldPage.socket.send(Buffer.concat([Buffer.from('KCB2'), crypto.randomBytes(16)]));
     assert.equal(await Promise.race([oldPage.closed, sleep(5000).then(() => 'timeout')]), 4426);
+
+    // Revoking the paired browser ends its session within seconds.
+    await cli('remote', 'revoke', deviceId);
+    await encrypted.waitForFunction(() => document.querySelector('#notice .title')?.textContent === 'This browser is not paired', undefined, { timeout: 10000 });
 
     // Replacing a host retires its browser immediately, even if old output
     // was queued. Use a separate synthetic identity, never the app's link.
@@ -302,9 +334,10 @@ async function until(fn, ms = 15000) {
     const resetExit = await new Promise(resolve => reset.once('exit', resolve));
     assert.equal(resetExit, 0);
     await until(async () => (await fetch(relayBase)).status === 404);
-    assert.notEqual(JSON.parse(fs.readFileSync(identityPath)).key, identity.key);
+    assert.notEqual(JSON.parse(fs.readFileSync(identityPath)).mac_key, identity.mac_key);
+    assert.equal((await cli('remote', 'devices')).includes(' on '), false);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ localTerminal: 'pass', foreignHostRefused: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', wrongKey: 'pass', idleAuthentication: 'pass', replayRejected: 'pass', oldPageAskedToReload: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass', rememberedNewTab: 'pass', resetRevokesLink: 'pass' }));
+    console.log(JSON.stringify({ localTerminal: 'pass', foreignHostRefused: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', pairingLinkOnce: 'pass', unknownDeviceRefused: 'pass', macSignatureVerified: 'pass', idleAuthentication: 'pass', replayRejected: 'pass', oldPageAskedToReload: 'pass', revokeEndsSession: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass', pairedNewTab: 'pass', resetForgetsDevices: 'pass' }));
   } finally {
     for (const ws of sockets) ws.terminate();
     await browser?.close();

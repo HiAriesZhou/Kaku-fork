@@ -14,9 +14,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 mod awake;
+mod pairing;
 mod share;
 mod web;
 
+pub use pairing::{list_devices, revoke_device, Device, OFFER_LIFETIME};
 pub use share::{load_or_create_identity, reset_identity, ShareIdentity};
 pub use web::{
     publish_tab_title, release_web_size, set_tab_action_handler, tab_is_web_sized,
