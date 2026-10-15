@@ -434,6 +434,23 @@ enum WebClientMsg {
     UploadEnd {
         id: u32,
     },
+    /// Send a file on the Mac to the browser: a path in the output that the
+    /// user Cmd+clicked. `~/` is the home folder and a relative path is read
+    /// from the pane's working directory. Chunks follow a `FileStart` and
+    /// wait for `DownloadAck`s, so the relay never holds much of the file.
+    Download {
+        id: u32,
+        path: String,
+        #[serde(default)]
+        pane_id: Option<usize>,
+    },
+    DownloadAck {
+        id: u32,
+        received: u64,
+    },
+    DownloadCancel {
+        id: u32,
+    },
     SplitPane {
         pane_id: usize,
         direction: config::keyassignment::PaneDirection,
@@ -538,6 +555,24 @@ enum WebServerMsg<'a> {
     Uploaded {
         id: u32,
         ok: bool,
+        detail: &'a str,
+    },
+    /// A file the page asked for: its name and size, then base64 chunks in
+    /// order and `FileEnd`, or `FileError` instead.
+    FileStart {
+        id: u32,
+        name: &'a str,
+        size: u64,
+    },
+    FileChunk {
+        id: u32,
+        data: &'a str,
+    },
+    FileEnd {
+        id: u32,
+    },
+    FileError {
+        id: u32,
         detail: &'a str,
     },
     /// Text a program in the attached pane copied, for the browser clipboard.
@@ -669,6 +704,154 @@ impl Drop for Uploads {
             let _ = std::fs::remove_file(&upload.path);
         }
     }
+}
+
+/// Files on their way to the browser, by the page's id.
+#[derive(Default)]
+struct Downloads(HashMap<u32, Download>);
+
+struct Download {
+    file: std::fs::File,
+    size: u64,
+    sent: u64,
+    acked: u64,
+}
+
+const DOWNLOAD_CHUNK: usize = 256 << 10;
+/// Bytes sent but not yet acknowledged: the relay holds at most this much
+/// of a file for one browser, well under its per-browser budget.
+const DOWNLOAD_WINDOW: u64 = 1 << 20;
+const MAX_DOWNLOAD_BYTES: u64 = 50 << 20;
+
+/// Where a path the user clicked points: `~` is the home folder, and a
+/// relative path is taken from the pane's working directory.
+fn download_path(path: &str, cwd: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let path = path.trim();
+    if path == "~" {
+        return Some(config::HOME_DIR.clone());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return Some(config::HOME_DIR.join(rest));
+    }
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    cwd.map(|cwd| cwd.join(path))
+}
+
+/// Open a file for the browser; only regular files up to the size cap.
+fn open_download(path: &std::path::Path) -> Result<(std::fs::File, String, u64), String> {
+    let shown =
+        path.display()
+            .to_string()
+            .replacen(&config::HOME_DIR.display().to_string(), "~", 1);
+    let meta = std::fs::metadata(path).map_err(|_| format!("{shown} was not found"))?;
+    if meta.is_dir() {
+        return Err(format!("{shown} is a folder"));
+    }
+    if !meta.is_file() {
+        return Err(format!("{shown} is not a file"));
+    }
+    if meta.len() > MAX_DOWNLOAD_BYTES {
+        return Err(format!("{shown} is larger than 50 MB"));
+    }
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot read {shown}: {e}"))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    Ok((file, name, meta.len()))
+}
+
+/// The next messages for a download: chunks while the window has room,
+/// then `FileEnd` once everything was sent. Returns whether it is done.
+fn pump_download(id: u32, download: &mut Download, out: &mut Vec<String>) -> bool {
+    use base64::Engine as _;
+    use std::io::Read as _;
+    while download.sent < download.size && download.sent - download.acked < DOWNLOAD_WINDOW {
+        let want = DOWNLOAD_CHUNK.min((download.size - download.sent) as usize);
+        let mut buf = vec![0u8; want];
+        if let Err(e) = download.file.read_exact(&mut buf) {
+            if let Some(json) = encode(&WebServerMsg::FileError {
+                id,
+                detail: &format!("read failed: {e}"),
+            }) {
+                out.push(json);
+            }
+            return true;
+        }
+        download.sent += want as u64;
+        let data = base64::engine::general_purpose::STANDARD.encode(&buf);
+        if let Some(json) = encode(&WebServerMsg::FileChunk { id, data: &data }) {
+            out.push(json);
+        }
+    }
+    if download.sent >= download.size {
+        if let Some(json) = encode(&WebServerMsg::FileEnd { id }) {
+            out.push(json);
+        }
+        return true;
+    }
+    false
+}
+
+/// Apply one download message; the messages to send back, or None when the
+/// message is not about downloads.
+fn handle_download(
+    msg: &WebClientMsg,
+    downloads: &mut HashMap<u32, Download>,
+    cwd: impl FnOnce(Option<usize>) -> Option<std::path::PathBuf>,
+) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    match msg {
+        WebClientMsg::Download { id, path, pane_id } => {
+            let opened = download_path(path, cwd(*pane_id))
+                .ok_or_else(|| format!("{path}: no working directory to find it from"))
+                .and_then(|path| open_download(&path));
+            match opened {
+                Ok((file, name, size)) => {
+                    if let Some(json) = encode(&WebServerMsg::FileStart {
+                        id: *id,
+                        name: &name,
+                        size,
+                    }) {
+                        out.push(json);
+                    }
+                    let mut download = Download {
+                        file,
+                        size,
+                        sent: 0,
+                        acked: 0,
+                    };
+                    if !pump_download(*id, &mut download, &mut out) {
+                        downloads.insert(*id, download);
+                    }
+                }
+                Err(detail) => {
+                    if let Some(json) = encode(&WebServerMsg::FileError {
+                        id: *id,
+                        detail: &detail,
+                    }) {
+                        out.push(json);
+                    }
+                }
+            }
+        }
+        WebClientMsg::DownloadAck { id, received } => {
+            if let Some(download) = downloads.get_mut(id) {
+                download.acked = download.acked.max((*received).min(download.sent));
+                if pump_download(*id, download, &mut out) {
+                    downloads.remove(id);
+                }
+            }
+        }
+        WebClientMsg::DownloadCancel { id } => {
+            downloads.remove(id);
+        }
+        _ => return None,
+    }
+    Some(out)
 }
 
 /// The outcome of an upload step that the page should hear about.
@@ -1761,7 +1944,10 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
         | WebClientMsg::UploadStart { .. }
         | WebClientMsg::UploadChunk { .. }
         | WebClientMsg::UploadCancel { .. }
-        | WebClientMsg::UploadEnd { .. } => Ok(()),
+        | WebClientMsg::UploadEnd { .. }
+        | WebClientMsg::Download { .. }
+        | WebClientMsg::DownloadAck { .. }
+        | WebClientMsg::DownloadCancel { .. } => Ok(()),
         WebClientMsg::Resize { cols, rows } => {
             let cols = cols.clamp(MIN_COLS, MAX_COLS);
             let rows = rows.clamp(MIN_ROWS, MAX_ROWS);
@@ -1825,6 +2011,7 @@ pub(crate) async fn run_session(
     // Image files this browser already has.
     let mut sent_images: HashSet<String> = HashSet::new();
     let mut uploads = Uploads::default();
+    let mut downloads = Downloads::default();
     let mut next_render = tokio::time::Instant::now();
     let mut idle = tokio::time::interval(IDLE_REFRESH);
     let mut last_heard = std::time::Instant::now();
@@ -1865,6 +2052,20 @@ pub(crate) async fn run_session(
                     let Some(json) = encode(&WebServerMsg::Pong) else { continue };
                     if outbox.send(json).await.is_err() {
                         break;
+                    }
+                    continue;
+                }
+                let cwd = |pane_id: Option<usize>| {
+                    let pane = pane_id.or(attached).and_then(lookup_pane)?;
+                    pane.get_current_working_dir(mux::pane::CachePolicy::AllowStale)?
+                        .to_file_path()
+                        .ok()
+                };
+                if let Some(replies) = handle_download(&msg, &mut downloads.0, cwd) {
+                    for json in replies {
+                        if outbox.send(json).await.is_err() {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -2436,6 +2637,106 @@ mod tests {
         assert_eq!(newer, Some((12, 5, 5)));
         // Wide characters take two cells.
         assert_eq!(find_in_rows(&rows, "中文", None, true), Some((12, 0, 4)));
+    }
+
+    #[test]
+    fn clicked_paths_resolve_from_home_and_the_pane() {
+        let home = config::HOME_DIR.clone();
+        assert_eq!(
+            download_path("~/Desktop/a.png", None),
+            Some(home.join("Desktop/a.png"))
+        );
+        assert_eq!(download_path("/tmp/a.png", None), Some("/tmp/a.png".into()));
+        assert_eq!(
+            download_path("out/a.png", Some("/work".into())),
+            Some("/work/out/a.png".into())
+        );
+        // A relative path with no known working directory is not guessed.
+        assert_eq!(download_path("a.png", None), None);
+    }
+
+    #[test]
+    fn a_download_sends_a_bounded_window_and_the_exact_bytes() {
+        use base64::Engine as _;
+        let dir = std::env::temp_dir().join(format!("kaku-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shot.png");
+        let bytes: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut downloads = HashMap::new();
+        let parse = |out: Vec<String>| -> Vec<serde_json::Value> {
+            out.iter()
+                .map(|j| serde_json::from_str(j).unwrap())
+                .collect()
+        };
+        let request = WebClientMsg::Download {
+            id: 1,
+            path: path.display().to_string(),
+            pane_id: None,
+        };
+        let first = parse(handle_download(&request, &mut downloads, |_| None).unwrap());
+        assert_eq!(first[0]["type"], "file_start");
+        assert_eq!(first[0]["size"], 3_000_000);
+        let mut got = Vec::new();
+        let take = |got: &mut Vec<u8>, msgs: &[serde_json::Value]| {
+            for m in msgs.iter().filter(|m| m["type"] == "file_chunk") {
+                got.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(m["data"].as_str().unwrap())
+                        .unwrap(),
+                );
+            }
+        };
+        take(&mut got, &first);
+        // Nothing past the window goes out before the page acknowledges.
+        assert!(got.len() as u64 <= DOWNLOAD_WINDOW);
+        assert!(!first.iter().any(|m| m["type"] == "file_end"));
+        let mut ended = false;
+        for _ in 0..10 {
+            let ack = WebClientMsg::DownloadAck {
+                id: 1,
+                received: got.len() as u64,
+            };
+            let before = got.len();
+            let next = parse(handle_download(&ack, &mut downloads, |_| None).unwrap());
+            take(&mut got, &next);
+            assert!((got.len() - before) as u64 <= DOWNLOAD_WINDOW);
+            if next.iter().any(|m| m["type"] == "file_end") {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended);
+        assert_eq!(got, bytes);
+        assert!(downloads.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn folders_missing_and_huge_files_are_refused_by_name() {
+        let dir = std::env::temp_dir().join(format!("kaku-dl-refuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let huge = dir.join("huge.bin");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_DOWNLOAD_BYTES + 1)
+            .unwrap();
+        let refused = |path: &std::path::Path| {
+            let mut downloads = HashMap::new();
+            let msg = WebClientMsg::Download {
+                id: 9,
+                path: path.display().to_string(),
+                pane_id: None,
+            };
+            let out = handle_download(&msg, &mut downloads, |_| None).unwrap();
+            let reply: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+            assert_eq!(reply["type"], "file_error");
+            reply["detail"].as_str().unwrap().to_string()
+        };
+        assert!(refused(&dir).ends_with("is a folder"));
+        assert!(refused(&dir.join("missing.png")).ends_with("was not found"));
+        assert!(refused(&huge).ends_with("larger than 50 MB"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

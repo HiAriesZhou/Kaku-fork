@@ -577,6 +577,7 @@
     }
     return candidate.replace(/[.,;:!?]+$/, "");
   };
+  const PATH_RE = /(?<![\w:/.~-])(?:~|\.{1,2})?\/[^\s"'`<>|;()\[\]{}]+/g;
   term.registerLinkProvider({
     provideLinks(y, callback) {
       const line = term.buffer.active.getLine(y - 1);
@@ -595,15 +596,32 @@
         }
       }
       const links = [];
+      const range = (index, length) => {
+        const start = cols[index];
+        const end = cols[index + length - 1];
+        return { start: { x: start + 1, y }, end: { x: end + Math.max(1, line.getCell(end)?.getWidth() || 1), y } };
+      };
+      const urls = [];
       for (const m of text.matchAll(URL_RE)) {
         const uri = linkText(m[0]);
-        const start = cols[m.index];
-        const end = cols[m.index + uri.length - 1];
+        urls.push([m.index, m.index + uri.length]);
         links.push({
-          range: { start: { x: start + 1, y }, end: { x: end + Math.max(1, line.getCell(end)?.getWidth() || 1), y } },
+          range: range(m.index, uri.length),
           text: uri,
           activate: (ev, uri) => {
             if (ev.metaKey || ev.ctrlKey) window.open(uri, "_blank", "noopener");
+          },
+        });
+      }
+      // Paths on the Mac (~/..., /..., ./...): Cmd+click downloads the file.
+      for (const m of text.matchAll(PATH_RE)) {
+        const path = m[0].replace(/[.,:;!?]+$/, "");
+        if (path.length < 2 || urls.some(([a, b]) => m.index < b && m.index + path.length > a)) continue;
+        links.push({
+          range: range(m.index, path.length),
+          text: path,
+          activate: (ev, path) => {
+            if (ev.metaKey || ev.ctrlKey) download(path);
           },
         });
       }
@@ -2257,6 +2275,45 @@
       Notification.requestPermission().catch(() => {});
     };
   };
+  // Files fetched from the Mac (a path Cmd+clicked in the output). Kaku
+  // sends a bounded window of chunks and waits for acknowledgements, then
+  // the page saves the whole file through the browser's downloads.
+  let downloadSeq = 0;
+  const incoming = new Map();
+  const download = (path) => {
+    const id = ++downloadSeq;
+    incoming.set(id, { path, name: path.split("/").pop(), size: 0, received: 0, parts: [] });
+    toast(`Getting ${path.split("/").pop()}`, true);
+    send({ type: "download", id, path, pane_id: paneId });
+  };
+  const onFile = (msg) => {
+    const file = incoming.get(msg.id);
+    if (!file) return;
+    if (msg.type === "file_start") {
+      file.name = msg.name;
+      file.size = msg.size;
+    } else if (msg.type === "file_chunk") {
+      const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
+      file.parts.push(bytes);
+      file.received += bytes.length;
+      send({ type: "download_ack", id: msg.id, received: file.received });
+      toast(`Getting ${file.name} ${file.size ? Math.round((file.received / file.size) * 100) : 100}%`, true);
+    } else if (msg.type === "file_end") {
+      incoming.delete(msg.id);
+      const url = URL.createObjectURL(new Blob(file.parts));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.name;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      toast(`Downloaded ${file.name}`);
+    } else if (msg.type === "file_error") {
+      incoming.delete(msg.id);
+      toast(`Not downloaded: ${msg.detail}`);
+    }
+  };
   let uploadSeq = 0;
   const uploadWaiters = new Map();
   const CHUNK = 64 * 1024;
@@ -2378,6 +2435,7 @@
     else if (msg.type === "image") onImage(msg);
     else if (msg.type === "found") onFound(msg);
     else if (msg.type === "history") onHistory(msg);
+    else if (msg.type.startsWith("file_")) onFile(msg);
     else if (msg.type === "upload_ack") { const a = uploadAcks.get(msg.id); if (a) a(msg.received); }
     else if (msg.type === "uploaded") { const w = uploadWaiters.get(msg.id); if (w) { uploadWaiters.delete(msg.id); w(msg); } }
     else if (msg.type === "closed") {
@@ -2487,6 +2545,11 @@
         linkRejected = true;
         setNotice("Kaku on the Mac was updated", "Reload this page.", { stale: true });
         return;
+      }
+      // Kaku drops a download with its session; ask for the file again.
+      if (incoming.size) {
+        incoming.clear();
+        toast("Download stopped: the connection dropped. Cmd+click the path again.");
       }
       // A quick blip reconnects before anyone notices; say something only if
       // it lasts, and after a few failures say why when the page can tell.

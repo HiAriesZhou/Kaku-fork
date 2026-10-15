@@ -188,6 +188,33 @@ async function until(fn, ms = 15000) {
     await encrypted.locator('.xterm-helper-textarea').focus();
     await encrypted.keyboard.type('echo ENCRYPTED-OK\n');
     await encrypted.waitForFunction(() => [...document.querySelectorAll('.xterm-rows > div')].some(row => row.textContent.trim() === 'ENCRYPTED-OK'));
+    // Cmd+clicking a path in the output brings that file from the Mac,
+    // through the encrypted relay, as a browser download.
+    const fixture = Buffer.from(Array.from({ length: 1500000 }, (_, i) => (i * 7) % 256));
+    fs.writeFileSync(path.join(home, 'dl-fixture.bin'), fixture);
+    await encrypted.keyboard.type('echo "FILE ~/dl-fixture.bin"\n');
+    await encrypted.waitForFunction(() => [...document.querySelectorAll('.xterm-rows > div')].some(row => row.textContent.trim() === 'FILE ~/dl-fixture.bin'));
+    const spot = await encrypted.evaluate(() => {
+      const row = [...document.querySelectorAll('.xterm-rows > div')].find(r => r.textContent.trim() === 'FILE ~/dl-fixture.bin');
+      const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+      for (let node; (node = walker.nextNode());) {
+        const at = node.textContent.indexOf('fixture');
+        if (at < 0) continue;
+        const range = document.createRange();
+        range.setStart(node, at); range.setEnd(node, at + 1);
+        const r = range.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }
+      return null;
+    });
+    const fetched = encrypted.waitForEvent('download', { timeout: 30000 });
+    await encrypted.keyboard.down('Meta');
+    await encrypted.mouse.move(spot.x, spot.y);
+    await encrypted.mouse.click(spot.x, spot.y);
+    await encrypted.keyboard.up('Meta');
+    const got = await fetched;
+    assert.equal(got.suggestedFilename(), 'dl-fixture.bin');
+    assert.deepEqual(fs.readFileSync(await got.path()), fixture);
     // Exercise the actual browser uploader through encryption, including a
     // dropped connection after the Mac acknowledges part of the file.
     await encrypted.evaluate(() => {
@@ -337,7 +364,7 @@ async function until(fn, ms = 15000) {
     assert.notEqual(JSON.parse(fs.readFileSync(identityPath)).mac_key, identity.mac_key);
     assert.equal((await cli('remote', 'devices')).includes(' on '), false);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ localTerminal: 'pass', foreignHostRefused: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', pairingLinkOnce: 'pass', unknownDeviceRefused: 'pass', macSignatureVerified: 'pass', idleAuthentication: 'pass', replayRejected: 'pass', oldPageAskedToReload: 'pass', revokeEndsSession: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass', pairedNewTab: 'pass', resetForgetsDevices: 'pass' }));
+    console.log(JSON.stringify({ localTerminal: 'pass', foreignHostRefused: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', pairingLinkOnce: 'pass', unknownDeviceRefused: 'pass', macSignatureVerified: 'pass', idleAuthentication: 'pass', replayRejected: 'pass', oldPageAskedToReload: 'pass', revokeEndsSession: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', downloadByCmdClick: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass', pairedNewTab: 'pass', resetForgetsDevices: 'pass' }));
   } finally {
     for (const ws of sockets) ws.terminate();
     await browser?.close();

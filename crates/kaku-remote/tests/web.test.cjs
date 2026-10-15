@@ -37,7 +37,7 @@ async function page(t, hash = '#t=fixture', options = {}, context = browser) {
   });
   const html = fs.readFileSync(process.env.KAKU_WEB_SOURCE || path.join(root, 'crates/kaku-remote/assets/web/index.html'), 'utf8')
     .replace('term.registerLinkProvider({', 'term.registerLinkProvider(window.testLinkProvider = {')
-    .replace(/\}\)\(\);\s*<\/script>/, 'window.probe = {term, handle, attach, openPast, onHistory, pastScroll, sendFile, sendFiles, snapshots};\n})();\n</script>');
+    .replace(/\}\)\(\);\s*<\/script>/, 'window.probe = {term, handle, attach, openPast, onHistory, pastScroll, sendFile, sendFiles, snapshots, download};\n})();\n</script>');
   await p.route('http://localhost:9988/**', route => {
     const name = new URL(route.request().url()).pathname.split('/').pop();
     if (!name) return route.fulfill({ contentType: 'text/html', body: html });
@@ -302,6 +302,38 @@ test('connection help and first-use notice fit narrow and short viewports', asyn
     await p.keyboard.press('Escape');
     assert.equal(await p.locator('#toast').evaluate(el => el.scrollWidth <= el.clientWidth), true);
   }
+});
+
+test('Cmd+clicking a Mac path downloads the file in acknowledged chunks', async t => {
+  const { p, errors } = await page(t);
+  await screen(p, 'Saved to ~/Desktop/shot.png.');
+  // Hovering the path with Cmd shows it as a link; the click asks the Mac.
+  const box = await p.locator('.xterm-screen').boundingBox();
+  const cell = await p.evaluate(() => probe.term._core._renderService.dimensions.css.cell);
+  await p.keyboard.down('Meta');
+  await p.mouse.move(box.x + cell.width * 14.5, box.y + cell.height / 2);
+  await p.mouse.click(box.x + cell.width * 14.5, box.y + cell.height / 2);
+  await p.keyboard.up('Meta');
+  const request = await p.waitForFunction(() => messages.find(m => m.type === 'download'));
+  const { id, path: asked } = await request.jsonValue();
+  assert.equal(asked, '~/Desktop/shot.png');
+  const bytes = Buffer.from(Array.from({ length: 300000 }, (_, i) => i % 251));
+  const downloaded = p.waitForEvent('download');
+  await p.evaluate(({ id, chunks }) => {
+    probe.handle({ type: 'file_start', id, name: 'shot.png', size: chunks.reduce((n, c) => n + atob(c).length, 0) });
+    for (const data of chunks) probe.handle({ type: 'file_chunk', id, data });
+    probe.handle({ type: 'file_end', id });
+  }, { id, chunks: [bytes.subarray(0, 200000).toString('base64'), bytes.subarray(200000).toString('base64')] });
+  const file = await downloaded;
+  assert.equal(file.suggestedFilename(), 'shot.png');
+  assert.deepEqual(fs.readFileSync(await file.path()), bytes);
+  // Each chunk was acknowledged with the bytes held so far.
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'download_ack').map(m => m.received)), [200000, 300000]);
+  assert.match(await p.locator('#toast').innerText(), /Downloaded shot.png/);
+  // A refused path says why, and a dropped link does not leave it hanging.
+  await p.evaluate(() => probe.handle({ type: 'file_error', id: 99, detail: 'x' }));
+  await p.evaluate(id => probe.handle({ type: 'file_error', id, detail: '~/Desktop is a folder' }), id);
+  assert.deepEqual(errors, []);
 });
 
 test('local LAN token stays tab-only', async t => {
