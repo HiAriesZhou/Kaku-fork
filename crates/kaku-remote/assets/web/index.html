@@ -521,15 +521,44 @@
   term.open(termEl);
   // WebGL draws the grid on one canvas, so Claude Code redrawing several
   // times a second no longer rebuilds DOM rows and restarts CSS cursor
-  // animations. Without WebGL, or once the GPU drops the context, the DOM
-  // renderer takes over again.
-  if (window.WebglAddon) {
+  // animations. Without WebGL the DOM renderer draws instead.
+  //
+  // Browsers drop the GPU context of a background tab under memory
+  // pressure. The addon then waits about 3 s for it to come back before
+  // giving up, and meanwhile the grid is blank, or Chrome's lost-context
+  // image once output arrives: the garbled screen on returning to the tab.
+  // So the DOM renderer takes over the moment the context is lost, and
+  // WebGL comes back when the page is next in front, unless the GPU keeps
+  // dropping it.
+  let webgl = null;
+  let webglLosses = [];
+  const dropWebgl = () => {
+    if (!webgl) return;
+    const lost = webgl;
+    webgl = null;
+    webglLosses.push(Date.now());
+    // Not from inside the addon's own context-lost handler.
+    setTimeout(() => {
+      try { lost.dispose(); } catch (_) {}
+      term.refresh(0, term.rows - 1);
+    });
+  };
+  const useWebgl = () => {
+    if (!window.WebglAddon || webgl || document.hidden) return;
+    webglLosses = webglLosses.filter((at) => Date.now() - at < 600000);
+    if (webglLosses.length >= 3) return;
     try {
-      const webgl = new WebglAddon.WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
-      term.loadAddon(webgl);
+      const addon = new WebglAddon.WebglAddon();
+      addon.onContextLoss(dropWebgl);
+      term.loadAddon(addon);
+      webgl = addon;
+      for (const canvas of termEl.querySelectorAll("canvas")) {
+        canvas.addEventListener("webglcontextlost", dropWebgl, { once: true });
+      }
     } catch (_) {}
-  }
+  };
+  useWebgl();
+  document.addEventListener("visibilitychange", useWebgl);
 
   // Links: URLs in the screen open with Cmd+click (Ctrl+click off the Mac),
   // as in Kaku. Cells and string positions differ once a row holds wide

@@ -830,6 +830,36 @@ test('terminal menu fits narrow and short viewport corners', async t => {
   }
 });
 
+// A background tab can lose its GPU context. The DOM renderer must take
+// over at once (the addon itself waits about 3 s, showing a blank or broken
+// grid), and WebGL must come back once the page is in front again.
+test('a lost WebGL context hands the grid to the DOM at once and comes back', async t => {
+  const gpu = await chromium.launch(launchOptions());
+  t.after(() => gpu.close());
+  const { p, errors } = await page(t, '#t=fixture', {}, gpu);
+  const hasWebgl = await p.evaluate(() => !!document.createElement('canvas').getContext('webgl2'));
+  if (!hasWebgl) return t.skip('this Chromium has no WebGL2');
+  await p.evaluate(() => {
+    probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] });
+    probe.handle({ type: 'frame', seq: 1, pane_id: 1, cols: 80, rows: 24, data: '\x1b[2J\x1b[1;1HLOST-CONTEXT' });
+  });
+  await p.waitForFunction(() => probe.term.buffer.active.getLine(0).translateToString(true) === 'LOST-CONTEXT');
+  const webglCanvas = () => p.evaluate(() => [...document.querySelectorAll('.xterm-screen canvas')].some(c => c.getContext('webgl2')));
+  assert.equal(await webglCanvas(), true);
+  await p.evaluate(() => {
+    const c = [...document.querySelectorAll('.xterm-screen canvas')].find(c => c.getContext('webgl2'));
+    c.getContext('webgl2').getExtension('WEBGL_lose_context').loseContext();
+  });
+  await p.waitForTimeout(300);
+  // Read now, without waiting: the addon alone hands over only after ~3 s.
+  assert.match(await p.evaluate(() => document.querySelector('.xterm-rows')?.textContent || ''), /LOST-CONTEXT/);
+  await p.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await p.waitForTimeout(300);
+  assert.equal(await webglCanvas(), true);
+  assert.equal(await p.locator('.xterm-rows').count(), 0);
+  assert.deepEqual(errors, []);
+});
+
 test('the grid draws with WebGL where the browser has it, and with the DOM otherwise', async t => {
   const { p: dom, errors: domErrors } = await page(t);
   await screen(dom, 'DOM-GRID');
