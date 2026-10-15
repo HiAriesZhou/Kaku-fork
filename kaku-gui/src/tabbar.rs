@@ -1504,6 +1504,9 @@ mod test {
             user_vars,
             progress: Progress::None,
         };
+        // The second write would wake the config watcher, whose reload 100ms
+        // later supersedes ours if ours is still loading on a slow runner,
+        // and the assertion then reads the first file's value.
         for enabled in [false, true] {
             std::fs::write(
                 config_file.path(),
@@ -1512,7 +1515,7 @@ mod test {
 local wezterm = require 'wezterm'
 wezterm.on('format-tab-title', function() return ' Lua title ' end)
 return {{ use_fancy_tab_bar = false, show_new_tab_button_in_tab_bar = false,
-          tab_title_use_pane_title = {} }}
+          automatically_reload_config = false, tab_title_use_pane_title = {} }}
 "#,
                     enabled
                 ),
