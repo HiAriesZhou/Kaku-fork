@@ -6,9 +6,12 @@ const path = require('node:path');
 const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '../../..');
 let browser;
+const launchOptions = (args = []) => ({ args,
+  ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
+// Most tests read the DOM renderer's rows, so this browser has no WebGL and
+// also covers the page's fallback; the WebGL test launches its own.
 before(async () => {
-  browser = await chromium.launch(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
-    ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {});
+  browser = await chromium.launch(launchOptions(['--disable-webgl', '--disable-3d-apis']));
 });
 after(async () => { await browser?.close(); });
 
@@ -785,4 +788,78 @@ test('terminal menu fits narrow and short viewport corners', async t => {
     await p.keyboard.press('Escape');
     assert.equal(await p.locator('#menu.show').count(), 0);
   }
+});
+
+test('the grid draws with WebGL where the browser has it, and with the DOM otherwise', async t => {
+  const { p: dom, errors: domErrors } = await page(t);
+  await screen(dom, 'DOM-GRID');
+  assert.equal(await dom.locator('.xterm-rows').count(), 1);
+  assert.deepEqual(domErrors, []);
+
+  const gpu = await chromium.launch(launchOptions());
+  t.after(() => gpu.close());
+  const { p, errors } = await page(t, '#t=fixture', {}, gpu);
+  const hasWebgl = await p.evaluate(() => !!document.createElement('canvas').getContext('webgl2'));
+  if (!hasWebgl) return t.skip('this Chromium has no WebGL2');
+  await p.evaluate(() => {
+    probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] });
+    probe.handle({ type: 'frame', seq: 1, pane_id: 1, cols: 80, rows: 24, data: '\x1b[2J\x1b[1;1HGPU-GRID' });
+  });
+  await p.waitForFunction(() => probe.term.buffer.active.getLine(0).translateToString(true) === 'GPU-GRID');
+  // The WebGL renderer replaces the DOM rows.
+  assert.equal(await p.locator('.xterm-rows').count(), 0);
+  // History still opens over the grid in the terminal's font.
+  const past = await p.evaluate(() => {
+    probe.openPast();
+    probe.onHistory({ request: messages.filter(m => m.type === 'history').at(-1)?.request, pane_id: 1, first: 0, top: 0,
+      rows: ['\x1b[0mhistory-row'] });
+    const el = document.querySelector('#past');
+    return { shown: el.classList.contains('show'), text: el.textContent, font: el.style.fontFamily, size: el.style.fontSize };
+  });
+  assert.ok(past.shown);
+  assert.match(past.text, /history-row/);
+  assert.match(past.font, /Kaku Mono/);
+  assert.equal(past.size, (await p.evaluate(() => probe.term.options.fontSize)) + 'px');
+  assert.deepEqual(errors, []);
+});
+
+test('the cursor stays steady while frames arrive and blinks once the screen is still', async t => {
+  const { p } = await page(t);
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }));
+  const frame = (seq, data) => p.evaluate(({ seq, data }) =>
+    probe.handle({ type: 'frame', seq, pane_id: 1, cols: 80, rows: 24, data }), { seq, data });
+  const blink = () => p.evaluate(() => probe.term.options.cursorBlink);
+  const style = () => p.evaluate(() => probe.term.options.cursorStyle);
+  await frame(1, '\x1b[1;1Hone\x1b[1;4H\x1b[5 q');
+  await p.waitForTimeout(50);
+  assert.equal(await blink(), false);
+  assert.equal(await style(), 'bar');
+  // Frames without a cursor escape keep it steady too.
+  for (let seq = 2; seq < 8; seq++) {
+    await frame(seq, '\x1b[1;1Hbusy ' + seq);
+    await p.waitForTimeout(150);
+    assert.equal(await blink(), false);
+  }
+  await p.waitForFunction(() => probe.term.options.cursorBlink === true, null, { timeout: 2000 });
+  assert.equal(await style(), 'bar');
+  await frame(9, '\x1b[1;1Hagain');
+  await p.waitForTimeout(50);
+  assert.equal(await blink(), false);
+  // A steady cursor the app asked for never starts blinking.
+  await frame(10, '\x1b[2 q');
+  await p.waitForTimeout(1000);
+  assert.equal(await blink(), false);
+  assert.equal(await style(), 'block');
+});
+
+test('offline stops retrying and coming back online reconnects at once', async t => {
+  const { p } = await page(t);
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }));
+  await p.context().setOffline(true);
+  const before = await p.evaluate(() => { connections.at(-1).close(1006); return connections.length; });
+  await p.waitForTimeout(2500);
+  assert.equal(await p.evaluate(() => connections.length), before);
+  assert.match(await p.locator('#notice').innerText(), /No connection/);
+  await p.context().setOffline(false);
+  await p.waitForFunction(n => connections.length === n + 1, before, { timeout: 500 });
 });

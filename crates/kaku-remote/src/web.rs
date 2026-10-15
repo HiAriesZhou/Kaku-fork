@@ -31,6 +31,10 @@ use wezterm_term::{MouseButton, MouseEvent, MouseEventKind, TerminalSize};
 const INDEX_HTML: &str = include_str!("../assets/web/index.html");
 const XTERM_JS: &str = include_str!("../assets/web/xterm.js");
 const XTERM_CSS: &str = include_str!("../assets/web/xterm.css");
+/// @xterm/addon-webgl 0.18.0 for xterm.js 5.5.0 (MIT, npm integrity verified):
+/// draws the grid on a canvas, so steady output does not rebuild DOM rows or
+/// restart CSS cursor animations.
+const XTERM_WEBGL_JS: &str = include_str!("../assets/web/xterm-webgl.js");
 // Kaku's bundled terminal font: Regular for text, Medium for bold, matching
 // the dark-theme weights in the bundled kaku.lua.
 const FONT_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
@@ -216,6 +220,7 @@ pub(crate) fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
         "" | "index.html" => ("text/html; charset=utf-8", INDEX_HTML.as_bytes()),
         "assets/xterm.js" => ("text/javascript; charset=utf-8", XTERM_JS.as_bytes()),
         "assets/xterm.css" => ("text/css; charset=utf-8", XTERM_CSS.as_bytes()),
+        "assets/xterm-webgl.js" => ("text/javascript; charset=utf-8", XTERM_WEBGL_JS.as_bytes()),
         "assets/font-regular.ttf" => ("font/ttf", FONT_REGULAR),
         "assets/font-medium.ttf" => ("font/ttf", FONT_MEDIUM),
         "assets/icon.png" => ("image/png", ICON_PNG),

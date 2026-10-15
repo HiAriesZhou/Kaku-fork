@@ -203,6 +203,7 @@
 <div id="help" role="dialog" aria-modal="true"><div class="card"><div class="title">Shortcuts</div><dl></dl></div></div>
 <div id="keys"></div>
 <script src="assets/xterm.js"></script>
+<script src="assets/xterm-webgl.js"></script>
 <script>
 (() => {
   const params = new URLSearchParams(location.hash.slice(1));
@@ -445,6 +446,17 @@
     theme: { background: getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#16161a" },
   });
   term.open(termEl);
+  // WebGL draws the grid on one canvas, so Claude Code redrawing several
+  // times a second no longer rebuilds DOM rows and restarts CSS cursor
+  // animations. Without WebGL, or once the GPU drops the context, the DOM
+  // renderer takes over again.
+  if (window.WebglAddon) {
+    try {
+      const webgl = new WebglAddon.WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      term.loadAddon(webgl);
+    } catch (_) {}
+  }
 
   // Links: URLs in the screen open with Cmd+click (Ctrl+click off the Mac),
   // as in Kaku. Cells and string positions differ once a row holds wide
@@ -1053,13 +1065,23 @@
     if (msg.pane_id !== paneId || !pastLoading || msg.request !== pastRequest) return;
     const cell = cellSize();
     const screenEl = termEl.querySelector(".xterm-screen");
-    const rowsEl = termEl.querySelector(".xterm-rows");
-    if (!cell || !screenEl || !rowsEl) { pastLoading = false; return; }
+    if (!cell || !screenEl) { pastLoading = false; return; }
 
     if (!pastOpen) {
       // Exactly over the terminal, in its font, so opening shows no change.
-      const rs = getComputedStyle(rowsEl);
-      for (const prop of ["fontFamily", "fontSize", "fontWeight", "letterSpacing", "fontKerning", "fontVariantLigatures"]) pastEl.style[prop] = rs[prop];
+      // The WebGL renderer has no row elements to copy the font from.
+      const rowsEl = termEl.querySelector(".xterm-rows");
+      if (rowsEl) {
+        const rs = getComputedStyle(rowsEl);
+        for (const prop of ["fontFamily", "fontSize", "fontWeight", "letterSpacing", "fontKerning", "fontVariantLigatures"]) pastEl.style[prop] = rs[prop];
+      } else {
+        pastEl.style.fontFamily = term.options.fontFamily;
+        pastEl.style.fontSize = term.options.fontSize + "px";
+        pastEl.style.fontWeight = term.options.fontWeight;
+        pastEl.style.letterSpacing = "0px";
+        pastEl.style.fontKerning = "none";
+        pastEl.style.fontVariantLigatures = "none";
+      }
       pastEl.style.lineHeight = cell.height + "px";
       pastEl.style.width = screenEl.offsetWidth + "px";
       pastEl.style.height = screenEl.offsetHeight + "px";
@@ -1288,6 +1310,31 @@
   };
   const snapshots = new Map();
   const NO_WRAP = "\x1b[?7l";
+  // The cursor blinks only once the screen is still. Every frame repeats the
+  // cursor's shape (DECSCUSR), and a blinking one restarts its blink on each
+  // write: while Claude Code works the cursor never settles and the browser
+  // keeps restarting the animation. Frames draw it steady instead, and the
+  // requested blink comes back after a quiet moment, as typing does in Kaku.
+  const CURSOR_IDLE_MS = 700;
+  const CURSOR_SHAPE_RE = /\x1b\[([0-6]) q/g;
+  let cursorBlink = "";
+  let cursorBlinkTimer = 0;
+  const steadyCursor = (data) => {
+    let shaped = false;
+    data = data.replace(CURSOR_SHAPE_RE, (all, n) => {
+      shaped = true;
+      const param = +n;
+      if (param && param % 2 === 0) { cursorBlink = ""; return all; }
+      cursorBlink = all;
+      return "\x1b[" + (param ? param + 1 : 2) + " q";
+    });
+    clearTimeout(cursorBlinkTimer);
+    if (!cursorBlink) return data;
+    if (!shaped) data = cursorBlink.replace(/\d/, (n) => +n ? +n + 1 : 2) + data;
+    const blink = cursorBlink;
+    cursorBlinkTimer = setTimeout(() => term.write(blink), CURSOR_IDLE_MS);
+    return data;
+  };
   const sgrColor = (cell, fg) => {
     const base = fg ? 30 : 40;
     if (fg ? cell.isFgDefault() : cell.isBgDefault()) return [base + 9];
@@ -1347,7 +1394,7 @@
       size = { cols: saved.cols, rows: saved.rows };
       resizeTerm(saved.cols, saved.rows);
       fit();
-      term.write(NO_WRAP + "\x1b[?25l\x1b[0m\x1b[2J" + saved.data);
+      term.write(NO_WRAP + "\x1b[?25l\x1b[0m\x1b[2J" + steadyCursor(saved.data));
     }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     renderTabs();
@@ -1888,7 +1935,7 @@
     // disagree on) must overwrite its last cell, not wrap. Wrapping on the
     // last row scrolled the whole screen, and every later frame then drew
     // over a shifted copy: stale rows stayed until a reload.
-    term.write(NO_WRAP + msg.data, () => {
+    term.write(NO_WRAP + steadyCursor(msg.data), () => {
       if (ws !== socket) return;
       if (msg.pane_id === paneId) markFound();
       if (msg.seq) send({ type: "frame_ack", seq: msg.seq });
@@ -2332,14 +2379,28 @@
       }
       // A quick blip reconnects before anyone notices; say something only if
       // it lasts, and after a few failures say why when the page can tell.
+      claimed = "";
+      // Offline, retrying cannot work; the online event reconnects at once.
+      if (navigator.onLine === false) {
+        setNotice("No connection", "Check this device's network. Reconnects when it is back.", { stale: true });
+        return;
+      }
       setNotice("Reconnecting", "", { stale: true, delay: retry ? 0 : 800 });
       if (retry >= 2) explainOffline();
-      claimed = "";
       const delay = Math.min(5000, 500 * 2 ** retry++);
       reconnectTimer = setTimeout(connect, delay);
     };
   };
   connect();
+
+  // Back online: reconnect now instead of waiting out the backoff.
+  window.addEventListener("online", () => {
+    if (linkRejected) return;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      retry = 0;
+      connect();
+    }
+  });
 
   // Phones suspend a page in the background and its socket often dies
   // there. On return, reconnect at once, or check the link with a ping
