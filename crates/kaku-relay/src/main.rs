@@ -40,6 +40,13 @@ const QUEUE: usize = 256;
 /// Bytes queued toward one Mac. Counting messages alone let a host that
 /// stopped reading hold hundreds of megabytes.
 const HOST_QUEUE_BYTES: usize = 8 << 20;
+/// Bytes queued toward one browser. Only a count bounded it before, and 256
+/// Mac messages of up to 4 MB each let one stalled page hold a gigabyte.
+const BROWSER_QUEUE_BYTES: usize = 8 << 20;
+/// Bytes queued toward every socket together. Per-socket budgets alone add
+/// up past the machine's 256 MB once enough sockets stall at once; past this
+/// the socket that wants to queue more is let go.
+const GLOBAL_QUEUE_BYTES: usize = 96 << 20;
 /// The Mac pings every 20 s and a page every 20 s (a background tab about
 /// once a minute); silence past these means a half-open socket.
 const HOST_SILENCE: Duration = Duration::from_secs(75);
@@ -50,7 +57,7 @@ const ASSET_TIMEOUT: Duration = Duration::from_secs(10);
 /// so visitors, or someone requesting them in a loop with only the id, do not
 /// make the Mac upload them again. A new registration (a Kaku update
 /// reconnects) starts empty; the page itself always comes fresh.
-const ASSET_CACHE_BUDGET: usize = 128 << 20;
+const ASSET_CACHE_BUDGET: usize = 48 << 20;
 const ASSET_CACHE_MAX_FILE: usize = 4 << 20;
 const KIND_DATA: u8 = 0;
 const KIND_ASSET: u8 = 1;
@@ -63,8 +70,58 @@ struct Asset {
     body: Bytes,
 }
 
+/// Bytes waiting in one socket's outgoing queue, within its own budget and
+/// the relay-wide one. Whatever is still queued when the last holder drops it
+/// (the socket ended with messages unsent) goes back to the relay-wide count.
+struct Queued {
+    bytes: AtomicUsize,
+    cap: usize,
+    global: Arc<AtomicUsize>,
+}
+
+impl Queued {
+    fn new(cap: usize, global: &Arc<AtomicUsize>) -> Self {
+        Self {
+            bytes: AtomicUsize::new(0),
+            cap,
+            global: global.clone(),
+        }
+    }
+
+    fn reserve(&self, len: usize) -> bool {
+        if self.bytes.fetch_add(len, Ordering::Relaxed) + len > self.cap {
+            self.bytes.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        if self.global.fetch_add(len, Ordering::Relaxed) + len > GLOBAL_QUEUE_BYTES {
+            self.global.fetch_sub(len, Ordering::Relaxed);
+            self.bytes.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    fn release(&self, len: usize) {
+        self.bytes.fetch_sub(len, Ordering::Relaxed);
+        self.global.fetch_sub(len, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn load(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.global
+            .fetch_sub(*self.bytes.get_mut(), Ordering::Relaxed);
+    }
+}
+
 struct BrowserLink {
     data: mpsc::Sender<ws::Message>,
+    queued: Arc<Queued>,
     close: watch::Sender<Option<u64>>,
     addr: String,
 }
@@ -74,7 +131,7 @@ struct Host {
     generation: u64,
     to_host: mpsc::Sender<ws::Message>,
     /// Bytes waiting in `to_host`.
-    queued: AtomicUsize,
+    queued: Queued,
     /// Ends this registration when newer ones push it out.
     evicted: tokio::sync::Notify,
     browsers: Mutex<HashMap<u32, BrowserLink>>,
@@ -125,15 +182,29 @@ impl Host {
         }
     }
 
-    /// Queue a message for the Mac within the byte budget.
+    /// Queue a message for the Mac within the byte budgets.
     fn send(&self, msg: ws::Message) -> bool {
         let len = message_len(&msg);
-        if self.queued.fetch_add(len, Ordering::Relaxed) + len > HOST_QUEUE_BYTES {
-            self.queued.fetch_sub(len, Ordering::Relaxed);
+        if !self.queued.reserve(len) {
             return false;
         }
         if self.to_host.try_send(msg).is_err() {
-            self.queued.fetch_sub(len, Ordering::Relaxed);
+            self.queued.release(len);
+            return false;
+        }
+        true
+    }
+}
+
+impl BrowserLink {
+    /// Queue a message for the browser within the byte budgets.
+    fn send(&self, msg: ws::Message) -> bool {
+        let len = message_len(&msg);
+        if !self.queued.reserve(len) {
+            return false;
+        }
+        if self.data.try_send(msg).is_err() {
+            self.queued.release(len);
             return false;
         }
         true
@@ -149,6 +220,8 @@ struct AppState {
     hosts: Arc<Mutex<HashMap<String, Vec<Arc<Host>>>>>,
     generation: Arc<AtomicU64>,
     cache_bytes: Arc<AtomicUsize>,
+    /// Bytes queued toward every socket (`GLOBAL_QUEUE_BYTES`).
+    queued_bytes: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -295,7 +368,7 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
     let host = Arc::new(Host {
         generation: state.generation.fetch_add(1, Ordering::Relaxed),
         to_host,
-        queued: AtomicUsize::new(0),
+        queued: Queued::new(HOST_QUEUE_BYTES, &state.queued_bytes),
         evicted: tokio::sync::Notify::new(),
         browsers: Mutex::new(HashMap::new()),
         assets: Mutex::new(HashMap::new()),
@@ -313,9 +386,7 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
     let writer_host = host.clone();
     let mut writer = tokio::spawn(async move {
         while let Some(msg) = outgoing.recv().await {
-            writer_host
-                .queued
-                .fetch_sub(message_len(&msg), Ordering::Relaxed);
+            writer_host.queued.release(message_len(&msg));
             if !matches!(
                 tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await,
                 Ok(Ok(()))
@@ -346,16 +417,12 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
                 let target = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
                 match kind {
                     KIND_DATA => {
-                        let tx = host
-                            .browsers
-                            .lock()
-                            .get(&target)
-                            .map(|link| link.data.clone());
-                        if let Some(tx) = tx {
+                        let mut browsers = host.browsers.lock();
+                        if let Some(link) = browsers.get(&target) {
                             let payload = bytes.slice(5..);
-                            if tx.try_send(ws::Message::Binary(payload)).is_err() {
+                            if !link.send(ws::Message::Binary(payload)) {
                                 // A browser that cannot keep up is let go.
-                                host.browsers.lock().remove(&target);
+                                browsers.remove(&target);
                             }
                         }
                     }
@@ -577,6 +644,7 @@ fn browser_close(code: u64) -> ws::Message {
 async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut outgoing) = mpsc::channel::<ws::Message>(QUEUE);
+    let queued = Arc::new(Queued::new(BROWSER_QUEUE_BYTES, &host.queued.global));
     let (close, mut closing) = watch::channel(None);
     let c = host.next_id.fetch_add(1, Ordering::Relaxed);
     // Reserve atomically, after the upgrade: simultaneous handshakes would
@@ -591,6 +659,7 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
                 c,
                 BrowserLink {
                     data: tx,
+                    queued: queued.clone(),
                     close,
                     addr,
                 },
@@ -626,6 +695,7 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
                 }
                 msg = outgoing.recv() => match msg { Some(msg) => msg, None => return },
             };
+            queued.release(message_len(&msg));
             tokio::select! {
                 biased;
                 _ = closing.changed() => {
@@ -770,7 +840,7 @@ mod tests {
         Arc::new(Host {
             generation: state.generation.fetch_add(1, Ordering::Relaxed),
             to_host,
-            queued: AtomicUsize::new(0),
+            queued: Queued::new(HOST_QUEUE_BYTES, &state.queued_bytes),
             evicted: tokio::sync::Notify::new(),
             browsers: Mutex::new(HashMap::new()),
             assets: Mutex::new(HashMap::new()),
@@ -807,8 +877,60 @@ mod tests {
         assert!(host.send(big()));
         // A third 3 MB message would pass 8 MB queued.
         assert!(!host.send(big()));
-        assert_eq!(host.queued.load(Ordering::Relaxed), 6 << 20);
+        assert_eq!(host.queued.load(), 6 << 20);
         assert!(host.send(ws::Message::Text("small".into())));
+    }
+
+    fn test_browser(global: &Arc<AtomicUsize>) -> BrowserLink {
+        let (data, rx) = mpsc::channel(QUEUE);
+        std::mem::forget(rx);
+        BrowserLink {
+            data,
+            queued: Arc::new(Queued::new(BROWSER_QUEUE_BYTES, global)),
+            close: watch::channel(None).0,
+            addr: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_browser_queue_is_bounded_by_bytes() {
+        let state = AppState::default();
+        let browser = test_browser(&state.queued_bytes);
+        // Screens from the Mac can be 4 MB each; a page that stopped reading
+        // must not hold more than its budget however few messages that is.
+        let screen = || ws::Message::Binary(vec![0u8; 3 << 20].into());
+        assert!(browser.send(screen()));
+        assert!(browser.send(screen()));
+        assert!(!browser.send(screen()));
+        assert_eq!(browser.queued.load(), 6 << 20);
+        assert_eq!(state.queued_bytes.load(Ordering::Relaxed), 6 << 20);
+    }
+
+    #[test]
+    fn the_relay_wide_budget_bounds_every_queue_together() {
+        let state = AppState::default();
+        let browsers: Vec<_> = (0..20).map(|_| test_browser(&state.queued_bytes)).collect();
+        let chunk = || ws::Message::Binary(vec![0u8; 6 << 20].into());
+        // Each stays within its own 8 MB, but together they stop at the
+        // relay-wide budget.
+        let accepted = browsers.iter().filter(|b| b.send(chunk())).count();
+        assert_eq!(accepted, GLOBAL_QUEUE_BYTES / (6 << 20));
+        assert!(state.queued_bytes.load(Ordering::Relaxed) <= GLOBAL_QUEUE_BYTES);
+    }
+
+    #[test]
+    fn a_closed_socket_gives_its_unsent_bytes_back() {
+        let state = AppState::default();
+        let browser = test_browser(&state.queued_bytes);
+        let host = test_host(&state);
+        assert!(browser.send(ws::Message::Binary(vec![0u8; 1 << 20].into())));
+        assert!(host.send(ws::Message::Binary(vec![0u8; 1 << 20].into())));
+        assert_eq!(state.queued_bytes.load(Ordering::Relaxed), 2 << 20);
+        // Sockets that end with messages still queued must not leak budget,
+        // or the relay slowly stops accepting anything.
+        drop(browser);
+        drop(host);
+        assert_eq!(state.queued_bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]

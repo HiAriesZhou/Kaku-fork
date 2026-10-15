@@ -16,13 +16,14 @@ primary_region = 'nrt'
   min_machines_running = 1
   processes = ['app']
 
-  # Each Mac holds one socket, each open page another, and offline pages
-  # poll; fly's default of 25 would turn friends away. The relay sheds
-  # floods itself (byte budgets, per-address and per-id caps).
+  # Each Mac holds one socket and each open page another, so 100 is about
+  # 50 people online. The bound is memory, not fly's proxy: 256 MB holds the
+  # relay-wide queue budget (96 MB), the page file cache (48 MB) and the
+  # sockets. Raise it only with a measured load test or a larger machine.
   [http_service.concurrency]
     type = 'connections'
-    soft_limit = 800
-    hard_limit = 1000
+    soft_limit = 80
+    hard_limit = 100
 
 [[vm]]
   memory = '256mb'
