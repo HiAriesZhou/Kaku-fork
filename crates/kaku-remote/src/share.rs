@@ -130,6 +130,32 @@ fn write_identity(identity: &ShareIdentity) -> anyhow::Result<()> {
     crate::write_private(&path, json.as_bytes()).context("save share identity")
 }
 
+fn token_path() -> PathBuf {
+    config::DATA_DIR.join("remote-token")
+}
+
+/// The relay registration token, if one was set (`kaku remote --token`).
+fn read_token() -> Option<String> {
+    let token = std::fs::read_to_string(token_path()).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Keep a relay registration token for the bridge to present; the running
+/// Kaku uses it from its next connection to the relay.
+pub fn save_token(token: &str) -> anyhow::Result<()> {
+    let token = token.trim();
+    anyhow::ensure!(
+        token.split('.').count() == 2 && token.bytes().all(|b| b.is_ascii_graphic()),
+        "that does not look like a Kaku relay token"
+    );
+    let path = token_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).context("create data dir")?;
+    }
+    crate::write_private(&path, token.as_bytes()).context("save relay token")
+}
+
 /// This Kaku's share identity, created on first use.
 pub fn load_or_create_identity() -> anyhow::Result<ShareIdentity> {
     if let Some(mut identity) = read_identity() {
@@ -442,6 +468,11 @@ async fn serve(
         "x-kaku-secret",
         identity.secret.parse().context("secret header")?,
     );
+    if let Some(token) = read_token() {
+        if let Ok(value) = token.parse() {
+            request.headers_mut().insert("x-kaku-token", value);
+        }
+    }
     let socket = connect_relay(request, CONNECT_TIMEOUT).await?;
     *connected_at = Some(tokio::time::Instant::now());
     log::info!("kaku-share: registered with relay as {id}");

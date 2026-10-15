@@ -7,6 +7,8 @@
 //! with a key carried in the link's fragment, so the relay only numbers the
 //! browsers and forwards bytes it cannot read.
 
+mod token;
+
 use axum::extract::{ws, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -207,6 +209,10 @@ struct AppState {
     /// instead of the link reading offline while a Kaku is running.
     hosts: Arc<Mutex<HashMap<String, Vec<Arc<Host>>>>>,
     generation: Arc<AtomicU64>,
+    /// Registration tokens (`token`): the public key to check them with,
+    /// and whether a Mac without a valid one is turned away. Unset, every
+    /// Mac registers as before.
+    tokens: Option<Arc<TokenPolicy>>,
     /// Bytes queued toward every socket (`GLOBAL_QUEUE_BYTES`).
     queued_bytes: Arc<AtomicUsize>,
 }
@@ -328,6 +334,38 @@ fn valid_id(id: &str) -> bool {
 
 // ── Host side ─────────────────────────────────────────────────────────────────
 
+struct TokenPolicy {
+    public_key: Vec<u8>,
+    required: bool,
+}
+
+impl TokenPolicy {
+    fn from_env() -> Option<Self> {
+        let key = std::env::var("KAKU_RELAY_TOKEN_KEY").ok()?;
+        let Some(public_key) = token::decode_key(&key) else {
+            tracing::warn!("KAKU_RELAY_TOKEN_KEY is not base64url; tokens are not checked");
+            return None;
+        };
+        Some(Self {
+            public_key,
+            required: std::env::var("KAKU_RELAY_REQUIRE_TOKEN").as_deref() == Ok("1"),
+        })
+    }
+
+    /// Whether a Mac presenting `presented` may register as `id` at `now`.
+    fn admits(&self, id: &str, presented: Option<&str>, now: u64) -> bool {
+        let checked = presented.map(|t| token::verify(t, &self.public_key, id, now));
+        match checked {
+            Some(Ok(_)) => true,
+            Some(Err(why)) => {
+                info!(host = short(id), ?why, "registration token refused");
+                !self.required
+            }
+            None => !self.required,
+        }
+    }
+}
+
 async fn host_ws(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -340,6 +378,16 @@ async fn host_ws(
         .unwrap_or_default();
     if !valid_id(&id) || !owns(&id, secret) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(policy) = &state.tokens {
+        let presented = headers.get("x-kaku-token").and_then(|v| v.to_str().ok());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if !policy.admits(&id, presented, now) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
     }
     if state.hosts.lock().len() >= MAX_HOSTS && state.host(&id).is_none() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -688,6 +736,17 @@ fn app(state: AppState) -> Router {
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(result) = token::run_command(&args) {
+        match result {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("kaku-relay: {e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -715,7 +774,18 @@ async fn main() {
             tracing::warn!("set_nodelay failed: {e}");
         }
     });
-    if let Err(e) = axum::serve(listener, app(AppState::default())).await {
+    let tokens = TokenPolicy::from_env().map(Arc::new);
+    if let Some(policy) = &tokens {
+        info!(
+            required = policy.required,
+            "registration tokens are checked"
+        );
+    }
+    let state = AppState {
+        tokens,
+        ..AppState::default()
+    };
+    if let Err(e) = axum::serve(listener, app(state)).await {
         eprintln!("kaku-relay: server error: {}", e);
         std::process::exit(1);
     }
@@ -914,6 +984,34 @@ mod tests {
         assert!(owns(&id, &secret));
         assert!(!owns(&id, "b"));
         assert!(!owns(&id, ""));
+    }
+
+    #[test]
+    fn tokens_are_checked_and_only_enforced_when_required() {
+        let (private, public) = token::generate().unwrap();
+        let private = token::decode_key(&private).unwrap();
+        let valid = token::sign(
+            &token::Claims {
+                sub: "*".into(),
+                kind: "invite".into(),
+                exp: 100,
+            },
+            &private,
+        )
+        .unwrap();
+        let mut policy = TokenPolicy {
+            public_key: token::decode_key(&public).unwrap(),
+            required: false,
+        };
+        // Until required, a Mac with no token (today's builds) or a bad one
+        // still registers; only the log notes the bad one.
+        assert!(policy.admits("id", None, 50));
+        assert!(policy.admits("id", Some("bad"), 50));
+        policy.required = true;
+        assert!(policy.admits("id", Some(&valid), 50));
+        assert!(!policy.admits("id", None, 50));
+        assert!(!policy.admits("id", Some(&valid), 150));
+        assert!(!policy.admits("id", Some("bad"), 50));
     }
 
     #[test]
