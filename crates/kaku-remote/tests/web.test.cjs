@@ -665,6 +665,25 @@ test('links exclude sentence punctuation and retain balanced paths and Unicode c
   }
 });
 
+test('Mac paths stop at Chinese sentence punctuation but keep Chinese file names', async t => {
+  const { p } = await page(t);
+  const cases = [
+    ['对照图在 /private/tmp/icons/all-ship.png，按字母顺序排：chatgpt', '/private/tmp/icons/all-ship.png'],
+    ['存到了 ~/Desktop/shot.png。', '~/Desktop/shot.png'],
+    ['见（~/Desktop/a.png）和「./b.txt」', '~/Desktop/a.png ./b.txt'],
+    ['截图在 ~/桌面/截图.png', '~/桌面/截图.png'],
+  ];
+  for (const [source, expected] of cases) {
+    const found = await p.evaluate(async source => {
+      probe.term.resize(180, 24);
+      await new Promise(resolve => probe.term.write('\x1b[?7l\x1b[2J\x1b[H' + source, resolve));
+      const links = await new Promise(resolve => testLinkProvider.provideLinks(1, resolve));
+      return (links || []).map(l => l.text).join(' ');
+    }, source);
+    assert.equal(found, expected);
+  }
+});
+
 test('middle click closes the clicked tab through the same confirmation path', async t => {
   const { p } = await page(t); await screen(p);
   await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'tabs', tabs: [

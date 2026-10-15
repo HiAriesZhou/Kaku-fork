@@ -577,7 +577,9 @@
     }
     return candidate.replace(/[.,;:!?]+$/, "");
   };
-  const PATH_RE = /(?<![\w:/.~-])(?:~|\.{1,2})?\/[^\s"'`<>|;()\[\]{}]+/g;
+  // Chinese sentence punctuation ends a path as it ends a URL; Chinese
+  // file names (~/桌面/截图.png) stay inside it.
+  const PATH_RE = /(?<![\w:/.~-])(?:~|\.{1,2})?\/[^\s"'`<>|;()\[\]{}，。；：！？、（）【】「」『』“”‘’]+/g;
   term.registerLinkProvider({
     provideLinks(y, callback) {
       const line = term.buffer.active.getLine(y - 1);
