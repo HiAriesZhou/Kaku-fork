@@ -2,6 +2,7 @@ use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::serve::ListenerExt as _;
 use axum::Router;
 use config::{configuration, RgbaColor};
 use mux::{Mux, MuxNotification};
@@ -363,8 +364,13 @@ pub fn start() {
                 log::info!("kaku-remote: listening on http://{}", addr);
                 write_state(port, token, tunnel_relay_opt.as_deref());
 
+                // Keystrokes and frames are small writes; Nagle would hold one
+                // back until the previous is acknowledged, as the relay
+                // already avoids on its own sockets.
                 let listener = match tokio::net::TcpListener::bind(addr).await {
-                    Ok(l) => l,
+                    Ok(l) => l.tap_io(|tcp| {
+                        let _ = tcp.set_nodelay(true);
+                    }),
                     Err(e) => {
                         log::error!("kaku-remote: failed to bind {addr}: {e}");
                         return std::future::pending().await;

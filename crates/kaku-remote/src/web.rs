@@ -41,8 +41,9 @@ const FONT_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-
 const FONT_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Medium.ttf");
 const ICON_PNG: &[u8] = include_bytes!("../assets/web/icon.png");
 
-/// Frames are coalesced to this interval; the trailing edge always flushes,
-/// so the last output of a burst is never dropped.
+/// At most one frame per interval. Output after a quiet spell goes out at
+/// once, so a keystroke's echo never waits for a tick; a burst is coalesced
+/// and its trailing edge always flushes, so its last output is never dropped.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// Re-render this often even without output, to pick up cursor moves,
 /// title changes and resizes that do not produce `PaneOutput`.
@@ -1824,8 +1825,7 @@ pub(crate) async fn run_session(
     // Image files this browser already has.
     let mut sent_images: HashSet<String> = HashSet::new();
     let mut uploads = Uploads::default();
-    let mut frame_tick = tokio::time::interval(FRAME_INTERVAL);
-    frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_render = tokio::time::Instant::now();
     let mut idle = tokio::time::interval(IDLE_REFRESH);
     let mut last_heard = std::time::Instant::now();
 
@@ -2014,7 +2014,7 @@ pub(crate) async fn run_session(
                     last_tabs = Some(tabs);
                 }
             }
-            _ = frame_tick.tick(), if dirty_frame && (!flow_control || frames_sent - frames_acked < 4) => {
+            _ = tokio::time::sleep_until(next_render), if dirty_frame && (!flow_control || frames_sent - frames_acked < 4) => {
                 dirty_frame = false;
                 let Some(pane_id) = attached else { continue };
                 let Some(pane) = lookup_pane(pane_id) else {
@@ -2067,6 +2067,10 @@ pub(crate) async fn run_session(
                 }
                 frames_sent += 1;
                 last_frame_at = std::time::Instant::now();
+                // Only a frame sent starts the interval: input marks the view
+                // dirty before its echo arrives, and that render, which finds
+                // nothing new, must not hold the echo back for a tick.
+                next_render = tokio::time::Instant::now() + FRAME_INTERVAL;
             }
         }
     }
