@@ -110,8 +110,8 @@ if command -v zsh >/dev/null 2>&1; then
     # No new command: no redundant reset on another prompt.
     [[ -z "$(_kaku_reset_mouse_tracking)" ]] || exit 1
   ')" || fail "mouse recovery hook is not registered"
-  [[ "$mouse_reset" == $'\e[?1000;1002;1003;1004;1005;1006;1007;1016l' ]] \
-    || fail "prompt did not reset stale mouse/focus reporting"
+  [[ "$mouse_reset" == $'\e[?1000;1002;1003;1004;1005;1006;1007;1016l\e[?25h' ]] \
+    || fail "prompt did not reset stale mouse/focus reporting and show the cursor"
 
   outside_reset="$(HOME="$tmp_home" TERM_PROGRAM=Apple_Terminal zsh -dfc '
     add-zsh-hook() { :; }

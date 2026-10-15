@@ -53,8 +53,8 @@ if command -v fish >/dev/null 2>&1; then
     source "$HOME/.config/kaku/fish/kaku.fish" >/dev/null
     __kaku_semantic_precmd
   ')"
-  [[ "$mouse_reset" == $'\e[?1000;1002;1003;1004;1005;1006;1007;1016l\e]133;A\a' ]] \
-    || fail "prompt did not reset stale mouse/focus reporting before its marker"
+  [[ "$mouse_reset" == $'\e[?1000;1002;1003;1004;1005;1006;1007;1016l\e[?25h\e]133;A\a' ]] \
+    || fail "prompt did not reset stale mouse/focus reporting and show the cursor before its marker"
 
   outside_reset="$(env HOME="$HOME" TERM_PROGRAM=Apple_Terminal "$fish_bin" --no-config -c '
     source "$HOME/.config/kaku/fish/kaku.fish" >/dev/null
