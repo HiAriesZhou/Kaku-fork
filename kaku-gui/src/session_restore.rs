@@ -384,7 +384,12 @@ fn write_pane_sidecar(
     // Every cell an image covers holds its own Arc to the same ImageData, and
     // serde writes the whole blob once per cell, so one inline image can encode
     // to gigabytes on the GUI thread (#559). Keep the text, drop the images.
+    // Only touch lines that hold an image: cells_mut decompresses a scrollback
+    // line, which would push plain text past the sidecar cap.
     for line in &mut lines {
+        if !line.visible_cells().any(|c| c.attrs().images().is_some()) {
+            continue;
+        }
         for cell in line.cells_mut_for_attr_changes_only() {
             if cell.attrs().images().is_some() {
                 cell.attrs_mut().clear_images();
@@ -2095,5 +2100,101 @@ mod tests {
         let last = out.last().unwrap();
         let total = PANE_CONTENT_CAP_LINES + 200;
         assert_eq!(last.as_str(), format!("L{}", total - 1));
+    }
+
+    fn compressed_text_scrollback(count: usize, cols: usize) -> Vec<wezterm_term::Line> {
+        use termwiz::cell::CellAttributes;
+        use termwiz::surface::SEQ_ZERO;
+
+        (0..count)
+            .map(|_| {
+                let mut line = wezterm_term::Line::from_text(
+                    &"x".repeat(cols),
+                    &CellAttributes::default(),
+                    SEQ_ZERO,
+                    None,
+                );
+                line.compress_for_scrollback();
+                line
+            })
+            .collect()
+    }
+
+    fn image_line(cols: usize, image: &Arc<termwiz::image::ImageData>) -> wezterm_term::Line {
+        use termwiz::cell::CellAttributes;
+        use termwiz::image::ImageCell;
+        use termwiz::surface::{TextureCoordinate, SEQ_ZERO};
+
+        let origin = ordered_float::NotNan::new(0.0f32).unwrap();
+        let mut line = wezterm_term::Line::from_text(
+            &"y".repeat(cols),
+            &CellAttributes::default(),
+            SEQ_ZERO,
+            None,
+        );
+        for cell in line.cells_mut_for_attr_changes_only() {
+            cell.attrs_mut().attach_image(ImageCell::new(
+                TextureCoordinate::new(origin, origin),
+                TextureCoordinate::new(origin, origin),
+                Arc::clone(image),
+            ));
+        }
+        line
+    }
+
+    #[test]
+    fn compressed_text_scrollback_without_images_fits_in_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = compressed_text_scrollback(1500, 200);
+
+        let content_ref = write_pane_sidecar(dir.path(), 11.into(), lines, 200, 50);
+
+        assert!(
+            content_ref.is_some(),
+            "1500 compressed 200-column text lines must still get a sidecar"
+        );
+        let content_ref = content_ref.unwrap();
+        assert_eq!(content_ref.line_count, 1500);
+        let size = std::fs::metadata(dir.path().join(&content_ref.filename))
+            .unwrap()
+            .len();
+        assert!(
+            size <= PANE_CONTENT_MAX_BYTES as u64,
+            "sidecar is {} bytes",
+            size
+        );
+    }
+
+    #[test]
+    fn image_lines_mixed_into_compressed_scrollback_lose_their_images() {
+        let image = Arc::new(termwiz::image::ImageData::with_raw_data(vec![
+            0u8;
+            64 * 1024
+        ]));
+        let mut lines = compressed_text_scrollback(1500, 200);
+        lines.insert(0, image_line(200, &image));
+        let mut compressed_image = image_line(200, &image);
+        compressed_image.compress_for_scrollback();
+        lines.insert(750, compressed_image);
+        lines.push(image_line(200, &image));
+
+        let dir = tempfile::tempdir().unwrap();
+        let content_ref = write_pane_sidecar(dir.path(), 12.into(), lines, 200, 50)
+            .expect("scrollback with image lines still gets a sidecar");
+
+        let payload = load_pane_payload(dir.path(), &content_ref).expect("payload");
+        assert_eq!(payload.lines.len(), 1503);
+        for idx in [0usize, 750, 1502] {
+            let restored = &payload.lines[idx];
+            assert_eq!(restored.as_str().trim_end(), "y".repeat(200), "line {idx}");
+            assert!(
+                restored
+                    .visible_cells()
+                    .all(|c| c.attrs().images().is_none()),
+                "line {} kept its image",
+                idx
+            );
+        }
+        assert_eq!(payload.lines[1].as_str().trim_end(), "x".repeat(200));
     }
 }
