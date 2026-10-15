@@ -12,6 +12,7 @@ config.workspace = true
 fastrand.workspace = true
 getrandom.workspace = true
 image.workspace = true
+libc.workspace = true
 futures-util.workspace = true
 log.workspace = true
 qrcode.workspace = true

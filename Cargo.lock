@@ -2971,6 +2971,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "image",
+ "libc",
  "log",
  "mux",
  "objc2",

@@ -256,6 +256,85 @@ pub fn read_state() -> anyhow::Result<RemoteState> {
     serde_json::from_str(&data).context("invalid state file")
 }
 
+/// What the relay bridge last saw, for `kaku doctor`. Holds nothing secret:
+/// no token, key or relay id.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct RelayStatus {
+    pub relay: String,
+    pub connected: bool,
+    /// Unix seconds when `connected` last changed.
+    pub since: u64,
+    #[serde(default)]
+    pub last_error: String,
+    /// The Kaku that wrote it; the file outlives it when it quits.
+    #[serde(default)]
+    pub pid: u32,
+}
+
+impl RelayStatus {
+    /// Whether the Kaku that wrote this is still running.
+    pub fn is_current(&self) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        self.pid != 0 && unsafe { libc::kill(self.pid as libc::pid_t, 0) } == 0
+    }
+}
+
+fn relay_status_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("kaku-remote-relay.json")
+}
+
+/// Record a change in the relay link; `since` moves only when `connected`
+/// flips, so a link failing every 30 s still reads as down since it fell.
+pub(crate) fn record_relay_status(relay: &str, connected: bool, error: Option<String>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let previous = read_relay_status();
+    let status = next_relay_status(
+        previous.as_ref(),
+        relay,
+        connected,
+        error,
+        now,
+        std::process::id(),
+    );
+    if previous.as_ref() == Some(&status) {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(&status) {
+        if let Err(e) = write_private(&relay_status_path(), json.as_bytes()) {
+            log::debug!("kaku-remote: failed to write relay status: {e}");
+        }
+    }
+}
+
+fn next_relay_status(
+    previous: Option<&RelayStatus>,
+    relay: &str,
+    connected: bool,
+    error: Option<String>,
+    now: u64,
+    pid: u32,
+) -> RelayStatus {
+    let since = match previous {
+        Some(p) if p.connected == connected && p.relay == relay && p.pid == pid => p.since,
+        _ => now,
+    };
+    RelayStatus {
+        relay: relay.to_string(),
+        connected,
+        since,
+        last_error: error.unwrap_or_default(),
+        pid,
+    }
+}
+
+pub fn read_relay_status() -> Option<RelayStatus> {
+    let data = std::fs::read_to_string(relay_status_path()).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
 /// A QR code for `url`, drawn with block characters, followed by the url.
 pub fn render_qr_terminal(url: &str) -> String {
     let qr = match QrCode::new(url.as_bytes()) {
@@ -389,6 +468,48 @@ pub fn start() {
             });
         })
         .expect("spawn kaku-remote thread");
+}
+
+#[cfg(test)]
+mod relay_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_link_failing_over_and_over_reads_as_down_since_it_fell() {
+        let up = next_relay_status(None, "wss://r", true, None, 100, 7);
+        assert_eq!(up.since, 100);
+        let down = next_relay_status(Some(&up), "wss://r", false, Some("reset".into()), 200, 7);
+        assert_eq!((down.since, down.last_error.as_str()), (200, "reset"));
+        let still_down = next_relay_status(
+            Some(&down),
+            "wss://r",
+            false,
+            Some("timed out".into()),
+            230,
+            7,
+        );
+        assert_eq!(
+            (still_down.since, still_down.last_error.as_str()),
+            (200, "timed out")
+        );
+        // A new Kaku, or another relay, starts its own clock.
+        assert_eq!(
+            next_relay_status(Some(&down), "wss://r", false, None, 300, 8).since,
+            300
+        );
+        assert_eq!(
+            next_relay_status(Some(&down), "wss://x", false, None, 300, 7).since,
+            300
+        );
+    }
+
+    #[test]
+    fn only_a_running_writer_makes_the_status_current() {
+        let mine = next_relay_status(None, "wss://r", true, None, 0, std::process::id());
+        assert!(mine.is_current());
+        let gone = RelayStatus { pid: 0, ..mine };
+        assert!(!gone.is_current());
+    }
 }
 
 #[cfg(test)]

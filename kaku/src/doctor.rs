@@ -677,6 +677,9 @@ fn build_runtime_group(shell_kind: &ShellKind) -> DoctorGroup {
     #[cfg(target_os = "macos")]
     checks.push(build_local_network_check());
 
+    #[cfg(feature = "remote")]
+    checks.push(build_remote_check());
+
     DoctorGroup {
         title: "Runtime",
         status: group_status(&checks),
@@ -721,6 +724,88 @@ fn build_local_network_check() -> DoctorCheck {
             .to_string(),
         details,
         fix: None,
+    }
+}
+
+/// The web terminal's state: whether the bridge runs, whether it reaches the
+/// relay, and which browsers are paired. Nothing secret goes in: no token,
+/// key or relay id, since the report is bundled into Kaku-Diagnose.zip.
+#[cfg(feature = "remote")]
+fn build_remote_check() -> DoctorCheck {
+    let check = |status, summary: String, details, fix| DoctorCheck {
+        title: "Remote Access",
+        status,
+        summary,
+        details,
+        fix,
+    };
+    let Ok(state) = kaku_remote::read_state() else {
+        return check(
+            DoctorStatus::Info,
+            "Not running: remote access is off, or Kaku is not open".to_string(),
+            Vec::new(),
+            None,
+        );
+    };
+    let devices = kaku_remote::list_devices();
+    let mut details = vec![
+        format!("Local page on port {}", state.port),
+        format!("Paired browsers: {}", devices.len()),
+    ];
+    details.extend(devices.iter().map(|d| format!("{}  {}", d.id, d.name)));
+    let Some(relay) = state.tunnel_relay else {
+        return check(
+            DoctorStatus::Ok,
+            "Local only, no relay".to_string(),
+            details,
+            None,
+        );
+    };
+    let status = kaku_remote::read_relay_status().filter(|s| s.relay == relay && s.is_current());
+    let elapsed = |since: u64| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(since);
+        human_duration(now.saturating_sub(since))
+    };
+    match status {
+        Some(s) if s.connected => check(
+            DoctorStatus::Ok,
+            format!("Connected to {relay} for {}", elapsed(s.since)),
+            details,
+            None,
+        ),
+        Some(s) => {
+            if !s.last_error.is_empty() {
+                details.push(format!("Last error: {}", s.last_error));
+            }
+            check(
+                DoctorStatus::Warn,
+                format!("Not connected to {relay} for {}", elapsed(s.since)),
+                details,
+                Some(
+                    "Kaku retries on its own, at least every 30 seconds. If this lasts, check this Mac's network and any proxy or VPN in front of it."
+                        .to_string(),
+                ),
+            )
+        }
+        None => check(
+            DoctorStatus::Info,
+            format!("No connection to {relay} recorded yet"),
+            details,
+            None,
+        ),
+    }
+}
+
+#[cfg(feature = "remote")]
+fn human_duration(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
+        _ => format!("{}d {}h", secs / 86400, secs % 86400 / 3600),
     }
 }
 

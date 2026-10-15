@@ -368,8 +368,14 @@ pub(crate) async fn run(relay_url: String, dirty: WebDirty) {
         };
         let mut connected_at = None;
         match serve(&relay_url, &identity, &dirty, &mut connected_at).await {
-            Ok(()) => backoff = Duration::from_secs(1),
-            Err(e) => log::info!("kaku-share: relay connection ended: {e:#}"),
+            Ok(()) => {
+                backoff = Duration::from_secs(1);
+                crate::record_relay_status(&relay_url, false, None);
+            }
+            Err(e) => {
+                log::info!("kaku-share: relay connection ended: {e:#}");
+                crate::record_relay_status(&relay_url, false, Some(format!("{e:#}")));
+            }
         }
         backoff = retry_delay(
             backoff,
@@ -439,6 +445,7 @@ async fn serve(
     let socket = connect_relay(request, CONNECT_TIMEOUT).await?;
     *connected_at = Some(tokio::time::Instant::now());
     log::info!("kaku-share: registered with relay as {id}");
+    crate::record_relay_status(relay_url, true, None);
     let (mut relay_tx, mut relay_rx) = socket.split();
 
     // Everything bound for the relay goes through one writer.
