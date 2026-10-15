@@ -4881,6 +4881,51 @@ provider = "managed:kimi-code"
         );
     }
 
+    const MALFORMED_ASSISTANT_TOML: &str =
+        "model = \"a\"\nmodel = \"b\"\napi_key = \"sk-x\"\nchat_tools_enabled = false\n";
+
+    const MALFORMED_ASSISTANT_TOML_SAVES: &[(&str, &str)] = &[
+        ("Enabled", "Off"),
+        ("Simple Model", "gpt-5.4"),
+        ("Deep Model", "gpt-5.5"),
+        ("Base URL", "https://proxy.example.com/v1"),
+        ("API Key", "sk-new"),
+    ];
+
+    #[test]
+    fn kaku_assistant_save_errors_on_malformed_toml() {
+        for (field, value) in MALFORMED_ASSISTANT_TOML_SAVES {
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("assistant.toml");
+            std::fs::write(&path, MALFORMED_ASSISTANT_TOML).expect("write temp config");
+
+            let result = save_kaku_assistant_field_to_path(&path, field, value);
+            assert!(
+                result.is_err(),
+                "saving {} over malformed assistant.toml must fail",
+                field
+            );
+        }
+    }
+
+    #[test]
+    fn kaku_assistant_save_leaves_malformed_toml_bytes_unchanged() {
+        for (field, value) in MALFORMED_ASSISTANT_TOML_SAVES {
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("assistant.toml");
+            std::fs::write(&path, MALFORMED_ASSISTANT_TOML).expect("write temp config");
+
+            let _ = save_kaku_assistant_field_to_path(&path, field, value);
+            let after = std::fs::read(&path).expect("read after save");
+            assert_eq!(
+                String::from_utf8_lossy(&after),
+                MALFORMED_ASSISTANT_TOML,
+                "saving {} must not rewrite malformed assistant.toml",
+                field
+            );
+        }
+    }
+
     #[test]
     fn kaku_assistant_save_omits_chat_model_when_unset() {
         // When the user has no chat_model, neither key should appear in the
