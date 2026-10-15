@@ -1426,6 +1426,7 @@ pub fn restore_previous_window_from_menu(current_window_id: Option<MuxWindowId>)
                     restore_window(closed.window, reuse_target, content_dir_path.as_deref())
                         .await?;
                     drop(_guard);
+                    mark_dirty();
                     // Consume the snapshot only on success: if restore failed
                     // (e.g. domain unavailable), keep the file so the user can
                     // retry after fixing the underlying issue.
@@ -2196,5 +2197,28 @@ mod tests {
             );
         }
         assert_eq!(payload.lines[1].as_str().trim_end(), "x".repeat(200));
+    }
+
+    #[test]
+    fn restore_previous_window_marks_the_session_dirty_after_restoring() {
+        let source = include_str!("session_restore.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let menu = source
+            .split("pub fn restore_previous_window_from_menu(")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn try_restore_on_startup()")
+            .next()
+            .unwrap();
+        let restored = menu.find("drop(_guard);").unwrap();
+        let dirty = menu
+            .find("mark_dirty();")
+            .expect("the menu restore must mark the session dirty");
+        assert!(
+            restored < dirty,
+            "the session must be marked dirty after the restore guard drops"
+        );
     }
 }
