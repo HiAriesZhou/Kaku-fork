@@ -630,7 +630,8 @@ async fn browser_ws(
 
 fn browser_close(code: u64) -> ws::Message {
     let (code, reason) = match code {
-        4403 => (4403, "invalid link key"),
+        4401 => (4401, "pairing link expired or used"),
+        4403 => (4403, "not a paired browser"),
         4408 => (4408, "authentication timed out"),
         4426 => (4426, "page is out of date"),
         _ => (4413, "connection is busy"),
@@ -804,7 +805,15 @@ mod tests {
             panic!("close frame")
         };
         assert_eq!(frame.code, 4403);
-        assert_eq!(frame.reason.as_str(), "invalid link key");
+        assert_eq!(frame.reason.as_str(), "not a paired browser");
+        // The page tells an expired pairing link from a removed browser by
+        // its code; a code the relay does not pass reads as busy and retries.
+        for code in [4401u16, 4408, 4426] {
+            let ws::Message::Close(Some(frame)) = browser_close(code.into()) else {
+                panic!("close frame")
+            };
+            assert_eq!(frame.code, code);
+        }
         let ws::Message::Close(Some(frame)) = browser_close(u64::MAX) else {
             panic!("close frame")
         };
