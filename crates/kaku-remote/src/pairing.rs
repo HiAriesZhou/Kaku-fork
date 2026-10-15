@@ -298,7 +298,8 @@ struct Offer {
 /// Where `admit` reads and records devices and the offer; files in the data
 /// dir for Kaku, memory in tests.
 pub(crate) trait DeviceStore {
-    /// The paired device with this id, marking it seen now.
+    /// The paired device with this id as it was (`last_seen` is the
+    /// previous visit), marking it seen now.
     fn seen(&mut self, id: &str) -> Option<Device>;
     fn add(&mut self, device: Device);
     /// Use up the current offer if `check` accepts its secret.
@@ -377,8 +378,8 @@ impl DeviceStore for DiskStore {
     fn seen(&mut self, id: &str) -> Option<Device> {
         let mut devices = list_devices();
         let device = devices.iter_mut().find(|d| d.id == id)?;
-        device.last_seen = now();
         let found = device.clone();
+        device.last_seen = now();
         let _ = save_devices(&devices);
         Some(found)
     }
@@ -425,6 +426,32 @@ pub(crate) fn announce(device: &Device) {
     let title = format!("{} can now use this Mac's terminals", device.name);
     let message = format!(
         "Paired through a Kaku remote link. If this was not you, run: kaku remote revoke {}",
+        device.id
+    );
+    promise::spawn::spawn_into_main_thread(async move {
+        wezterm_toast_notification::persistent_toast_notification(&title, &message);
+    })
+    .detach();
+}
+
+/// A paired device away this long says so on the Mac when it connects
+/// again; reloads and reconnects within a session stay quiet.
+const QUIET_RETURN: u64 = 30 * 60;
+
+/// Whether a paired device that last connected at `last_seen` is back
+/// after long enough to tell the person at the Mac.
+pub(crate) fn back_after_a_while(last_seen: u64, now: u64) -> bool {
+    now.saturating_sub(last_seen) >= QUIET_RETURN
+}
+
+/// Tell the person at the Mac that a paired device is using it again.
+pub(crate) fn announce_return(device: &Device) {
+    if !back_after_a_while(device.last_seen, now()) {
+        return;
+    }
+    let title = format!("{} is using this Mac's terminals", device.name);
+    let message = format!(
+        "Connected through Kaku remote. To remove it, run: kaku remote revoke {}",
         device.id
     );
     promise::spawn::spawn_into_main_thread(async move {
@@ -662,6 +689,15 @@ pub(crate) mod tests {
         assert!(store.devices.is_empty());
         // The real link still works afterwards.
         assert!(admit(&pair(&key, &t, &[7u8; OFFER_SECRET_LEN]), &t, &mut store).is_ok());
+    }
+
+    #[test]
+    fn only_a_device_back_after_a_while_is_announced() {
+        assert!(back_after_a_while(0, QUIET_RETURN));
+        assert!(back_after_a_while(1_000, 1_000 + QUIET_RETURN));
+        // A reload or reconnect within the half hour stays quiet.
+        assert!(!back_after_a_while(1_000, 1_000 + QUIET_RETURN - 1));
+        assert!(!back_after_a_while(1_000, 900));
     }
 
     #[test]

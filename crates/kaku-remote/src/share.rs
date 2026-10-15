@@ -536,6 +536,8 @@ async fn serve(
                                 if new {
                                     log::info!("kaku-share: paired {} ({})", device.name, device.id);
                                     pairing::announce(&device);
+                                } else {
+                                    pairing::announce_return(&device);
                                 }
                                 if let Stage::Session { keys, inbox, .. } = &mut browser.stage {
                                     // Kaku's own signature was message 0.
