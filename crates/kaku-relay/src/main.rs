@@ -7,7 +7,6 @@
 //! with a key carried in the link's fragment, so the relay only numbers the
 //! browsers and forwards bytes it cannot read.
 
-use axum::body::Bytes;
 use axum::extract::{ws, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -20,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tracing::info;
 
 const MAX_HOSTS: usize = 10_000;
@@ -52,22 +51,46 @@ const GLOBAL_QUEUE_BYTES: usize = 96 << 20;
 const HOST_SILENCE: Duration = Duration::from_secs(75);
 const BROWSER_SILENCE: Duration = Duration::from_secs(150);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-const ASSET_TIMEOUT: Duration = Duration::from_secs(10);
-/// The page's files (xterm.js, fonts) are kept in memory per registration,
-/// so visitors, or someone requesting them in a loop with only the id, do not
-/// make the Mac upload them again. A new registration (a Kaku update
-/// reconnects) starts empty; the page itself always comes fresh.
-const ASSET_CACHE_BUDGET: usize = 48 << 20;
-const ASSET_CACHE_MAX_FILE: usize = 4 << 20;
 const KIND_DATA: u8 = 0;
-const KIND_ASSET: u8 = 1;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-struct Asset {
-    status: u16,
-    content_type: String,
-    body: Bytes,
+/// The web terminal's page and files, built into the relay from the same
+/// sources Kaku serves on the LAN. Every Mac's page shares this origin, so
+/// it must not be whatever each Mac sends: a Mac whose owner altered its
+/// page could otherwise use the keys a browser holds for other Macs.
+fn page_file(name: &str) -> Option<(&'static str, &'static [u8])> {
+    Some(match name {
+        "index.html" => (
+            "text/html; charset=utf-8",
+            include_bytes!("../../kaku-remote/assets/web/index.html"),
+        ),
+        "xterm.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../kaku-remote/assets/web/xterm.js"),
+        ),
+        "xterm-webgl.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../kaku-remote/assets/web/xterm-webgl.js"),
+        ),
+        "xterm.css" => (
+            "text/css; charset=utf-8",
+            include_bytes!("../../kaku-remote/assets/web/xterm.css"),
+        ),
+        "icon.png" => (
+            "image/png",
+            include_bytes!("../../kaku-remote/assets/web/icon.png"),
+        ),
+        "font-regular.ttf" => (
+            "font/ttf",
+            include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf"),
+        ),
+        "font-medium.ttf" => (
+            "font/ttf",
+            include_bytes!("../../../assets/fonts/JetBrainsMono-Medium.ttf"),
+        ),
+        _ => return None,
+    })
 }
 
 /// Bytes waiting in one socket's outgoing queue, within its own budget and
@@ -135,19 +158,7 @@ struct Host {
     /// Ends this registration when newer ones push it out.
     evicted: tokio::sync::Notify,
     browsers: Mutex<HashMap<u32, BrowserLink>>,
-    assets: Mutex<HashMap<u32, oneshot::Sender<Asset>>>,
     next_id: AtomicU32,
-    /// Page files already fetched from this Mac: path to type and body.
-    cache: Mutex<HashMap<String, (String, Bytes)>>,
-    /// Bytes cached across every registration, shared with `AppState`.
-    cache_bytes: Arc<AtomicUsize>,
-}
-
-impl Drop for Host {
-    fn drop(&mut self) {
-        let held: usize = self.cache.lock().values().map(|(_, body)| body.len()).sum();
-        self.cache_bytes.fetch_sub(held, Ordering::Relaxed);
-    }
 }
 
 fn message_len(msg: &ws::Message) -> usize {
@@ -159,29 +170,6 @@ fn message_len(msg: &ws::Message) -> usize {
 }
 
 impl Host {
-    fn cached(&self, path: &str) -> Option<(String, Bytes)> {
-        self.cache.lock().get(path).cloned()
-    }
-
-    /// Keep a fetched page file, within the relay-wide budget.
-    fn keep(&self, path: &str, content_type: &str, body: &Bytes) {
-        if path == "index.html" || body.len() > ASSET_CACHE_MAX_FILE {
-            return;
-        }
-        let len = body.len();
-        if self.cache_bytes.fetch_add(len, Ordering::Relaxed) + len > ASSET_CACHE_BUDGET {
-            self.cache_bytes.fetch_sub(len, Ordering::Relaxed);
-            return;
-        }
-        let replaced = self
-            .cache
-            .lock()
-            .insert(path.to_string(), (content_type.to_string(), body.clone()));
-        if let Some((_, old)) = replaced {
-            self.cache_bytes.fetch_sub(old.len(), Ordering::Relaxed);
-        }
-    }
-
     /// Queue a message for the Mac within the byte budgets.
     fn send(&self, msg: ws::Message) -> bool {
         let len = message_len(&msg);
@@ -219,7 +207,6 @@ struct AppState {
     /// instead of the link reading offline while a Kaku is running.
     hosts: Arc<Mutex<HashMap<String, Vec<Arc<Host>>>>>,
     generation: Arc<AtomicU64>,
-    cache_bytes: Arc<AtomicUsize>,
     /// Bytes queued toward every socket (`GLOBAL_QUEUE_BYTES`).
     queued_bytes: Arc<AtomicUsize>,
 }
@@ -371,10 +358,7 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
         queued: Queued::new(HOST_QUEUE_BYTES, &state.queued_bytes),
         evicted: tokio::sync::Notify::new(),
         browsers: Mutex::new(HashMap::new()),
-        assets: Mutex::new(HashMap::new()),
         next_id: AtomicU32::new(1),
-        cache: Mutex::new(HashMap::new()),
-        cache_bytes: state.cache_bytes.clone(),
     });
     // The newest registration serves; the previous one stays connected as a
     // standby, and its browsers reconnect to this one.
@@ -412,28 +396,17 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
             }
         };
         match msg {
-            ws::Message::Binary(bytes) if bytes.len() >= 5 => {
-                let kind = bytes[0];
+            // Older Kakus also answer page file requests (kind 1); the relay
+            // serves its own copy now and asks for none.
+            ws::Message::Binary(bytes) if bytes.len() >= 5 && bytes[0] == KIND_DATA => {
                 let target = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-                match kind {
-                    KIND_DATA => {
-                        let mut browsers = host.browsers.lock();
-                        if let Some(link) = browsers.get(&target) {
-                            let payload = bytes.slice(5..);
-                            if !link.send(ws::Message::Binary(payload)) {
-                                // A browser that cannot keep up is let go.
-                                browsers.remove(&target);
-                            }
-                        }
+                let mut browsers = host.browsers.lock();
+                if let Some(link) = browsers.get(&target) {
+                    let payload = bytes.slice(5..);
+                    if !link.send(ws::Message::Binary(payload)) {
+                        // A browser that cannot keep up is let go.
+                        browsers.remove(&target);
                     }
-                    KIND_ASSET => {
-                        if let Some(asset) = parse_asset(bytes.slice(5..)) {
-                            if let Some(waiter) = host.assets.lock().remove(&target) {
-                                let _ = waiter.send(asset);
-                            }
-                        }
-                    }
-                    _ => {}
                 }
             }
             ws::Message::Text(text) => {
@@ -473,25 +446,6 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
     }
 }
 
-fn parse_asset(payload: Bytes) -> Option<Asset> {
-    if payload.len() < 3 {
-        return None;
-    }
-    let status = u16::from_be_bytes([payload[0], payload[1]]);
-    let type_len = payload[2] as usize;
-    if payload.len() < 3 + type_len {
-        return None;
-    }
-    let content_type = String::from_utf8(payload[3..3 + type_len].to_vec()).ok()?;
-    Some(Asset {
-        status,
-        content_type,
-        body: payload.slice(3 + type_len..),
-    })
-}
-
-// ── Browser side ──────────────────────────────────────────────────────────────
-
 /// Shown while the Mac's Kaku is not connected. It looks like the terminal
 /// page's own notice and opens the terminal by itself once the Mac is back;
 /// the link's key is still in the address bar, so the reload keeps it.
@@ -513,55 +467,24 @@ setInterval(function () {
 }, 3000);
 </script>"#;
 
-async fn fetch_asset(state: &AppState, id: &str, path: &str) -> Response {
-    let Some(host) = state.host(id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            OFFLINE_PAGE,
-        )
-            .into_response();
+fn asset_response(name: &str) -> Response {
+    let Some((content_type, body)) = page_file(name) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-    if let Some((content_type, body)) = host.cached(path) {
-        return asset_response(path, content_type, body);
-    }
-    let request = host.next_id.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = oneshot::channel();
-    host.assets.lock().insert(request, tx);
-    let get = serde_json::json!({ "t": "get", "r": request, "p": path }).to_string();
-    if !host.send(ws::Message::Text(get.into())) {
-        host.assets.lock().remove(&request);
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    match tokio::time::timeout(ASSET_TIMEOUT, rx).await {
-        Ok(Ok(asset)) if asset.status == 200 => {
-            host.keep(path, &asset.content_type, &asset.body);
-            asset_response(path, asset.content_type, asset.body)
-        }
-        Ok(Ok(_)) => StatusCode::NOT_FOUND.into_response(),
-        _ => {
-            host.assets.lock().remove(&request);
-            StatusCode::GATEWAY_TIMEOUT.into_response()
-        }
-    }
-}
-
-fn asset_response(path: &str, content_type: String, body: Bytes) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
-            // The page always comes fresh from the Mac; xterm.js and the
-            // fonts are ~1 MB that rarely change, so a reload skips them.
+            // The page comes fresh so an update reaches it at once; xterm.js
+            // and the fonts are ~1 MB that rarely change.
             (
                 header::CACHE_CONTROL,
-                if path == "index.html" {
+                if name == "index.html" {
                     "no-cache"
                 } else {
                     "max-age=3600"
-                }
-                .to_string(),
+                },
             ),
-            (header::REFERRER_POLICY, "no-referrer".to_string()),
+            (header::REFERRER_POLICY, "no-referrer"),
         ],
         body,
     )
@@ -582,21 +505,24 @@ async fn page(Path(id): Path<String>, State(state): State<AppState>) -> Response
     if !valid_id(&id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    fetch_asset(&state, &id, "index.html").await
+    // The page answers 404 while the Mac is away: that is how an open page
+    // tells an offline Mac from a network problem.
+    if state.host(&id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            OFFLINE_PAGE,
+        )
+            .into_response();
+    }
+    asset_response("index.html")
 }
 
-async fn page_asset(
-    Path((id, name)): Path<(String, String)>,
-    State(state): State<AppState>,
-) -> Response {
-    let safe = !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_');
-    if !valid_id(&id) || !safe {
+async fn page_asset(Path((id, name)): Path<(String, String)>) -> Response {
+    if !valid_id(&id) || name == "index.html" {
         return StatusCode::NOT_FOUND.into_response();
     }
-    fetch_asset(&state, &id, &format!("assets/{name}")).await
+    asset_response(&name)
 }
 
 async fn browser_ws(
@@ -820,26 +746,33 @@ mod tests {
         assert_eq!(frame.code, 4413);
     }
 
-    /// Page files come from the Mac once per registration; the page itself
-    /// never caches, the budget bounds memory, and a dropped registration
-    /// gives its bytes back.
     #[test]
-    fn page_files_are_cached_per_registration_within_the_budget() {
+    fn the_page_is_the_relay_own_and_shows_only_for_a_connected_mac() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let state = AppState::default();
-        let host = test_host(&state);
-        let font = Bytes::from(vec![0u8; 1000]);
-        host.keep("assets/font.ttf", "font/ttf", &font);
-        host.keep("index.html", "text/html", &Bytes::from_static(b"<html>"));
-        assert_eq!(host.cached("assets/font.ttf").map(|(_, b)| b.len()), Some(1000));
-        assert!(host.cached("index.html").is_none());
-        assert_eq!(state.cache_bytes.load(Ordering::Relaxed), 1000);
-        // Past the budget nothing more is kept.
-        state.cache_bytes.fetch_add(ASSET_CACHE_BUDGET, Ordering::Relaxed);
-        host.keep("assets/xterm.js", "text/javascript", &font);
-        assert!(host.cached("assets/xterm.js").is_none());
-        state.cache_bytes.fetch_sub(ASSET_CACHE_BUDGET, Ordering::Relaxed);
-        drop(host);
-        assert_eq!(state.cache_bytes.load(Ordering::Relaxed), 0);
+        let id = "0123456789abcdef0123456789abcdef".to_string();
+        let page_for = |state: AppState| rt.block_on(page(Path(id.clone()), State(state)));
+        // Away: the offline notice, as a 404 the open page can recognize.
+        assert_eq!(page_for(state.clone()).status(), StatusCode::NOT_FOUND);
+        state.register(&id, test_host(&state));
+        let shown = page_for(state.clone());
+        assert_eq!(shown.status(), StatusCode::OK);
+        assert_eq!(shown.headers()[header::CACHE_CONTROL], "no-cache");
+        // Files come from the relay's own copy, with or without the Mac.
+        let asset = |name: &str| rt.block_on(page_asset(Path((id.clone(), name.to_string()))));
+        assert_eq!(asset("xterm.js").status(), StatusCode::OK);
+        assert_eq!(
+            asset("font-regular.ttf").headers()[header::CONTENT_TYPE],
+            "font/ttf"
+        );
+        assert_eq!(asset("../Cargo.toml").status(), StatusCode::NOT_FOUND);
+        assert_eq!(asset("index.html").status(), StatusCode::NOT_FOUND);
+        assert!(page_file("index.html")
+            .unwrap()
+            .1
+            .starts_with(b"<!doctype html>"));
     }
 
     fn test_host(state: &AppState) -> Arc<Host> {
@@ -852,10 +785,7 @@ mod tests {
             queued: Queued::new(HOST_QUEUE_BYTES, &state.queued_bytes),
             evicted: tokio::sync::Notify::new(),
             browsers: Mutex::new(HashMap::new()),
-            assets: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
-            cache: Mutex::new(HashMap::new()),
-            cache_bytes: state.cache_bytes.clone(),
         })
     }
 
@@ -984,18 +914,6 @@ mod tests {
         assert!(owns(&id, &secret));
         assert!(!owns(&id, "b"));
         assert!(!owns(&id, ""));
-    }
-
-    #[test]
-    fn asset_frames_round_trip() {
-        let mut payload = vec![0, 200, 9];
-        payload.extend_from_slice(b"text/html");
-        payload.extend_from_slice(b"<p>hi</p>");
-        let asset = parse_asset(Bytes::from(payload)).unwrap();
-        assert_eq!(asset.status, 200);
-        assert_eq!(asset.content_type, "text/html");
-        assert_eq!(&asset.body[..], b"<p>hi</p>");
-        assert!(parse_asset(Bytes::from_static(&[0, 200, 50])).is_none());
     }
 
     #[test]

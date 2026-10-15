@@ -1,0 +1,9 @@
+# Only the relay is built with Docker (crates/kaku-relay/Dockerfile, from
+# the repository root). Send it just what it needs, never target/ or dist/.
+*
+!crates/kaku-relay/Cargo.toml
+!crates/kaku-relay/Cargo.lock
+!crates/kaku-relay/src
+!crates/kaku-remote/assets/web
+!assets/fonts/JetBrainsMono-Regular.ttf
+!assets/fonts/JetBrainsMono-Medium.ttf
