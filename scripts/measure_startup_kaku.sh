@@ -89,11 +89,15 @@ done
 jq -n --arg version "$("$GUI" --version)" --argjson runs "$RUNS" \
   --slurpfile cw "$BENCH_DIR/cold-window.json" --slurpfile ww "$BENCH_DIR/warm-window.json" \
   --slurpfile cr "$BENCH_DIR/cold-ready.json" --slurpfile wr "$BENCH_DIR/warm-ready.json" '
-  def metric($r): $r.results[0] | {mean_ms:(.mean*1000),
+  # hyperfine 2 moved wall-clock times under summary and measurements.
+  def wall: if .summary then {mean:.summary.time_wall_clock.mean,
+    median:.summary.time_wall_clock.median, times:[.measurements[].time_wall_clock.value]}
+    else {mean, median, times} end;
+  def metric($r): $r.results[0] | wall | {mean_ms:(.mean*1000),
     p50_ms:(.median*1000), p95_ms:(.times | sort | .[(([length*0.95|ceil,1]|max)-1)] * 1000)};
   {schema_version:2, measurement:"launch_to_prompt_and_first_paint", version:$version, runs:$runs,
-   cold_start_ms:($cr[0].results[0].mean*1000|round),
-   warm_start_ms:($wr[0].results[0].mean*1000|round),
+   cold_start_ms:($cr[0].results[0] | wall | .mean*1000|round),
+   warm_start_ms:($wr[0].results[0] | wall | .mean*1000|round),
    cold_window:metric($cw[0]), warm_window:metric($ww[0]),
    cold_ready:metric($cr[0]), warm_ready:metric($wr[0]),
    cache_policy:"cold resets fixture app cache; warm reuses it; OS and font caches are retained",
