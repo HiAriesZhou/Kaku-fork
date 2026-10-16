@@ -385,6 +385,28 @@ test('clicking back to a cached tab shows it in the next frame, never blank', as
   assert.ok(!(await p.evaluate(() => window.__states.some(s => s === ''))));
 });
 
+test('a closed tab leaves the bar on the click and stays gone until Kaku agrees', async t => {
+  const { p } = await page(t);
+  await screen(p, 'first');
+  await p.evaluate(() => probe.attach({ pane_id: 2, tab_id: 2 }));
+  await screen(p, 'second', 2);
+  const titles = () => p.evaluate(() => [...document.querySelectorAll('#bar .tab')].map(b => b.textContent.trim()));
+  await p.evaluate(() => { messages.length = 0; });
+  await p.locator('#bar .tab').nth(1).hover();
+  await p.locator('#bar .tab').nth(1).locator('.close').click();
+  // Gone at once, and the neighbour shown from its snapshot.
+  assert.deepEqual(await titles(), ['one']);
+  await p.waitForFunction(() => document.querySelector('.xterm-rows').textContent.includes('first'), null, { timeout: 1000 });
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'close_tab').map(m => m.tab_id)), [2]);
+  // A list sent before Kaku closed it does not bring it back.
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }, { tab_id: 2, pane_id: 2, panes: [], title: 'two' }] }));
+  assert.deepEqual(await titles(), ['one']);
+  // Kaku still has it after the grace: it was not closed, so it returns.
+  await p.evaluate(() => { const now = Date.now; Date.now = () => now() + 4000; });
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }, { tab_id: 2, pane_id: 2, panes: [], title: 'two' }] }));
+  assert.deepEqual(await titles(), ['one', 'two']);
+});
+
 test('renaming from a menu opened before the tab bar was rebuilt still edits the tab', async t => {
   const { p } = await page(t);
   await screen(p);
