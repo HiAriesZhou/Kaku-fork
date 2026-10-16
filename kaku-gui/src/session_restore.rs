@@ -2000,9 +2000,8 @@ mod tests {
     // Bug B (`restore_window` force-reuses when `current_window_id` is Some)
     // and Bug C (menu caller pre-checks `is_window_empty`) both depend on a
     // live `Mux` singleton plus a freshly spawned async window. There is no
-    // mux test harness in this crate yet, so they are covered by the manual
-    // verification step in /Users/tw93/.claude/plans/quiet-weaving-valiant.md:
-    // cold-launch with a saved one-window session must produce exactly one
+    // mux test harness in this crate yet, so they are covered by a manual
+    // check: cold-launch with a saved one-window session must produce exactly one
     // window, and the menu "restore previous window" path inside a non-empty
     // window must open a new window beside the user's current work.
 

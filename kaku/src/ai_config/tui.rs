@@ -3677,7 +3677,7 @@ mod tests {
             },
             FieldEntry {
                 key: "Auth".into(),
-                value: "✓ hitw93@gmail.com".into(),
+                value: "✓ user@example.com".into(),
                 options: vec![],
                 editable: false,
             },
@@ -4203,15 +4203,15 @@ mod tests {
     #[test]
     fn parse_claude_keychain_account_extracts_account_name() {
         let raw = r#"
-keychain: "/Users/tw93/Library/Keychains/login.keychain-db"
+keychain: "/Users/alice/Library/Keychains/login.keychain-db"
 version: 512
 class: "genp"
 attributes:
-    "acct"<blob>="tw93"
+    "acct"<blob>="alice"
     "svce"<blob>="Claude Code-credentials"
 "#;
 
-        assert_eq!(parse_claude_keychain_account(raw), Some("tw93".into()));
+        assert_eq!(parse_claude_keychain_account(raw), Some("alice".into()));
     }
 
     #[test]
