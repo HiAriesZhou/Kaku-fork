@@ -96,5 +96,7 @@
 37	全局快捷键会从屏幕顶部拉出终端，长按可以打开右键菜单
 37	Starship branch and git status icons are back for installs that kept the blank ones
 37	之前留下空白图标的安装也会恢复 Starship 的分支和 git 状态图标
-38	<English highlight 1 — describe the config change>
-38	<中文 highlight 1 — 这次配置变更内容>
+38	The cursor comes back at the prompt after a program hides it and exits
+38	程序隐藏光标后退出，回到提示符时光标会自动恢复
+38	Dotfiles kept as symlinks stay linked when Kaku updates them
+38	用符号链接管理的配置文件在 Kaku 更新时保持链接不变
