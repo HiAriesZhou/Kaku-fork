@@ -369,9 +369,29 @@ exit 127
     }
 
     fn resolve_setup_script(script_name: &str) -> Option<PathBuf> {
+        let cwd = std::env::current_dir().ok();
+        let exe = std::env::current_exe().ok();
+        // Only debug builds trust the working directory, so a release build
+        // run inside any checkout still uses the bundled script.
+        setup_script_candidates(
+            script_name,
+            cwd.as_deref(),
+            exe.as_deref(),
+            cfg!(debug_assertions),
+        )
+        .into_iter()
+        .find(|p| p.exists())
+    }
+
+    fn setup_script_candidates(
+        script_name: &str,
+        cwd: Option<&Path>,
+        exe: Option<&Path>,
+        include_cwd: bool,
+    ) -> Vec<PathBuf> {
         let mut candidates = Vec::new();
 
-        if let Ok(cwd) = std::env::current_dir() {
+        if let Some(cwd) = cwd.filter(|_| include_cwd) {
             candidates.push(
                 cwd.join("assets")
                     .join("shell-integration")
@@ -379,7 +399,7 @@ exit 127
             );
         }
 
-        if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe) = exe {
             if let Some(contents_dir) = exe.parent().and_then(|p| p.parent()) {
                 candidates.push(contents_dir.join("Resources").join(script_name));
             }
@@ -398,7 +418,7 @@ exit 127
                 .join(script_name),
         );
 
-        candidates.into_iter().find(|p| p.exists())
+        candidates
     }
 
     fn read_setup_config_version(setup_script: &Path) -> anyhow::Result<u64> {
@@ -447,6 +467,70 @@ exit 127
             fs::write(root.path().join("config_version.txt"), "31\n").unwrap();
 
             assert_eq!(read_setup_config_version(&script).unwrap(), 31);
+        }
+
+        fn checkout() -> PathBuf {
+            PathBuf::from("/Users/someone/src/Kaku")
+        }
+
+        fn app_exe() -> PathBuf {
+            PathBuf::from("/Applications/Kaku.app/Contents/MacOS/kaku")
+        }
+
+        #[test]
+        fn release_setup_script_candidates_skip_the_working_directory() {
+            let cwd = checkout();
+            let exe = app_exe();
+            let candidates = setup_script_candidates("setup_zsh.sh", Some(&cwd), Some(&exe), false);
+
+            assert!(
+                candidates.iter().all(|p| !p.starts_with(&cwd)),
+                "release candidates must not come from the working directory: {:?}",
+                candidates
+            );
+            assert_eq!(
+                candidates.first(),
+                Some(&PathBuf::from(
+                    "/Applications/Kaku.app/Contents/Resources/setup_zsh.sh"
+                )),
+                "the bundled script comes first: {candidates:?}"
+            );
+        }
+
+        #[test]
+        fn debug_setup_script_candidates_start_with_the_checkout() {
+            let cwd = checkout();
+            let exe = app_exe();
+            let candidates = setup_script_candidates("setup_zsh.sh", Some(&cwd), Some(&exe), true);
+
+            assert_eq!(
+                candidates.first(),
+                Some(
+                    &cwd.join("assets")
+                        .join("shell-integration")
+                        .join("setup_zsh.sh")
+                ),
+                "debug builds look in the checkout first: {candidates:?}"
+            );
+        }
+
+        #[test]
+        fn setup_script_lookup_includes_the_working_directory_only_in_debug_builds() {
+            let source = include_str!("init.rs");
+            let start = source
+                .find("fn resolve_setup_script(")
+                .expect("resolve_setup_script exists");
+            let body = &source[start..];
+            let body = &body[..body.find("\n    }\n").expect("end of resolve_setup_script")];
+
+            assert!(
+                body.contains("setup_script_candidates("),
+                "resolve_setup_script builds its list through setup_script_candidates"
+            );
+            assert!(
+                body.contains("cfg!(debug_assertions)"),
+                "the working directory is gated on debug builds"
+            );
         }
     }
 }

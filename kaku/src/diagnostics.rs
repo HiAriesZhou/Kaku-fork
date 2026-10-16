@@ -389,8 +389,10 @@ static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)((?:api[_-]?key|token|secret|password|passwd)[A-Za-z0-9_]*\s*[:=]\s*)(['"]?)[^'"\s,}]+(['"]?)"#)
         .unwrap()
 });
+static URL_USERINFO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\b([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s'"]+@"#).unwrap());
 static TOKEN_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9-]{10,})|(?i:bearer\s+)[A-Za-z0-9._-]{16,}")
+    Regex::new(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,})|(?i:bearer\s+)[A-Za-z0-9._-]{16,}")
         .unwrap()
 });
 
@@ -477,6 +479,9 @@ impl Redactor {
         out = SERIAL_NUMBER.replace_all(&out, "${1}<serial>").into_owned();
         out = SECRET_ASSIGNMENT
             .replace_all(&out, "${1}${2}<redacted>${3}")
+            .into_owned();
+        out = URL_USERINFO
+            .replace_all(&out, "${1}<redacted>@")
             .into_owned();
         TOKEN_LITERAL.replace_all(&out, "<redacted>").into_owned()
     }
@@ -579,6 +584,63 @@ key_down: sending "\r", Char('\r') NONE
     fn leaves_ordinary_text_alone() {
         let input = "Kaku 0.21.0 on macOS 26.1, font_size = 17, line_height = 1.28\n";
         assert_eq!(redactor().redact(input), input);
+    }
+
+    #[test]
+    fn redacts_url_userinfo_and_keeps_the_host() {
+        let input = "https_proxy = \"http://alice:Hunter2pw@proxy:3128\"\n";
+        let out = redactor().redact(input);
+        assert!(!out.contains("Hunter2pw"), "leaked password in:\n{}", out);
+        assert!(!out.contains("alice:"), "leaked user in:\n{}", out);
+        assert!(out.contains("proxy:3128"), "lost host in:\n{}", out);
+    }
+
+    #[test]
+    fn redacts_fine_grained_github_tokens() {
+        let token = "github_pat_11ABCDEFG0aBcDeFgHiJkLmN_oPqRsTuVwXyZ0123456789";
+        let input = format!("credential {token} stored\n");
+        let out = redactor().redact(&input);
+        assert!(!out.contains(token), "leaked token in:\n{}", out);
+        assert!(
+            !out.contains("11ABCDEFG0aBcDeFgHiJkLmN"),
+            "leaked token in:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn leaves_urls_without_credentials_alone() {
+        for input in [
+            "see https://example.com/x for details\n",
+            "remote origin git@github.com:o/r.git (fetch)\n",
+        ] {
+            assert_eq!(redactor().redact(input), input);
+        }
+    }
+
+    #[test]
+    fn redacts_url_userinfo_whose_user_name_contains_an_at_sign() {
+        let input = "https_proxy = \"http://alice@example.com:Hunter2pw@proxy.local:3128\"\n";
+        let out = redactor().redact(input);
+        assert!(!out.contains("Hunter2pw"), "leaked password in:\n{}", out);
+        assert!(
+            !out.contains("alice@example.com"),
+            "leaked user in:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn keeps_the_host_after_an_at_sign_user_name_and_leaves_path_at_signs_alone() {
+        let input = "https_proxy = \"http://alice@example.com:Hunter2pw@proxy.local:3128\"\n";
+        let out = redactor().redact(input);
+        assert!(out.contains("proxy.local:3128"), "lost host in:\n{}", out);
+        for input in [
+            "see https://example.com/a@b for details\n",
+            "remote origin git@github.com:o/r.git (fetch)\n",
+        ] {
+            assert_eq!(redactor().redact(input), input);
+        }
     }
 
     #[test]
