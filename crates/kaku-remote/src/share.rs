@@ -81,7 +81,12 @@ impl ShareIdentity {
     /// This Mac's page through the relay at `relay_url` (ws:// or wss://).
     /// Opening it pairs nothing; a paired browser bookmarks it.
     pub fn page_url(&self, relay_url: &str) -> String {
-        format!("{}/{}/", http_base(relay_url), self.id())
+        let base = if relay_url.trim_end_matches('/') == crate::DEFAULT_RELAY {
+            crate::DEFAULT_PAGE.to_string()
+        } else {
+            http_base(relay_url)
+        };
+        format!("{base}/{}/", self.id())
     }
 
     /// A link that pairs one more browser, once, within
@@ -839,6 +844,11 @@ mod tests {
         assert_eq!(
             a.page_url("wss://relay.example.com/"),
             format!("https://relay.example.com/{}/", a.id())
+        );
+        // The default relay's page lives on its own origin.
+        assert_eq!(
+            a.page_url("wss://r.kaku.fun"),
+            format!("https://t.kaku.fun/{}/", a.id())
         );
         let fragment = pairing::pairing_fragment(mac.public_key(), "c2VjcmV0");
         let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);

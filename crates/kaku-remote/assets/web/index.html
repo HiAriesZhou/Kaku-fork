@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="referrer" content="no-referrer">
+<!-- The relay this page talks to when it is served from its own origin
+     (t.kaku.fun, filled in by scripts/publish_web_page.sh). Empty, the page
+     reaches the relay or Kaku that served it. -->
+<meta name="kaku-relay" content="">
 <title>Kaku</title>
 <link rel="icon" type="image/png" href="assets/icon.png">
 <link rel="apple-touch-icon" href="assets/icon.png">
@@ -261,7 +265,9 @@
   const toBase64Url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   // This Mac's relay id, which both sides sign over.
   const hostId = location.pathname.split("/").find((part) => /^[0-9a-f]{32}$/.test(part)) || "";
-  const DEVICE_SLOT = location.pathname;
+  // Keyed by the id, so /<id> and /<id>/ find the same paired device.
+  const DEVICE_SLOT = hostId ? "/" + hostId + "/" : location.pathname;
+  const RELAY = (document.querySelector('meta[name="kaku-relay"]')?.content || "").replace(/\/+$/, "");
   const deviceStore = (mode, work) => new Promise((resolve, reject) => {
     const open = indexedDB.open("kaku", 1);
     open.onupgradeneeded = () => open.result.createObjectStore("devices");
@@ -338,6 +344,7 @@
   const wsUrl = () => {
     const scheme = location.protocol === "https:" ? "wss://" : "ws://";
     if (relay) {
+      if (RELAY) return RELAY + "/" + hostId + "/ws";
       const base = location.pathname.endsWith("/") ? location.pathname : location.pathname + "/";
       return scheme + location.host + base + "ws";
     }
@@ -2468,14 +2475,18 @@
     send({ type: "ping" });
   }, 20000);
 
-  // Through the relay the page's own address answers 404 while the Mac's
-  // Kaku is not connected, and fails outright without a network.
+  // Through the relay the Mac's status (or, when the relay served this page,
+  // the page's own address) answers 404 while the Mac's Kaku is not
+  // connected, and fails outright without a network.
   const explainOffline = () => {
     if (!relay) {
       setNotice("Kaku is not running", "This page reconnects when it is back.", { stale: true, brand: true });
       return;
     }
-    fetch(location.pathname, { method: "HEAD", cache: "no-store" }).then((res) => {
+    const asked = RELAY
+      ? fetch(RELAY.replace(/^ws/, "http") + "/" + hostId + "/status", { cache: "no-store" })
+      : fetch(location.pathname, { method: "HEAD", cache: "no-store" });
+    asked.then((res) => {
       if (ws && ws.readyState === WebSocket.OPEN) return;
       if (res.status === 404) setNotice("Kaku on the Mac is offline", "This page reconnects when it is back.", { stale: true, brand: true });
     }).catch(() => {

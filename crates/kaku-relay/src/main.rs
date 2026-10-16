@@ -226,6 +226,11 @@ struct AppState {
     /// The access code a Mac must present to register; unset, none is asked.
     access: Option<Arc<AccessCode>>,
     limits: Arc<Mutex<AddrLimits>>,
+    /// Where the page lives when it is not served here
+    /// (`KAKU_RELAY_PAGE_ORIGIN`, e.g. `https://t.kaku.fun`): page addresses
+    /// redirect there and browsers are admitted only from it. Unset (local
+    /// runs, tests), the relay serves its own copy to any origin.
+    page_origin: Option<Arc<str>>,
     /// Bytes queued toward every socket (`GLOBAL_QUEUE_BYTES`).
     queued_bytes: Arc<AtomicUsize>,
 }
@@ -698,6 +703,11 @@ async fn page(Path(id): Path<String>, State(state): State<AppState>) -> Response
     if !valid_id(&id) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    // The page lives on its own origin: links from older Kakus land there,
+    // and the browser carries the fragment (the pairing secret) over.
+    if let Some(origin) = &state.page_origin {
+        return Redirect::permanent(&format!("{origin}/{id}/")).into_response();
+    }
     // The page answers 404 while the Mac is away: that is how an open page
     // tells an offline Mac from a network problem.
     if state.host(&id).is_none() {
@@ -711,11 +721,48 @@ async fn page(Path(id): Path<String>, State(state): State<AppState>) -> Response
     asset_response("index.html")
 }
 
-async fn page_asset(Path((id, name)): Path<(String, String)>) -> Response {
-    if !valid_id(&id) || name == "index.html" {
+async fn page_asset(
+    Path((id, name)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    if !valid_id(&id) || name == "index.html" || state.page_origin.is_some() {
         return StatusCode::NOT_FOUND.into_response();
     }
     asset_response(&name)
+}
+
+/// Whether this Mac is connected: 200 or 404, readable by the page's origin,
+/// so a page served elsewhere can tell an offline Mac from no network.
+async fn host_status(Path(id): Path<String>, State(state): State<AppState>) -> Response {
+    let status = if valid_id(&id) && state.host(&id).is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    let mut response = status.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    if let Some(origin) = state.page_origin.as_deref().and_then(|o| o.parse().ok()) {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    }
+    response
+}
+
+/// Whether a browser socket comes from the page: with a page origin set, its
+/// `Origin` must be exactly that, so another site cannot drive a browser's
+/// paired keys through the relay. Browsers always send `Origin` on a
+/// WebSocket handshake.
+fn origin_allowed(page_origin: Option<&str>, headers: &HeaderMap) -> bool {
+    let Some(expected) = page_origin else {
+        return true;
+    };
+    headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|origin| origin == expected)
 }
 
 async fn browser_ws(
@@ -724,6 +771,9 @@ async fn browser_ws(
     headers: HeaderMap,
     upgrade: ws::WebSocketUpgrade,
 ) -> Response {
+    if !origin_allowed(state.page_origin.as_deref(), &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let addr = client_addr(&headers);
     if !state.limits.lock().allow_connect(&addr, Instant::now()) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
@@ -872,6 +922,7 @@ fn app(state: AppState) -> Router {
         .route("/{id}", get(short_page_redirect))
         .route("/{id}/", get(page))
         .route("/{id}/ws", get(browser_ws))
+        .route("/{id}/status", get(host_status))
         .route("/{id}/assets/{name}", get(page_asset))
         .with_state(state)
 }
@@ -927,9 +978,18 @@ async fn main() {
     if access.is_some() {
         info!("Macs need the access code to register");
     }
+    let page_origin = std::env::var("KAKU_RELAY_PAGE_ORIGIN")
+        .ok()
+        .map(|o| o.trim().trim_end_matches('/').to_string())
+        .filter(|o| !o.is_empty())
+        .map(Arc::from);
+    if let Some(origin) = &page_origin {
+        info!("the page is served from {origin}");
+    }
     let state = AppState {
         tokens,
         access,
+        page_origin,
         ..AppState::default()
     };
     if let Err(e) = axum::serve(listener, app(state)).await {
@@ -978,7 +1038,12 @@ mod tests {
         assert_eq!(shown.status(), StatusCode::OK);
         assert_eq!(shown.headers()[header::CACHE_CONTROL], "no-cache");
         // Files come from the relay's own copy, with or without the Mac.
-        let asset = |name: &str| rt.block_on(page_asset(Path((id.clone(), name.to_string()))));
+        let asset = |name: &str| {
+            rt.block_on(page_asset(
+                Path((id.clone(), name.to_string())),
+                State(state.clone()),
+            ))
+        };
         assert_eq!(asset("xterm.js").status(), StatusCode::OK);
         assert_eq!(
             asset("font-regular.ttf").headers()[header::CONTENT_TYPE],
@@ -990,6 +1055,55 @@ mod tests {
             .unwrap()
             .1
             .starts_with(b"<!doctype html>"));
+    }
+
+    #[test]
+    fn with_a_page_origin_links_move_there_and_only_its_browsers_join() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let state = AppState {
+            page_origin: Some(Arc::from("https://t.kaku.fun")),
+            ..AppState::default()
+        };
+        let id = "0123456789abcdef0123456789abcdef".to_string();
+        let shown = rt.block_on(page(Path(id.clone()), State(state.clone())));
+        assert_eq!(shown.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            shown.headers()[header::LOCATION],
+            "https://t.kaku.fun/0123456789abcdef0123456789abcdef/"
+        );
+        let asset = rt.block_on(page_asset(
+            Path((id.clone(), "xterm.js".into())),
+            State(state.clone()),
+        ));
+        assert_eq!(asset.status(), StatusCode::NOT_FOUND);
+
+        let from = |origin: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(origin) = origin {
+                headers.insert(header::ORIGIN, origin.parse().unwrap());
+            }
+            origin_allowed(state.page_origin.as_deref(), &headers)
+        };
+        assert!(from(Some("https://t.kaku.fun")));
+        assert!(!from(Some("https://evil.example")));
+        assert!(!from(Some("https://r.kaku.fun")));
+        assert!(!from(None));
+        // Without a page origin (local runs) any browser joins, as before.
+        assert!(origin_allowed(None, &HeaderMap::new()));
+
+        // The page asks whether the Mac is here, across origins.
+        let status =
+            |state: &AppState| rt.block_on(host_status(Path(id.clone()), State(state.clone())));
+        let away = status(&state);
+        assert_eq!(away.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            away.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://t.kaku.fun"
+        );
+        state.register(&id, test_host(&state));
+        assert_eq!(status(&state).status(), StatusCode::OK);
     }
 
     fn test_host(state: &AppState) -> Arc<Host> {

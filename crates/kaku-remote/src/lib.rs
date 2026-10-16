@@ -356,6 +356,9 @@ pub fn render_qr_terminal(url: &str) -> String {
 /// The relay when `remote.tunnel_url` is empty. It lives here, not in the
 /// config crate, so builds without the web terminal do not carry it.
 const DEFAULT_RELAY: &str = "wss://r.kaku.fun";
+/// Where the page lives for the default relay: its own origin, apart from
+/// the relay, which only forwards ciphertext and redirects old links here.
+const DEFAULT_PAGE: &str = "https://t.kaku.fun";
 
 pub fn start() {
     // install_default() returns Err if a provider is already installed; that is fine.
