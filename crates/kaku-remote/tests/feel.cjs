@@ -169,6 +169,40 @@ const WATCH = () => {
     report.burst = { chars: burst.length, until_all_shown_ms: +(t1 - t0).toFixed(1), intact: await page.evaluate(b => window.__rows().includes(b), burst) };
     await page.keyboard.press('Control+U');
 
+    // ── Chinese through an input method ───────────────────────────────────
+    // The composition shows in the page as it is typed (xterm's composition
+    // view); only the committed text goes to the Mac.
+    const cdp = await context.newCDPSession(page);
+    await textarea.focus();
+    await cdp.send('Input.imeSetComposition', { text: 'ni', selectionStart: 2, selectionEnd: 2 });
+    await cdp.send('Input.imeSetComposition', { text: 'nihao', selectionStart: 5, selectionEnd: 5 });
+    const composing = await page.evaluate(() => document.querySelector('.composition-view')?.textContent || '');
+    const imeAt = await page.evaluate(() => performance.now());
+    await cdp.send('Input.insertText', { text: '你好世界' });
+    await shows('你好世界');
+    const imeShown = await page.evaluate(() => performance.now());
+    report.ime = {
+      composition_shown_locally: composing === 'nihao',
+      commit_to_echo_ms: +(imeShown - imeAt).toFixed(1),
+      exact_once: await page.evaluate(() => (window.__rows().match(/你好世界/g) || []).length === 1 && !window.__rows().includes('nihao')),
+    };
+    await page.keyboard.press('Control+U');
+
+    // ── Pasting a block of text (Cmd+V) ───────────────────────────────────
+    await page.keyboard.type('clear; cat\n');
+    await sleep(400);
+    const block = Array.from({ length: 100 }, (_, i) => `paste line ${String(i).padStart(3, '0')} ${'x'.repeat(28)}`).join('\n') + '\n';
+    await page.evaluate(text => navigator.clipboard.writeText(text), block);
+    const pasteAt = await page.evaluate(() => performance.now());
+    await page.keyboard.press('Meta+V');
+    await shows('paste line 099');
+    const pasteShown = await page.evaluate(() => performance.now());
+    await page.keyboard.press('Control+D');
+    report.paste = { bytes: block.length, until_last_line_shown_ms: +(pasteShown - pasteAt).toFixed(1) };
+    await sleep(300);
+    await page.keyboard.type('clear\n');
+    await sleep(300);
+
     // ── Scrolling a long plain-shell history ──────────────────────────────
     await page.keyboard.type('seq 1 4000\n');
     await shows('4000');
