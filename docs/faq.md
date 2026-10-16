@@ -252,3 +252,7 @@ Kaku is compatible with yabai and AeroSpace. If you see continuous flickering, i
 Hold anywhere for about half a second, then lift, to open the menu a right click would: on a tab you get New Tab, Tab Navigator and Close Tab, and on the terminal you get Copy, Paste, Split and the rest. This works in every window, as long as the remote client forwards a held press as a held left button, which UU does. In panes where a program such as vim or tmux takes mouse input, the hold stays with that program.
 
 **Window > Touch Mode** adds a close button to every tab, since a finger has no hover. The tab bar keeps its height and look, and the terminal font and line height do not change.
+
+## The remote web page says the Mac is offline, or asks me to pair again.
+
+The page reaches your Mac through Kaku, so the Mac has to be awake with Kaku running and remote access on. On a laptop, keep it plugged in and turn on Prevent automatic sleeping on power adapter when the display is off in System Settings > Battery > Options; on a desktop Mac it is Prevent automatic sleeping when the display is off in System Settings > Energy. Pairing lives in the browser: another browser, a private window or cleared site data needs a new link, which only `kaku remote` on the Mac can make, so pair each device you plan to use before you leave.

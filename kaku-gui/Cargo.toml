@@ -22,7 +22,7 @@ name = "k"
 path = "src/bin/k.rs"
 
 [features]
-default = ["vendored-fonts"]
+default = ["vendored-fonts", "remote"]
 distro-defaults = ["config/distro-defaults"]
 vendor-nerd-font-symbols-font = ["wezterm-font/vendor-nerd-font-symbols"]
 vendor-jetbrains-font = ["wezterm-font/vendor-jetbrains"]

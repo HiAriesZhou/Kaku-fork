@@ -8,6 +8,11 @@ primary_region = 'nrt'
 
 [build]
 
+# The web terminal page lives on its own origin; the relay redirects old page
+# addresses there and admits browser sockets only from it.
+[env]
+  KAKU_RELAY_PAGE_ORIGIN = 'https://t.kaku.fun'
+
 [http_service]
   internal_port = 8080
   force_https = true

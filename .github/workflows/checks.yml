@@ -102,7 +102,7 @@ jobs:
 
       - name: Run tests
         run: |
-          cargo nextest run --locked --features kaku/remote,kaku-gui/remote -E 'not test(shapecache::test::ligatures_jetbrains)'
+          cargo nextest run --locked -E 'not test(shapecache::test::ligatures_jetbrains)'
           cargo nextest run --locked -p wezterm-escape-parser
 
       - name: Browser terminal regressions
@@ -177,15 +177,6 @@ jobs:
       # own Cargo.toml are scoped here. Other crates (vendored, wezterm
       # upstream-tracking, etc.) will be added incrementally.
       - name: Run clippy on lint-opt-in crates
-        run: |
-          cargo clippy --locked --all-targets --features kaku/remote,kaku-gui/remote \
-            -p kaku -p kaku-gui -p mux -p config \
-            -- -D warnings
-
-      # Releases build without `remote`, and Build Validation is path-filtered,
-      # so lint the shipped feature set too: an item only remote code uses is
-      # dead code there, which the remote build above never sees.
-      - name: Run clippy on the shipped feature set
         run: |
           cargo clippy --locked --all-targets -p kaku -p kaku-gui -p mux -p config -- -D warnings
 

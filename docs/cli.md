@@ -58,6 +58,20 @@ kaku reset
 kaku reset --shell fish # use fish for restart and restore guidance
 ```
 
+## kaku remote
+
+Use this Mac's terminals from a browser on another device, through Kaku's relay. Remote access is off until you turn it on, and it is free while it is in testing.
+
+```bash
+kaku remote               # turn remote access on (asks first) and print a pairing link
+kaku remote devices       # list paired browsers
+kaku remote revoke <id>   # remove a browser; its open sessions end within seconds
+kaku remote off           # turn remote access off
+kaku remote --reset       # new identity, every paired browser removed
+```
+
+Open the link on the other device to pair it. A link works once, for 10 minutes, so run `kaku remote` again for each device. After pairing, bookmark the page: the browser keeps its own key and comes back without a new link. What you type and see is encrypted between the browser and Kaku, and the relay only forwards it. Kaku posts a notification when a new browser pairs, and when a paired one returns after a while. `kaku doctor` shows whether Kaku is connected to the relay.
+
 ## kaku init
 
 Set up Kaku's shell integration for zsh or fish. When both shells are installed, an interactive run asks which one to configure. Use `--shell` to make the choice explicit in scripts or when `$SHELL` does not match your daily shell. Also installs optional CLI tools (Starship, Delta, Lazygit, Yazi) via Homebrew.
