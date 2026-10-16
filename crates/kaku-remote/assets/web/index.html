@@ -512,7 +512,11 @@
 
   // Kaku's own fallback order (JetBrains Mono, PingFang SC, Apple Symbols,
   // Apple Color Emoji), then the Windows equivalents for CJK and emoji.
-  const FONT_STACK = '"Kaku Mono", "PingFang SC", "Apple Symbols", "Apple Color Emoji", "Microsoft YaHei", "Segoe UI Emoji", "Segoe UI Symbol", monospace';
+  // No emoji font by name: listed, it drew the symbols Claude Code colors by
+  // status (⏺ ✳) as fixed-color emoji whenever the fonts before it lacked
+  // them. The browser's own fallback still gives real emoji (✅) the emoji
+  // font and draws text-style symbols in the text color, as Kaku does.
+  const FONT_STACK = '"Kaku Mono", "PingFang SC", "Apple Symbols", "Microsoft YaHei", "Segoe UI Symbol", monospace';
   const term = new Terminal({
     fontSize,
     fontFamily: FONT_STACK,

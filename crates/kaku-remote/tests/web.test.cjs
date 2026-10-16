@@ -431,6 +431,16 @@ test('an acknowledged close stays gone after the recovery timer', async t => {
   assert.deepEqual(await p.evaluate(() => [...document.querySelectorAll('#bar .tab')].map(b => b.textContent.trim())), ['one']);
 });
 
+test('the terminal names no emoji font, so status symbols keep their color', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  // Named, an emoji font drew Claude Code's ⏺ and ✳ (green, red by status)
+  // as fixed-color emoji whenever the fonts before it lacked them.
+  const family = await p.evaluate(() => probe.term.options.fontFamily);
+  assert.doesNotMatch(family, /Emoji/i);
+  assert.match(family, /Kaku Mono/);
+});
+
 test('renaming from a menu opened before the tab bar was rebuilt still edits the tab', async t => {
   const { p } = await page(t);
   await screen(p);
