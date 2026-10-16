@@ -139,6 +139,23 @@ fn access_path() -> PathBuf {
     config::DATA_DIR.join("remote-access")
 }
 
+/// A short fingerprint of an access code, recorded with each attempt so
+/// `kaku remote` knows the relay's answer was to the code it just saved.
+pub fn access_fingerprint(code: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, code.trim().as_bytes());
+    digest.as_ref()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The fingerprint of the code the latest attempt presented ("" for none).
+static TRIED_ACCESS: parking_lot::Mutex<String> = parking_lot::Mutex::new(String::new());
+
+pub(crate) fn tried_access() -> String {
+    TRIED_ACCESS.lock().clone()
+}
+
 /// The relay's access code, once `kaku remote` asked for it.
 fn read_access_code() -> Option<String> {
     let code = std::fs::read_to_string(access_path()).ok()?;
@@ -451,22 +468,24 @@ pub(crate) async fn run(relay_url: String, dirty: WebDirty) {
     }
 }
 
-/// Sleep `delay`, or less when `kaku remote` saves a new access code, so the
-/// person typing it is not left waiting out a 30 s backoff. True when it did.
+/// Sleep `delay`, or less when the saved access code is not the one the
+/// last attempt presented, so the person typing it is not left waiting out a
+/// 30 s backoff. Compared with what was tried, not with the file at the
+/// start of the wait, so a code saved during the attempt also wakes it.
+/// True when it did.
 async fn wait_unless_access_changes(delay: Duration) -> bool {
-    let stamp = || {
-        std::fs::metadata(access_path())
-            .and_then(|m| m.modified())
-            .ok()
+    let saved = || {
+        read_access_code()
+            .map(|c| access_fingerprint(&c))
+            .unwrap_or_default()
     };
-    let before = stamp();
     let deadline = tokio::time::Instant::now() + delay;
     while tokio::time::Instant::now() < deadline {
-        let step = (deadline - tokio::time::Instant::now()).min(Duration::from_secs(1));
-        tokio::time::sleep(step).await;
-        if stamp() != before {
+        if saved() != tried_access() {
             return true;
         }
+        let step = (deadline - tokio::time::Instant::now()).min(Duration::from_secs(1));
+        tokio::time::sleep(step).await;
     }
     false
 }
@@ -548,7 +567,9 @@ async fn serve(
             request.headers_mut().insert("x-kaku-token", value);
         }
     }
-    if let Some(code) = read_access_code() {
+    let code = read_access_code();
+    *TRIED_ACCESS.lock() = code.as_deref().map(access_fingerprint).unwrap_or_default();
+    if let Some(code) = code {
         if let Ok(value) = code.parse() {
             request.headers_mut().insert("x-kaku-access", value);
         }

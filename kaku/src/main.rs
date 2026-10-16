@@ -342,7 +342,16 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
             if !config_tui::set_remote_enabled(false)? {
                 anyhow::bail!("Your kaku.lua sets other remote options; set `enabled = false` in its `config.remote` yourself.");
             }
-            println!("Remote access is off. Open web sessions end within a few seconds.");
+            // The bridge stops only once Kaku reloads the config; do not say
+            // sessions end unless it did.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while kaku_remote::read_state().is_ok() {
+                if std::time::Instant::now() > deadline {
+                    anyhow::bail!("Saved, but Kaku has not applied it, so web sessions are still open. Choose Reload Configuration in Kaku or quit it.");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            println!("Remote access is off. Open web sessions have ended.");
             return Ok(());
         }
         None => {}
@@ -443,15 +452,13 @@ fn ensure_relay_access() -> anyhow::Result<()> {
         }
         kaku_remote::save_access_code(&code)?;
         asked = true;
-        let saved = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // Wait for an attempt that presented this very code.
+        let tried = kaku_remote::access_fingerprint(&code);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(300));
             match current() {
-                Some(s) if s.checked >= saved => break,
+                Some(s) if s.access == tried => break,
                 Some(_) if std::time::Instant::now() < deadline => continue,
                 _ => anyhow::bail!("Kaku did not reach the relay in time; see `kaku doctor`."),
             }

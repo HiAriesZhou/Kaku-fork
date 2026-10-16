@@ -250,6 +250,12 @@ fn with_remote_enabled(content: &str, enabled: bool) -> Option<String> {
         let t = l.trim_start();
         t.starts_with("config.remote") && t["config.remote".len()..].trim_start().starts_with('=')
     }) {
+        // `config.remote =` with its table on the next lines: the line writer
+        // would replace only this line and leave the table behind.
+        let after = lines[start].split_once('=').map(|(_, v)| v).unwrap_or("");
+        if after.split("--").next().unwrap_or("").trim().is_empty() {
+            return None;
+        }
         let mut block = String::new();
         let mut depth = 0;
         for line in &lines[start..] {
@@ -2188,6 +2194,8 @@ return config
         let custom =
             "config.remote = {\n  enabled = true,\n  tunnel_url = 'wss://x',\n}\nreturn config\n";
         assert_eq!(with_remote_enabled(custom, false), None);
+        let allman = "config.remote =\n{\n  enabled = true,\n}\nreturn config\n";
+        assert_eq!(with_remote_enabled(allman, false), None);
         // A commented-out line is not the setting.
         let commented = "-- config.remote = { tunnel_url = 'wss://x' }\nreturn config\n";
         assert_eq!(

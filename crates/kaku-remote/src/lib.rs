@@ -20,7 +20,8 @@ mod web;
 
 pub use pairing::{list_devices, revoke_device, Device, OFFER_LIFETIME};
 pub use share::{
-    load_or_create_identity, reset_identity, save_access_code, save_token, ShareIdentity,
+    access_fingerprint, load_or_create_identity, reset_identity, save_access_code, save_token,
+    ShareIdentity,
 };
 pub use web::{
     publish_tab_title, release_web_size, set_tab_action_handler, tab_is_web_sized,
@@ -268,6 +269,10 @@ pub struct RelayStatus {
     /// that the bridge tried again after a new access code was saved.
     #[serde(default)]
     pub checked: u64,
+    /// `share::access_fingerprint` of the access code that attempt
+    /// presented, "" for none.
+    #[serde(default)]
+    pub access: String,
 }
 
 impl RelayStatus {
@@ -332,6 +337,7 @@ fn next_relay_status(
         last_error: error.unwrap_or_default(),
         pid,
         checked: now,
+        access: share::tried_access(),
     }
 }
 
@@ -450,6 +456,9 @@ fn launch() {
     };
     let token = get_or_init_token();
     let web_dirty = WEB_DIRTY.get().expect("start() sets it").clone();
+    // The status left by an earlier run (say "remote access is off") must
+    // not stand in for this one's first attempt.
+    let _ = std::fs::remove_file(relay_status_path());
 
     log::info!("kaku-remote: starting on 127.0.0.1:{}", port);
 
