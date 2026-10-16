@@ -570,6 +570,15 @@
   };
   useWebgl();
   document.addEventListener("visibilitychange", useWebgl);
+  // The context can also survive with its glyph atlas wrong: letters drawn
+  // as other glyphs across the newly shown tab (maintainer, 2026-10-16,
+  // switching tabs). Rebuild the atlas whenever a different screen comes up
+  // or the page comes back, a few milliseconds of re-rasterizing.
+  const freshGlyphs = () => {
+    if (webgl && !document.hidden) { try { term.clearTextureAtlas(); } catch (_) {} }
+  };
+  document.addEventListener("visibilitychange", freshGlyphs);
+  window.addEventListener("focus", freshGlyphs);
 
   // Links: URLs in the screen open with Cmd+click (Ctrl+click off the Mac),
   // as in Kaku. Cells and string positions differ once a row holds wide
@@ -1544,6 +1553,7 @@
     }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     renderTabs();
+    freshGlyphs();
     term.focus();
   };
 
