@@ -106,13 +106,31 @@ backup_tmuxrc_once() {
 	fi
 }
 
-# Write through a symlinked dotfile so it stays a link; replace a regular file
-# with mv so a reader never sees it half-written.
+# Keep dotfile links intact and replace their final target only after a complete
+# write. Copy its permissions before writing into a temporary sibling file.
 write_through() {
-	if [[ -L "$2" ]]; then
-		cat "$1" >"$2" && rm -f "$1"
-	else
+	if [[ ! -L "$2" ]]; then
 		mv "$1" "$2"
+		return
+	fi
+	local target="$2" link tmp hops=0
+	while [[ -L "$target" ]]; do
+		hops=$((hops + 1))
+		[[ "$hops" -le 40 ]] || return 1
+		link="$(readlink "$target")" || return 1
+		if [[ "$link" == /* ]]; then
+			target="$link"
+		else
+			target="$(dirname "$target")/$link"
+		fi
+	done
+	tmp="$(mktemp "$(dirname "$target")/.kaku-write.XXXXXX")" || return 1
+	if { [[ ! -e "$target" ]] || cp -p "$target" "$tmp"; } &&
+		cat "$1" >"$tmp" && mv "$tmp" "$target"; then
+		rm -f "$1"
+	else
+		rm -f "$tmp"
+		return 1
 	fi
 }
 
@@ -398,13 +416,31 @@ current_flavor() {
 	resolve_kaku_flavor_from_config "$(active_kaku_config_path)"
 }
 
-# Write through a symlinked dotfile so it stays a link; replace a regular file
-# with mv so a reader never sees it half-written.
+# Keep dotfile links intact and replace their final target only after a complete
+# write. Copy its permissions before writing into a temporary sibling file.
 write_through() {
-	if [[ -L "$2" ]]; then
-		cat "$1" >"$2" && rm -f "$1"
-	else
+	if [[ ! -L "$2" ]]; then
 		mv "$1" "$2"
+		return
+	fi
+	local target="$2" link tmp hops=0
+	while [[ -L "$target" ]]; do
+		hops=$((hops + 1))
+		[[ "$hops" -le 40 ]] || return 1
+		link="$(readlink "$target")" || return 1
+		if [[ "$link" == /* ]]; then
+			target="$link"
+		else
+			target="$(dirname "$target")/$link"
+		fi
+	done
+	tmp="$(mktemp "$(dirname "$target")/.kaku-write.XXXXXX")" || return 1
+	if { [[ ! -e "$target" ]] || cp -p "$target" "$tmp"; } &&
+		cat "$1" >"$tmp" && mv "$tmp" "$target"; then
+		rm -f "$1"
+	else
+		rm -f "$tmp"
+		return 1
 	fi
 }
 

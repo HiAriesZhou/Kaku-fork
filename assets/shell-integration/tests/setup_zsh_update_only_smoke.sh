@@ -312,6 +312,90 @@ for site in "setup_zsh.sh 2" "setup_fish.sh 1" "setup_fish.sh 2"; do
     test "$(write_through_body "$SHELL_DIR/$site_file" "$site_nth")" = "$reference_body"
 done
 
+# Exercise all four real helpers, including the generated wrapper definitions.
+# A file-size limit makes the OS reject a partial write without filling the disk.
+python3 - "$SHELL_DIR" <<'PYTEST'
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+
+shell_dir = Path(sys.argv.pop())
+
+class WriteThroughTests(unittest.TestCase):
+    pass
+
+def probe(helper, shape):
+    with tempfile.TemporaryDirectory(prefix="kaku-write-through-") as folder:
+        root = Path(folder)
+        target_dir = root / "dotfiles with spaces"
+        target_dir.mkdir()
+        target = target_dir / "config"
+        original = b"keep original user config\n"
+        target.write_bytes(original)
+        target.chmod(0o640)
+        original_inode = target.stat().st_ino
+        original_owner = (target.stat().st_uid, target.stat().st_gid)
+        source = root / "replacement"
+        replacement = b"new config\n" if shape != "write_failure" else b"x" * 65536
+        source.write_bytes(replacement)
+        link = root / "config-link"
+        if shape == "relative":
+            link.symlink_to("dotfiles with spaces/config")
+        elif shape == "chained":
+            intermediate = root / "middle"
+            intermediate.symlink_to("dotfiles with spaces/config")
+            link.symlink_to("middle")
+        elif shape == "dangling":
+            target.unlink()
+            link.symlink_to(target)
+        elif shape == "cycle":
+            link.symlink_to("middle")
+            (root / "middle").symlink_to("config-link")
+        else:
+            link.symlink_to(target)
+        link_text = os.readlink(link)
+        command = "set -euo pipefail\n" + helper + "\n"
+        if shape == "write_failure":
+            command += "ulimit -f 1\n"
+        command += 'write_through "$1" "$2"\n'
+        result = subprocess.run(
+            ["/bin/bash", "-c", command, "probe", str(source), str(link)],
+            capture_output=True, timeout=5,
+        )
+        assert link.is_symlink() and os.readlink(link) == link_text, "symlink changed"
+        if shape in ("write_failure", "cycle"):
+            assert result.returncode != 0, "failed write reported success"
+            assert target.read_bytes() == original, "failed write changed original content"
+            assert target.stat().st_ino == original_inode, "failed write replaced original file"
+            assert source.read_bytes() == replacement, "failed write discarded replacement"
+        else:
+            assert result.returncode == 0, result.stderr.decode()
+            assert target.read_bytes() == replacement, "target was not updated"
+            assert not source.exists(), "successful write left its source behind"
+            if shape != "dangling":
+                assert target.stat().st_ino != original_inode, "target was truncated in place"
+        if shape != "dangling":
+            assert stat.S_IMODE(target.stat().st_mode) == 0o640, "target mode changed"
+            assert (target.stat().st_uid, target.stat().st_gid) == original_owner, "target owner changed"
+        assert sorted(p.name for p in target_dir.iterdir()) == ["config"], "temporary file leaked"
+
+for script in ("setup_zsh.sh", "setup_fish.sh"):
+    helpers = re.findall(r"^write_through\(\) \{\n.*?^\}", (shell_dir / script).read_text(), re.M | re.S)
+    assert len(helpers) == 2, f"expected two helper definitions in {script}"
+    for index, helper in enumerate(helpers):
+        for shape in ("absolute", "relative", "chained", "dangling", "cycle", "write_failure"):
+            def test(self, helper=helper, shape=shape):
+                probe(helper, shape)
+            setattr(WriteThroughTests, f"test_{script.replace('.', '_')}_{index}_{shape}", test)
+
+unittest.main()
+PYTEST
+
 if [[ "$link_failures" != 0 ]]; then
   cat "$output_log" "$error_log" >&2
   fail "$link_failures linked dotfile check(s) failed"
