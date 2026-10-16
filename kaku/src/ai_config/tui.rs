@@ -1721,6 +1721,39 @@ fn save_factory_droid_field(
     Ok(())
 }
 
+fn save_gemini_model(obj: &mut serde_json::Map<String, serde_json::Value>, new_val: &str) {
+    let clear = new_val == "-" || new_val.is_empty();
+    if let Some(model) = obj.get_mut("model").and_then(|m| m.as_object_mut()) {
+        // Only touch `name` so other model settings (e.g. maxSessionTurns) survive.
+        if clear {
+            model.remove("name");
+            if model.is_empty() {
+                obj.remove("model");
+            }
+        } else {
+            model.insert(
+                "name".to_string(),
+                serde_json::Value::String(new_val.to_string()),
+            );
+        }
+        return;
+    }
+
+    if clear {
+        obj.remove("model");
+    } else {
+        let keep_string_shape = obj.get("model").is_some_and(|m| m.is_string());
+        if keep_string_shape {
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(new_val.to_string()),
+            );
+        } else {
+            obj.insert("model".to_string(), serde_json::json!({"name": new_val}));
+        }
+    }
+}
+
 fn extract_openclaw_fields(val: &serde_json::Value) -> Vec<FieldEntry> {
     let agents = val.get("agents").unwrap_or(&serde_json::Value::Null);
     let defaults = agents.get("defaults").unwrap_or(&serde_json::Value::Null);
@@ -2744,19 +2777,7 @@ fn save_field(tool: Tool, field_key: &str, new_val: &str) -> anyhow::Result<()> 
         Tool::Gemini => {
             if field_key == "Model" {
                 if let Some(obj) = parsed.as_object_mut() {
-                    if new_val == "-" || new_val.is_empty() {
-                        obj.remove("model");
-                    } else {
-                        let keep_string_shape = obj.get("model").is_some_and(|m| m.is_string());
-                        if keep_string_shape {
-                            obj.insert(
-                                "model".to_string(),
-                                serde_json::Value::String(new_val.to_string()),
-                            );
-                        } else {
-                            obj.insert("model".to_string(), serde_json::json!({"name": new_val}));
-                        }
-                    }
+                    save_gemini_model(obj, new_val);
                 }
             } else {
                 return Ok(());
@@ -4881,6 +4902,51 @@ provider = "managed:kimi-code"
         );
     }
 
+    const MALFORMED_ASSISTANT_TOML: &str =
+        "model = \"a\"\nmodel = \"b\"\napi_key = \"sk-x\"\nchat_tools_enabled = false\n";
+
+    const MALFORMED_ASSISTANT_TOML_SAVES: &[(&str, &str)] = &[
+        ("Enabled", "Off"),
+        ("Simple Model", "gpt-5.4"),
+        ("Deep Model", "gpt-5.5"),
+        ("Base URL", "https://proxy.example.com/v1"),
+        ("API Key", "sk-new"),
+    ];
+
+    #[test]
+    fn kaku_assistant_save_errors_on_malformed_toml() {
+        for (field, value) in MALFORMED_ASSISTANT_TOML_SAVES {
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("assistant.toml");
+            std::fs::write(&path, MALFORMED_ASSISTANT_TOML).expect("write temp config");
+
+            let result = save_kaku_assistant_field_to_path(&path, field, value);
+            assert!(
+                result.is_err(),
+                "saving {} over malformed assistant.toml must fail",
+                field
+            );
+        }
+    }
+
+    #[test]
+    fn kaku_assistant_save_leaves_malformed_toml_bytes_unchanged() {
+        for (field, value) in MALFORMED_ASSISTANT_TOML_SAVES {
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("assistant.toml");
+            std::fs::write(&path, MALFORMED_ASSISTANT_TOML).expect("write temp config");
+
+            let _ = save_kaku_assistant_field_to_path(&path, field, value);
+            let after = std::fs::read(&path).expect("read after save");
+            assert_eq!(
+                String::from_utf8_lossy(&after),
+                MALFORMED_ASSISTANT_TOML,
+                "saving {} must not rewrite malformed assistant.toml",
+                field
+            );
+        }
+    }
+
     #[test]
     fn kaku_assistant_save_omits_chat_model_when_unset() {
         // When the user has no chat_model, neither key should appear in the
@@ -4947,5 +5013,40 @@ provider = "managed:kimi-code"
         let summary = snapshot.summary.expect("summary");
         assert!(summary.starts_with("5h remain 37.3% · reset "));
         assert!(summary.contains("  |  7d remain 82% · reset "));
+    }
+
+    #[test]
+    fn gemini_save_model_updates_name_and_keeps_other_model_settings() {
+        let mut parsed = serde_json::json!({"model": {"name": "a", "maxSessionTurns": 5}});
+        let obj = parsed.as_object_mut().expect("settings object");
+
+        save_gemini_model(obj, "b");
+
+        assert_eq!(
+            parsed.pointer("/model/name").and_then(|v| v.as_str()),
+            Some("b")
+        );
+        assert_eq!(
+            parsed
+                .pointer("/model/maxSessionTurns")
+                .and_then(|v| v.as_i64()),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn gemini_clear_model_removes_name_and_keeps_other_model_settings() {
+        let mut parsed = serde_json::json!({"model": {"name": "a", "maxSessionTurns": 5}});
+        let obj = parsed.as_object_mut().expect("settings object");
+
+        save_gemini_model(obj, "-");
+
+        assert_eq!(parsed.pointer("/model/name"), None);
+        assert_eq!(
+            parsed
+                .pointer("/model/maxSessionTurns")
+                .and_then(|v| v.as_i64()),
+            Some(5)
+        );
     }
 }

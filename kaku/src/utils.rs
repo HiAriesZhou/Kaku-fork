@@ -21,6 +21,25 @@ pub fn parse_json_or_jsonc(input: &str) -> serde_json::Result<serde_json::Value>
 }
 
 pub fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    // Write through symlinks so a linked config (e.g. from a dotfiles repo) stays a link.
+    // A dangling link writes its target, relative to the link's directory.
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            let mut current = path.to_path_buf();
+            let mut hops = 0;
+            while let Ok(target) = std::fs::read_link(&current) {
+                // macOS MAXSYMLINKS; this also ends a link cycle.
+                if hops == 32 {
+                    anyhow::bail!("too many levels of symbolic links at {}", path.display());
+                }
+                hops += 1;
+                current = current.parent().unwrap_or(Path::new("")).join(target);
+            }
+            current
+        }
+    };
+    let path = resolved.as_path();
     let parent = path
         .parent()
         .context("atomic write requires a parent directory")?;
@@ -342,6 +361,189 @@ mod tests {
 
         let saved = std::fs::read_to_string(&path).expect("read");
         assert_eq!(saved, r#"{"a":2}"#);
+    }
+
+    fn link_to_file_elsewhere() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let target_dir = tempdir().expect("target dir");
+        let link_dir = tempdir().expect("link dir");
+        let target = target_dir.path().join("kaku.lua");
+        std::fs::write(&target, b"old").expect("seed target");
+        let link = link_dir.path().join("kaku.lua");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        (target_dir, link_dir, link)
+    }
+
+    #[test]
+    fn atomic_write_keeps_a_symlinked_path_a_symlink() {
+        let (_target_dir, _link_dir, link) = link_to_file_elsewhere();
+
+        write_atomic(&link, b"new").expect("write atomic");
+
+        let meta = std::fs::symlink_metadata(&link).expect("link metadata");
+        assert!(meta.file_type().is_symlink(), "symlink was replaced");
+    }
+
+    #[test]
+    fn atomic_write_through_a_symlink_updates_the_link_target() {
+        let (target_dir, _link_dir, link) = link_to_file_elsewhere();
+
+        write_atomic(&link, b"new").expect("write atomic");
+
+        let target = target_dir.path().join("kaku.lua");
+        assert_eq!(std::fs::read(&target).expect("read target"), b"new");
+    }
+
+    #[test]
+    fn atomic_write_creates_a_regular_file_when_the_path_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("kaku.lua");
+
+        write_atomic(&path, b"new").expect("write atomic");
+
+        let meta = std::fs::symlink_metadata(&path).expect("metadata");
+        assert!(meta.file_type().is_file());
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
+    }
+
+    fn absolute_link_to_missing_file() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf)
+    {
+        let target_dir = tempdir().expect("target dir");
+        let link_dir = tempdir().expect("link dir");
+        let target = target_dir.path().join("kaku.lua");
+        let link = link_dir.path().join("kaku.lua");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        (target_dir, link_dir, link)
+    }
+
+    #[test]
+    fn atomic_write_keeps_a_dangling_absolute_symlink_a_symlink() {
+        let (_target_dir, _link_dir, link) = absolute_link_to_missing_file();
+
+        write_atomic(&link, b"new").expect("write atomic");
+
+        let meta = std::fs::symlink_metadata(&link).expect("link metadata");
+        assert!(meta.file_type().is_symlink(), "symlink was replaced");
+    }
+
+    #[test]
+    fn atomic_write_through_a_dangling_absolute_symlink_creates_the_target() {
+        let (target_dir, _link_dir, link) = absolute_link_to_missing_file();
+
+        write_atomic(&link, b"new").expect("write atomic");
+
+        let target = target_dir.path().join("kaku.lua");
+        assert_eq!(std::fs::read(&target).expect("read target"), b"new");
+    }
+
+    #[test]
+    fn atomic_write_through_a_dangling_relative_symlink_creates_the_target_beside_the_link() {
+        let home = tempdir().expect("home");
+        let config_dir = home.path().join(".config");
+        let dotfiles = home.path().join("dotfiles");
+        std::fs::create_dir(&config_dir).expect("config dir");
+        std::fs::create_dir(&dotfiles).expect("dotfiles dir");
+        let link = config_dir.join("kaku.lua");
+        std::os::unix::fs::symlink("../dotfiles/kaku.lua", &link).expect("symlink");
+
+        write_atomic(&link, b"new").expect("write atomic");
+
+        assert_eq!(
+            std::fs::read(dotfiles.join("kaku.lua")).expect("read target"),
+            b"new"
+        );
+        let meta = std::fs::symlink_metadata(&link).expect("link metadata");
+        assert!(meta.file_type().is_symlink(), "symlink was replaced");
+    }
+
+    #[test]
+    fn atomic_write_through_a_symlink_into_a_missing_directory_fails_and_keeps_the_link() {
+        let dir = tempdir().expect("tempdir");
+        let link = dir.path().join("kaku.lua");
+        std::os::unix::fs::symlink("missing-dir/kaku.lua", &link).expect("symlink");
+
+        let result = write_atomic(&link, b"new");
+
+        assert!(result.is_err(), "write into a missing directory succeeded");
+        assert_eq!(
+            std::fs::read_link(&link).expect("read link"),
+            std::path::PathBuf::from("missing-dir/kaku.lua")
+        );
+    }
+
+    fn chain_of_links_to(target_exists: bool) -> tempfile::TempDir {
+        let dir = tempdir().expect("tempdir");
+        if target_exists {
+            std::fs::write(dir.path().join("c"), b"old").expect("seed target");
+        }
+        std::os::unix::fs::symlink("c", dir.path().join("b")).expect("symlink b");
+        std::os::unix::fs::symlink("b", dir.path().join("a")).expect("symlink a");
+        dir
+    }
+
+    fn assert_is_symlink(path: &Path) {
+        let meta = std::fs::symlink_metadata(path).expect("link metadata");
+        assert!(
+            meta.file_type().is_symlink(),
+            "{} was replaced",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn atomic_write_through_a_chain_of_dangling_links_keeps_every_link_a_symlink() {
+        let dir = chain_of_links_to(false);
+
+        write_atomic(&dir.path().join("a"), b"new").expect("write atomic");
+
+        assert_is_symlink(&dir.path().join("a"));
+        assert_is_symlink(&dir.path().join("b"));
+    }
+
+    #[test]
+    fn atomic_write_through_a_chain_of_dangling_links_creates_the_final_target() {
+        let dir = chain_of_links_to(false);
+
+        write_atomic(&dir.path().join("a"), b"new").expect("write atomic");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("c")).expect("read target"),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn atomic_write_through_a_symlink_cycle_fails_and_keeps_both_links() {
+        let dir = tempdir().expect("tempdir");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::os::unix::fs::symlink("b", &a).expect("symlink a");
+        std::os::unix::fs::symlink("a", &b).expect("symlink b");
+
+        let result = write_atomic(&a, b"new");
+
+        assert!(result.is_err(), "write through a symlink cycle succeeded");
+        assert_eq!(
+            std::fs::read_link(&a).expect("read link a"),
+            std::path::PathBuf::from("b")
+        );
+        assert_eq!(
+            std::fs::read_link(&b).expect("read link b"),
+            std::path::PathBuf::from("a")
+        );
+    }
+
+    #[test]
+    fn atomic_write_through_a_chain_of_links_to_an_existing_file_updates_it() {
+        let dir = chain_of_links_to(true);
+
+        write_atomic(&dir.path().join("a"), b"new").expect("write atomic");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("c")).expect("read target"),
+            b"new"
+        );
+        assert_is_symlink(&dir.path().join("a"));
+        assert_is_symlink(&dir.path().join("b"));
     }
 
     #[test]

@@ -403,10 +403,11 @@ pub(in crate::ai_config::tui) fn write_kaku_assistant_config_preserving(
     // toml_edit keeps the user's comments, ordering, and formatting for every
     // line the TUI does not own; plain `toml` re-serialization stripped all
     // template comments on each save.
-    let Ok(mut original) = original_raw.parse::<toml_edit::DocumentMut>() else {
-        return write_atomic(path, canonical.as_bytes())
-            .with_context(|| format!("write {}", path.display()));
-    };
+    // A file that does not parse is refused rather than replaced: overwriting it
+    // with `canonical` dropped the user's keys, including a hand-entered api_key.
+    let mut original = original_raw
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parse {}", path.display()))?;
     let canonical_doc = canonical
         .parse::<toml_edit::DocumentMut>()
         .context("parse generated assistant config")?;
