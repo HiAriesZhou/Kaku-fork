@@ -1670,13 +1670,23 @@
   // closes a tab on the click rather than a round trip later. One Kaku
   // keeps for longer than CLOSE_GRACE_MS comes back.
   const closing = new Map();
+  let authoritativeTabs = [];
   const CLOSE_GRACE_MS = 3000;
   const closeTab = (t) => {
     const go = () => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
       send({ type: "close_tab", tab_id: t.tab_id });
       const rest = tabs.filter((x) => x.tab_id !== t.tab_id);
       if (!rest.length) return;
-      closing.set(t.tab_id, Date.now() + CLOSE_GRACE_MS);
+      const until = Date.now() + CLOSE_GRACE_MS;
+      closing.set(t.tab_id, until);
+      // The host sends only changed lists. A rejected or lost close must
+      // recover even if its authoritative list never changes again.
+      setTimeout(() => {
+        if (closing.get(t.tab_id) !== until) return;
+        closing.delete(t.tab_id);
+        onTabs(authoritativeTabs);
+      }, CLOSE_GRACE_MS);
       const at = tabs.findIndex((x) => x.tab_id === t.tab_id);
       tabs = rest;
       if (t.tab_id === tabId) attach(rest[Math.min(at, rest.length - 1)], true);
@@ -1967,12 +1977,13 @@
   // pane a moment later; until then the old one is not a reason to follow.
   let paneChosen = { id: null, until: 0 };
   const onTabs = (list) => {
+    authoritativeTabs = list;
     const now = Date.now();
     for (const [id, until] of closing) {
       if (now > until || !list.some((t) => t.tab_id === id)) closing.delete(id);
     }
     tabs = list.filter((t) => !closing.has(t.tab_id));
-    const livePanes = new Set(tabs.flatMap(t => (t.panes?.length ? t.panes : [{ pane_id: t.pane_id }]).map(p => p.pane_id)));
+    const livePanes = new Set(list.flatMap(t => (t.panes?.length ? t.panes : [{ pane_id: t.pane_id }]).map(p => p.pane_id)));
     for (const id of snapshots.keys()) if (!livePanes.has(id)) snapshots.delete(id);
     attentionTabs = tabs.some((t) => (t.title || "").endsWith("\u2022"));
     renderTitle();
@@ -2489,7 +2500,7 @@
       snapshots.delete(gone);
       tabId = null;
       paneId = null;
-      onTabs(tabs.filter((t) => t.pane_id !== gone));
+      onTabs(authoritativeTabs.filter((t) => t.pane_id !== gone));
     }
   };
 

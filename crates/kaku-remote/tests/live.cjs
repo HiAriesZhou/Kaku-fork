@@ -47,8 +47,13 @@ async function until(fn, ms = 15000) {
     await until(() => fs.existsSync(statePath));
     const state = JSON.parse(fs.readFileSync(statePath));
     const url = `http://127.0.0.1:${local}/#t=${state.token}`;
-    browser = await chromium.launch(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
-      ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {});
+    // This integration smoke reads DOM rows and link geometry. The browser
+    // unit suite separately verifies WebGL rendering and context recovery.
+    browser = await chromium.launch({
+      args: ['--disable-webgl', '--disable-3d-apis'],
+      ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+        ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}),
+    });
     const page = await browser.newPage({ viewport: { width: 1100, height: 650 } });
     const errors = []; page.on('pageerror', e => errors.push(e.message));
     await page.goto(url);

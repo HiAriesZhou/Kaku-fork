@@ -398,13 +398,37 @@ test('a closed tab leaves the bar on the click and stays gone until Kaku agrees'
   assert.deepEqual(await titles(), ['one']);
   await p.waitForFunction(() => document.querySelector('.xterm-rows').textContent.includes('first'), null, { timeout: 1000 });
   assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'close_tab').map(m => m.tab_id)), [2]);
-  // A list sent before Kaku closed it does not bring it back.
+  // Drop the request in flight and reconnect before the grace expires.
+  await p.evaluate(() => connections.at(-1).close(1006));
+  await p.waitForFunction(() => connections.length === 2);
   await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }, { tab_id: 2, pane_id: 2, panes: [], title: 'two' }] }));
   assert.deepEqual(await titles(), ['one']);
-  // Kaku still has it after the grace: it was not closed, so it returns.
-  await p.evaluate(() => { const now = Date.now; Date.now = () => now() + 4000; });
-  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }, { tab_id: 2, pane_id: 2, panes: [], title: 'two' }] }));
+  // A quick reconnect returns this same list before the grace expires.
+  // The host deduplicates it afterwards, so recovery must use a real timer.
+  await p.waitForTimeout(3300);
   assert.deepEqual(await titles(), ['one', 'two']);
+  // Hiding a pending close must not discard its cached screen.
+  assert.equal(await p.evaluate(() => probe.snapshots.has(2)), true);
+});
+
+test('closing while disconnected leaves the live tab visible', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.evaluate(() => { connections.at(-1).readyState = 3; messages.length = 0; });
+  await p.locator('#bar .tab').nth(1).hover();
+  await p.locator('#bar .tab').nth(1).locator('.close').click();
+  assert.deepEqual(await p.evaluate(() => [...document.querySelectorAll('#bar .tab')].map(b => b.textContent.trim())), ['one', 'two']);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'close_tab').length), 0);
+});
+
+test('an acknowledged close stays gone after the recovery timer', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.locator('#bar .tab').nth(1).hover();
+  await p.locator('#bar .tab').nth(1).locator('.close').click();
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }));
+  await p.waitForTimeout(3300);
+  assert.deepEqual(await p.evaluate(() => [...document.querySelectorAll('#bar .tab')].map(b => b.textContent.trim())), ['one']);
 });
 
 test('renaming from a menu opened before the tab bar was rebuilt still edits the tab', async t => {

@@ -122,7 +122,7 @@ const WATCH = () => {
     // The DOM renderer, so text and its timing are observable. WebGL draws
     // the same frames; its own cost is measured by web.test.cjs.
     browser = await chromium.launch({
-      args: ['--disable-gpu'],
+      args: ['--disable-webgl', '--disable-3d-apis'],
       ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}),
     });
     const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });

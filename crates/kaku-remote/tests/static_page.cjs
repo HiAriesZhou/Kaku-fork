@@ -88,12 +88,10 @@ function serveLikeVercel(dir, listenPort) {
     await until(async () => (await status()).ok);
     assert.equal((await status()).headers.get('access-control-allow-origin'), origin);
 
-    // Without a GPU: headless Helium on Metal stops opening new tabs after a
-    // page drew with WebGL (navigations abort before any request, newPage
-    // hangs), and this smoke is about origins, not drawing; web.test.cjs
-    // covers WebGL.
+    // This smoke reads DOM rows; --disable-gpu alone still permits WebGL.
+    // The dedicated browser suite covers WebGL rendering and recovery.
     browser = await chromium.launch({
-      args: ['--disable-gpu'],
+      args: ['--disable-webgl', '--disable-3d-apis'],
       ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}),
     });
     const context = await browser.newContext();
