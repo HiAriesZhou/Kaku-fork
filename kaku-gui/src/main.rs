@@ -875,6 +875,16 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     maybe_show_configuration_error_window();
     stall_watchdog::start();
+    // CLI-only commands and existing-instance handoffs return before here.
+    // Keep SIGTERM on the normal GUI exit path, without a quit prompt.
+    start_termination_listener(|| {
+        promise::spawn::spawn_into_main_thread(async move {
+            if let Some(connection) = ::window::Connection::get() {
+                connection.terminate_message_loop();
+            }
+        })
+        .detach();
+    })?;
     startup_trace::mark("gui.run_forever() entering event loop");
     gui.run_forever()
 }
@@ -928,6 +938,21 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
     terminate_with_error_message(&err_text)
 }
 
+fn start_termination_listener(on_terminate: impl FnOnce() + Send + 'static) -> anyhow::Result<()> {
+    let mut signals = signal_hook::iterator::Signals::new([libc::SIGTERM])?;
+    crate::thread_util::spawn_with_pool(move || {
+        let mut on_terminate = Some(on_terminate);
+        for _ in signals.forever() {
+            if let Some(callback) = on_terminate.take() {
+                callback();
+            }
+            // The update helper repeats TERM while waiting. Retain the
+            // registration until process exit so it cannot interrupt saving.
+        }
+    });
+    Ok(())
+}
+
 fn main() {
     startup_trace::init();
     startup_trace::mark("main() entry");
@@ -942,7 +967,7 @@ fn main() {
         terminate_with_error(e);
     }
     if config::configuration().restore_previous_session {
-        if let Err(err) = session_restore::save_session_snapshot() {
+        if let Err(err) = session_restore::save_session_checkpoint() {
             log::warn!("failed to save session snapshot on exit: {err:#}");
         }
     }
@@ -1038,6 +1063,38 @@ fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{should_spawn_in_current_window, should_try_existing_gui};
+
+    #[test]
+    fn gui_termination_reaches_the_owning_checkpoint_on_the_main_thread() {
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let gui = source
+            .split("fn run_terminal_gui(")
+            .nth(1)
+            .unwrap()
+            .split("fn fatal_toast_notification(")
+            .next()
+            .unwrap();
+        let listener = gui.find("start_termination_listener(|| {").unwrap();
+        assert!(gui.rfind("return Ok(());").unwrap() < listener);
+        let callback = &gui[listener..gui.find("gui.run_forever()\n").unwrap()];
+        assert!(callback.contains("promise::spawn::spawn_into_main_thread(async move {"));
+        assert!(callback.contains("connection.terminate_message_loop();"));
+        let main = source
+            .split("fn main() {")
+            .nth(1)
+            .unwrap()
+            .split("fn run()")
+            .next()
+            .unwrap();
+        let checkpoint = main
+            .find("session_restore::save_session_checkpoint()")
+            .unwrap();
+        assert!(main.find("if let Err(e) = run()").unwrap() < checkpoint);
+        assert!(checkpoint < main.find("Mux::shutdown();").unwrap());
+    }
 
     #[test]
     fn version_flag_uses_package_version_without_bootstrap() {

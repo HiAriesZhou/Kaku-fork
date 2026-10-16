@@ -337,7 +337,7 @@ pub fn check_for_updates_from_menu() {
         confirm_and_apply_update();
     } else {
         if config::configuration().restore_previous_session {
-            if let Err(err) = crate::session_restore::save_session_snapshot() {
+            if let Err(err) = crate::session_restore::save_session_checkpoint() {
                 log::error!("failed to save session snapshot before update: {err:#}");
             }
         }
@@ -390,7 +390,7 @@ pub fn confirm_and_apply_update() {
 /// auto-confirm (user already approved the restart in the overlay).
 pub(crate) fn apply_update_now() {
     if config::configuration().restore_previous_session {
-        if let Err(err) = crate::session_restore::save_session_snapshot() {
+        if let Err(err) = crate::session_restore::save_session_checkpoint() {
             log::error!("failed to save session snapshot before update: {err:#}");
         }
     }
@@ -2216,7 +2216,7 @@ mod tests {
             .next()
             .unwrap();
         let save = apply
-            .find("save_session_snapshot(")
+            .find("crate::session_restore::save_session_checkpoint()")
             .expect("applying a confirmed update must save the session first");
         let gate = apply
             .find("restore_previous_session")
@@ -2257,7 +2257,7 @@ mod tests {
             .find("restore_previous_session")
             .expect("the save must follow the restore_previous_session setting");
         let save = body
-            .find("save_session_snapshot(")
+            .find("crate::session_restore::save_session_checkpoint()")
             .expect("checking for updates must save the session before the update tab");
         let tab = body
             .find("run_kaku_update_in_tab(")
@@ -2279,7 +2279,7 @@ mod tests {
             .find("confirm_and_apply_update()")
             .expect("a staged update must go through the confirmation overlay");
         assert!(
-            !body[..confirm].contains("save_session_snapshot("),
+            !body[..confirm].contains("crate::session_restore::save_session_checkpoint()"),
             "the staged path saves only after the user confirms"
         );
     }

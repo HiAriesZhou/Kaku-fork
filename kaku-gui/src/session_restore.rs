@@ -384,9 +384,11 @@ fn write_pane_sidecar(
     // Every cell an image covers holds its own Arc to the same ImageData, and
     // serde writes the whole blob once per cell, so one inline image can encode
     // to gigabytes on the GUI thread (#559). Keep the text, drop the images.
-    // Only touch lines that hold an image: cells_mut decompresses a scrollback
-    // line, which would push plain text past the sidecar cap.
+    // Normalize vector-backed lines first: wide-character continuation cells
+    // can retain hidden Kitty placements. Compression discards those cells and
+    // lets plain scrollback stay compact without decompressing every line.
     for line in &mut lines {
+        line.compress_for_scrollback();
         if !line.visible_cells().any(|c| c.attrs().images().is_some()) {
             continue;
         }
@@ -395,6 +397,7 @@ fn write_pane_sidecar(
                 cell.attrs_mut().clear_images();
             }
         }
+        line.compress_for_scrollback();
     }
     let filename = format!("pane_{pane_id}.bin");
     let path = content_dir.join(&filename);
@@ -606,10 +609,11 @@ fn focused_window_id() -> Option<MuxWindowId> {
 // ---------- Pristine state + logically-closed window tracking ----------
 
 // Counts active RestoringGuards so concurrent / nested restores compose
-// correctly. mark_dirty is a no-op when depth > 0, and only the last guard's
-// drop clears MUX_DIRTY.
+// correctly. mark_dirty is a no-op when depth > 0; the last guard applies
+// any pending menu changes, or leaves a startup-only restore pristine.
 static RESTORING_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static MUX_DIRTY: AtomicBool = AtomicBool::new(false);
+static RESTORE_KEEP_DIRTY: AtomicBool = AtomicBool::new(false);
 /// Set once the on-disk session snapshot has been restored into this
 /// process. From that point the live mux is strictly more authoritative
 /// than the file, so exit-time saves must not preserve the old file in
@@ -736,23 +740,42 @@ pub fn start_periodic_session_snapshot() {
     .detach();
 }
 
-struct RestoringGuard;
+struct RestoringGuard {
+    keep_dirty: bool,
+}
 
 impl RestoringGuard {
     fn new() -> Self {
         RESTORING_DEPTH.fetch_add(1, Ordering::AcqRel);
-        Self
+        Self { keep_dirty: false }
+    }
+
+    fn for_menu() -> Self {
+        let mut guard = Self::new();
+        // A failed menu restore must not erase changes made before it began.
+        guard.keep_dirty = is_dirty();
+        guard
+    }
+
+    fn restored(mut self) {
+        self.keep_dirty = true;
     }
 }
 
 impl Drop for RestoringGuard {
     fn drop(&mut self) {
-        // Only the outermost guard clears MUX_DIRTY: nested / concurrent
-        // restores share the gate, and clearing on every drop would let one
-        // restore steal the pristine bit from another that is still running.
+        // Carry successful menu restores across overlapping guards, including
+        // a later failing restore. Startup-only restores still end pristine.
+        if self.keep_dirty {
+            RESTORE_KEEP_DIRTY.store(true, Ordering::Release);
+        }
         let prev = RESTORING_DEPTH.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            MUX_DIRTY.store(false, Ordering::Release);
+            let keep_dirty = RESTORE_KEEP_DIRTY.swap(false, Ordering::AcqRel);
+            MUX_DIRTY.store(keep_dirty, Ordering::Release);
+            if keep_dirty {
+                SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
+            }
         }
     }
 }
@@ -936,8 +959,32 @@ pub fn save_closed_window_snapshot(window_id: MuxWindowId) -> anyhow::Result<()>
     result
 }
 
+fn snapshot_save_due(checkpoint: bool) -> bool {
+    if RESTORING_DEPTH.load(Ordering::Acquire) > 0 {
+        return false;
+    }
+    if checkpoint {
+        // Output and cwd changes do not set MUX_DIRTY. Before replacing the
+        // app, refresh even a pristine session, but only in its owning process.
+        owns_session_file(
+            SNAPSHOT_CONSUMED.load(Ordering::Acquire),
+            STARTUP_FOUND_NO_SNAPSHOT.load(Ordering::Acquire),
+        )
+    } else {
+        is_dirty()
+    }
+}
+
 pub fn save_session_snapshot() -> anyhow::Result<()> {
-    if !is_dirty() {
+    save_session_snapshot_impl(false)
+}
+
+pub fn save_session_checkpoint() -> anyhow::Result<()> {
+    save_session_snapshot_impl(true)
+}
+
+fn save_session_snapshot_impl(checkpoint: bool) -> anyhow::Result<()> {
+    if !snapshot_save_due(checkpoint) {
         return Ok(());
     }
     if should_preserve_existing_session_snapshot() {
@@ -1408,7 +1455,7 @@ pub fn restore_previous_window_from_menu(current_window_id: Option<MuxWindowId>)
         let result = async {
             match load_closed_window()? {
                 Some(closed) => {
-                    let _guard = RestoringGuard::new();
+                    let guard = RestoringGuard::for_menu();
                     // The menu path must preserve the user's current work.
                     // Only force-reuse `current_window_id` when it is empty;
                     // otherwise pass `None` so `restore_window` opens a
@@ -1425,8 +1472,7 @@ pub fn restore_previous_window_from_menu(current_window_id: Option<MuxWindowId>)
                     };
                     restore_window(closed.window, reuse_target, content_dir_path.as_deref())
                         .await?;
-                    drop(_guard);
-                    mark_dirty();
+                    guard.restored();
                     // Consume the snapshot only on success: if restore failed
                     // (e.g. domain unavailable), keep the file so the user can
                     // retry after fixing the underlying issue.
@@ -1894,6 +1940,7 @@ mod tests {
 
     #[test]
     fn session_snapshot_is_consumed_only_after_every_window_restores() {
+        let _lock = DIRTY_TEST_GATE.lock();
         SNAPSHOT_CONSUMED.store(false, Ordering::Release);
         SNAPSHOT_RESTORE_INCOMPLETE.store(false, Ordering::Release);
 
@@ -2103,6 +2150,164 @@ mod tests {
         assert_eq!(last.as_str(), format!("L{}", total - 1));
     }
 
+    #[test]
+    fn termination_checkpoint_persists_pristine_cwd_and_output() {
+        const CHILD: &str = "KAKU_TEST_TERMINATION_CHECKPOINT";
+        if let Some(scratch) = std::env::var_os(CHILD) {
+            use mux::domain::{Domain, LocalDomain};
+            config::designate_this_as_the_main_thread();
+            promise::spawn::set_schedulers(Box::new(|_| {}), Box::new(|_| {}));
+            config::use_this_configuration(config::Config::default_config());
+            let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local").unwrap());
+            let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+            Mux::set_mux(&mux);
+            let window = mux.new_empty_window(None, None);
+            let tab = smol::block_on(domain.spawn(
+                &mux,
+                TerminalSize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 800,
+                    pixel_height: 600,
+                    dpi: 96,
+                },
+                Some(portable_pty::CommandBuilder::new("/bin/cat")),
+                None,
+                config::keyassignment::PaneEncoding::Utf8,
+                *window,
+            ))
+            .unwrap();
+            let pane = tab.get_active_pane().unwrap();
+            let cwd = url::Url::from_directory_path(&scratch).unwrap();
+            let text = format!("\x1b]7;{}\x1b\\checkpoint latest output\r\n", cwd);
+            let mut parser = termwiz::escape::parser::Parser::new();
+            pane.perform_actions(parser.parse_as_vec(text.as_bytes()));
+            SNAPSHOT_CONSUMED.store(true, Ordering::Release);
+            MUX_DIRTY.store(false, Ordering::Release);
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::start_termination_listener(move || {
+                let _ = tx.send(());
+            })
+            .unwrap();
+            let scratch = PathBuf::from(scratch);
+            std::fs::write(scratch.join("ready"), "ready").unwrap();
+            rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            std::fs::write(scratch.join("received"), "first TERM handled").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !scratch.join("continue").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "second TERM never arrived"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // The same exit checkpoint used by main, after its event loop ends.
+            save_session_checkpoint().unwrap();
+            let session = load_session_from_path(&session_file()).unwrap().unwrap();
+            let SavedPaneNode::Leaf(entry) = &session.windows[0].tabs[0].pane_tree else {
+                panic!("expected one saved pane");
+            };
+            assert_eq!(entry.working_dir.as_ref().unwrap().url, cwd);
+            let payload = load_pane_payload(
+                &content_root_dir().join(&session.content_dir),
+                entry.content_ref.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert!(payload
+                .lines
+                .iter()
+                .any(|line| line.as_str().contains("checkpoint latest output")));
+            std::fs::write(scratch.join("exited"), "checkpoint saved").unwrap();
+            // No AppKit or existing GUI process is involved in this child.
+            pane.kill();
+            return;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_restore::tests::termination_checkpoint_persists_pristine_cwd_and_output",
+                "--nocapture",
+            ])
+            .env(CHILD, scratch.path())
+            .env("XDG_CONFIG_HOME", scratch.path())
+            .env("HOME", scratch.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        for marker in ["ready", "received"] {
+            while !scratch.path().join(marker).exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("checkpoint child exited before signal: {}", status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("checkpoint child did not become ready");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        }
+        std::fs::write(scratch.path().join("continue"), "second TERM sent").unwrap();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("checkpoint child did not exit");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "SIGTERM bypassed the checkpoint: {}",
+            status
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.path().join("exited")).unwrap(),
+            "checkpoint saved"
+        );
+    }
+
+    #[test]
+    fn hidden_kitty_placement_is_removed_before_sidecar_encoding() {
+        use termwiz::cell::{Cell, CellAttributes};
+        use termwiz::image::{ImageCell, ImageData};
+        use termwiz::surface::TextureCoordinate;
+        let mut line = wezterm_term::Line::from_text("  ", &CellAttributes::default(), 0, None);
+        let origin = TextureCoordinate::new_f32(0.0, 0.0);
+        let image = ImageCell::with_z_index(
+            origin,
+            origin,
+            Arc::new(ImageData::with_raw_data(vec![42; 5 * 1024 * 1024])),
+            0,
+            (0, 0, 0, 0),
+            Some(1),
+            Some(1),
+        );
+        let mut cell = Cell::blank();
+        cell.attrs_mut().attach_image(image);
+        line.set_cell(1, cell, 1);
+        line.set_cell(0, Cell::new('界', CellAttributes::default()), 2);
+        assert!(!line.visible_cells().any(|c| c.attrs().images().is_some()));
+        assert!(line
+            .cells_mut_for_attr_changes_only()
+            .iter()
+            .any(|c| c.attrs().images().is_some()));
+        let dir = tempfile::tempdir().unwrap();
+        let content = write_pane_sidecar(dir.path(), 13.into(), vec![line], 2, 1)
+            .expect("hidden image data must not reach the byte cap");
+        let mut payload = load_pane_payload(dir.path(), &content).unwrap();
+        assert_eq!(payload.lines[0].as_str(), "界");
+        assert!(payload.lines[0]
+            .cells_mut_for_attr_changes_only()
+            .iter()
+            .all(|cell| cell.attrs().images().is_none()));
+    }
+
     fn compressed_text_scrollback(count: usize, cols: usize) -> Vec<wezterm_term::Line> {
         use termwiz::cell::CellAttributes;
         use termwiz::surface::SEQ_ZERO;
@@ -2200,7 +2405,54 @@ mod tests {
     }
 
     #[test]
-    fn restore_previous_window_marks_the_session_dirty_after_restoring() {
+    fn failed_menu_restore_keeps_existing_unsaved_changes() {
+        let _lock = DIRTY_TEST_GATE.lock();
+        MUX_DIRTY.store(false, Ordering::Release);
+        mark_dirty();
+        let guard = RestoringGuard::for_menu();
+        drop(guard);
+        assert!(is_dirty());
+    }
+
+    #[test]
+    fn overlapping_menu_restore_success_survives_later_failure() {
+        let _lock = DIRTY_TEST_GATE.lock();
+        MUX_DIRTY.store(false, Ordering::Release);
+        let first = RestoringGuard::for_menu();
+        let second = RestoringGuard::for_menu();
+        let generation = SESSION_GENERATION.load(Ordering::Acquire);
+        first.restored();
+        assert!(!is_dirty());
+        drop(second);
+        assert!(is_dirty());
+        assert!(SESSION_GENERATION.load(Ordering::Acquire) > generation);
+    }
+
+    #[test]
+    fn update_checkpoint_captures_pristine_owner_but_not_secondary_or_restore() {
+        let _lock = DIRTY_TEST_GATE.lock();
+        MUX_DIRTY.store(false, Ordering::Release);
+        SNAPSHOT_CONSUMED.store(true, Ordering::Release);
+        STARTUP_FOUND_NO_SNAPSHOT.store(false, Ordering::Release);
+        assert!(!snapshot_save_due(false));
+        assert!(snapshot_save_due(true));
+        let guard = RestoringGuard::new();
+        assert!(!snapshot_save_due(true));
+        drop(guard);
+        SNAPSHOT_CONSUMED.store(false, Ordering::Release);
+        assert!(!snapshot_save_due(true));
+        STARTUP_FOUND_NO_SNAPSHOT.store(true, Ordering::Release);
+        assert!(snapshot_save_due(true));
+        // Even an eligible checkpoint cannot overwrite the only complete
+        // snapshot after a partial restore. This returns before asking for mux.
+        SNAPSHOT_RESTORE_INCOMPLETE.store(true, Ordering::Release);
+        save_session_checkpoint().unwrap();
+        SNAPSHOT_RESTORE_INCOMPLETE.store(false, Ordering::Release);
+        STARTUP_FOUND_NO_SNAPSHOT.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn menu_restore_uses_dirty_preserving_guard_and_records_success() {
         let source = include_str!("session_restore.rs")
             .split("#[cfg(test)]")
             .next()
@@ -2212,13 +2464,8 @@ mod tests {
             .split("pub async fn try_restore_on_startup()")
             .next()
             .unwrap();
-        let restored = menu.find("drop(_guard);").unwrap();
-        let dirty = menu
-            .find("mark_dirty();")
-            .expect("the menu restore must mark the session dirty");
-        assert!(
-            restored < dirty,
-            "the session must be marked dirty after the restore guard drops"
-        );
+        assert!(menu.contains("let guard = RestoringGuard::for_menu();"));
+        let restored = menu.find(".await?;").unwrap();
+        assert!(restored < menu.find("guard.restored();").unwrap());
     }
 }
