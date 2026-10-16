@@ -36,6 +36,17 @@ enum MouseDispatchTarget {
     Terminal,
 }
 
+fn clear_stale_tab_drag(state: &mut Option<super::TabDragState>, event: &MouseEvent) -> bool {
+    // A missing release must not let the next gesture reuse a tab drag.
+    // Keep Release intact so its handler can settle a completed drag.
+    if matches!(event.kind, WMEK::Press(_))
+        || (matches!(event.kind, WMEK::Move) && event.mouse_buttons != WMB::LEFT)
+    {
+        return state.take().is_some();
+    }
+    false
+}
+
 fn should_show_terminal_context_menu(
     event_kind: &WMEK,
     modifiers: window::Modifiers,
@@ -516,6 +527,16 @@ impl super::TermWindow {
     }
 
     fn start_tab_drag(&mut self, tab_idx: usize, start_event: MouseEvent) {
+        if self.config.debug_key_events {
+            log::info!(
+                "tab_drag press index={} coords={:?} fullscreen={} rect={:?}",
+                tab_idx,
+                start_event.coords,
+                self.window_state.contains(WindowState::FULL_SCREEN),
+                self.tab_ui_item(tab_idx)
+                    .map(|item| (item.x, item.y, item.width, item.height))
+            );
+        }
         self.tab_drag_state = Some(super::TabDragState {
             tab_idx,
             start_event,
@@ -621,12 +642,21 @@ impl super::TermWindow {
         };
 
         if event.mouse_buttons != WMB::LEFT {
-            self.tab_drag_state = Some(state);
             return false;
         }
 
         let delta_x = (event.coords.x - state.start_event.coords.x).abs();
         let delta_y = (event.coords.y - state.start_event.coords.y).abs();
+        if self.config.debug_key_events {
+            log::info!(
+                "tab_drag motion index={} coords={:?} delta=({}, {}) started={}",
+                state.tab_idx,
+                event.coords,
+                delta_x,
+                delta_y,
+                state.has_dragged
+            );
+        }
         if !state.has_dragged && delta_x.max(delta_y) < Self::TAB_DRAG_THRESHOLD {
             self.tab_drag_state = Some(state);
             return true;
@@ -642,6 +672,14 @@ impl super::TermWindow {
 
         if let Some(target_idx) = target_idx {
             if target_idx != state.tab_idx {
+                if self.config.debug_key_events {
+                    log::info!(
+                        "tab_drag reorder from={} to={} coords={:?}",
+                        state.tab_idx,
+                        target_idx,
+                        event.coords
+                    );
+                }
                 if let Err(err) = self.move_tab(target_idx) {
                     log::debug!("move_tab({target_idx}) failed while dragging tab: {err:#}");
                 } else {
@@ -807,16 +845,20 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+        if clear_stale_tab_drag(&mut self.tab_drag_state, &event) {
+            context.invalidate();
+        }
         if self.config.debug_key_events && matches!(event.kind, WMEK::Press(_) | WMEK::Release(_)) {
             // Remote desktop clients map touch gestures to clicks in their own
             // ways (a long press may arrive as Ctrl+click or a plain press), so
             // log what actually arrives alongside the key events.
             log::info!(
-                "mouse_event {:?} mods={:?} buttons={:?} clicks={}",
+                "mouse_event {:?} mods={:?} buttons={:?} clicks={} coords={:?}",
                 event.kind,
                 event.modifiers,
                 event.mouse_buttons,
-                event.platform_click_count
+                event.platform_click_count,
+                event.coords
             );
         }
         #[cfg(feature = "remote")]
@@ -2555,6 +2597,60 @@ mod tests {
             modifiers: Modifiers::NONE,
             platform_click_count: 1,
         }
+    }
+
+    fn pending_tab_drag() -> Option<crate::termwindow::TabDragState> {
+        Some(crate::termwindow::TabDragState {
+            tab_idx: 1,
+            start_event: drag_event((20, 10), (20, 10), (0, 0)),
+            has_dragged: true,
+            drag_offset_x: 12.0,
+        })
+    }
+
+    #[test]
+    fn tab_drag_lifecycle_clears_motion_without_exclusive_left_button() {
+        for buttons in [
+            MouseButtons::NONE,
+            MouseButtons::RIGHT,
+            MouseButtons::LEFT | MouseButtons::RIGHT,
+        ] {
+            let mut state = pending_tab_drag();
+            let mut event = drag_event((180, 200), (180, 200), (0, 0));
+            event.mouse_buttons = buttons;
+            assert!(super::clear_stale_tab_drag(&mut state, &event));
+            assert!(state.is_none());
+            event.mouse_buttons = MouseButtons::LEFT;
+            assert!(!super::clear_stale_tab_drag(&mut state, &event));
+            assert!(state.is_none());
+        }
+    }
+
+    #[test]
+    fn tab_drag_lifecycle_new_press_cannot_reuse_previous_gesture() {
+        for button in [MousePress::Left, MousePress::Middle, MousePress::Right] {
+            let mut state = pending_tab_drag();
+            let mut event = drag_event((180, 200), (180, 200), (0, 0));
+            event.kind = MouseEventKind::Press(button);
+            assert!(super::clear_stale_tab_drag(&mut state, &event));
+            assert!(state.is_none());
+        }
+    }
+
+    #[test]
+    fn tab_drag_lifecycle_preserves_left_motion_and_release_for_settling() {
+        let mut state = pending_tab_drag();
+        let mut event = drag_event((180, 10), (180, 10), (0, 0));
+        assert!(!super::clear_stale_tab_drag(&mut state, &event));
+        assert_eq!(state.as_ref().unwrap().drag_offset_x, 12.0);
+        event.kind = MouseEventKind::Release(MousePress::Left);
+        event.mouse_buttons = MouseButtons::NONE;
+        assert!(!super::clear_stale_tab_drag(&mut state, &event));
+        // The existing Release arm consumes this state for its settle animation.
+        let finished = state.take().unwrap();
+        assert!(finished.has_dragged);
+        assert_eq!(finished.tab_idx, 1);
+        assert_eq!(finished.drag_offset_x, 12.0);
     }
 
     #[test]
