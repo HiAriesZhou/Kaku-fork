@@ -168,6 +168,18 @@ pub(crate) fn pane_removed(dirty: &WebDirty, pane_id: usize) {
     dirty.lock().remove(&pane_id);
 }
 
+/// Tabs, windows or panes changed (true) or only a title did (false).
+/// Sessions resend the tab list at once for the first, so a tab opened,
+/// closed or focused shows in the page in a frame instead of at the next
+/// idle refresh; titles, which some programs animate, at most every
+/// `TITLE_REFRESH`.
+static TABS_CHANGED: LazyLock<broadcast::Sender<bool>> = LazyLock::new(|| broadcast::channel(64).0);
+const TITLE_REFRESH: Duration = Duration::from_millis(250);
+
+pub(crate) fn tabs_changed(structural: bool) {
+    let _ = TABS_CHANGED.send(structural);
+}
+
 /// Text a program put on the clipboard (OSC 52: Claude Code's copy, a vim
 /// yank), by pane. The Mac's clipboard gets it as before; a browser viewing
 /// that pane gets it too, since that is where the user is.
@@ -1991,6 +2003,25 @@ fn encode(msg: &WebServerMsg) -> Option<String> {
     serde_json::to_string(msg).ok()
 }
 
+/// Send the tab list if it changed since `last`. Tab state lives on the GUI
+/// thread; the close-confirmation check reads the Lua config, which only
+/// that thread may touch.
+async fn send_tabs(
+    last: &mut Option<Vec<TabInfo>>,
+    outbox: &mpsc::Sender<String>,
+) -> Result<(), ()> {
+    let tabs = promise::spawn::spawn_into_main_thread(async { collect_tabs() }).await;
+    if last.as_ref() == Some(&tabs) {
+        return Ok(());
+    }
+    let Some(json) = encode(&WebServerMsg::Tabs { tabs: &tabs }) else {
+        return Ok(());
+    };
+    outbox.send(json).await.map_err(|_| ())?;
+    *last = Some(tabs);
+    Ok(())
+}
+
 /// One browser, whatever carries its messages: the local WebSocket or the
 /// relay tunnel. `inbox` yields the page's JSON messages and `outbox` takes
 /// ours; the session ends when either side goes away.
@@ -2027,6 +2058,8 @@ pub(crate) async fn run_session(
     let mut next_render = tokio::time::Instant::now();
     let mut idle = tokio::time::interval(IDLE_REFRESH);
     let mut last_heard = std::time::Instant::now();
+    let mut tab_changes = TABS_CHANGED.subscribe();
+    let mut tabs_due: Option<tokio::time::Instant> = None;
 
     loop {
         let pane_update = async {
@@ -2216,15 +2249,23 @@ pub(crate) async fn run_session(
                     break;
                 }
                 dirty_frame = attached.is_some();
-                // Tab state lives on the GUI thread; the close-confirmation
-                // check reads the Lua config, which only that thread may touch.
-                let tabs = promise::spawn::spawn_into_main_thread(async { collect_tabs() }).await;
-                if last_tabs.as_ref() != Some(&tabs) {
-                    let Some(json) = encode(&WebServerMsg::Tabs { tabs: &tabs }) else { continue };
-                    if outbox.send(json).await.is_err() {
-                        break;
-                    }
-                    last_tabs = Some(tabs);
+                if send_tabs(&mut last_tabs, &outbox).await.is_err() {
+                    break;
+                }
+            }
+            changed = tab_changes.recv() => {
+                let wait = match changed {
+                    Ok(false) => TITLE_REFRESH,
+                    Ok(true) | Err(broadcast::error::RecvError::Lagged(_)) => Duration::ZERO,
+                    Err(broadcast::error::RecvError::Closed) => IDLE_REFRESH,
+                };
+                let due = tokio::time::Instant::now() + wait;
+                tabs_due = Some(tabs_due.map_or(due, |d| d.min(due)));
+            }
+            _ = tokio::time::sleep_until(tabs_due.unwrap_or_else(tokio::time::Instant::now)), if tabs_due.is_some() => {
+                tabs_due = None;
+                if send_tabs(&mut last_tabs, &outbox).await.is_err() {
+                    break;
                 }
             }
             _ = tokio::time::sleep_until(next_render), if dirty_frame && (!flow_control || frames_sent - frames_acked < 4) => {

@@ -406,7 +406,18 @@ pub fn start() {
                     }
                     MuxNotification::PaneRemoved(pane_id) => {
                         web::pane_removed(&web_dirty_for_sub, (*pane_id).into());
+                        web::tabs_changed(true);
                     }
+                    MuxNotification::PaneAdded(_)
+                    | MuxNotification::PaneFocused(_)
+                    | MuxNotification::TabAddedToWindow { .. }
+                    | MuxNotification::TabResized(_)
+                    | MuxNotification::WindowCreated(_)
+                    | MuxNotification::WindowRemoved(_)
+                    | MuxNotification::WindowInvalidated(_)
+                    | MuxNotification::WindowWorkspaceChanged(_) => web::tabs_changed(true),
+                    MuxNotification::TabTitleChanged { .. }
+                    | MuxNotification::WindowTitleChanged { .. } => web::tabs_changed(false),
                     _ => {}
                 }
                 true
