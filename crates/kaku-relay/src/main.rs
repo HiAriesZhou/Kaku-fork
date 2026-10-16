@@ -536,6 +536,9 @@ async fn host_ws(
         }
     }
     upgrade
+        // A frame is buffered whole before the message cap is checked, so
+        // cap frames too, or one 16 MB frame header pins 16 MB per socket.
+        .max_frame_size(MAX_HOST_MESSAGE)
         .max_message_size(MAX_HOST_MESSAGE)
         .on_upgrade(move |socket| serve_host(socket, id, edge(&headers), addr, state))
 }
@@ -690,12 +693,19 @@ fn asset_response(name: &str) -> Response {
 }
 
 async fn page_redirect(Path(id): Path<String>) -> Response {
+    // A decoded `%2F` would otherwise make `//host/` and leave the site.
+    if !valid_id(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     // Keep the trailing slash so the page's relative paths resolve under it;
     // the browser carries the fragment (the key) over the redirect.
     Redirect::permanent(&format!("/t/{id}/")).into_response()
 }
 
 async fn short_page_redirect(Path(id): Path<String>) -> Response {
+    if !valid_id(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     Redirect::permanent(&format!("/{id}/")).into_response()
 }
 
@@ -771,17 +781,26 @@ async fn browser_ws(
     headers: HeaderMap,
     upgrade: ws::WebSocketUpgrade,
 ) -> Response {
-    if !origin_allowed(state.page_origin.as_deref(), &headers) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     let addr = client_addr(&headers);
     if !state.limits.lock().allow_connect(&addr, Instant::now()) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    if !origin_allowed(state.page_origin.as_deref(), &headers) {
+        // Pages opened before the page moved to its own origin still run;
+        // 4426 tells them to reload, where a refused handshake reads as no
+        // network. The socket closes at once, carrying nothing.
+        return upgrade
+            .max_frame_size(1024)
+            .max_message_size(1024)
+            .on_upgrade(|mut socket| async move {
+                let _ = tokio::time::timeout(WRITE_TIMEOUT, socket.send(browser_close(4426))).await;
+            });
     }
     let Some(host) = state.host(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     upgrade
+        .max_frame_size(MAX_BROWSER_MESSAGE)
         .max_message_size(MAX_BROWSER_MESSAGE)
         .on_upgrade(move |socket| async move {
             info!(
@@ -1309,6 +1328,21 @@ mod tests {
         assert!(limits.access_locked("1.2.3.4", start));
         assert!(!limits.access_locked("5.6.7.8", start));
         assert!(!limits.access_locked("1.2.3.4", start + ACCESS_WINDOW));
+    }
+
+    #[test]
+    fn page_addresses_redirect_only_for_a_real_id() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        // `/%2Fevil.example` reaches the handler decoded.
+        let evil = rt.block_on(short_page_redirect(Path("/evil.example".into())));
+        assert_eq!(evil.status(), StatusCode::NOT_FOUND);
+        let evil = rt.block_on(page_redirect(Path("/evil.example".into())));
+        assert_eq!(evil.status(), StatusCode::NOT_FOUND);
+        let id = "0123456789abcdef0123456789abcdef".to_string();
+        let ok = rt.block_on(short_page_redirect(Path(id.clone())));
+        assert_eq!(ok.headers()[header::LOCATION], format!("/{id}/"));
     }
 
     #[test]

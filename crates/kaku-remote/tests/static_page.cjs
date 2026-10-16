@@ -127,12 +127,12 @@ function serveLikeVercel(dir, listenPort) {
     // Another site cannot open a browser socket to this Mac.
     const foreign = new WebSocket(`ws://127.0.0.1:${relay}/${id}/ws`, { headers: { Origin: 'https://evil.example' } });
     sockets.push(foreign);
+    // It is closed at once with 4426, which tells an old page to reload.
     const refused = await new Promise(resolve => {
-      foreign.once('unexpected-response', (_, res) => resolve(res.statusCode));
-      foreign.once('open', () => resolve('open'));
-      foreign.once('error', () => resolve('error'));
+      foreign.once('close', code => resolve(code));
+      foreign.once('unexpected-response', (_, res) => resolve('http ' + res.statusCode));
     });
-    assert.equal(refused, 403);
+    assert.equal(refused, 4426);
 
     // The site root is not a page.
     const rootResponse = await fetch(`${origin}/`, { redirect: 'manual' });
