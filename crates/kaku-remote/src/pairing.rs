@@ -228,13 +228,14 @@ pub(crate) fn admit(
         return Err(Refusal::BadProof);
     }
     let id = device_id(&public);
+    let key = b64(&public);
     match auth {
         PageAuth::Auth { .. } => store
-            .seen(&id)
+            .seen(&id, &key)
             .map(|d| (d, false))
             .ok_or(Refusal::UnknownDevice),
         PageAuth::Pair { proof, name, .. } => {
-            if let Some(known) = store.seen(&id) {
+            if let Some(known) = store.seen(&id, &key) {
                 return Ok((known, false));
             }
             let proof = unb64(proof).ok_or(Refusal::BadProof)?;
@@ -247,7 +248,7 @@ pub(crate) fn admit(
             }
             let device = Device {
                 id,
-                public_key: b64(&public),
+                public_key: key,
                 name: clean_name(name),
                 paired_at: now(),
                 last_seen: now(),
@@ -298,9 +299,11 @@ struct Offer {
 /// Where `admit` reads and records devices and the offer; files in the data
 /// dir for Kaku, memory in tests.
 pub(crate) trait DeviceStore {
-    /// The paired device with this id as it was (`last_seen` is the
-    /// previous visit), marking it seen now.
-    fn seen(&mut self, id: &str) -> Option<Device>;
+    /// The paired device with this id and this whole public key as it was
+    /// (`last_seen` is the previous visit), marking it seen now. The short id
+    /// alone is not enough: it is shown to people and a key matching its 32
+    /// bits can be ground offline.
+    fn seen(&mut self, id: &str, public_key: &str) -> Option<Device>;
     fn add(&mut self, device: Device);
     /// Use up the current offer if `check` accepts its secret.
     fn take_offer(&mut self, check: &dyn Fn(&[u8]) -> bool) -> bool;
@@ -375,9 +378,11 @@ pub(crate) fn new_offer() -> anyhow::Result<String> {
 pub(crate) struct DiskStore;
 
 impl DeviceStore for DiskStore {
-    fn seen(&mut self, id: &str) -> Option<Device> {
+    fn seen(&mut self, id: &str, public_key: &str) -> Option<Device> {
         let mut devices = list_devices();
-        let device = devices.iter_mut().find(|d| d.id == id)?;
+        let device = devices
+            .iter_mut()
+            .find(|d| d.id == id && d.public_key == public_key)?;
         let found = device.clone();
         device.last_seen = now();
         let _ = save_devices(&devices);
@@ -477,8 +482,11 @@ pub(crate) mod tests {
     }
 
     impl DeviceStore for MemoryStore {
-        fn seen(&mut self, id: &str) -> Option<Device> {
-            self.devices.get(id).cloned()
+        fn seen(&mut self, id: &str, public_key: &str) -> Option<Device> {
+            self.devices
+                .get(id)
+                .filter(|d| d.public_key == public_key)
+                .cloned()
         }
         fn add(&mut self, device: Device) {
             self.devices.insert(device.id.clone(), device);
@@ -625,6 +633,48 @@ pub(crate) mod tests {
         assert_eq!(
             admit(&auth(&key, &transcript), &transcript, &mut store).map(|(d, _)| d.id),
             Ok(id)
+        );
+    }
+
+    /// The short id is shown in notifications and `kaku remote devices`, and
+    /// a key whose SHA-256 starts with the same 32 bits can be ground
+    /// offline. Signing in must take the paired key itself.
+    #[test]
+    fn a_key_that_only_shares_the_short_id_does_not_sign_in_or_pair_over_it() {
+        let (transcript, _, key) = exchange("host");
+        let paired = TestPage::new()
+            .finish(
+                "host",
+                &Exchange::new(&SystemRandom::new()).unwrap().hello(),
+            )
+            .2;
+        let mut store = MemoryStore::default();
+        // A paired device whose id the attacker's key happens to share.
+        store.add(Device {
+            id: device_id(key.public_key()),
+            public_key: b64(paired.public_key()),
+            name: "Safari on iPhone".into(),
+            paired_at: 0,
+            last_seen: 0,
+        });
+        assert_eq!(
+            admit(&auth(&key, &transcript), &transcript, &mut store).map(|(d, _)| d.id),
+            Err(Refusal::UnknownDevice)
+        );
+        // Without a pairing link it cannot pair either, and the paired device
+        // is left as it was.
+        assert_eq!(
+            admit(
+                &pair(&key, &transcript, b"no offer"),
+                &transcript,
+                &mut store
+            )
+            .map(|(d, _)| d.id),
+            Err(Refusal::PairingLink)
+        );
+        assert_eq!(
+            store.devices[&device_id(key.public_key())].public_key,
+            b64(paired.public_key())
         );
     }
 
