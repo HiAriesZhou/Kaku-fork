@@ -4,9 +4,11 @@
 // app, loopback relay, the page as published); never touches an installed
 // Kaku or a real link. The network is loopback, so these are Kaku's and the
 // page's own costs; a real relay adds its round trip to echo and round-trip
-// operations, not to local scrolling or copying.
+// operations, not to local scrolling or copying. FEEL_RTT_MS puts that round
+// trip between the page and the relay (half each way), to see which steps
+// wait on it once and which wait several times.
 //
-//   KAKU_TEST_APP=dist/Kaku.app node crates/kaku-remote/tests/feel.cjs
+//   KAKU_TEST_APP=dist/Kaku.app [FEEL_RTT_MS=150] node crates/kaku-remote/tests/feel.cjs
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
@@ -33,6 +35,23 @@ const stats = list => {
   const at = p => s[Math.min(s.length - 1, Math.floor(p * s.length))];
   return { n: s.length, p50: +at(0.5).toFixed(1), p95: +at(0.95).toFixed(1), max: +s[s.length - 1].toFixed(1) };
 };
+
+// A TCP relay that holds every chunk for half the round trip each way, in
+// order, like a long network path between the browser and the relay.
+function delayProxy(listenPort, targetPort, rttMs) {
+  const half = rttMs / 2;
+  const server = net.createServer(client => {
+    const upstream = net.connect(targetPort, '127.0.0.1');
+    const pipe = (from, to) => {
+      from.on('data', chunk => setTimeout(() => { if (!to.destroyed) to.write(chunk); }, half));
+      from.on('end', () => setTimeout(() => to.end(), half));
+      from.on('error', () => to.destroy());
+    };
+    pipe(client, upstream);
+    pipe(upstream, client);
+  });
+  return new Promise(r => server.listen(listenPort, '127.0.0.1', () => r(server)));
+}
 
 function serveLikeVercel(dir, listenPort) {
   const config = JSON.parse(fs.readFileSync(path.join(dir, 'vercel.json')));
@@ -75,9 +94,13 @@ const WATCH = () => {
   const report = {};
   try {
     const relay = await port(), local = await port(), pagePort = await port();
+    const rtt = Number(process.env.FEEL_RTT_MS || 0);
+    const pageRelay = rtt ? await port() : relay;
+    if (rtt) await delayProxy(pageRelay, relay, rtt);
+    report.rtt_ms = rtt;
     const origin = `http://127.0.0.1:${pagePort}`;
     const dir = path.resolve(execFileSync(path.join(root, 'scripts/publish_web_page.sh'), ['--dry-run'], {
-      env: { ...process.env, KAKU_WEB_RELAY: `ws://127.0.0.1:${relay}` },
+      env: { ...process.env, KAKU_WEB_RELAY: `ws://127.0.0.1:${pageRelay}` },
     }).toString().trim());
     server = await serveLikeVercel(dir, pagePort);
     start(path.join(root, 'crates/kaku-relay/target/debug/kaku-relay'), [], { PORT: String(relay), KAKU_RELAY_PAGE_ORIGIN: origin });
