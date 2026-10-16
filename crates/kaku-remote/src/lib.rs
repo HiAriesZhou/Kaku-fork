@@ -20,8 +20,7 @@ mod web;
 
 pub use pairing::{list_devices, revoke_device, Device, OFFER_LIFETIME};
 pub use share::{
-    access_fingerprint, load_or_create_identity, reset_identity, save_access_code, save_token,
-    ShareIdentity,
+    access_fingerprint, load_or_create_identity, reset_identity, save_access_code, ShareIdentity,
 };
 pub use web::{
     publish_tab_title, release_web_size, set_tab_action_handler, tab_is_web_sized,

@@ -7,8 +7,6 @@
 //! with a key carried in the link's fragment, so the relay only numbers the
 //! browsers and forwards bytes it cannot read.
 
-mod token;
-
 use axum::extract::{ws, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -244,10 +242,6 @@ struct AppState {
     /// instead of the link reading offline while a Kaku is running.
     hosts: Arc<Mutex<HashMap<String, Vec<Arc<Host>>>>>,
     generation: Arc<AtomicU64>,
-    /// Registration tokens (`token`): the public key to check them with,
-    /// and whether a Mac without a valid one is turned away. Unset, every
-    /// Mac registers as before.
-    tokens: Option<Arc<TokenPolicy>>,
     /// The access code a Mac must present to register; unset, none is asked.
     access: Option<Arc<AccessCode>>,
     limits: Arc<Mutex<AddrLimits>>,
@@ -397,54 +391,6 @@ fn valid_id(id: &str) -> bool {
 
 // ── Host side ─────────────────────────────────────────────────────────────────
 
-struct TokenPolicy {
-    public_key: Vec<u8>,
-    required: bool,
-}
-
-impl TokenPolicy {
-    fn from_env() -> Result<Option<Self>, &'static str> {
-        Self::from_settings(
-            std::env::var("KAKU_RELAY_TOKEN_KEY").ok().as_deref(),
-            std::env::var("KAKU_RELAY_REQUIRE_TOKEN").as_deref() == Ok("1"),
-        )
-    }
-
-    fn from_settings(key: Option<&str>, required: bool) -> Result<Option<Self>, &'static str> {
-        let public_key = key
-            .and_then(token::decode_key)
-            .filter(|key| key.len() == 32);
-        let Some(public_key) = public_key else {
-            if required {
-                return Err(
-                    "KAKU_RELAY_REQUIRE_TOKEN=1 needs a valid 32-byte KAKU_RELAY_TOKEN_KEY",
-                );
-            }
-            if key.is_some() {
-                tracing::warn!("KAKU_RELAY_TOKEN_KEY is invalid; tokens are not checked");
-            }
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            public_key,
-            required,
-        }))
-    }
-
-    /// Whether a Mac presenting `presented` may register as `id` at `now`.
-    fn admits(&self, id: &str, presented: Option<&str>, now: u64) -> bool {
-        let checked = presented.map(|t| token::verify(t, &self.public_key, id, now));
-        match checked {
-            Some(Ok(_)) => true,
-            Some(Err(why)) => {
-                info!(host = short(id), ?why, "registration token refused");
-                !self.required
-            }
-            None => !self.required,
-        }
-    }
-}
-
 /// The access code Macs present to register (`KAKU_RELAY_ACCESS_CODE`, a
 /// fly secret), kept as its SHA-256 and compared in constant time.
 struct AccessCode {
@@ -454,9 +400,7 @@ struct AccessCode {
 impl AccessCode {
     fn new(code: &str) -> Self {
         Self {
-            digest: ring::digest::digest(&ring::digest::SHA256, code.trim().as_bytes())
-                .as_ref()
-                .to_vec(),
+            digest: Sha256::digest(code.trim().as_bytes()).to_vec(),
         }
     }
 
@@ -466,9 +410,8 @@ impl AccessCode {
     }
 
     fn admits(&self, presented: &str) -> bool {
-        let digest = ring::digest::digest(&ring::digest::SHA256, presented.trim().as_bytes());
+        let digest = Sha256::digest(presented.trim().as_bytes());
         digest
-            .as_ref()
             .iter()
             .zip(&self.digest)
             .fold(0u8, |acc, (a, b)| acc | (a ^ b))
@@ -568,16 +511,6 @@ async fn host_ws(
                 return refuse(StatusCode::UNAUTHORIZED, "wrong access code");
             }
             Some(_) => {}
-        }
-    }
-    if let Some(policy) = &state.tokens {
-        let presented = headers.get("x-kaku-token").and_then(|v| v.to_str().ok());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if !policy.admits(&id, presented, now) {
-            return refuse(StatusCode::UNAUTHORIZED, "registration token refused");
         }
     }
     if let Err(status) = AppState::check_registration(&state.hosts.lock(), &id, &addr) {
@@ -1015,17 +948,6 @@ fn app(state: AppState) -> Router {
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(result) = token::run_command(&args) {
-        match result {
-            Ok(out) => println!("{out}"),
-            Err(e) => {
-                eprintln!("kaku-relay: {e}");
-                std::process::exit(2);
-            }
-        }
-        return;
-    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1053,19 +975,6 @@ async fn main() {
             tracing::warn!("set_nodelay failed: {e}");
         }
     });
-    let tokens = match TokenPolicy::from_env() {
-        Ok(policy) => policy.map(Arc::new),
-        Err(error) => {
-            eprintln!("kaku-relay: {error}");
-            std::process::exit(2);
-        }
-    };
-    if let Some(policy) = &tokens {
-        info!(
-            required = policy.required,
-            "registration tokens are checked"
-        );
-    }
     let access = AccessCode::from_env().map(Arc::new);
     if access.is_some() {
         info!("Macs need the access code to register");
@@ -1079,7 +988,6 @@ async fn main() {
         info!("the page is served from {origin}");
     }
     let state = AppState {
-        tokens,
         access,
         page_origin,
         ..AppState::default()
@@ -1093,22 +1001,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn required_tokens_reject_missing_malformed_and_wrong_length_keys() {
-        for key in [None, Some("not!base64"), Some(""), Some("AA")] {
-            assert!(
-                TokenPolicy::from_settings(key, true).is_err(),
-                "key={key:?}"
-            );
-        }
-        assert!(TokenPolicy::from_settings(None, false).unwrap().is_none());
-        let (_, public) = token::generate().unwrap();
-        let policy = TokenPolicy::from_settings(Some(&public), true)
-            .unwrap()
-            .unwrap();
-        assert!(!policy.admits("id", None, 0));
-    }
 
     #[test]
     fn concurrent_host_registration_cannot_exceed_the_address_budget() {
@@ -1409,34 +1301,6 @@ mod tests {
         assert!(owns(&id, &secret));
         assert!(!owns(&id, "b"));
         assert!(!owns(&id, ""));
-    }
-
-    #[test]
-    fn tokens_are_checked_and_only_enforced_when_required() {
-        let (private, public) = token::generate().unwrap();
-        let private = token::decode_key(&private).unwrap();
-        let valid = token::sign(
-            &token::Claims {
-                sub: "*".into(),
-                kind: "invite".into(),
-                exp: 100,
-            },
-            &private,
-        )
-        .unwrap();
-        let mut policy = TokenPolicy {
-            public_key: token::decode_key(&public).unwrap(),
-            required: false,
-        };
-        // Until required, a Mac with no token (today's builds) or a bad one
-        // still registers; only the log notes the bad one.
-        assert!(policy.admits("id", None, 50));
-        assert!(policy.admits("id", Some("bad"), 50));
-        policy.required = true;
-        assert!(policy.admits("id", Some(&valid), 50));
-        assert!(!policy.admits("id", None, 50));
-        assert!(!policy.admits("id", Some(&valid), 150));
-        assert!(!policy.admits("id", Some("bad"), 50));
     }
 
     #[test]

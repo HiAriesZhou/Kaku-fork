@@ -205,9 +205,6 @@ enum SubCommand {
         /// Start over: a new identity, and every paired browser removed
         #[arg(long)]
         reset: bool,
-        /// Keep a relay registration token (from an invite) for this Kaku
-        #[arg(long, value_name = "TOKEN")]
-        token: Option<String>,
         #[command(subcommand)]
         action: Option<RemoteAction>,
     },
@@ -544,16 +541,7 @@ fn run() -> anyhow::Result<()> {
             cli::run_cli(&opts, cli)
         }
         #[cfg(feature = "remote")]
-        SubCommand::Remote {
-            reset,
-            token,
-            action,
-        } => {
-            if let Some(token) = token {
-                kaku_remote::save_token(&token)?;
-                println!("Saved. Kaku uses it from its next connection to the relay.");
-                return Ok(());
-            }
+        SubCommand::Remote { reset, action } => {
             // Read the user's config: whether remote access is on, and where.
             init_config(&opts)?;
             run_remote(reset, action)

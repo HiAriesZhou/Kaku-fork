@@ -16,14 +16,16 @@ primary_region = 'nrt'
   min_machines_running = 1
   processes = ['app']
 
-  # Each Mac holds one socket and each open page another, so 100 is about
-  # 50 people online. The bound is memory, not fly's proxy: 256 MB holds the
-  # relay-wide queue budget (96 MB), the built-in page files (about 1 MB)
-  # and the sockets. Raise it only with a measured load test or a larger machine.
+  # Every Mac with remote access on holds a socket all day, and each open
+  # page another, so 400 is about 200 people online. Memory bounds it, not
+  # fly's proxy: a release build load test (2026-10-17) held 400 Macs plus
+  # 200 pages each receiving 15 KB/s at 88 MB, every frame delivered, which
+  # leaves room in 256 MB for the relay-wide queue budget (96 MB). Raise it
+  # only with a new load test or a larger machine.
   [http_service.concurrency]
     type = 'connections'
-    soft_limit = 80
-    hard_limit = 100
+    soft_limit = 300
+    hard_limit = 400
 
 [[vm]]
   memory = '256mb'
