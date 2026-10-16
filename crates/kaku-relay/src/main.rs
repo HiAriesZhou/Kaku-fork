@@ -426,17 +426,24 @@ impl AccessCode {
 struct AddrLimits {
     connects: HashMap<String, (Instant, u32)>,
     failures: HashMap<String, (Instant, u32)>,
+    /// When a large map was last swept; at most once a second, or a flood of
+    /// fresh sources would make every connect scan the whole map.
+    swept_at: Option<Instant>,
 }
 
 impl AddrLimits {
     fn count(
         map: &mut HashMap<String, (Instant, u32)>,
+        swept_at: &mut Option<Instant>,
         addr: &str,
         window: Duration,
         now: Instant,
     ) -> u32 {
-        if map.len() > 10_000 {
+        if map.len() > 10_000
+            && swept_at.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1))
+        {
             map.retain(|_, (start, _)| now.duration_since(*start) < window);
+            *swept_at = Some(now);
         }
         let entry = map.entry(addr.to_string()).or_insert((now, 0));
         if now.duration_since(entry.0) >= window {
@@ -448,8 +455,13 @@ impl AddrLimits {
 
     fn allow_connect(&mut self, addr: &str, now: Instant) -> bool {
         addr == "-"
-            || Self::count(&mut self.connects, addr, Duration::from_secs(60), now)
-                <= CONNECTS_PER_MINUTE
+            || Self::count(
+                &mut self.connects,
+                &mut self.swept_at,
+                addr,
+                Duration::from_secs(60),
+                now,
+            ) <= CONNECTS_PER_MINUTE
     }
 
     fn access_locked(&self, addr: &str, now: Instant) -> bool {
@@ -461,7 +473,13 @@ impl AddrLimits {
 
     fn note_access_failure(&mut self, addr: &str, now: Instant) {
         if addr != "-" {
-            Self::count(&mut self.failures, addr, ACCESS_WINDOW, now);
+            Self::count(
+                &mut self.failures,
+                &mut self.swept_at,
+                addr,
+                ACCESS_WINDOW,
+                now,
+            );
         }
     }
 }
@@ -469,11 +487,30 @@ impl AddrLimits {
 /// Fly puts the real client address in `fly-client-ip`; without it (local
 /// runs) every client shares the `-` bucket.
 fn client_addr(headers: &HeaderMap) -> String {
-    headers
-        .get("fly-client-ip")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string()
+    source_of(
+        headers
+            .get("fly-client-ip")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-"),
+    )
+}
+
+/// The client a budget is kept for: an IPv4 address, or an IPv6 /64. r.kaku.fun
+/// answers on IPv6 too, and one IPv6 client holds a whole /64 to pick source
+/// addresses from, so counting full addresses let it start fresh on every
+/// request. Anything unparsable is kept as it came.
+fn source_of(raw: &str) -> String {
+    match raw.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+        Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Err(_) => raw.to_string(),
+    }
 }
 
 /// A refusal the Mac shows its user: the status and why, as plain text.
@@ -1301,6 +1338,28 @@ mod tests {
         assert!(owns(&id, &secret));
         assert!(!owns(&id, "b"));
         assert!(!owns(&id, ""));
+    }
+
+    /// One IPv6 client holds a whole /64 and can use a new source address
+    /// per request, which made every per-address budget per-request.
+    #[test]
+    fn ipv6_clients_are_held_to_budgets_per_slash_64() {
+        assert_eq!(
+            source_of("2001:db8:1:2:aaaa::1"),
+            source_of("2001:db8:1:2:bbbb:cccc:dddd:9")
+        );
+        assert_ne!(source_of("2001:db8:1:2::1"), source_of("2001:db8:1:3::1"));
+        assert_eq!(source_of("::ffff:1.2.3.4"), "1.2.3.4");
+        assert_eq!(source_of("1.2.3.4"), "1.2.3.4");
+        assert_eq!(source_of("-"), "-");
+        let mut limits = AddrLimits::default();
+        let start = Instant::now();
+        for i in 0..CONNECTS_PER_MINUTE {
+            let addr = source_of(&format!("2001:db8:1:2::{i:x}"));
+            assert!(limits.allow_connect(&addr, start));
+        }
+        assert!(!limits.allow_connect(&source_of("2001:db8:1:2:ffff::1"), start));
+        assert!(limits.allow_connect(&source_of("2001:db8:1:3::1"), start));
     }
 
     #[test]
