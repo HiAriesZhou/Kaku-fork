@@ -192,8 +192,67 @@ const WATCH = () => {
       const past = document.querySelector('#past');
       return !!past && /\b3[0-9]{3}\b/.test(past.textContent + window.__rows());
     });
-    await page.keyboard.press('Escape');
+    // Back down by the wheel; an Escape here would reach zsh and turn the
+    // next key into Alt+key.
     await page.mouse.wheel(0, 100000);
+    await sleep(300);
+
+    // ── Scrolling inside a program that takes the wheel (less) ────────────
+    // Each wheel goes to the Mac and comes back as a frame, so this is the
+    // round trip plus how many frames the page may have in flight.
+    await page.keyboard.type('seq 1 3000 | less -M\n');
+    await shows('lines 1-');
+    await sleep(400);
+    const firstLine = () => page.evaluate(() => window.__rows().split('\n')[0].trim());
+    const top0 = await firstLine();
+    await page.evaluate(() => { window.__wheelStart = performance.now(); window.__changes.length = 0; });
+    for (let i = 0; i < 30; i++) {
+      await page.mouse.wheel(0, 100);
+      await sleep(16);
+    }
+    const wheelEnd = await page.evaluate(() => performance.now());
+    await sleep(1500);
+    report.alt_scroll = await page.evaluate(({ top0, wheelEnd }) => {
+      const start = window.__wheelStart;
+      const tops = window.__changes.map(c => ({ t: c.t, top: c.text.split('\n')[0].trim() }));
+      const moved = tops.find(c => c.top !== top0);
+      const last = tops.at(-1);
+      const settled = tops.find(c => c.top === last.top);
+      const during = tops.filter(c => c.t <= wheelEnd + 50);
+      const span = Math.max(1, (wheelEnd - start) / 1000);
+      return {
+        first_move_ms: moved ? +(moved.t - start).toFixed(1) : null,
+        updates_per_s_while_scrolling: +(new Set(during.map(c => c.top)).size / span).toFixed(1),
+        settled_after_last_wheel_ms: settled ? +(settled.t - wheelEnd).toFixed(1) : null,
+        moved_lines: last ? Number(last.top) - Number(top0) : 0,
+      };
+    }, { top0, wheelEnd });
+    await page.keyboard.press('q');
+    await sleep(300);
+
+    // ── A program writing as fast as it can ───────────────────────────────
+    // Under a flood Kaku applies output to the terminal in batches of up to
+    // 128 KB (mux_output_parser_buffer_size), from about 5 to 20 a second for
+    // this loop, and the app's window reads the same state: this rate is the
+    // terminal's, not the page's (2026-10-16: the page stayed at 60 fps and
+    // the Mac sent a frame for every change it saw).
+    await page.keyboard.type('clear\n');
+    await sleep(300);
+    await page.evaluate(() => { window.__changes.length = 0; window.__floodStart = performance.now(); });
+    await page.keyboard.type('for i in {1..300000}; do echo line $i; done\n');
+    await sleep(3000);
+    report.flood = await page.evaluate(() => {
+      const start = window.__floodStart;
+      const inWindow = window.__changes.filter(c => c.t > start + 500 && c.t < start + 2500);
+      return { screen_updates_per_s: +(inWindow.length / 2).toFixed(1) };
+    });
+    // Ctrl+C stops it, and the shell answers again right away.
+    const stopAt = await page.evaluate(() => performance.now());
+    await page.keyboard.press('Control+C');
+    await page.keyboard.type('echo FLOOD-STOPPED\n');
+    await until(() => page.evaluate(() => /^FLOOD-STOPPED\s*$/m.test(window.__rows())), 10000);
+    report.flood.ctrl_c_then_echo_ms = +((await page.evaluate(() => performance.now())) - stopAt).toFixed(1);
+    await page.keyboard.type('clear\n');
     await sleep(300);
 
     // ── Copying a selection (copy on select, as on the Mac) ───────────────
