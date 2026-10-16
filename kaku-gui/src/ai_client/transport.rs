@@ -103,6 +103,8 @@ fn build_no_proxy_list() -> Vec<String> {
         "localhost",
         "127.0.0.0/8",
         "::1",
+        "fc00::/7",
+        "fe80::/10",
         "169.254.0.0/16",
         "10.0.0.0/8",
         "172.16.0.0/12",
@@ -423,5 +425,41 @@ mod tests {
                 expected
             );
         }
+    }
+
+    fn proxy_received_connection(url: &str) -> bool {
+        let fake = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        fake.set_nonblocking(true).unwrap();
+        let proxy = reqwest::Proxy::all(format!("http://{}", fake.local_addr().unwrap()))
+            .unwrap()
+            .no_proxy(super::build_no_proxy());
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .connect_timeout(std::time::Duration::from_millis(300))
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let _ = client.get(url).send();
+        match fake.accept() {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("fake proxy accept failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn ipv6_unique_local_host_bypasses_proxy() {
+        assert!(!proxy_received_connection("http://[fd7a:115c:a1e0::5]:9/"));
+    }
+
+    #[test]
+    fn ipv6_link_local_host_bypasses_proxy() {
+        assert!(!proxy_received_connection("http://[fe80::1]:9/"));
+    }
+
+    #[test]
+    fn public_ipv6_host_still_uses_proxy() {
+        assert!(proxy_received_connection("http://[2001:db8::1]:9/"));
     }
 }
