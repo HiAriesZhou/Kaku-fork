@@ -246,9 +246,13 @@ pub(crate) fn set_remote_enabled(enabled: bool) -> anyhow::Result<bool> {
 #[cfg(any(feature = "remote", test))]
 fn with_remote_enabled(content: &str, enabled: bool) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
-    if let Some(start) = lines.iter().position(|l| {
-        let t = l.trim_start();
-        t.starts_with("config.remote") && t["config.remote".len()..].trim_start().starts_with('=')
+    // The line writer replaces every matching assignment, including overrides
+    // in conditional blocks. Check all of them before allowing any rewrite.
+    for start in lines.iter().enumerate().filter_map(|(i, line)| {
+        let after = line.trim().strip_prefix("config.remote")?;
+        after
+            .starts_with(|c: char| c.is_whitespace() || c == '=')
+            .then_some(i)
     }) {
         // `config.remote =` with its table on the next lines: the line writer
         // would replace only this line and leave the table behind.
@@ -2202,6 +2206,31 @@ return config
             with_remote_enabled(commented, true).unwrap(),
             "-- config.remote = { tunnel_url = 'wss://x' }\nconfig.remote = { enabled = true }\nreturn config\n"
         );
+    }
+
+    #[test]
+    fn remote_access_checks_every_assignment_before_rewriting() {
+        for later in [
+            "config.remote = { enabled = true, tunnel_url = 'wss://mine' }",
+            "if use_private_relay then\n  config.remote = {\n    enabled = true,\n    tunnel_url = 'wss://mine',\n  }\nend",
+            "config.remote = { enabled = true } -- keep my explanation",
+            "config.remote =\n{ enabled = true, tunnel = false }",
+        ] {
+            let content = format!(
+                "config.remote = {{ enabled = true }}\n{later}\nreturn config\n"
+            );
+            assert_eq!(with_remote_enabled(&content, false), None, "{content}");
+        }
+        let safe = "config.remote = { enabled = true }\nif on_laptop then\n  config.remote = { enabled = false }\nend\n-- config.remote = { tunnel_url = 'wss://mine' }\nreturn config\n";
+        let updated = with_remote_enabled(safe, false).unwrap();
+        assert_eq!(
+            updated
+                .matches("config.remote = { enabled = false }")
+                .count(),
+            2
+        );
+        assert!(updated.contains("-- config.remote = { tunnel_url = 'wss://mine' }"));
+        assert!(updated.contains("if on_laptop then\n"));
     }
 
     #[test]
