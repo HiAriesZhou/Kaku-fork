@@ -49,6 +49,8 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// title changes and resizes that do not produce `PaneOutput`.
 const IDLE_REFRESH: Duration = Duration::from_secs(1);
 const MAX_INPUT_LEN: usize = 65_536;
+/// How long a click from the page holds the button, about a quick hand's.
+const CLICK_HOLD: Duration = Duration::from_millis(50);
 /// A page pings every 20 s, and a background tab still gets a timer about
 /// once a minute. This long without a word means the browser is gone (a
 /// laptop asleep with the socket half open), and the session ends rather
@@ -1860,22 +1862,32 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
                 return;
             }
             let dims = pane.get_dimensions();
-            let mut result = Ok(());
-            for kind in [MouseEventKind::Press, MouseEventKind::Release] {
-                result = pane.mouse_event(MouseEvent {
-                    kind,
-                    x: x.min(dims.cols.saturating_sub(1)),
-                    y: y.min(dims.viewport_rows.saturating_sub(1)) as i64,
-                    x_pixel_offset: 0,
-                    y_pixel_offset: 0,
-                    button: MouseButton::Left,
-                    modifiers: Modifiers::NONE,
-                });
-                if result.is_err() {
-                    break;
-                }
-            }
-            result
+            let (x, y) = (
+                x.min(dims.cols.saturating_sub(1)),
+                y.min(dims.viewport_rows.saturating_sub(1)) as i64,
+            );
+            let event = move |kind, button| MouseEvent {
+                kind,
+                x,
+                y,
+                x_pixel_offset: 0,
+                y_pixel_offset: 0,
+                button,
+                modifiers: Modifiers::NONE,
+            };
+            // As a hand does in the Mac window: the pointer arrives, presses,
+            // and lets go a moment later. Press and release in one instant,
+            // with no move first, left Claude Code's expandable blocks in a
+            // half-made selection instead of expanding them.
+            pane.mouse_event(event(MouseEventKind::Move, MouseButton::None))
+                .and_then(|()| pane.mouse_event(event(MouseEventKind::Press, MouseButton::Left)))
+                .map(|()| {
+                    let pane = Arc::clone(pane);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(CLICK_HOLD).await;
+                        let _ = pane.mouse_event(event(MouseEventKind::Release, MouseButton::Left));
+                    });
+                })
         }
         WebClientMsg::Scroll { lines } if pane.is_alt_screen_active() => {
             let key = if lines > 0 {
