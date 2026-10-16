@@ -37,7 +37,7 @@ async function until(fn, ms = 15000) {
     fs.mkdirSync(path.join(home, 'tmp'));
     const config = path.join(home, '.config/kaku/kaku.lua');
     fs.writeFileSync(config, `return {default_prog={'/bin/zsh','-f'}, default_cwd=${JSON.stringify(home)}, restore_previous_session=false, pane_close_confirmation="AlwaysPrompt", tab_close_confirmation="AlwaysPrompt", initial_cols=80, initial_rows=24, font_size=16, remote={enabled=true,bind='127.0.0.1',port=${local},tunnel=true,tunnel_url='ws://127.0.0.1:${relay}'}}`);
-    start(path.join(root, 'crates/kaku-relay/target/debug/kaku-relay'), [], { PORT: String(relay) });
+    start(path.join(root, 'crates/kaku-relay/target/debug/kaku-relay'), [], { PORT: String(relay), KAKU_RELAY_ACCESS_CODE: 'live-code' });
     await until(async () => { try { return (await fetch(`http://127.0.0.1:${relay}/health`)).ok; } catch { return false; } });
     const app = process.env.KAKU_TEST_APP || path.join(root, 'dist/Kaku.app');
     start(path.join(app, 'Contents/MacOS/kaku-gui'), ['--config-file', config, 'start', '--always-new-process'], {
@@ -47,8 +47,13 @@ async function until(fn, ms = 15000) {
     await until(() => fs.existsSync(statePath));
     const state = JSON.parse(fs.readFileSync(statePath));
     const url = `http://127.0.0.1:${local}/#t=${state.token}`;
-    browser = await chromium.launch(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
-      ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {});
+    // This integration smoke reads DOM rows and link geometry. The browser
+    // unit suite separately verifies WebGL rendering and context recovery.
+    browser = await chromium.launch({
+      args: ['--disable-webgl', '--disable-3d-apis'],
+      ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+        ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}),
+    });
     const page = await browser.newPage({ viewport: { width: 1100, height: 650 } });
     const errors = []; page.on('pageerror', e => errors.push(e.message));
     await page.goto(url);
@@ -139,6 +144,16 @@ async function until(fn, ms = 15000) {
     const id = crypto.createHash('sha256').update(identity.secret).digest('hex').slice(0, 32);
     const relayBase = `http://127.0.0.1:${relay}/${id}/`;
     const legacyBase = `http://127.0.0.1:${relay}/t/${id}/`;
+    // This relay asks for an access code: without one the Mac is turned
+    // away and says so; once `kaku remote` saves it, Kaku tries again within
+    // a second or two instead of waiting out its backoff.
+    const statusPath = path.join(home, 'tmp/kaku-remote-relay.json');
+    await until(() => fs.existsSync(statusPath) && JSON.parse(fs.readFileSync(statusPath)).last_error.includes('access code required'));
+    assert.equal((await fetch(relayBase)).status, 404);
+    fs.writeFileSync(path.join(home, 'Library/Application Support/kaku/remote-access'), 'live-code\n', { mode: 0o600 });
+    const saved = Date.now();
+    await until(async () => (await fetch(relayBase)).ok, 8000);
+    console.log(`access code accepted after ${Date.now() - saved} ms`);
     await until(async () => (await fetch(legacyBase)).ok);
     await until(async () => (await fetch(relayBase)).ok);
     const cli = (...args) => new Promise((resolve, reject) => {
@@ -325,7 +340,7 @@ async function until(fn, ms = 15000) {
     const replacementId = crypto.createHash('sha256').update(secret).digest('hex').slice(0, 32);
     const hostURL = `ws://127.0.0.1:${relay}/host/${replacementId}`;
     const connectHost = async () => {
-      const socket = new WebSocket(hostURL, { headers: { 'x-kaku-secret': secret } });
+      const socket = new WebSocket(hostURL, { headers: { 'x-kaku-secret': secret, 'x-kaku-access': 'live-code' } });
       sockets.push(socket);
       await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
       return socket;

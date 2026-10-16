@@ -212,6 +212,9 @@ jobs:
       - name: Signing and notarization retry tests
         run: python3 scripts/test_notarize_retry.py
 
+      - name: Restart process selection tests
+        run: python3 scripts/test_restart_kaku.py
+
       - name: Shell integration smoke tests
         run: |
           set -euo pipefail

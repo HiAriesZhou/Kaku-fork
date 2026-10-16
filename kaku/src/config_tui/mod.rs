@@ -227,6 +227,65 @@ where
     action_result.and(restore_result)
 }
 
+/// Turn remote access on or off in the user's config, the way the settings
+/// screen writes a value. Returns false, writing nothing, when `config.remote`
+/// holds settings besides `enabled`, which a whole-line rewrite would lose.
+#[cfg(feature = "remote")]
+pub(crate) fn set_remote_enabled(enabled: bool) -> anyhow::Result<bool> {
+    let path = ensure_editable_config_exists(None)?;
+    let content = std::fs::read_to_string(&path)?;
+    let Some(updated) = with_remote_enabled(&content, enabled) else {
+        return Ok(false);
+    };
+    std::fs::write(&path, updated)?;
+    Ok(true)
+}
+
+/// `content` with remote access set to `enabled`, or None when its
+/// `config.remote` holds other settings.
+#[cfg(any(feature = "remote", test))]
+fn with_remote_enabled(content: &str, enabled: bool) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    // The line writer replaces every matching assignment, including overrides
+    // in conditional blocks. Check all of them before allowing any rewrite.
+    for start in lines.iter().enumerate().filter_map(|(i, line)| {
+        let after = line.trim().strip_prefix("config.remote")?;
+        after
+            .starts_with(|c: char| c.is_whitespace() || c == '=')
+            .then_some(i)
+    }) {
+        // `config.remote =` with its table on the next lines: the line writer
+        // would replace only this line and leave the table behind.
+        let after = lines[start].split_once('=').map(|(_, v)| v).unwrap_or("");
+        if after.split("--").next().unwrap_or("").trim().is_empty() {
+            return None;
+        }
+        let mut block = String::new();
+        let mut depth = 0;
+        for line in &lines[start..] {
+            block.push_str(line);
+            block.push('\n');
+            depth += App::count_brace_depth(line);
+            if depth <= 0 {
+                break;
+            }
+        }
+        let rest = block
+            .replacen("config.remote", "", 1)
+            .replace("enabled", "")
+            .replace("true", "")
+            .replace("false", "");
+        if rest
+            .chars()
+            .any(|c| !matches!(c, '=' | '{' | '}' | ',' | ';') && !c.is_whitespace())
+        {
+            return None;
+        }
+    }
+    let value = format!("{{ enabled = {enabled} }}");
+    Some(App::set_lua_config_line(content, "remote", &value))
+}
+
 pub(crate) fn ensure_editable_config_exists(config_path: Option<&Path>) -> anyhow::Result<PathBuf> {
     if let Some(path) = config_path {
         return config::ensure_config_exists_at_path(path);
@@ -1285,6 +1344,10 @@ impl App {
 
     /// Insert or replace a `config.<lua_key> = <lua_value>` line in the config.
     fn set_lua_config(&self, content: &str, lua_key: &str, lua_value: &str) -> String {
+        Self::set_lua_config_line(content, lua_key, lua_value)
+    }
+
+    fn set_lua_config_line(content: &str, lua_key: &str, lua_value: &str) -> String {
         let config_line = format!("config.{} = {}", lua_key, lua_value);
         let pattern = format!("config.{}", lua_key);
 
@@ -1481,8 +1544,8 @@ fn signal_config_changed() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_editable_config_exists, normal_mode_action, App, Mode, NormalModeAction,
-        KAKU_AUTO_COLOR_SCHEME_EXPR,
+        ensure_editable_config_exists, normal_mode_action, with_remote_enabled, App, Mode,
+        NormalModeAction, KAKU_AUTO_COLOR_SCHEME_EXPR,
     };
     use crossterm::event::KeyCode;
     use std::path::PathBuf;
@@ -2117,6 +2180,57 @@ return config
         app.confirm_edit();
 
         assert_eq!(app.fields[idx].value, "Ctrl+Alt+Cmd+K");
+    }
+
+    #[test]
+    fn remote_access_is_switched_in_place_and_never_drops_other_settings() {
+        let fresh = "local config = {}\nreturn config\n";
+        assert_eq!(
+            with_remote_enabled(fresh, true).unwrap(),
+            "local config = {}\nconfig.remote = { enabled = true }\nreturn config\n"
+        );
+        let on = "local config = {}\nconfig.remote = { enabled = true }\nreturn config\n";
+        assert_eq!(
+            with_remote_enabled(on, false).unwrap(),
+            "local config = {}\nconfig.remote = { enabled = false }\nreturn config\n"
+        );
+        // A relay of their own, possibly over several lines, is theirs to edit.
+        let custom =
+            "config.remote = {\n  enabled = true,\n  tunnel_url = 'wss://x',\n}\nreturn config\n";
+        assert_eq!(with_remote_enabled(custom, false), None);
+        let allman = "config.remote =\n{\n  enabled = true,\n}\nreturn config\n";
+        assert_eq!(with_remote_enabled(allman, false), None);
+        // A commented-out line is not the setting.
+        let commented = "-- config.remote = { tunnel_url = 'wss://x' }\nreturn config\n";
+        assert_eq!(
+            with_remote_enabled(commented, true).unwrap(),
+            "-- config.remote = { tunnel_url = 'wss://x' }\nconfig.remote = { enabled = true }\nreturn config\n"
+        );
+    }
+
+    #[test]
+    fn remote_access_checks_every_assignment_before_rewriting() {
+        for later in [
+            "config.remote = { enabled = true, tunnel_url = 'wss://mine' }",
+            "if use_private_relay then\n  config.remote = {\n    enabled = true,\n    tunnel_url = 'wss://mine',\n  }\nend",
+            "config.remote = { enabled = true } -- keep my explanation",
+            "config.remote =\n{ enabled = true, tunnel = false }",
+        ] {
+            let content = format!(
+                "config.remote = {{ enabled = true }}\n{later}\nreturn config\n"
+            );
+            assert_eq!(with_remote_enabled(&content, false), None, "{content}");
+        }
+        let safe = "config.remote = { enabled = true }\nif on_laptop then\n  config.remote = { enabled = false }\nend\n-- config.remote = { tunnel_url = 'wss://mine' }\nreturn config\n";
+        let updated = with_remote_enabled(safe, false).unwrap();
+        assert_eq!(
+            updated
+                .matches("config.remote = { enabled = false }")
+                .count(),
+            2
+        );
+        assert!(updated.contains("-- config.remote = { tunnel_url = 'wss://mine' }"));
+        assert!(updated.contains("if on_laptop then\n"));
     }
 
     #[test]

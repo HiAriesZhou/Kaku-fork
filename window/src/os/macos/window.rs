@@ -5572,7 +5572,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// The drawer opens at the height the user last dragged to, and the
     /// config's height applies until then or after it changes; a slide that
     /// would pass over a display stacked above happens at once instead.
@@ -5604,6 +5603,7 @@ mod tests {
         assert!(animate.contains("reduce_motion == YES || instant"));
     }
 
+    #[test]
     fn hotkey_options_native_consumer_wiring() {
         let source = include_str!("window.rs");
         let reveal = production_method(source, "pub(crate) fn show_global_hotkey_window(");

@@ -389,10 +389,70 @@ static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)((?:api[_-]?key|token|secret|password|passwd)[A-Za-z0-9_]*\s*[:=]\s*)(['"]?)[^'"\s,}]+(['"]?)"#)
         .unwrap()
 });
+static URL_USERINFO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\b([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s'"]+@"#).unwrap());
 static TOKEN_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9-]{10,})|(?i:bearer\s+)[A-Za-z0-9._-]{16,}")
+    Regex::new(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,})|(?i:bearer\s+)[A-Za-z0-9._-]{16,}")
         .unwrap()
 });
+
+// `debug_key_events` logs every key, so a bundle would carry whatever was
+// typed, a password at a sudo prompt included. Printable characters, the
+// physical keys behind them and composed text are hidden. Keys held with Ctrl
+// or Cmd stay readable, since those are what key bug reports are about, and so
+// do control characters such as Enter.
+static KEY_LOG_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"key_event |send to pane|: sending |DeadKeyStatus|native-line-editor|-> perform ")
+        .unwrap()
+});
+static SHORTCUT_MODS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:LEFT_|RIGHT_)?(?:CTRL|SUPER)\b").unwrap());
+static TYPED_CHAR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"Char\('(?:[^'\\]|\\['"\\])'\)"#).unwrap());
+static PHYSICAL_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(phys_code: Some\(|Physical\()\w+\)").unwrap());
+static RAW_KEY_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"raw_code: \d+").unwrap());
+static TYPED_STRING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"((?:sending |string=|original: |Compos(?:ing|ed)\()")((?:[^"\\]|\\.)*)""#)
+        .unwrap()
+});
+static CONTROL_ESCAPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\u\{[0-9a-fA-F]+\}|\\[rnt0]").unwrap());
+static LINE_EDITOR_INPUT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" bytes=.*").unwrap());
+
+fn redact_typed_input(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| {
+            if !KEY_LOG_LINE.is_match(line) {
+                return line.to_string();
+            }
+            let (body, end) = match line.strip_suffix('\n') {
+                Some(body) => (body, "\n"),
+                None => (line, ""),
+            };
+            let mut out = TYPED_STRING
+                .replace_all(body, |caps: &regex::Captures| {
+                    if CONTROL_ESCAPE.replace_all(&caps[2], "").is_empty() {
+                        caps[0].to_string()
+                    } else {
+                        format!("{}<typed>\"", &caps[1])
+                    }
+                })
+                .into_owned();
+            if out.contains("native-line-editor") {
+                out = LINE_EDITOR_INPUT
+                    .replace(&out, " bytes=<typed>")
+                    .into_owned();
+            }
+            if !SHORTCUT_MODS.is_match(&out) {
+                out = TYPED_CHAR.replace_all(&out, "Char(_)").into_owned();
+                out = PHYSICAL_KEY.replace_all(&out, "${1}_)").into_owned();
+                out = RAW_KEY_CODE.replace_all(&out, "raw_code: _").into_owned();
+            }
+            out + end
+        })
+        .collect()
+}
 
 impl Redactor {
     fn for_this_machine() -> Self {
@@ -407,7 +467,7 @@ impl Redactor {
     }
 
     fn redact(&self, text: &str) -> String {
-        let mut out = text.to_string();
+        let mut out = redact_typed_input(text);
         if self.home.len() > 1 {
             out = out.replace(&self.home, "~");
             out = out.replace(&self.home.replace('/', "\\/"), "~");
@@ -419,6 +479,9 @@ impl Redactor {
         out = SERIAL_NUMBER.replace_all(&out, "${1}<serial>").into_owned();
         out = SECRET_ASSIGNMENT
             .replace_all(&out, "${1}${2}<redacted>${3}")
+            .into_owned();
+        out = URL_USERINFO
+            .replace_all(&out, "${1}<redacted>@")
             .into_owned();
         TOKEN_LITERAL.replace_all(&out, "<redacted>").into_owned()
     }
@@ -464,9 +527,120 @@ Authorization: Bearer abcdefghijklmnopqrstuvwxyz
     }
 
     #[test]
+    fn hides_what_was_typed_but_keeps_shortcuts() {
+        // Line shapes as `debug_key_events` writes them.
+        let input = r#"key_event RawKeyEvent { key: Char('h'), modifiers: NONE, leds: (empty), phys_code: Some(H), raw_code: 4, repeat_count: 1, key_is_down: true, handled: Handled(false) }
+key_event KeyEvent { key: Char('\''), modifiers: SHIFT, leds: (empty), repeat_count: 1, key_is_down: false, raw: Some(RawKeyEvent { key: Char('\''), modifiers: SHIFT, leds: (empty), phys_code: Some(Quote), raw_code: 39, repeat_count: 1, key_is_down: false, handled: Handled(false) }) }
+send to pane DOWN key=Char('u') mods=NONE
+key_down: sending "u", Char('u') NONE
+DeadKeyStatus now: Composing("nihao")
+send to pane string="你好"
+native-line-editor shortcut key=Char('w') mods=ALT bytes="\u{1b}w" selection=Some(Selection { text: "hunter" })
+key_down: sending "\u{3}", Char('c') CTRL
+Char('v') SUPER -> perform PasteFrom(Clipboard)
+key_down: sending "\r", Char('\r') NONE
+"#;
+        let out = redactor().redact(input);
+        for leaked in [
+            "Char('h')",
+            "Some(H)",
+            "raw_code: 4",
+            "Char('\\'')",
+            "Some(Quote)",
+            "Char('u')",
+            "sending \"u\"",
+            "nihao",
+            "你好",
+            "hunter",
+        ] {
+            assert!(!out.contains(leaked), "leaked {:?} in:\n{}", leaked, out);
+        }
+        // Shortcuts and control keys are what key bug reports are about.
+        for kept in [
+            "sending \"\\u{3}\", Char('c') CTRL",
+            "Char('v') SUPER -> perform PasteFrom(Clipboard)",
+            "sending \"\\r\", Char('\\r') NONE",
+            "key_is_down: true",
+            "modifiers: SHIFT",
+        ] {
+            assert!(out.contains(kept), "lost {:?} in:\n{}", kept, out);
+        }
+    }
+
+    #[test]
+    fn hides_committed_composed_text_in_key_events() {
+        for text in ["你好隐私内容", r#"quoted \"private\" text"#, "emoji 👩‍💻"] {
+            let input = format!(
+                "key_event KeyEvent {{ key: Composed({text:?}), modifiers: NONE, raw: None }}\n"
+            );
+            let out = redactor().redact(&input);
+            assert!(out.contains("Composed(\"<typed>\")"), "{}", out);
+            assert!(!out.contains(text), "{}", out);
+            assert!(out.contains("modifiers: NONE, raw: None"));
+        }
+    }
+
+    #[test]
     fn leaves_ordinary_text_alone() {
         let input = "Kaku 0.21.0 on macOS 26.1, font_size = 17, line_height = 1.28\n";
         assert_eq!(redactor().redact(input), input);
+    }
+
+    #[test]
+    fn redacts_url_userinfo_and_keeps_the_host() {
+        let input = "https_proxy = \"http://alice:Hunter2pw@proxy:3128\"\n";
+        let out = redactor().redact(input);
+        assert!(!out.contains("Hunter2pw"), "leaked password in:\n{}", out);
+        assert!(!out.contains("alice:"), "leaked user in:\n{}", out);
+        assert!(out.contains("proxy:3128"), "lost host in:\n{}", out);
+    }
+
+    #[test]
+    fn redacts_fine_grained_github_tokens() {
+        let token = "github_pat_11ABCDEFG0aBcDeFgHiJkLmN_oPqRsTuVwXyZ0123456789";
+        let input = format!("credential {token} stored\n");
+        let out = redactor().redact(&input);
+        assert!(!out.contains(token), "leaked token in:\n{}", out);
+        assert!(
+            !out.contains("11ABCDEFG0aBcDeFgHiJkLmN"),
+            "leaked token in:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn leaves_urls_without_credentials_alone() {
+        for input in [
+            "see https://example.com/x for details\n",
+            "remote origin git@github.com:o/r.git (fetch)\n",
+        ] {
+            assert_eq!(redactor().redact(input), input);
+        }
+    }
+
+    #[test]
+    fn redacts_url_userinfo_whose_user_name_contains_an_at_sign() {
+        let input = "https_proxy = \"http://alice@example.com:Hunter2pw@proxy.local:3128\"\n";
+        let out = redactor().redact(input);
+        assert!(!out.contains("Hunter2pw"), "leaked password in:\n{}", out);
+        assert!(
+            !out.contains("alice@example.com"),
+            "leaked user in:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn keeps_the_host_after_an_at_sign_user_name_and_leaves_path_at_signs_alone() {
+        let input = "https_proxy = \"http://alice@example.com:Hunter2pw@proxy.local:3128\"\n";
+        let out = redactor().redact(input);
+        assert!(out.contains("proxy.local:3128"), "lost host in:\n{}", out);
+        for input in [
+            "see https://example.com/a@b for details\n",
+            "remote origin git@github.com:o/r.git (fetch)\n",
+        ] {
+            assert_eq!(redactor().redact(input), input);
+        }
     }
 
     #[test]

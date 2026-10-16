@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="referrer" content="no-referrer">
+<!-- The relay this page talks to when it is served from its own origin
+     (t.kaku.fun, filled in by scripts/publish_web_page.sh). Empty, the page
+     reaches the relay or Kaku that served it. -->
+<meta name="kaku-relay" content="">
 <title>Kaku</title>
 <link rel="icon" type="image/png" href="assets/icon.png">
 <link rel="apple-touch-icon" href="assets/icon.png">
@@ -207,13 +211,13 @@
 <script>
 (async () => {
   const params = new URLSearchParams(location.hash.slice(1));
-  // #t=<token>: this Mac or the LAN, plain WebSocket to Kaku.
+  // #t=<token>: a page on this Mac, plain WebSocket to Kaku on loopback.
   // Through the relay a browser is paired: #p=<one-time secret>&m=<the Mac's
   // public key> from `kaku remote` pairs it once, and the browser keeps its
   // own signing key, which it cannot export, in IndexedDB. Fragments are
   // never sent to servers, and are erased from the address at once.
   const supplied = params.has("t") || params.has("p") || params.has("k");
-  // A LAN token lives in this tab only (it changes with every Kaku launch),
+  // A local token lives in this tab only (it changes with every Kaku launch),
   // so a reload finds it there. Relay links from before pairing kept a key
   // in the same slot; it no longer opens anything, so it is dropped.
   const LINK_SLOT = "kaku.link:" + location.pathname;
@@ -261,7 +265,9 @@
   const toBase64Url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   // This Mac's relay id, which both sides sign over.
   const hostId = location.pathname.split("/").find((part) => /^[0-9a-f]{32}$/.test(part)) || "";
-  const DEVICE_SLOT = location.pathname;
+  // Keyed by the id, so /<id> and /<id>/ find the same paired device.
+  const DEVICE_SLOT = hostId ? "/" + hostId + "/" : location.pathname;
+  const RELAY = (document.querySelector('meta[name="kaku-relay"]')?.content || "").replace(/\/+$/, "");
   const deviceStore = (mode, work) => new Promise((resolve, reject) => {
     const open = indexedDB.open("kaku", 1);
     open.onupgradeneeded = () => open.result.createObjectStore("devices");
@@ -338,6 +344,7 @@
   const wsUrl = () => {
     const scheme = location.protocol === "https:" ? "wss://" : "ws://";
     if (relay) {
+      if (RELAY) return RELAY + "/" + hostId + "/ws";
       const base = location.pathname.endsWith("/") ? location.pathname : location.pathname + "/";
       return scheme + location.host + base + "ws";
     }
@@ -505,7 +512,11 @@
 
   // Kaku's own fallback order (JetBrains Mono, PingFang SC, Apple Symbols,
   // Apple Color Emoji), then the Windows equivalents for CJK and emoji.
-  const FONT_STACK = '"Kaku Mono", "PingFang SC", "Apple Symbols", "Apple Color Emoji", "Microsoft YaHei", "Segoe UI Emoji", "Segoe UI Symbol", monospace';
+  // No emoji font by name: listed, it drew the symbols Claude Code colors by
+  // status (⏺ ✳) as fixed-color emoji whenever the fonts before it lacked
+  // them. The browser's own fallback still gives real emoji (✅) the emoji
+  // font and draws text-style symbols in the text color, as Kaku does.
+  const FONT_STACK = '"Kaku Mono", "PingFang SC", "Apple Symbols", "Microsoft YaHei", "Segoe UI Symbol", monospace';
   const term = new Terminal({
     fontSize,
     fontFamily: FONT_STACK,
@@ -559,6 +570,15 @@
   };
   useWebgl();
   document.addEventListener("visibilitychange", useWebgl);
+  // The context can also survive with its glyph atlas wrong: letters drawn
+  // as other glyphs across the newly shown tab (maintainer, 2026-10-16,
+  // switching tabs). Rebuild the atlas whenever a different screen comes up
+  // or the page comes back, a few milliseconds of re-rasterizing.
+  const freshGlyphs = () => {
+    if (webgl && !document.hidden) { try { term.clearTextureAtlas(); } catch (_) {} }
+  };
+  document.addEventListener("visibilitychange", freshGlyphs);
+  window.addEventListener("focus", freshGlyphs);
 
   // Links: URLs in the screen open with Cmd+click (Ctrl+click off the Mac),
   // as in Kaku. Cells and string positions differ once a row holds wide
@@ -577,7 +597,9 @@
     }
     return candidate.replace(/[.,;:!?]+$/, "");
   };
-  const PATH_RE = /(?<![\w:/.~-])(?:~|\.{1,2})?\/[^\s"'`<>|;()\[\]{}]+/g;
+  // Chinese sentence punctuation ends a path as it ends a URL; Chinese
+  // file names (~/桌面/截图.png) stay inside it.
+  const PATH_RE = /(?<![\w:/.~-])(?:~|\.{1,2})?\/[^\s"'`<>|;()\[\]{}，。；：！？、（）【】「」『』“”‘’]+/g;
   term.registerLinkProvider({
     provideLinks(y, callback) {
       const line = term.buffer.active.getLine(y - 1);
@@ -1424,10 +1446,18 @@
   // the last row took no writes and kept stale text: the ghost rows seen
   // while scrolling on a phone. A reset clears that; what follows a size
   // change is always a full frame (or a snapshot), so nothing is lost.
+  // Resize only, and clear in the same write as the new content (CLEAR), so
+  // the old screen stays up until the new one is drawn, in one frame. A
+  // term.reset() here blanked the screen at once and the content came two
+  // frames later: every tab switch flashed empty. RIS (ESC c) in the write
+  // is no better: xterm.js also wipes what follows it in the same write.
+  // Nothing else needs resetting: Kaku encodes keys and mouse for the pane,
+  // and its frames place every row, so this xterm holds no modes of its own.
   const resizeTerm = (cols, rows) => {
-    term.resize(cols, rows);
-    term.reset();
+    if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows);
   };
+  const CLEAR = "\x1b[0m\x1b[2J\x1b[3J";
+  let clearPending = false;
   const snapshots = new Map();
   const NO_WRAP = "\x1b[?7l";
   // The cursor blinks only once the screen is still. Every frame repeats the
@@ -1514,10 +1544,16 @@
       size = { cols: saved.cols, rows: saved.rows };
       resizeTerm(saved.cols, saved.rows);
       fit();
-      term.write(NO_WRAP + "\x1b[?25l\x1b[0m\x1b[2J" + steadyCursor(saved.data));
+      clearPending = false;
+      // Parse it now, as xterm does after a keystroke. Otherwise its parse
+      // waits on a timer, which Chrome runs only after the frame that
+      // follows a click, and the tab showed one frame late.
+      term._core?._writeBuffer?.handleUserInput?.();
+      term.write(NO_WRAP + "\x1b[?25l" + CLEAR + steadyCursor(saved.data));
     }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     renderTabs();
+    freshGlyphs();
     term.focus();
   };
 
@@ -1644,8 +1680,32 @@
     if (isHelp) { ev.preventDefault(); ev.stopPropagation(); toggleHelp(); }
     else if (ev.key === "Escape" && helpEl.classList.contains("show")) { ev.preventDefault(); ev.stopPropagation(); toggleHelp(false); }
   }, true);
+  // Tabs asked to close, shown gone until Kaku's list agrees, as the app
+  // closes a tab on the click rather than a round trip later. One Kaku
+  // keeps for longer than CLOSE_GRACE_MS comes back.
+  const closing = new Map();
+  let authoritativeTabs = [];
+  const CLOSE_GRACE_MS = 3000;
   const closeTab = (t) => {
-    const go = () => send({ type: "close_tab", tab_id: t.tab_id });
+    const go = () => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      send({ type: "close_tab", tab_id: t.tab_id });
+      const rest = tabs.filter((x) => x.tab_id !== t.tab_id);
+      if (!rest.length) return;
+      const until = Date.now() + CLOSE_GRACE_MS;
+      closing.set(t.tab_id, until);
+      // The host sends only changed lists. A rejected or lost close must
+      // recover even if its authoritative list never changes again.
+      setTimeout(() => {
+        if (closing.get(t.tab_id) !== until) return;
+        closing.delete(t.tab_id);
+        onTabs(authoritativeTabs);
+      }, CLOSE_GRACE_MS);
+      const at = tabs.findIndex((x) => x.tab_id === t.tab_id);
+      tabs = rest;
+      if (t.tab_id === tabId) attach(rest[Math.min(at, rest.length - 1)], true);
+      else renderTabs();
+    };
     if (t.confirm_close) askClose(t.title || "Tab").then((ok) => { if (ok) go(); });
     else go();
   };
@@ -1931,8 +1991,13 @@
   // pane a moment later; until then the old one is not a reason to follow.
   let paneChosen = { id: null, until: 0 };
   const onTabs = (list) => {
-    tabs = list;
-    const livePanes = new Set(tabs.flatMap(t => (t.panes?.length ? t.panes : [{ pane_id: t.pane_id }]).map(p => p.pane_id)));
+    authoritativeTabs = list;
+    const now = Date.now();
+    for (const [id, until] of closing) {
+      if (now > until || !list.some((t) => t.tab_id === id)) closing.delete(id);
+    }
+    tabs = list.filter((t) => !closing.has(t.tab_id));
+    const livePanes = new Set(list.flatMap(t => (t.panes?.length ? t.panes : [{ pane_id: t.pane_id }]).map(p => p.pane_id)));
     for (const id of snapshots.keys()) if (!livePanes.has(id)) snapshots.delete(id);
     attentionTabs = tabs.some((t) => (t.title || "").endsWith("\u2022"));
     renderTitle();
@@ -2047,6 +2112,7 @@
         size = { cols: msg.cols, rows: msg.rows };
       resizeTerm(msg.cols, msg.rows);
       fit();
+      clearPending = true;
     }
     localScroll = !!msg.local_scroll;
     if (!localScroll) closePast();
@@ -2055,7 +2121,9 @@
     // disagree on) must overwrite its last cell, not wrap. Wrapping on the
     // last row scrolled the whole screen, and every later frame then drew
     // over a shifted copy: stale rows stayed until a reload.
-    term.write(NO_WRAP + steadyCursor(msg.data), () => {
+    const clear = clearPending ? CLEAR : "";
+    clearPending = false;
+    term.write(clear + NO_WRAP + steadyCursor(msg.data), () => {
       if (ws !== socket) return;
       if (msg.pane_id === paneId) markFound();
       if (msg.seq) send({ type: "frame_ack", seq: msg.seq });
@@ -2446,7 +2514,7 @@
       snapshots.delete(gone);
       tabId = null;
       paneId = null;
-      onTabs(tabs.filter((t) => t.pane_id !== gone));
+      onTabs(authoritativeTabs.filter((t) => t.pane_id !== gone));
     }
   };
 
@@ -2466,14 +2534,18 @@
     send({ type: "ping" });
   }, 20000);
 
-  // Through the relay the page's own address answers 404 while the Mac's
-  // Kaku is not connected, and fails outright without a network.
+  // Through the relay the Mac's status (or, when the relay served this page,
+  // the page's own address) answers 404 while the Mac's Kaku is not
+  // connected, and fails outright without a network.
   const explainOffline = () => {
     if (!relay) {
       setNotice("Kaku is not running", "This page reconnects when it is back.", { stale: true, brand: true });
       return;
     }
-    fetch(location.pathname, { method: "HEAD", cache: "no-store" }).then((res) => {
+    const asked = RELAY
+      ? fetch(RELAY.replace(/^ws/, "http") + "/" + hostId + "/status", { cache: "no-store" })
+      : fetch(location.pathname, { method: "HEAD", cache: "no-store" });
+    asked.then((res) => {
       if (ws && ws.readyState === WebSocket.OPEN) return;
       if (res.status === 404) setNotice("Kaku on the Mac is offline", "This page reconnects when it is back.", { stale: true, brand: true });
     }).catch(() => {

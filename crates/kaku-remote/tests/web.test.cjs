@@ -336,7 +336,7 @@ test('Cmd+clicking a Mac path downloads the file in acknowledged chunks', async 
   assert.deepEqual(errors, []);
 });
 
-test('local LAN token stays tab-only', async t => {
+test('local token stays tab-only', async t => {
   const { p } = await page(t);
   assert.equal(await p.evaluate(() => localStorage.getItem('kaku.link:/')), null);
   assert.ok(await p.evaluate(() => sessionStorage.getItem('kaku.link:/')));
@@ -361,6 +361,84 @@ test('returning to a cached tab attaches before claiming its new size', async t 
   assert.equal(commands[0].type, 'attach');
   assert.equal(commands[0].pane_id, 1);
   assert.ok(commands.some(m => m.type === 'resize'));
+});
+
+test('clicking back to a cached tab shows it in the next frame, never blank', async t => {
+  const { p } = await page(t);
+  await screen(p, 'first');
+  await p.evaluate(() => probe.attach({ pane_id: 2, tab_id: 2 }));
+  await screen(p, 'second', 2);
+  await p.evaluate(() => {
+    const rows = () => document.querySelector('.xterm-rows').textContent;
+    window.__states = [];
+    new MutationObserver(() => window.__states.push(rows().trim()))
+      .observe(document.querySelector('.xterm-rows'), { subtree: true, childList: true, characterData: true });
+    // After the tab's own click handler: what the first frame after it shows.
+    window.addEventListener('click', () => requestAnimationFrame(() => { window.__firstFrame = rows(); }), { once: true });
+  });
+  await p.locator('#bar .tab').first().click();
+  await p.waitForFunction(() => window.__firstFrame !== undefined);
+  // xterm parses a write on a timer, which Chrome runs only after the frame
+  // following a click; the snapshot then showed a frame late, and a
+  // term.reset() before it blanked the screen in between.
+  assert.ok(await p.evaluate(() => window.__firstFrame.includes('first')));
+  assert.ok(!(await p.evaluate(() => window.__states.some(s => s === ''))));
+});
+
+test('a closed tab leaves the bar on the click and stays gone until Kaku agrees', async t => {
+  const { p } = await page(t);
+  await screen(p, 'first');
+  await p.evaluate(() => probe.attach({ pane_id: 2, tab_id: 2 }));
+  await screen(p, 'second', 2);
+  const titles = () => p.evaluate(() => [...document.querySelectorAll('#bar .tab')].map(b => b.textContent.trim()));
+  await p.evaluate(() => { messages.length = 0; });
+  await p.locator('#bar .tab').nth(1).hover();
+  await p.locator('#bar .tab').nth(1).locator('.close').click();
+  // Gone at once, and the neighbour shown from its snapshot.
+  assert.deepEqual(await titles(), ['one']);
+  await p.waitForFunction(() => document.querySelector('.xterm-rows').textContent.includes('first'), null, { timeout: 1000 });
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'close_tab').map(m => m.tab_id)), [2]);
+  // Drop the request in flight and reconnect before the grace expires.
+  await p.evaluate(() => connections.at(-1).close(1006));
+  await p.waitForFunction(() => connections.length === 2);
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }, { tab_id: 2, pane_id: 2, panes: [], title: 'two' }] }));
+  assert.deepEqual(await titles(), ['one']);
+  // A quick reconnect returns this same list before the grace expires.
+  // The host deduplicates it afterwards, so recovery must use a real timer.
+  await p.waitForTimeout(3300);
+  assert.deepEqual(await titles(), ['one', 'two']);
+  // Hiding a pending close must not discard its cached screen.
+  assert.equal(await p.evaluate(() => probe.snapshots.has(2)), true);
+});
+
+test('closing while disconnected leaves the live tab visible', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.evaluate(() => { connections.at(-1).readyState = 3; messages.length = 0; });
+  await p.locator('#bar .tab').nth(1).hover();
+  await p.locator('#bar .tab').nth(1).locator('.close').click();
+  assert.deepEqual(await p.evaluate(() => [...document.querySelectorAll('#bar .tab')].map(b => b.textContent.trim())), ['one', 'two']);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'close_tab').length), 0);
+});
+
+test('an acknowledged close stays gone after the recovery timer', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.locator('#bar .tab').nth(1).hover();
+  await p.locator('#bar .tab').nth(1).locator('.close').click();
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }));
+  await p.waitForTimeout(3300);
+  assert.deepEqual(await p.evaluate(() => [...document.querySelectorAll('#bar .tab')].map(b => b.textContent.trim())), ['one']);
+});
+
+test('the terminal names no emoji font, so status symbols keep their color', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  // Named, an emoji font drew Claude Code's ⏺ and ✳ (green, red by status)
+  // as fixed-color emoji whenever the fonts before it lacked them.
+  const family = await p.evaluate(() => probe.term.options.fontFamily);
+  assert.doesNotMatch(family, /Emoji/i);
+  assert.match(family, /Kaku Mono/);
 });
 
 test('renaming from a menu opened before the tab bar was rebuilt still edits the tab', async t => {
@@ -662,6 +740,25 @@ test('links exclude sentence punctuation and retain balanced paths and Unicode c
       assert.equal(found.links[0].range.start.x, 3);
       assert.equal(found.links[0].range.end.x, 26);
     }
+  }
+});
+
+test('Mac paths stop at Chinese sentence punctuation but keep Chinese file names', async t => {
+  const { p } = await page(t);
+  const cases = [
+    ['对照图在 /private/tmp/icons/all-ship.png，按字母顺序排：chatgpt', '/private/tmp/icons/all-ship.png'],
+    ['存到了 ~/Desktop/shot.png。', '~/Desktop/shot.png'],
+    ['见（~/Desktop/a.png）和「./b.txt」', '~/Desktop/a.png ./b.txt'],
+    ['截图在 ~/桌面/截图.png', '~/桌面/截图.png'],
+  ];
+  for (const [source, expected] of cases) {
+    const found = await p.evaluate(async source => {
+      probe.term.resize(180, 24);
+      await new Promise(resolve => probe.term.write('\x1b[?7l\x1b[2J\x1b[H' + source, resolve));
+      const links = await new Promise(resolve => testLinkProvider.provideLinks(1, resolve));
+      return (links || []).map(l => l.text).join(' ');
+    }, source);
+    assert.equal(found, expected);
   }
 });
 

@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tracing::info;
 
@@ -32,6 +32,14 @@ const MAX_BROWSERS_PER_ADDR: usize = 4;
 /// Registrations kept per id: the serving one and one standby (a second
 /// Kaku on the same Mac). A newer one pushes the oldest out.
 const MAX_REGISTRATIONS_PER_ID: usize = 2;
+/// Macs one address may keep registered at once; an office NAT can hold a
+/// few dozen Kaku users.
+const MAX_HOSTS_PER_ADDR: usize = 32;
+/// New relay sockets (Macs and browsers) one address may open per minute.
+const CONNECTS_PER_MINUTE: u32 = 120;
+/// Wrong access codes one address may try before it waits out the window.
+const ACCESS_FAILURES: u32 = 10;
+const ACCESS_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// A Mac sends frames of a whole screen; a page sends keys, pastes capped at
 /// 64 KB and 64 KB upload chunks.
 const MAX_HOST_MESSAGE: usize = 4 << 20;
@@ -149,6 +157,31 @@ struct BrowserLink {
     queued: Arc<Queued>,
     close: watch::Sender<Option<u64>>,
     addr: String,
+    /// The Mac admitted it (`{"t":"ok"}`): a paired browser, not a socket
+    /// that only knows the id.
+    admitted: bool,
+}
+
+/// Make room for one more browser of a host at `MAX_BROWSERS_PER_HOST`:
+/// the oldest socket the Mac has not admitted is let go (4413), so sockets
+/// that only know the id cannot hold every slot and lock the owner out.
+/// False when every slot holds an admitted browser.
+fn make_room(browsers: &mut HashMap<u32, BrowserLink>) -> bool {
+    if browsers.len() < MAX_BROWSERS_PER_HOST {
+        return true;
+    }
+    let Some(oldest) = browsers
+        .iter()
+        .filter(|(_, b)| !b.admitted)
+        .map(|(c, _)| *c)
+        .min()
+    else {
+        return false;
+    };
+    if let Some(link) = browsers.remove(&oldest) {
+        let _ = link.close.send(Some(4413));
+    }
+    true
 }
 
 struct Host {
@@ -161,6 +194,8 @@ struct Host {
     evicted: tokio::sync::Notify,
     browsers: Mutex<HashMap<u32, BrowserLink>>,
     next_id: AtomicU32,
+    /// The client address it registered from (`MAX_HOSTS_PER_ADDR`).
+    addr: String,
 }
 
 fn message_len(msg: &ws::Message) -> usize {
@@ -213,6 +248,14 @@ struct AppState {
     /// and whether a Mac without a valid one is turned away. Unset, every
     /// Mac registers as before.
     tokens: Option<Arc<TokenPolicy>>,
+    /// The access code a Mac must present to register; unset, none is asked.
+    access: Option<Arc<AccessCode>>,
+    limits: Arc<Mutex<AddrLimits>>,
+    /// Where the page lives when it is not served here
+    /// (`KAKU_RELAY_PAGE_ORIGIN`, e.g. `https://t.kaku.fun`): page addresses
+    /// redirect there and browsers are admitted only from it. Unset (local
+    /// runs, tests), the relay serves its own copy to any origin.
+    page_origin: Option<Arc<str>>,
     /// Bytes queued toward every socket (`GLOBAL_QUEUE_BYTES`).
     queued_bytes: Arc<AtomicUsize>,
 }
@@ -226,8 +269,10 @@ impl AppState {
     }
 
     /// Make `host` the one serving `id`; returns the one it displaced.
-    fn register(&self, id: &str, host: Arc<Host>) -> Option<Arc<Host>> {
+    /// Admission and insertion share the lock, including after an upgrade.
+    fn register(&self, id: &str, host: Arc<Host>) -> Result<Option<Arc<Host>>, StatusCode> {
         let mut hosts = self.hosts.lock();
+        Self::check_registration(&hosts, id, &host.addr)?;
         let all = hosts.entry(id.to_string()).or_default();
         let displaced = all.last().cloned();
         all.push(host);
@@ -235,7 +280,25 @@ impl AppState {
             let oldest = all.remove(0);
             oldest.evicted.notify_one();
         }
-        displaced
+        Ok(displaced)
+    }
+
+    fn check_registration(
+        hosts: &HashMap<String, Vec<Arc<Host>>>,
+        id: &str,
+        addr: &str,
+    ) -> Result<(), StatusCode> {
+        if hosts.len() >= MAX_HOSTS && !hosts.contains_key(id) {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let from_addr = hosts
+            .iter()
+            .filter(|(other, all)| other.as_str() != id && all.iter().any(|h| h.addr == addr))
+            .count();
+        if addr != "-" && from_addr >= MAX_HOSTS_PER_ADDR {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        Ok(())
     }
 
     /// Drop this registration; returns how many remain for `id`.
@@ -340,16 +403,32 @@ struct TokenPolicy {
 }
 
 impl TokenPolicy {
-    fn from_env() -> Option<Self> {
-        let key = std::env::var("KAKU_RELAY_TOKEN_KEY").ok()?;
-        let Some(public_key) = token::decode_key(&key) else {
-            tracing::warn!("KAKU_RELAY_TOKEN_KEY is not base64url; tokens are not checked");
-            return None;
+    fn from_env() -> Result<Option<Self>, &'static str> {
+        Self::from_settings(
+            std::env::var("KAKU_RELAY_TOKEN_KEY").ok().as_deref(),
+            std::env::var("KAKU_RELAY_REQUIRE_TOKEN").as_deref() == Ok("1"),
+        )
+    }
+
+    fn from_settings(key: Option<&str>, required: bool) -> Result<Option<Self>, &'static str> {
+        let public_key = key
+            .and_then(token::decode_key)
+            .filter(|key| key.len() == 32);
+        let Some(public_key) = public_key else {
+            if required {
+                return Err(
+                    "KAKU_RELAY_REQUIRE_TOKEN=1 needs a valid 32-byte KAKU_RELAY_TOKEN_KEY",
+                );
+            }
+            if key.is_some() {
+                tracing::warn!("KAKU_RELAY_TOKEN_KEY is invalid; tokens are not checked");
+            }
+            return Ok(None);
         };
-        Some(Self {
+        Ok(Some(Self {
             public_key,
-            required: std::env::var("KAKU_RELAY_REQUIRE_TOKEN").as_deref() == Ok("1"),
-        })
+            required,
+        }))
     }
 
     /// Whether a Mac presenting `presented` may register as `id` at `now`.
@@ -366,6 +445,99 @@ impl TokenPolicy {
     }
 }
 
+/// The access code Macs present to register (`KAKU_RELAY_ACCESS_CODE`, a
+/// fly secret), kept as its SHA-256 and compared in constant time.
+struct AccessCode {
+    digest: Vec<u8>,
+}
+
+impl AccessCode {
+    fn new(code: &str) -> Self {
+        Self {
+            digest: ring::digest::digest(&ring::digest::SHA256, code.trim().as_bytes())
+                .as_ref()
+                .to_vec(),
+        }
+    }
+
+    fn from_env() -> Option<Self> {
+        let code = std::env::var("KAKU_RELAY_ACCESS_CODE").ok()?;
+        (!code.trim().is_empty()).then(|| Self::new(&code))
+    }
+
+    fn admits(&self, presented: &str) -> bool {
+        let digest = ring::digest::digest(&ring::digest::SHA256, presented.trim().as_bytes());
+        digest
+            .as_ref()
+            .iter()
+            .zip(&self.digest)
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+    }
+}
+
+/// Per-address budgets: new sockets per minute, and wrong access codes per
+/// `ACCESS_WINDOW`. Local runs have no client address (`-`) and are not
+/// limited, so tests can open as many sockets as they need.
+#[derive(Default)]
+struct AddrLimits {
+    connects: HashMap<String, (Instant, u32)>,
+    failures: HashMap<String, (Instant, u32)>,
+}
+
+impl AddrLimits {
+    fn count(
+        map: &mut HashMap<String, (Instant, u32)>,
+        addr: &str,
+        window: Duration,
+        now: Instant,
+    ) -> u32 {
+        if map.len() > 10_000 {
+            map.retain(|_, (start, _)| now.duration_since(*start) < window);
+        }
+        let entry = map.entry(addr.to_string()).or_insert((now, 0));
+        if now.duration_since(entry.0) >= window {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        entry.1
+    }
+
+    fn allow_connect(&mut self, addr: &str, now: Instant) -> bool {
+        addr == "-"
+            || Self::count(&mut self.connects, addr, Duration::from_secs(60), now)
+                <= CONNECTS_PER_MINUTE
+    }
+
+    fn access_locked(&self, addr: &str, now: Instant) -> bool {
+        addr != "-"
+            && self.failures.get(addr).is_some_and(|(start, n)| {
+                now.duration_since(*start) < ACCESS_WINDOW && *n >= ACCESS_FAILURES
+            })
+    }
+
+    fn note_access_failure(&mut self, addr: &str, now: Instant) {
+        if addr != "-" {
+            Self::count(&mut self.failures, addr, ACCESS_WINDOW, now);
+        }
+    }
+}
+
+/// Fly puts the real client address in `fly-client-ip`; without it (local
+/// runs) every client shares the `-` bucket.
+fn client_addr(headers: &HeaderMap) -> String {
+    headers
+        .get("fly-client-ip")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string()
+}
+
+/// A refusal the Mac shows its user: the status and why, as plain text.
+fn refuse(status: StatusCode, why: &'static str) -> Response {
+    (status, why).into_response()
+}
+
 async fn host_ws(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -379,6 +551,25 @@ async fn host_ws(
     if !valid_id(&id) || !owns(&id, secret) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let addr = client_addr(&headers);
+    let now = Instant::now();
+    if !state.limits.lock().allow_connect(&addr, now) {
+        return refuse(StatusCode::TOO_MANY_REQUESTS, "too many connections");
+    }
+    if let Some(access) = &state.access {
+        if state.limits.lock().access_locked(&addr, now) {
+            return refuse(StatusCode::TOO_MANY_REQUESTS, "too many wrong access codes");
+        }
+        match headers.get("x-kaku-access").and_then(|v| v.to_str().ok()) {
+            None => return refuse(StatusCode::UNAUTHORIZED, "access code required"),
+            Some(code) if !access.admits(code) => {
+                state.limits.lock().note_access_failure(&addr, now);
+                info!(host = short(&id), "wrong access code");
+                return refuse(StatusCode::UNAUTHORIZED, "wrong access code");
+            }
+            Some(_) => {}
+        }
+    }
     if let Some(policy) = &state.tokens {
         let presented = headers.get("x-kaku-token").and_then(|v| v.to_str().ok());
         let now = std::time::SystemTime::now()
@@ -386,18 +577,31 @@ async fn host_ws(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if !policy.admits(&id, presented, now) {
-            return StatusCode::UNAUTHORIZED.into_response();
+            return refuse(StatusCode::UNAUTHORIZED, "registration token refused");
         }
     }
-    if state.hosts.lock().len() >= MAX_HOSTS && state.host(&id).is_none() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    if let Err(status) = AppState::check_registration(&state.hosts.lock(), &id, &addr) {
+        return if status == StatusCode::TOO_MANY_REQUESTS {
+            refuse(status, "too many Macs from this address")
+        } else {
+            status.into_response()
+        };
     }
     upgrade
+        // A frame is buffered whole before the message cap is checked, so
+        // cap frames too, or one 16 MB frame header pins 16 MB per socket.
+        .max_frame_size(MAX_HOST_MESSAGE)
         .max_message_size(MAX_HOST_MESSAGE)
-        .on_upgrade(move |socket| serve_host(socket, id, edge(&headers), state))
+        .on_upgrade(move |socket| serve_host(socket, id, edge(&headers), addr, state))
 }
 
-async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppState) {
+async fn serve_host(
+    socket: ws::WebSocket,
+    id: String,
+    edge: String,
+    addr: String,
+    state: AppState,
+) {
     let (mut sink, mut stream) = socket.split();
     let (to_host, mut outgoing) = mpsc::channel::<ws::Message>(QUEUE);
     let host = Arc::new(Host {
@@ -407,11 +611,18 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
         evicted: tokio::sync::Notify::new(),
         browsers: Mutex::new(HashMap::new()),
         next_id: AtomicU32::new(1),
+        addr,
     });
     // The newest registration serves; the previous one stays connected as a
     // standby, and its browsers reconnect to this one.
-    if let Some(old) = state.register(&id, host.clone()) {
-        old.browsers.lock().clear();
+    match state.register(&id, host.clone()) {
+        Ok(Some(old)) => old.browsers.lock().clear(),
+        Ok(None) => {}
+        Err(_) => {
+            // Other handshakes can consume the last slot during the upgrade.
+            let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(browser_close(4413))).await;
+            return;
+        }
     }
     info!("host {} registered via edge {}", short(&id), edge);
 
@@ -458,8 +669,16 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
                 }
             }
             ws::Message::Text(text) => {
-                // The Mac rejected a browser (its key did not match).
+                // The Mac rejected a browser (its key did not match), or
+                // admitted one.
                 if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(text.as_str()) {
+                    if map.get("t").and_then(|t| t.as_str()) == Some("ok") {
+                        if let Some(c) = map.get("c").and_then(|c| c.as_u64()) {
+                            if let Some(link) = host.browsers.lock().get_mut(&(c as u32)) {
+                                link.admitted = true;
+                            }
+                        }
+                    }
                     if map.get("t").and_then(|t| t.as_str()) == Some("close") {
                         if let Some(c) = map.get("c").and_then(|c| c.as_u64()) {
                             if let Some(tx) = host.browsers.lock().remove(&(c as u32)) {
@@ -540,18 +759,30 @@ fn asset_response(name: &str) -> Response {
 }
 
 async fn page_redirect(Path(id): Path<String>) -> Response {
+    // A decoded `%2F` would otherwise make `//host/` and leave the site.
+    if !valid_id(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     // Keep the trailing slash so the page's relative paths resolve under it;
     // the browser carries the fragment (the key) over the redirect.
     Redirect::permanent(&format!("/t/{id}/")).into_response()
 }
 
 async fn short_page_redirect(Path(id): Path<String>) -> Response {
+    if !valid_id(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     Redirect::permanent(&format!("/{id}/")).into_response()
 }
 
 async fn page(Path(id): Path<String>, State(state): State<AppState>) -> Response {
     if !valid_id(&id) {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    // The page lives on its own origin: links from older Kakus land there,
+    // and the browser carries the fragment (the pairing secret) over.
+    if let Some(origin) = &state.page_origin {
+        return Redirect::permanent(&format!("{origin}/{id}/")).into_response();
     }
     // The page answers 404 while the Mac is away: that is how an open page
     // tells an offline Mac from a network problem.
@@ -566,11 +797,48 @@ async fn page(Path(id): Path<String>, State(state): State<AppState>) -> Response
     asset_response("index.html")
 }
 
-async fn page_asset(Path((id, name)): Path<(String, String)>) -> Response {
-    if !valid_id(&id) || name == "index.html" {
+async fn page_asset(
+    Path((id, name)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    if !valid_id(&id) || name == "index.html" || state.page_origin.is_some() {
         return StatusCode::NOT_FOUND.into_response();
     }
     asset_response(&name)
+}
+
+/// Whether this Mac is connected: 200 or 404, readable by the page's origin,
+/// so a page served elsewhere can tell an offline Mac from no network.
+async fn host_status(Path(id): Path<String>, State(state): State<AppState>) -> Response {
+    let status = if valid_id(&id) && state.host(&id).is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    let mut response = status.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    if let Some(origin) = state.page_origin.as_deref().and_then(|o| o.parse().ok()) {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    }
+    response
+}
+
+/// Whether a browser socket comes from the page: with a page origin set, its
+/// `Origin` must be exactly that, so another site cannot drive a browser's
+/// paired keys through the relay. Browsers always send `Origin` on a
+/// WebSocket handshake.
+fn origin_allowed(page_origin: Option<&str>, headers: &HeaderMap) -> bool {
+    let Some(expected) = page_origin else {
+        return true;
+    };
+    headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|origin| origin == expected)
 }
 
 async fn browser_ws(
@@ -579,17 +847,26 @@ async fn browser_ws(
     headers: HeaderMap,
     upgrade: ws::WebSocketUpgrade,
 ) -> Response {
+    let addr = client_addr(&headers);
+    if !state.limits.lock().allow_connect(&addr, Instant::now()) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    if !origin_allowed(state.page_origin.as_deref(), &headers) {
+        // Pages opened before the page moved to its own origin still run;
+        // 4426 tells them to reload, where a refused handshake reads as no
+        // network. The socket closes at once, carrying nothing.
+        return upgrade
+            .max_frame_size(1024)
+            .max_message_size(1024)
+            .on_upgrade(|mut socket| async move {
+                let _ = tokio::time::timeout(WRITE_TIMEOUT, socket.send(browser_close(4426))).await;
+            });
+    }
     let Some(host) = state.host(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // Fly puts the real client address here; without it (local runs) every
-    // browser shares one bucket.
-    let addr = headers
-        .get("fly-client-ip")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
     upgrade
+        .max_frame_size(MAX_BROWSER_MESSAGE)
         .max_message_size(MAX_BROWSER_MESSAGE)
         .on_upgrade(move |socket| async move {
             info!(
@@ -627,7 +904,7 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
     let accepted = {
         let mut browsers = host.browsers.lock();
         let from_addr = browsers.values().filter(|b| b.addr == addr).count();
-        if browsers.len() >= MAX_BROWSERS_PER_HOST || from_addr >= MAX_BROWSERS_PER_ADDR {
+        if from_addr >= MAX_BROWSERS_PER_ADDR || !make_room(&mut browsers) {
             false
         } else {
             browsers.insert(
@@ -637,6 +914,7 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
                     queued: queued.clone(),
                     close,
                     addr,
+                    admitted: false,
                 },
             );
             true
@@ -730,6 +1008,7 @@ fn app(state: AppState) -> Router {
         .route("/{id}", get(short_page_redirect))
         .route("/{id}/", get(page))
         .route("/{id}/ws", get(browser_ws))
+        .route("/{id}/status", get(host_status))
         .route("/{id}/assets/{name}", get(page_asset))
         .with_state(state)
 }
@@ -774,15 +1053,35 @@ async fn main() {
             tracing::warn!("set_nodelay failed: {e}");
         }
     });
-    let tokens = TokenPolicy::from_env().map(Arc::new);
+    let tokens = match TokenPolicy::from_env() {
+        Ok(policy) => policy.map(Arc::new),
+        Err(error) => {
+            eprintln!("kaku-relay: {error}");
+            std::process::exit(2);
+        }
+    };
     if let Some(policy) = &tokens {
         info!(
             required = policy.required,
             "registration tokens are checked"
         );
     }
+    let access = AccessCode::from_env().map(Arc::new);
+    if access.is_some() {
+        info!("Macs need the access code to register");
+    }
+    let page_origin = std::env::var("KAKU_RELAY_PAGE_ORIGIN")
+        .ok()
+        .map(|o| o.trim().trim_end_matches('/').to_string())
+        .filter(|o| !o.is_empty())
+        .map(Arc::from);
+    if let Some(origin) = &page_origin {
+        info!("the page is served from {origin}");
+    }
     let state = AppState {
         tokens,
+        access,
+        page_origin,
         ..AppState::default()
     };
     if let Err(e) = axum::serve(listener, app(state)).await {
@@ -794,6 +1093,75 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_tokens_reject_missing_malformed_and_wrong_length_keys() {
+        for key in [None, Some("not!base64"), Some(""), Some("AA")] {
+            assert!(
+                TokenPolicy::from_settings(key, true).is_err(),
+                "key={key:?}"
+            );
+        }
+        assert!(TokenPolicy::from_settings(None, false).unwrap().is_none());
+        let (_, public) = token::generate().unwrap();
+        let policy = TokenPolicy::from_settings(Some(&public), true)
+            .unwrap()
+            .unwrap();
+        assert!(!policy.admits("id", None, 0));
+    }
+
+    #[test]
+    fn concurrent_host_registration_cannot_exceed_the_address_budget() {
+        let state = AppState::default();
+        std::thread::scope(|scope| {
+            let barrier = Arc::new(std::sync::Barrier::new(64));
+            for n in 0..64 {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    let mut host = test_host(&state);
+                    Arc::get_mut(&mut host).unwrap().addr = "192.0.2.1".into();
+                    barrier.wait();
+                    let _ = state.register(&format!("host-{n}"), host);
+                });
+            }
+        });
+        assert_eq!(state.hosts.lock().len(), MAX_HOSTS_PER_ADDR);
+        let id = state.hosts.lock().keys().next().unwrap().clone();
+        let mut replacement = test_host(&state);
+        Arc::get_mut(&mut replacement).unwrap().addr = "192.0.2.1".into();
+        let displaced = state.register(&id, replacement.clone()).unwrap().unwrap();
+        assert_eq!(state.hosts.lock().len(), MAX_HOSTS_PER_ADDR);
+        assert_eq!(state.unregister(&id, replacement.generation), 1);
+        assert_eq!(state.host(&id).unwrap().generation, displaced.generation);
+        assert_eq!(state.unregister(&id, displaced.generation), 0);
+        let mut new_host = test_host(&state);
+        Arc::get_mut(&mut new_host).unwrap().addr = "192.0.2.1".into();
+        assert!(state
+            .register("after-disconnect", new_host)
+            .unwrap()
+            .is_none());
+        assert_eq!(state.hosts.lock().len(), MAX_HOSTS_PER_ADDR);
+    }
+
+    #[test]
+    fn global_host_budget_still_allows_replacement_and_standby() {
+        let state = AppState::default();
+        let first = test_host(&state);
+        for n in 0..MAX_HOSTS {
+            state
+                .hosts
+                .lock()
+                .insert(format!("host-{n}"), vec![first.clone()]);
+        }
+        let _ = state.register("extra", test_host(&state));
+        assert_eq!(state.hosts.lock().len(), MAX_HOSTS);
+        let second = test_host(&state);
+        let _ = state.register("host-0", second.clone());
+        assert_eq!(state.host("host-0").unwrap().generation, second.generation);
+        assert_eq!(state.unregister("host-0", second.generation), 1);
+        assert_eq!(state.host("host-0").unwrap().generation, first.generation);
+    }
 
     #[test]
     fn rejection_code_reaches_the_browser_without_arbitrary_reason_text() {
@@ -826,12 +1194,17 @@ mod tests {
         let page_for = |state: AppState| rt.block_on(page(Path(id.clone()), State(state)));
         // Away: the offline notice, as a 404 the open page can recognize.
         assert_eq!(page_for(state.clone()).status(), StatusCode::NOT_FOUND);
-        state.register(&id, test_host(&state));
+        state.register(&id, test_host(&state)).unwrap();
         let shown = page_for(state.clone());
         assert_eq!(shown.status(), StatusCode::OK);
         assert_eq!(shown.headers()[header::CACHE_CONTROL], "no-cache");
         // Files come from the relay's own copy, with or without the Mac.
-        let asset = |name: &str| rt.block_on(page_asset(Path((id.clone(), name.to_string()))));
+        let asset = |name: &str| {
+            rt.block_on(page_asset(
+                Path((id.clone(), name.to_string())),
+                State(state.clone()),
+            ))
+        };
         assert_eq!(asset("xterm.js").status(), StatusCode::OK);
         assert_eq!(
             asset("font-regular.ttf").headers()[header::CONTENT_TYPE],
@@ -845,6 +1218,55 @@ mod tests {
             .starts_with(b"<!doctype html>"));
     }
 
+    #[test]
+    fn with_a_page_origin_links_move_there_and_only_its_browsers_join() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let state = AppState {
+            page_origin: Some(Arc::from("https://t.kaku.fun")),
+            ..AppState::default()
+        };
+        let id = "0123456789abcdef0123456789abcdef".to_string();
+        let shown = rt.block_on(page(Path(id.clone()), State(state.clone())));
+        assert_eq!(shown.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            shown.headers()[header::LOCATION],
+            "https://t.kaku.fun/0123456789abcdef0123456789abcdef/"
+        );
+        let asset = rt.block_on(page_asset(
+            Path((id.clone(), "xterm.js".into())),
+            State(state.clone()),
+        ));
+        assert_eq!(asset.status(), StatusCode::NOT_FOUND);
+
+        let from = |origin: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(origin) = origin {
+                headers.insert(header::ORIGIN, origin.parse().unwrap());
+            }
+            origin_allowed(state.page_origin.as_deref(), &headers)
+        };
+        assert!(from(Some("https://t.kaku.fun")));
+        assert!(!from(Some("https://evil.example")));
+        assert!(!from(Some("https://r.kaku.fun")));
+        assert!(!from(None));
+        // Without a page origin (local runs) any browser joins, as before.
+        assert!(origin_allowed(None, &HeaderMap::new()));
+
+        // The page asks whether the Mac is here, across origins.
+        let status =
+            |state: &AppState| rt.block_on(host_status(Path(id.clone()), State(state.clone())));
+        let away = status(&state);
+        assert_eq!(away.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            away.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://t.kaku.fun"
+        );
+        state.register(&id, test_host(&state)).unwrap();
+        assert_eq!(status(&state).status(), StatusCode::OK);
+    }
+
     fn test_host(state: &AppState) -> Arc<Host> {
         let (to_host, rx) = mpsc::channel(QUEUE);
         // Keep the receiver alive so sends are judged by the budget alone.
@@ -856,6 +1278,7 @@ mod tests {
             evicted: tokio::sync::Notify::new(),
             browsers: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
+            addr: "-".into(),
         })
     }
 
@@ -864,7 +1287,7 @@ mod tests {
         let state = AppState::default();
         let hosts: Vec<_> = (0..3).map(|_| test_host(&state)).collect();
         for h in &hosts {
-            state.register("id", h.clone());
+            state.register("id", h.clone()).unwrap();
         }
         let kept: Vec<u64> = state.hosts.lock()["id"]
             .iter()
@@ -898,6 +1321,7 @@ mod tests {
             queued: Arc::new(Queued::new(BROWSER_QUEUE_BYTES, global)),
             close: watch::channel(None).0,
             addr: String::new(),
+            admitted: false,
         }
     }
 
@@ -947,9 +1371,10 @@ mod tests {
         let state = AppState::default();
         let first = test_host(&state);
         let second = test_host(&state);
-        assert!(state.register("id", first.clone()).is_none());
+        assert!(state.register("id", first.clone()).unwrap().is_none());
         let displaced = state
             .register("id", second.clone())
+            .unwrap()
             .expect("first displaced");
         assert_eq!(displaced.generation, first.generation);
         assert_eq!(state.host("id").unwrap().generation, second.generation);
@@ -1012,6 +1437,98 @@ mod tests {
         assert!(!policy.admits("id", None, 50));
         assert!(!policy.admits("id", Some(&valid), 150));
         assert!(!policy.admits("id", Some("bad"), 50));
+    }
+
+    #[test]
+    fn the_access_code_matches_whole_and_trimmed() {
+        let code = AccessCode::new("open sesame");
+        assert!(code.admits("open sesame"));
+        assert!(code.admits(" open sesame\n"));
+        assert!(!code.admits("open sesam"));
+        assert!(!code.admits("open sesame2"));
+        assert!(!code.admits(""));
+    }
+
+    #[test]
+    fn an_address_is_held_to_its_budgets_and_freed_after_the_window() {
+        let mut limits = AddrLimits::default();
+        let start = Instant::now();
+        for _ in 0..CONNECTS_PER_MINUTE {
+            assert!(limits.allow_connect("1.2.3.4", start));
+        }
+        assert!(!limits.allow_connect("1.2.3.4", start));
+        // Another address and local runs are not affected.
+        assert!(limits.allow_connect("5.6.7.8", start));
+        for _ in 0..1000 {
+            assert!(limits.allow_connect("-", start));
+        }
+        assert!(limits.allow_connect("1.2.3.4", start + Duration::from_secs(61)));
+
+        for _ in 0..ACCESS_FAILURES - 1 {
+            limits.note_access_failure("1.2.3.4", start);
+        }
+        assert!(!limits.access_locked("1.2.3.4", start));
+        limits.note_access_failure("1.2.3.4", start);
+        assert!(limits.access_locked("1.2.3.4", start));
+        assert!(!limits.access_locked("5.6.7.8", start));
+        assert!(!limits.access_locked("1.2.3.4", start + ACCESS_WINDOW));
+    }
+
+    #[test]
+    fn sockets_the_mac_never_admitted_cannot_hold_every_slot() {
+        let state = AppState::default();
+        let host = test_host(&state);
+        let link = |admitted: bool| {
+            let (data, rx) = mpsc::channel(QUEUE);
+            std::mem::forget(rx);
+            let (close, closing) = watch::channel(None);
+            (
+                BrowserLink {
+                    data,
+                    queued: Arc::new(Queued::new(BROWSER_QUEUE_BYTES, &host.queued.global)),
+                    close,
+                    addr: "-".into(),
+                    admitted,
+                },
+                closing,
+            )
+        };
+        let mut browsers = HashMap::new();
+        let (owner, _) = link(true);
+        browsers.insert(1, owner);
+        let mut squatters = Vec::new();
+        for c in 2..=MAX_BROWSERS_PER_HOST as u32 {
+            let (squatter, closing) = link(false);
+            browsers.insert(c, squatter);
+            squatters.push(closing);
+        }
+        // Full: the next browser pushes out the oldest unadmitted socket,
+        // never the admitted one.
+        assert!(make_room(&mut browsers));
+        assert!(browsers.contains_key(&1) && !browsers.contains_key(&2));
+        assert_eq!(*squatters[0].borrow(), Some(4413));
+        // Every slot admitted: no room.
+        for b in browsers.values_mut() {
+            b.admitted = true;
+        }
+        let (extra, _) = link(true);
+        browsers.insert(99, extra);
+        assert!(!make_room(&mut browsers));
+    }
+
+    #[test]
+    fn page_addresses_redirect_only_for_a_real_id() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        // `/%2Fevil.example` reaches the handler decoded.
+        let evil = rt.block_on(short_page_redirect(Path("/evil.example".into())));
+        assert_eq!(evil.status(), StatusCode::NOT_FOUND);
+        let evil = rt.block_on(page_redirect(Path("/evil.example".into())));
+        assert_eq!(evil.status(), StatusCode::NOT_FOUND);
+        let id = "0123456789abcdef0123456789abcdef".to_string();
+        let ok = rt.block_on(short_page_redirect(Path(id.clone())));
+        assert_eq!(ok.headers()[header::LOCATION], format!("/{id}/"));
     }
 
     #[test]

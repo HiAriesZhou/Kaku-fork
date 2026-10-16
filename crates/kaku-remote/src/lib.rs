@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 mod awake;
@@ -19,7 +19,10 @@ mod share;
 mod web;
 
 pub use pairing::{list_devices, revoke_device, Device, OFFER_LIFETIME};
-pub use share::{load_or_create_identity, reset_identity, save_token, ShareIdentity};
+pub use share::{
+    access_fingerprint, load_or_create_identity, reset_identity, save_access_code, save_token,
+    ShareIdentity,
+};
 pub use web::{
     publish_tab_title, release_web_size, set_tab_action_handler, tab_is_web_sized,
     window_relayout_resizes_tab, TabAction, TabActionHandler,
@@ -146,7 +149,10 @@ fn check_token(query: &WsQuery, headers: &axum::http::HeaderMap) -> bool {
     let expected = get_or_init_token();
     let header = headers.get("x-kaku-token").and_then(|v| v.to_str().ok());
     header.is_some_and(|t| same_secret(t, expected))
-        || query.token.as_deref().is_some_and(|t| same_secret(t, expected))
+        || query
+            .token
+            .as_deref()
+            .is_some_and(|t| same_secret(t, expected))
 }
 
 /// Compare a presented secret without leaking, through timing, how much of
@@ -158,34 +164,20 @@ fn same_secret(presented: &str, expected: &str) -> bool {
 
 // ── Host guard ────────────────────────────────────────────────────────────────
 
-/// Whether `host` names this server: a loopback name, or, when it listens
-/// beyond loopback, one of this Mac's own addresses written as an IP. A web
-/// page on another site can rebind its own name to 127.0.0.1 and then read
+/// Whether `host` names this server by a loopback name. A web page on
+/// another site can rebind its own name to 127.0.0.1 and then read
 /// same-origin responses from this port; its requests still carry that name,
-/// never an IP literal, so they stay out. `port` is the listener's, which a
-/// config reload does not move.
-fn host_allowed(host: &str, port: u16, lan: bool, is_own_ip: impl Fn(IpAddr) -> bool) -> bool {
+/// so they stay out. `port` is the listener's, which a config reload does not
+/// move. The server listens on loopback only (2026-10-16: no LAN access).
+fn host_allowed(host: &str, port: u16) -> bool {
     let Some((name, host_port)) = host.rsplit_once(':') else {
         return false;
     };
-    if host_port != port.to_string() {
-        return false;
-    }
-    if matches!(name, "127.0.0.1" | "localhost" | "[::1]") {
-        return true;
-    }
-    let literal = name.trim_start_matches('[').trim_end_matches(']');
-    lan && literal.parse::<IpAddr>().is_ok_and(is_own_ip)
-}
-
-/// Binding succeeds only for an address on one of this Mac's interfaces right
-/// now, so a Wi-Fi change is followed without caching anything.
-fn is_own_ip(ip: IpAddr) -> bool {
-    !ip.is_unspecified() && std::net::UdpSocket::bind((ip, 0)).is_ok()
+    host_port == port.to_string() && matches!(name, "127.0.0.1" | "localhost" | "[::1]")
 }
 
 async fn require_own_host(
-    axum::extract::State((port, lan)): axum::extract::State<(u16, bool)>,
+    axum::extract::State(port): axum::extract::State<u16>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -194,7 +186,7 @@ async fn require_own_host(
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !host_allowed(host, port, lan, is_own_ip) {
+    if !host_allowed(host, port) {
         return (StatusCode::FORBIDDEN, "unexpected host").into_response();
     }
     next.run(req).await
@@ -205,7 +197,11 @@ async fn require_own_host(
 /// name, then renamed over the target.
 pub(crate) fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
+    // One name per writer: the GUI and the CLI may write the same file at
+    // once, and a shared name let one delete the other's half-written copy.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -269,9 +265,22 @@ pub struct RelayStatus {
     /// The Kaku that wrote it; the file outlives it when it quits.
     #[serde(default)]
     pub pid: u32,
+    /// Unix seconds of the attempt this records, so `kaku remote` can tell
+    /// that the bridge tried again after a new access code was saved.
+    #[serde(default)]
+    pub checked: u64,
+    /// `share::access_fingerprint` of the access code that attempt
+    /// presented, "" for none.
+    #[serde(default)]
+    pub access: String,
 }
 
 impl RelayStatus {
+    /// Whether the relay turned this Mac away for its access code.
+    pub fn needs_access_code(&self) -> bool {
+        !self.connected && self.last_error.contains(share::ACCESS_REFUSAL)
+    }
+
     /// Whether the Kaku that wrote this is still running.
     pub fn is_current(&self) -> bool {
         // SAFETY: signal 0 only checks that the process exists.
@@ -327,6 +336,8 @@ fn next_relay_status(
         since,
         last_error: error.unwrap_or_default(),
         pid,
+        checked: now,
+        access: share::tried_access(),
     }
 }
 
@@ -355,57 +366,112 @@ pub fn render_qr_terminal(url: &str) -> String {
 /// The relay when `remote.tunnel_url` is empty. It lives here, not in the
 /// config crate, so builds without the web terminal do not carry it.
 const DEFAULT_RELAY: &str = "wss://r.kaku.fun";
+/// Where the page lives for the default relay: its own origin, apart from
+/// the relay, which only forwards ciphertext and redirects old links here.
+const DEFAULT_PAGE: &str = "https://t.kaku.fun";
 
+/// Whether the bridge is serving; it follows `remote.enabled` on reload.
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WEB_DIRTY: std::sync::OnceLock<web::WebDirty> = std::sync::OnceLock::new();
+
+/// Called once at GUI startup. Remote access stays off until the user turns
+/// it on (`kaku remote` writes `remote.enabled`); the bridge then starts on
+/// that config reload, and stops, ending every web session, when it is
+/// turned off again.
 pub fn start() {
     // install_default() returns Err if a provider is already installed; that is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cfg = configuration();
-    if !cfg.remote.enabled {
+    WEB_DIRTY.get_or_init(|| {
+        let web_dirty: web::WebDirty = Arc::new(Mutex::new(HashMap::new()));
+        let web_dirty_for_sub = web_dirty.clone();
+        if let Some(mux) = Mux::try_get() {
+            mux.subscribe(move |notification| {
+                match notification {
+                    MuxNotification::PaneOutput(pane_id) => {
+                        web::notify_output(&web_dirty_for_sub, (*pane_id).into());
+                    }
+                    MuxNotification::AssignClipboard {
+                        pane_id,
+                        clipboard: Some(text),
+                        ..
+                    } => {
+                        web::publish_clipboard((*pane_id).into(), text.clone());
+                    }
+                    MuxNotification::Alert {
+                        pane_id,
+                        alert: wezterm_term::Alert::ToastNotification { title, body, .. },
+                    } => {
+                        web::publish_notification((*pane_id).into(), title.as_deref(), body);
+                    }
+                    MuxNotification::PaneRemoved(pane_id) => {
+                        web::pane_removed(&web_dirty_for_sub, (*pane_id).into());
+                        web::tabs_changed(true);
+                    }
+                    MuxNotification::PaneAdded(_)
+                    | MuxNotification::PaneFocused(_)
+                    | MuxNotification::TabAddedToWindow { .. }
+                    | MuxNotification::TabResized(_)
+                    | MuxNotification::WindowCreated(_)
+                    | MuxNotification::WindowRemoved(_)
+                    | MuxNotification::WindowInvalidated(_)
+                    | MuxNotification::WindowWorkspaceChanged(_) => web::tabs_changed(true),
+                    MuxNotification::TabTitleChanged { .. }
+                    | MuxNotification::WindowTitleChanged { .. } => web::tabs_changed(false),
+                    _ => {}
+                }
+                true
+            });
+        }
+        web_dirty
+    });
+
+    // Kept for the life of the process.
+    std::mem::forget(config::subscribe_to_config_reload(|| {
+        follow_config();
+        true
+    }));
+    follow_config();
+}
+
+/// Start the bridge if remote access is on and it is not running.
+fn follow_config() {
+    use std::sync::atomic::Ordering;
+    if !configuration().remote.enabled {
+        if !RUNNING.load(Ordering::SeqCst) {
+            // A state file left by an earlier run would tell `kaku remote`
+            // that sharing is on.
+            let _ = std::fs::remove_file(state_path());
+        }
         return;
     }
+    if !RUNNING.swap(true, Ordering::SeqCst) {
+        launch();
+    }
+}
 
+/// Resolves once remote access is turned off.
+async fn turned_off() {
+    while configuration().remote.enabled {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+fn launch() {
+    let cfg = configuration();
     let port = cfg.remote.port;
-    let bind = cfg.remote.bind.clone();
     let tunnel = cfg.remote.tunnel;
     let tunnel_url = match cfg.remote.tunnel_url.trim() {
         "" => DEFAULT_RELAY.to_string(),
         url => url.to_string(),
     };
     let token = get_or_init_token();
+    let web_dirty = WEB_DIRTY.get().expect("start() sets it").clone();
+    // The status left by an earlier run (say "remote access is off") must
+    // not stand in for this one's first attempt.
+    let _ = std::fs::remove_file(relay_status_path());
 
-    log::info!("kaku-remote: starting on {}:{}", bind, port);
-
-    let web_dirty: web::WebDirty = Arc::new(Mutex::new(HashMap::new()));
-    let web_dirty_for_sub = web_dirty.clone();
-
-    if let Some(mux) = Mux::try_get() {
-        mux.subscribe(move |notification| {
-            match notification {
-                MuxNotification::PaneOutput(pane_id) => {
-                    web::notify_output(&web_dirty_for_sub, (*pane_id).into());
-                }
-                MuxNotification::AssignClipboard {
-                    pane_id,
-                    clipboard: Some(text),
-                    ..
-                } => {
-                    web::publish_clipboard((*pane_id).into(), text.clone());
-                }
-                MuxNotification::Alert {
-                    pane_id,
-                    alert: wezterm_term::Alert::ToastNotification { title, body, .. },
-                } => {
-                    web::publish_notification((*pane_id).into(), title.as_deref(), body);
-                }
-                MuxNotification::PaneRemoved(pane_id) => {
-                    web::pane_removed(&web_dirty_for_sub, (*pane_id).into());
-                }
-                _ => {}
-            }
-            true
-        });
-    }
+    log::info!("kaku-remote: starting on 127.0.0.1:{}", port);
 
     let tunnel_relay_opt: Option<String> = if tunnel { Some(tunnel_url) } else { None };
     std::thread::Builder::new()
@@ -417,57 +483,71 @@ pub fn start() {
                 .build()
                 .expect("kaku-remote tokio runtime");
 
+            let relay_for_status = tunnel_relay_opt.clone();
             rt.block_on(async move {
-                if let Some(relay_url) = tunnel_relay_opt.clone() {
-                    tokio::spawn(share::run(relay_url, web_dirty.clone()));
-                }
-
-                let app = Router::new()
-                    .route("/", get(web::route_index))
-                    .route("/assets/{name}", get(web::route_asset))
-                    .route("/web/ws", get(web::route_ws))
-                    .with_state(web_dirty)
-                    .layer(axum::middleware::from_fn_with_state(
-                        (port, bind != "127.0.0.1" && bind != "localhost"),
-                        require_own_host,
-                    ));
-
-                // The relay link does not depend on the local listener, so a
-                // busy port must not take it down with this task.
-                let addr: SocketAddr = match format!("{}:{}", bind, port).parse() {
-                    Ok(a) => a,
-                    Err(e) => {
-                        log::error!("kaku-remote: invalid bind address: {e}");
-                        return std::future::pending().await;
-                    }
-                };
-
-                log::info!("kaku-remote: listening on http://{}", addr);
-                write_state(port, token, tunnel_relay_opt.as_deref());
-
-                // Keystrokes and frames are small writes; Nagle would hold one
-                // back until the previous is acknowledged, as the relay
-                // already avoids on its own sockets.
-                let listener = match tokio::net::TcpListener::bind(addr).await {
-                    Ok(l) => l.tap_io(|tcp| {
-                        let _ = tcp.set_nodelay(true);
-                    }),
-                    Err(e) => {
-                        log::error!("kaku-remote: failed to bind {addr}: {e}");
-                        return std::future::pending().await;
-                    }
-                };
-                if let Err(e) = axum::serve(
-                    listener,
-                    app.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                {
-                    log::error!("kaku-remote: server error: {e}");
+                tokio::select! {
+                    _ = serve_all(port, token, tunnel_relay_opt, web_dirty) => {}
+                    _ = turned_off() => log::info!("kaku-remote: remote access turned off"),
                 }
             });
+            // Dropping the runtime ends the relay link and every session.
+            drop(rt);
+            let _ = std::fs::remove_file(state_path());
+            if let Some(relay) = relay_for_status {
+                record_relay_status(&relay, false, Some("remote access is off".into()));
+            }
+            RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            // Turned back on while this one was stopping.
+            follow_config();
         })
         .expect("spawn kaku-remote thread");
+}
+
+async fn serve_all(
+    port: u16,
+    token: &'static str,
+    tunnel_relay_opt: Option<String>,
+    web_dirty: web::WebDirty,
+) {
+    if let Some(relay_url) = tunnel_relay_opt.clone() {
+        tokio::spawn(share::run(relay_url, web_dirty.clone()));
+    }
+
+    let app = Router::new()
+        .route("/", get(web::route_index))
+        .route("/assets/{name}", get(web::route_asset))
+        .route("/web/ws", get(web::route_ws))
+        .with_state(web_dirty)
+        .layer(axum::middleware::from_fn_with_state(port, require_own_host));
+
+    // The relay link does not depend on the local listener, so a busy port
+    // must not take it down with this task.
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+    log::info!("kaku-remote: listening on http://{}", addr);
+    write_state(port, token, tunnel_relay_opt.as_deref());
+
+    // Keystrokes and frames are small writes; Nagle would hold one back
+    // until the previous is acknowledged, as the relay already avoids on its
+    // own sockets.
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l.tap_io(|tcp| {
+            let _ = tcp.set_nodelay(true);
+        }),
+        Err(e) => {
+            log::error!("kaku-remote: failed to bind {addr}: {e}");
+            return std::future::pending().await;
+        }
+    };
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    {
+        log::error!("kaku-remote: server error: {e}");
+    }
+    std::future::pending().await
 }
 
 #[cfg(test)]
@@ -504,6 +584,34 @@ mod relay_status_tests {
     }
 
     #[test]
+    fn an_access_code_refusal_is_told_apart() {
+        let refused = |why: &str| {
+            next_relay_status(
+                None,
+                "wss://r",
+                false,
+                Some(format!("relay refused this Mac (401 Unauthorized): {why}")),
+                1,
+                7,
+            )
+        };
+        assert!(refused("access code required").needs_access_code());
+        assert!(refused("wrong access code").needs_access_code());
+        assert!(!refused("registration token refused").needs_access_code());
+        assert!(!next_relay_status(None, "wss://r", true, None, 1, 7).needs_access_code());
+        // Every attempt is stamped, even one that changes nothing else.
+        let again = next_relay_status(
+            Some(&refused("wrong access code")),
+            "wss://r",
+            false,
+            Some("x".into()),
+            9,
+            7,
+        );
+        assert_eq!(again.checked, 9);
+    }
+
+    #[test]
     fn only_a_running_writer_makes_the_status_current() {
         let mine = next_relay_status(None, "wss://r", true, None, 0, std::process::id());
         assert!(mine.is_current());
@@ -517,31 +625,16 @@ mod host_guard_tests {
     use super::*;
 
     #[test]
-    fn only_this_servers_own_names_are_accepted() {
-        let own = |ip: IpAddr| ip.to_string() == "192.168.1.5" || ip.to_string() == "fe80::1";
-        let ok = |host: &str, lan: bool| host_allowed(host, 9988, lan, own);
-        assert!(ok("127.0.0.1:9988", false));
-        assert!(ok("localhost:9988", false));
-        assert!(ok("[::1]:9988", false));
-        assert!(ok("192.168.1.5:9988", true));
-        assert!(ok("[fe80::1]:9988", true));
-        // A rebound name, another port, the LAN address while bound to
-        // loopback only, an address that is not this Mac's, a missing header.
-        assert!(!ok("evil.example:9988", true));
-        assert!(!ok("127.0.0.1:9989", false));
-        assert!(!ok("192.168.1.5:9988", false));
-        assert!(!ok("192.168.1.9:9988", true));
-        assert!(!ok("", true));
-    }
-
-    /// After a Wi-Fi change the new address must be accepted without a
-    /// restart: ownership is checked per request, against the live
-    /// interfaces, and loopback always binds.
-    #[test]
-    fn own_addresses_are_checked_live() {
-        assert!(is_own_ip("127.0.0.1".parse().unwrap()));
-        assert!(!is_own_ip("0.0.0.0".parse().unwrap()));
-        assert!(!is_own_ip("203.0.113.7".parse().unwrap()));
+    fn only_loopback_names_are_accepted() {
+        let ok = |host: &str| host_allowed(host, 9988);
+        assert!(ok("127.0.0.1:9988"));
+        assert!(ok("localhost:9988"));
+        assert!(ok("[::1]:9988"));
+        // A rebound name, another port, a LAN address, a missing header.
+        assert!(!ok("evil.example:9988"));
+        assert!(!ok("127.0.0.1:9989"));
+        assert!(!ok("192.168.1.5:9988"));
+        assert!(!ok(""));
     }
 
     #[test]

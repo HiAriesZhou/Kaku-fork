@@ -81,7 +81,12 @@ impl ShareIdentity {
     /// This Mac's page through the relay at `relay_url` (ws:// or wss://).
     /// Opening it pairs nothing; a paired browser bookmarks it.
     pub fn page_url(&self, relay_url: &str) -> String {
-        format!("{}/{}/", http_base(relay_url), self.id())
+        let base = if relay_url.trim_end_matches('/') == crate::DEFAULT_RELAY {
+            crate::DEFAULT_PAGE.to_string()
+        } else {
+            http_base(relay_url)
+        };
+        format!("{base}/{}/", self.id())
     }
 
     /// A link that pairs one more browser, once, within
@@ -129,6 +134,54 @@ fn write_identity(identity: &ShareIdentity) -> anyhow::Result<()> {
     let json = serde_json::to_string(identity)?;
     crate::write_private(&path, json.as_bytes()).context("save share identity")
 }
+
+fn access_path() -> PathBuf {
+    config::DATA_DIR.join("remote-access")
+}
+
+/// A short fingerprint of an access code, recorded with each attempt so
+/// `kaku remote` knows the relay's answer was to the code it just saved.
+pub fn access_fingerprint(code: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, code.trim().as_bytes());
+    digest.as_ref()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The fingerprint of the code the latest attempt presented ("" for none).
+static TRIED_ACCESS: parking_lot::Mutex<String> = parking_lot::Mutex::new(String::new());
+
+pub(crate) fn tried_access() -> String {
+    TRIED_ACCESS.lock().clone()
+}
+
+/// The relay's access code, once `kaku remote` asked for it.
+fn read_access_code() -> Option<String> {
+    let code = std::fs::read_to_string(access_path()).ok()?;
+    let code = code.trim();
+    (!code.is_empty()).then(|| code.to_string())
+}
+
+/// Keep the relay's access code for the bridge to present. The running Kaku
+/// notices the new file within a second and tries again.
+pub fn save_access_code(code: &str) -> anyhow::Result<()> {
+    let code = code.trim();
+    anyhow::ensure!(!code.is_empty(), "the access code is empty");
+    anyhow::ensure!(
+        code.len() <= 256 && code.bytes().all(|b| (b' '..=b'~').contains(&b)),
+        "an access code is letters, digits and punctuation"
+    );
+    let path = access_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).context("create data dir")?;
+    }
+    crate::write_private(&path, code.as_bytes()).context("save access code")
+}
+
+/// Marks a refusal over the access code in the relay status, which
+/// `RelayStatus::needs_access_code` looks for.
+pub(crate) const ACCESS_REFUSAL: &str = "access code";
 
 fn token_path() -> PathBuf {
     config::DATA_DIR.join("remote-token")
@@ -407,9 +460,34 @@ pub(crate) async fn run(relay_url: String, dirty: WebDirty) {
             backoff,
             connected_at.map(|at: tokio::time::Instant| at.elapsed()),
         );
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF);
+        if wait_unless_access_changes(backoff).await {
+            backoff = Duration::from_secs(1);
+        } else {
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
     }
+}
+
+/// Sleep `delay`, or less when the saved access code is not the one the
+/// last attempt presented, so the person typing it is not left waiting out a
+/// 30 s backoff. Compared with what was tried, not with the file at the
+/// start of the wait, so a code saved during the attempt also wakes it.
+/// True when it did.
+async fn wait_unless_access_changes(delay: Duration) -> bool {
+    let saved = || {
+        read_access_code()
+            .map(|c| access_fingerprint(&c))
+            .unwrap_or_default()
+    };
+    let deadline = tokio::time::Instant::now() + delay;
+    while tokio::time::Instant::now() < deadline {
+        if saved() != tried_access() {
+            return true;
+        }
+        let step = (deadline - tokio::time::Instant::now()).min(Duration::from_secs(1));
+        tokio::time::sleep(step).await;
+    }
+    false
 }
 
 fn retry_delay(previous: Duration, connected_for: Option<Duration>) -> Duration {
@@ -443,14 +521,30 @@ async fn connect_relay(
     limit: Duration,
 ) -> anyhow::Result<RelaySocket> {
     // Keystrokes and echoes are tiny frames; Nagle would hold them back.
-    let (socket, _) = tokio::time::timeout(
+    let connected = tokio::time::timeout(
         limit,
         tokio_tungstenite::connect_async_with_config(request, None, true),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("relay handshake timed out after {limit:?}"))?
-    .context("connect to relay")?;
-    Ok(socket)
+    .map_err(|_| anyhow::anyhow!("relay handshake timed out after {limit:?}"))?;
+    match connected {
+        Ok((socket, _)) => Ok(socket),
+        // The relay says why in plain text: an access code it needs or did
+        // not accept, a full address, a busy relay.
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            let why = response
+                .body()
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .unwrap_or_default()
+                .trim()
+                .chars()
+                .take(120)
+                .collect::<String>();
+            anyhow::bail!("relay refused this Mac ({}): {why}", response.status())
+        }
+        Err(e) => Err(anyhow::Error::new(e).context("connect to relay")),
+    }
 }
 
 async fn serve(
@@ -471,6 +565,13 @@ async fn serve(
     if let Some(token) = read_token() {
         if let Ok(value) = token.parse() {
             request.headers_mut().insert("x-kaku-token", value);
+        }
+    }
+    let code = read_access_code();
+    *TRIED_ACCESS.lock() = code.as_deref().map(access_fingerprint).unwrap_or_default();
+    if let Some(code) = code {
+        if let Ok(value) = code.parse() {
+            request.headers_mut().insert("x-kaku-access", value);
         }
     }
     let socket = connect_relay(request, CONNECT_TIMEOUT).await?;
@@ -574,6 +675,10 @@ async fn serve(
                                     // Kaku's own signature was message 0.
                                     *inbox = Some(start_session(c, keys.clone(), 1, dirty.clone(), to_relay.clone()));
                                 }
+                                // Tell the relay this socket is a paired browser, so
+                                // sockets that only know the id cannot push it out.
+                                let ok = serde_json::json!({ "t": "ok", "c": c }).to_string();
+                                let _ = to_relay.try_send(Message::Text(ok.into()));
                                 continue;
                             }
                             Step::Input(text) => text,
@@ -764,6 +869,11 @@ mod tests {
         assert_eq!(
             a.page_url("wss://relay.example.com/"),
             format!("https://relay.example.com/{}/", a.id())
+        );
+        // The default relay's page lives on its own origin.
+        assert_eq!(
+            a.page_url("wss://r.kaku.fun"),
+            format!("https://t.kaku.fun/{}/", a.id())
         );
         let fragment = pairing::pairing_fragment(mac.public_key(), "c2VjcmV0");
         let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);

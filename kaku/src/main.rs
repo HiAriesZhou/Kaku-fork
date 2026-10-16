@@ -118,6 +118,8 @@ enum RemoteAction {
         /// The id `kaku remote devices` shows
         id: String,
     },
+    /// Turn remote access off; open web sessions end within seconds
+    Off,
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -336,7 +338,26 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
             println!("Removed {id}. Its open sessions end within a few seconds.");
             return Ok(());
         }
+        Some(RemoteAction::Off) => {
+            if !config_tui::set_remote_enabled(false)? {
+                anyhow::bail!("Your kaku.lua sets other remote options; set `enabled = false` in its `config.remote` yourself.");
+            }
+            // The bridge stops only once Kaku reloads the config; do not say
+            // sessions end unless it did.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while kaku_remote::read_state().is_ok() {
+                if std::time::Instant::now() > deadline {
+                    anyhow::bail!("Saved, but Kaku has not applied it, so web sessions are still open. Choose Reload Configuration in Kaku or quit it.");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            println!("Remote access is off. Open web sessions have ended.");
+            return Ok(());
+        }
         None => {}
+    }
+    if !config::configuration().remote.enabled {
+        turn_remote_on()?;
     }
     let identity = if reset {
         kaku_remote::reset_identity()?
@@ -344,6 +365,9 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
         kaku_remote::load_or_create_identity()?
     };
     let state = kaku_remote::read_state()?;
+    if state.tunnel_relay.is_some() {
+        ensure_relay_access()?;
+    }
     let Some(relay) = &state.tunnel_relay else {
         // Without the relay the page is only reachable on this Mac, and its
         // token changes with every Kaku launch.
@@ -361,6 +385,105 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
         kaku_remote::OFFER_LIFETIME.as_secs() / 60
     );
     Ok(())
+}
+
+/// Ask before turning remote access on, write it to kaku.lua, and wait for
+/// the running Kaku to pick it up from its config reload.
+#[cfg(feature = "remote")]
+fn turn_remote_on() -> anyhow::Result<()> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("Remote access is off. Run `kaku remote` in a terminal to turn it on.");
+    }
+    println!("Remote access lets a browser on another device use this Mac's terminals, through Kaku's relay.");
+    print!("Turn it on? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
+        anyhow::bail!("Remote access stays off.");
+    }
+    if !config_tui::set_remote_enabled(true)? {
+        anyhow::bail!("Your kaku.lua sets other remote options; set `enabled = true` in its `config.remote` yourself.");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while kaku_remote::read_state().is_err() {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("Remote access is on. Open Kaku, then run `kaku remote` again.");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// When the relay turned this Mac away for its access code, ask for the
+/// code, save it, and wait for the running Kaku to try it.
+#[cfg(feature = "remote")]
+fn ensure_relay_access() -> anyhow::Result<()> {
+    let current = || kaku_remote::read_relay_status().filter(|s| s.is_current());
+    // Kaku records its first attempt a moment after it starts.
+    let first = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while current().is_none() && std::time::Instant::now() < first {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let mut asked = false;
+    loop {
+        let Some(status) = current() else {
+            return Ok(());
+        };
+        if status.last_error.contains("too many wrong access codes") {
+            anyhow::bail!(
+                "Too many wrong access codes from this network. Try again in 10 minutes."
+            );
+        }
+        if !status.needs_access_code() {
+            return Ok(());
+        }
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "The relay asks for an access code. Run `kaku remote` in a terminal to enter it."
+            );
+        }
+        if asked {
+            println!("That access code was not accepted.");
+        }
+        let code = read_hidden_line("Access code: ")?;
+        if code.trim().is_empty() {
+            anyhow::bail!("No access code entered.");
+        }
+        kaku_remote::save_access_code(&code)?;
+        asked = true;
+        // Wait for an attempt that presented this very code.
+        let tried = kaku_remote::access_fingerprint(&code);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            match current() {
+                Some(s) if s.access == tried => break,
+                Some(_) if std::time::Instant::now() < deadline => continue,
+                _ => anyhow::bail!("Kaku did not reach the relay in time; see `kaku doctor`."),
+            }
+        }
+    }
+}
+
+/// Read a line from the terminal without echoing it.
+#[cfg(feature = "remote")]
+fn read_hidden_line(prompt: &str) -> anyhow::Result<String> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let fd = std::io::stdin().as_raw_fd();
+    let original = termios::Termios::from_fd(fd)?;
+    let mut quiet = original;
+    quiet.c_lflag &= !termios::ECHO;
+    termios::tcsetattr(fd, termios::TCSANOW, &quiet)?;
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    termios::tcsetattr(fd, termios::TCSANOW, &original)?;
+    println!();
+    read?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 fn main() {
@@ -431,6 +554,8 @@ fn run() -> anyhow::Result<()> {
                 println!("Saved. Kaku uses it from its next connection to the relay.");
                 return Ok(());
             }
+            // Read the user's config: whether remote access is on, and where.
+            init_config(&opts)?;
             run_remote(reset, action)
         }
         SubCommand::SetCwd(cmd) => cmd.run(),

@@ -228,13 +228,14 @@ pub(crate) fn admit(
         return Err(Refusal::BadProof);
     }
     let id = device_id(&public);
+    let key = b64(&public);
     match auth {
         PageAuth::Auth { .. } => store
-            .seen(&id)
+            .seen(&id, &key)
             .map(|d| (d, false))
             .ok_or(Refusal::UnknownDevice),
         PageAuth::Pair { proof, name, .. } => {
-            if let Some(known) = store.seen(&id) {
+            if let Some(known) = store.seen(&id, &key) {
                 return Ok((known, false));
             }
             let proof = unb64(proof).ok_or(Refusal::BadProof)?;
@@ -247,7 +248,7 @@ pub(crate) fn admit(
             }
             let device = Device {
                 id,
-                public_key: b64(&public),
+                public_key: key,
                 name: clean_name(name),
                 paired_at: now(),
                 last_seen: now(),
@@ -298,9 +299,11 @@ struct Offer {
 /// Where `admit` reads and records devices and the offer; files in the data
 /// dir for Kaku, memory in tests.
 pub(crate) trait DeviceStore {
-    /// The paired device with this id as it was (`last_seen` is the
-    /// previous visit), marking it seen now.
-    fn seen(&mut self, id: &str) -> Option<Device>;
+    /// The paired device with this id and this whole public key as it was
+    /// (`last_seen` is the previous visit), marking it seen now. The short id
+    /// alone is not enough: it is shown to people and a key matching its 32
+    /// bits can be ground offline.
+    fn seen(&mut self, id: &str, public_key: &str) -> Option<Device>;
     fn add(&mut self, device: Device);
     /// Use up the current offer if `check` accepts its secret.
     fn take_offer(&mut self, check: &dyn Fn(&[u8]) -> bool) -> bool;
@@ -322,31 +325,67 @@ pub fn list_devices() -> Vec<Device> {
         .unwrap_or_default()
 }
 
-fn save_devices(devices: &[Device]) -> anyhow::Result<()> {
-    let path = devices_path();
+/// Read, change and write the devices file at `path` under an exclusive
+/// lock. The GUI updates it on every sign-in while `kaku remote revoke` edits
+/// it from another process; without the lock the GUI could write back a list
+/// read before the revoke and bring the device back. `change` returns whether
+/// to save.
+fn update_devices_at<T>(
+    path: &std::path::Path,
+    change: impl FnOnce(&mut Vec<Device>) -> (bool, T),
+) -> anyhow::Result<T> {
+    use std::os::unix::io::AsRawFd;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).context("create data dir")?;
     }
-    let json = serde_json::to_string_pretty(devices)?;
-    crate::write_private(&path, json.as_bytes()).context("save paired devices")
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))
+        .context("open devices lock")?;
+    // SAFETY: flock on a file descriptor we own; released when `lock` closes.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        anyhow::bail!("lock paired devices: {}", std::io::Error::last_os_error());
+    }
+    let mut devices: Vec<Device> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default();
+    let (save, out) = change(&mut devices);
+    if save {
+        let json = serde_json::to_string_pretty(&devices)?;
+        crate::write_private(path, json.as_bytes()).context("save paired devices")?;
+    }
+    drop(lock);
+    Ok(out)
+}
+
+fn update_devices<T>(change: impl FnOnce(&mut Vec<Device>) -> (bool, T)) -> anyhow::Result<T> {
+    update_devices_at(&devices_path(), change)
+}
+
+fn revoke_at(path: &std::path::Path, id: &str) -> anyhow::Result<bool> {
+    update_devices_at(path, |devices| {
+        let before = devices.len();
+        devices.retain(|d| d.id != id);
+        let removed = devices.len() != before;
+        (removed, removed)
+    })
 }
 
 /// Remove a paired device; its open sessions end within seconds. Returns
 /// whether it was paired.
 pub fn revoke_device(id: &str) -> anyhow::Result<bool> {
-    let mut devices = list_devices();
-    let before = devices.len();
-    devices.retain(|d| d.id != id);
-    if devices.len() == before {
-        return Ok(false);
-    }
-    save_devices(&devices)?;
-    Ok(true)
+    revoke_at(&devices_path(), id)
 }
 
 /// Forget every device and any pending pairing link.
 pub fn forget_all_devices() -> anyhow::Result<()> {
-    save_devices(&[])?;
+    update_devices(|devices| {
+        devices.clear();
+        (true, ())
+    })?;
     let _ = std::fs::remove_file(offer_path());
     Ok(())
 }
@@ -371,24 +410,39 @@ pub(crate) fn new_offer() -> anyhow::Result<String> {
     Ok(offer.secret)
 }
 
+fn seen_at(path: &std::path::Path, id: &str, public_key: &str) -> Option<Device> {
+    update_devices_at(path, |devices| {
+        match devices
+            .iter_mut()
+            .find(|d| d.id == id && d.public_key == public_key)
+        {
+            Some(device) => {
+                let found = device.clone();
+                device.last_seen = now();
+                (true, Some(found))
+            }
+            None => (false, None),
+        }
+    })
+    .ok()
+    .flatten()
+}
+
 /// The devices file and offer file in Kaku's data dir.
 pub(crate) struct DiskStore;
 
 impl DeviceStore for DiskStore {
-    fn seen(&mut self, id: &str) -> Option<Device> {
-        let mut devices = list_devices();
-        let device = devices.iter_mut().find(|d| d.id == id)?;
-        let found = device.clone();
-        device.last_seen = now();
-        let _ = save_devices(&devices);
-        Some(found)
+    fn seen(&mut self, id: &str, public_key: &str) -> Option<Device> {
+        seen_at(&devices_path(), id, public_key)
     }
 
     fn add(&mut self, device: Device) {
-        let mut devices = list_devices();
-        devices.retain(|d| d.id != device.id);
-        devices.push(device);
-        if let Err(e) = save_devices(&devices) {
+        let added = update_devices(|devices| {
+            devices.retain(|d| d.id != device.id);
+            devices.push(device);
+            (true, ())
+        });
+        if let Err(e) = added {
             log::warn!("kaku-share: {e:#}");
         }
     }
@@ -477,8 +531,11 @@ pub(crate) mod tests {
     }
 
     impl DeviceStore for MemoryStore {
-        fn seen(&mut self, id: &str) -> Option<Device> {
-            self.devices.get(id).cloned()
+        fn seen(&mut self, id: &str, public_key: &str) -> Option<Device> {
+            self.devices
+                .get(id)
+                .filter(|d| d.public_key == public_key)
+                .cloned()
         }
         fn add(&mut self, device: Device) {
             self.devices.insert(device.id.clone(), device);
@@ -626,6 +683,88 @@ pub(crate) mod tests {
             admit(&auth(&key, &transcript), &transcript, &mut store).map(|(d, _)| d.id),
             Ok(id)
         );
+    }
+
+    /// The short id is shown in notifications and `kaku remote devices`, and
+    /// a key whose SHA-256 starts with the same 32 bits can be ground
+    /// offline. Signing in must take the paired key itself.
+    #[test]
+    fn a_key_that_only_shares_the_short_id_does_not_sign_in_or_pair_over_it() {
+        let (transcript, _, key) = exchange("host");
+        let paired = TestPage::new()
+            .finish(
+                "host",
+                &Exchange::new(&SystemRandom::new()).unwrap().hello(),
+            )
+            .2;
+        let mut store = MemoryStore::default();
+        // A paired device whose id the attacker's key happens to share.
+        store.add(Device {
+            id: device_id(key.public_key()),
+            public_key: b64(paired.public_key()),
+            name: "Safari on iPhone".into(),
+            paired_at: 0,
+            last_seen: 0,
+        });
+        assert_eq!(
+            admit(&auth(&key, &transcript), &transcript, &mut store).map(|(d, _)| d.id),
+            Err(Refusal::UnknownDevice)
+        );
+        // Without a pairing link it cannot pair either, and the paired device
+        // is left as it was.
+        assert_eq!(
+            admit(
+                &pair(&key, &transcript, b"no offer"),
+                &transcript,
+                &mut store
+            )
+            .map(|(d, _)| d.id),
+            Err(Refusal::PairingLink)
+        );
+        assert_eq!(
+            store.devices[&device_id(key.public_key())].public_key,
+            b64(paired.public_key())
+        );
+    }
+
+    /// A sign-in that read the list before a revoke must not write the
+    /// device back after it.
+    #[test]
+    fn a_revoked_device_stays_revoked_while_it_keeps_signing_in() {
+        let dir = std::env::temp_dir().join(format!("kaku-devices-{}", std::process::id()));
+        let path = dir.join("remote-devices.json");
+        let device = Device {
+            id: "abcd1234".into(),
+            public_key: "key".into(),
+            name: "Chrome".into(),
+            paired_at: 0,
+            last_seen: 0,
+        };
+        for _ in 0..200 {
+            update_devices_at(&path, |devices| {
+                devices.clear();
+                devices.push(device.clone());
+                (true, ())
+            })
+            .unwrap();
+            let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let toucher = {
+                let (path, busy) = (path.clone(), busy.clone());
+                std::thread::spawn(move || {
+                    while busy.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = seen_at(&path, "abcd1234", "key");
+                    }
+                })
+            };
+            assert!(revoke_at(&path, "abcd1234").unwrap());
+            busy.store(false, std::sync::atomic::Ordering::SeqCst);
+            toucher.join().unwrap();
+            assert!(
+                seen_at(&path, "abcd1234", "key").is_none(),
+                "the revoked device came back"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

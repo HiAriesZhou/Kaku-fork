@@ -10,6 +10,7 @@ use crate::{check_token, WsQuery};
 use axum::extract::{ws, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use mux::pane::{CloseReason, Pane, PaneId};
 use mux::Mux;
@@ -20,11 +21,11 @@ use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
-use termwiz::color::ColorAttribute;
+use termwiz::color::{ColorAttribute, LinearRgba};
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 use tokio::sync::{broadcast, mpsc};
-use base64::Engine as _;
+use wezterm_term::color::ColorPalette;
 use wezterm_term::image::{ImageData, ImageDataType};
 use wezterm_term::{MouseButton, MouseEvent, MouseEventKind, TerminalSize};
 
@@ -49,6 +50,8 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// title changes and resizes that do not produce `PaneOutput`.
 const IDLE_REFRESH: Duration = Duration::from_secs(1);
 const MAX_INPUT_LEN: usize = 65_536;
+/// How long a click from the page holds the button, about a quick hand's.
+const CLICK_HOLD: Duration = Duration::from_millis(50);
 /// A page pings every 20 s, and a background tab still gets a timer about
 /// once a minute. This long without a word means the browser is gone (a
 /// laptop asleep with the socket half open), and the session ends rather
@@ -166,6 +169,18 @@ pub(crate) fn notify_output(dirty: &WebDirty, pane_id: usize) {
 
 pub(crate) fn pane_removed(dirty: &WebDirty, pane_id: usize) {
     dirty.lock().remove(&pane_id);
+}
+
+/// Tabs, windows or panes changed (true) or only a title did (false).
+/// Sessions resend the tab list at once for the first, so a tab opened,
+/// closed or focused shows in the page in a frame instead of at the next
+/// idle refresh; titles, which some programs animate, at most every
+/// `TITLE_REFRESH`.
+static TABS_CHANGED: LazyLock<broadcast::Sender<bool>> = LazyLock::new(|| broadcast::channel(64).0);
+const TITLE_REFRESH: Duration = Duration::from_millis(250);
+
+pub(crate) fn tabs_changed(structural: bool) {
+    let _ = TABS_CHANGED.send(structural);
 }
 
 /// Text a program put on the clipboard (OSC 52: Claude Code's copy, a vim
@@ -1281,7 +1296,9 @@ fn image_placements(lines: &[Line]) -> (Vec<ImagePlacement>, HashMap<String, Arc
     let round = |v: f32| (v * 1000.0).round() / 1000.0;
     for (row, line) in lines.iter().enumerate() {
         for cell in line.visible_cells() {
-            let Some(images) = cell.attrs().images() else { continue };
+            let Some(images) = cell.attrs().images() else {
+                continue;
+            };
             for image in images {
                 let (tl, br) = (image.top_left(), image.bottom_right());
                 let du = *br.x - *tl.x;
@@ -1336,8 +1353,18 @@ fn image_file(image: &ImageData) -> Option<(&'static str, Vec<u8>)> {
     let file = match &*image.data() {
         ImageDataType::EncodedFile(bytes) => sniff(bytes.clone()),
         ImageDataType::EncodedLease(lease) => sniff(lease.get_data().ok()?),
-        ImageDataType::Rgba8 { data, width, height, .. } => png(*width, *height, data),
-        ImageDataType::AnimRgba8 { width, height, frames, .. } => png(*width, *height, frames.first()?),
+        ImageDataType::Rgba8 {
+            data,
+            width,
+            height,
+            ..
+        } => png(*width, *height, data),
+        ImageDataType::AnimRgba8 {
+            width,
+            height,
+            frames,
+            ..
+        } => png(*width, *height, frames.first()?),
     }?;
     (file.1.len() <= MAX_IMAGE_BYTES).then_some(file)
 }
@@ -1357,12 +1384,13 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
 
     let (_, lines) = pane.get_lines(top..top + rows as isize);
 
+    let palette = pane.palette();
     let mut rendered = Vec::with_capacity(rows);
     for row in 0..rows {
         let mut out = String::with_capacity(dims.cols + 16);
         let _ = write!(out, "\x1b[{};1H", row + 1);
         if let Some(line) = lines.get(row) {
-            render_cells(line, dims.cols, &mut out);
+            render_cells(line, dims.cols, &palette, &mut out);
         }
         // Clear the rest of the row with the default background.
         out.push_str("\x1b[0m\x1b[K");
@@ -1401,14 +1429,14 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
 }
 
 /// One row's cells as SGR runs, at most `cols` wide.
-fn render_cells(line: &Line, cols: usize, out: &mut String) {
+fn render_cells(line: &Line, cols: usize, palette: &ColorPalette, out: &mut String) {
     let mut current: Option<Sgr> = None;
     let mut col = 0;
     for cell in line.visible_cells() {
         if col >= cols {
             break;
         }
-        let sgr = Sgr::from_attrs(cell.attrs());
+        let sgr = Sgr::from_attrs(cell.attrs(), palette);
         if current.as_ref() != Some(&sgr) {
             sgr.write(out);
             current = Some(sgr);
@@ -1440,11 +1468,12 @@ fn history_rows(pane: &Arc<dyn Pane>, end: Option<isize>) -> (isize, isize, Vec<
     let end = end.unwrap_or(bottom).clamp(dims.scrollback_top, bottom);
     let top = (end - HISTORY_PAGE).max(dims.scrollback_top);
     let (_, lines) = pane.get_lines(top..end);
+    let palette = pane.palette();
     let rows = lines
         .iter()
         .map(|line| {
             let mut out = String::new();
-            render_cells(line, dims.cols, &mut out);
+            render_cells(line, dims.cols, &palette, &mut out);
             out
         })
         .collect();
@@ -1651,12 +1680,33 @@ struct Sgr {
     invisible: bool,
 }
 
+/// What the Mac window does to dim (half intensity) text: its color times
+/// 0.75 in linear light (`HALF_INTENSITY_DIM_FACTOR` in kaku-gui).
+const HALF_INTENSITY_DIM_FACTOR: f32 = 0.75;
+
 impl Sgr {
-    fn from_attrs(attrs: &CellAttributes) -> Self {
+    fn from_attrs(attrs: &CellAttributes, palette: &ColorPalette) -> Self {
+        // xterm.js draws dim text at half opacity over the background, after
+        // swapping for reverse video; the Mac window darkens the foreground a
+        // quarter, before the swap. Claude Code's selected chips (reverse and
+        // dim) came out grey on light blue, unreadable, where the app shows
+        // dark text on blue. Send the Mac's color instead of the flag.
+        let (fg, intensity) = match attrs.intensity() {
+            Intensity::Half => {
+                let (r, g, b, a) = palette.resolve_fg(attrs.foreground()).to_linear().tuple();
+                let f = HALF_INTENSITY_DIM_FACTOR;
+                let dimmed = LinearRgba(r * f, g * f, b * f, a).to_srgb();
+                (
+                    ColorAttribute::TrueColorWithDefaultFallback(dimmed),
+                    Intensity::Normal,
+                )
+            }
+            other => (attrs.foreground(), other),
+        };
         Self {
-            fg: attrs.foreground(),
+            fg,
             bg: attrs.background(),
-            intensity: attrs.intensity(),
+            intensity,
             underline: attrs.underline(),
             blink: attrs.blink(),
             italic: attrs.italic(),
@@ -1836,22 +1886,32 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
                 return;
             }
             let dims = pane.get_dimensions();
-            let mut result = Ok(());
-            for kind in [MouseEventKind::Press, MouseEventKind::Release] {
-                result = pane.mouse_event(MouseEvent {
-                    kind,
-                    x: x.min(dims.cols.saturating_sub(1)),
-                    y: y.min(dims.viewport_rows.saturating_sub(1)) as i64,
-                    x_pixel_offset: 0,
-                    y_pixel_offset: 0,
-                    button: MouseButton::Left,
-                    modifiers: Modifiers::NONE,
-                });
-                if result.is_err() {
-                    break;
-                }
-            }
-            result
+            let (x, y) = (
+                x.min(dims.cols.saturating_sub(1)),
+                y.min(dims.viewport_rows.saturating_sub(1)) as i64,
+            );
+            let event = move |kind, button| MouseEvent {
+                kind,
+                x,
+                y,
+                x_pixel_offset: 0,
+                y_pixel_offset: 0,
+                button,
+                modifiers: Modifiers::NONE,
+            };
+            // As a hand does in the Mac window: the pointer arrives, presses,
+            // and lets go a moment later. Press and release in one instant,
+            // with no move first, left Claude Code's expandable blocks in a
+            // half-made selection instead of expanding them.
+            pane.mouse_event(event(MouseEventKind::Move, MouseButton::None))
+                .and_then(|()| pane.mouse_event(event(MouseEventKind::Press, MouseButton::Left)))
+                .map(|()| {
+                    let pane = Arc::clone(pane);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(CLICK_HOLD).await;
+                        let _ = pane.mouse_event(event(MouseEventKind::Release, MouseButton::Left));
+                    });
+                })
         }
         WebClientMsg::Scroll { lines } if pane.is_alt_screen_active() => {
             let key = if lines > 0 {
@@ -1979,6 +2039,25 @@ fn encode(msg: &WebServerMsg) -> Option<String> {
     serde_json::to_string(msg).ok()
 }
 
+/// Send the tab list if it changed since `last`. Tab state lives on the GUI
+/// thread; the close-confirmation check reads the Lua config, which only
+/// that thread may touch.
+async fn send_tabs(
+    last: &mut Option<Vec<TabInfo>>,
+    outbox: &mpsc::Sender<String>,
+) -> Result<(), ()> {
+    let tabs = promise::spawn::spawn_into_main_thread(async { collect_tabs() }).await;
+    if last.as_ref() == Some(&tabs) {
+        return Ok(());
+    }
+    let Some(json) = encode(&WebServerMsg::Tabs { tabs: &tabs }) else {
+        return Ok(());
+    };
+    outbox.send(json).await.map_err(|_| ())?;
+    *last = Some(tabs);
+    Ok(())
+}
+
 /// One browser, whatever carries its messages: the local WebSocket or the
 /// relay tunnel. `inbox` yields the page's JSON messages and `outbox` takes
 /// ours; the session ends when either side goes away.
@@ -2015,6 +2094,10 @@ pub(crate) async fn run_session(
     let mut next_render = tokio::time::Instant::now();
     let mut idle = tokio::time::interval(IDLE_REFRESH);
     let mut last_heard = std::time::Instant::now();
+    let mut tab_changes = TABS_CHANGED.subscribe();
+    let mut tabs_due: Option<tokio::time::Instant> = None;
+    // A tab this browser asked for: the tabs it saw before, until it shows.
+    let mut follow_new: Option<(HashSet<usize>, std::time::Instant)> = None;
 
     loop {
         let pane_update = async {
@@ -2170,6 +2253,10 @@ pub(crate) async fn run_session(
                     dirty_frame = true;
                     continue;
                 }
+                if matches!(msg, WebClientMsg::NewTab) {
+                    let seen = last_tabs.iter().flatten().map(|t| t.tab_id).collect();
+                    follow_new = Some((seen, std::time::Instant::now() + Duration::from_secs(5)));
+                }
                 let Some(pane) = attached.and_then(lookup_pane) else { continue };
                 handle_input(&pane, msg, &mut view);
                 dirty_frame = true;
@@ -2204,15 +2291,43 @@ pub(crate) async fn run_session(
                     break;
                 }
                 dirty_frame = attached.is_some();
-                // Tab state lives on the GUI thread; the close-confirmation
-                // check reads the Lua config, which only that thread may touch.
-                let tabs = promise::spawn::spawn_into_main_thread(async { collect_tabs() }).await;
-                if last_tabs.as_ref() != Some(&tabs) {
-                    let Some(json) = encode(&WebServerMsg::Tabs { tabs: &tabs }) else { continue };
-                    if outbox.send(json).await.is_err() {
-                        break;
+                if send_tabs(&mut last_tabs, &outbox).await.is_err() {
+                    break;
+                }
+            }
+            changed = tab_changes.recv() => {
+                let wait = match changed {
+                    Ok(false) => TITLE_REFRESH,
+                    Ok(true) | Err(broadcast::error::RecvError::Lagged(_)) => Duration::ZERO,
+                    Err(broadcast::error::RecvError::Closed) => IDLE_REFRESH,
+                };
+                let due = tokio::time::Instant::now() + wait;
+                tabs_due = Some(tabs_due.map_or(due, |d| d.min(due)));
+            }
+            _ = tokio::time::sleep_until(tabs_due.unwrap_or_else(tokio::time::Instant::now)), if tabs_due.is_some() => {
+                tabs_due = None;
+                if send_tabs(&mut last_tabs, &outbox).await.is_err() {
+                    break;
+                }
+                // The tab this browser opened: view it now and send its first
+                // frame right behind the list, rather than a round trip later
+                // when the page asks for it.
+                if let Some((seen, until)) = &follow_new {
+                    let fresh = last_tabs.iter().flatten().find(|t| !seen.contains(&t.tab_id)).map(|t| t.pane_id);
+                    if let Some(pane_id) = fresh {
+                        follow_new = None;
+                        attached = Some(pane_id);
+                        view.claimed = None;
+                        updates = Some(subscribe(&dirty, pane_id));
+                        view.pinned_top = None;
+                        view.seen_at = None;
+                        mark_seen(pane_id, &mut view);
+                        shown = Shown::default();
+                        dirty_frame = true;
+                        next_render = tokio::time::Instant::now();
+                    } else if std::time::Instant::now() > *until {
+                        follow_new = None;
                     }
-                    last_tabs = Some(tabs);
                 }
             }
             _ = tokio::time::sleep_until(next_render), if dirty_frame && (!flow_control || frames_sent - frames_acked < 4) => {
@@ -2366,7 +2481,10 @@ mod tests {
         };
         let (whole, files) = image_placements(&[line_with((0.0, 0.0), (0.5, 0.5))]);
         assert_eq!(whole.len(), 1);
-        assert_eq!((whole[0].col, whole[0].row, whole[0].cols, whole[0].rows), (3.0, 0.0, 2.0, 2.0));
+        assert_eq!(
+            (whole[0].col, whole[0].row, whole[0].cols, whole[0].rows),
+            (3.0, 0.0, 2.0, 2.0)
+        );
         let (scrolled, _) = image_placements(&[line_with((0.0, 0.5), (0.5, 1.0))]);
         assert_eq!((scrolled[0].col, scrolled[0].row), (3.0, -1.0));
         let (mime, png) = image_file(&files[&whole[0].id]).unwrap();
@@ -2407,8 +2525,31 @@ mod tests {
         attrs.set_intensity(Intensity::Bold);
         attrs.set_reverse(true);
         let mut out = String::new();
-        Sgr::from_attrs(&attrs).write(&mut out);
+        Sgr::from_attrs(&attrs, &ColorPalette::default()).write(&mut out);
         assert_eq!(out, "\x1b[0;1;7;38;5;2;48;2;255;0;127m");
+    }
+
+    /// Dim text as the Mac window draws it: the foreground darkened a quarter
+    /// in linear light, sent as a color, never as xterm's half-opacity dim,
+    /// which after a reverse swap turned Claude Code's chips grey on blue.
+    #[test]
+    fn dim_text_is_sent_as_the_macs_darkened_color() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(
+            1.0, 1.0, 1.0, 1.0,
+        )));
+        attrs.set_intensity(Intensity::Half);
+        attrs.set_reverse(true);
+        let mut out = String::new();
+        Sgr::from_attrs(&attrs, &ColorPalette::default()).write(&mut out);
+        // White at 0.75 linear is 224 in sRGB; no SGR 2, reverse kept.
+        assert_eq!(out, "\x1b[0;7;38;2;224;224;224m");
+        // The default foreground resolves through the pane's palette first.
+        let mut plain = CellAttributes::default();
+        plain.set_intensity(Intensity::Half);
+        let mut out = String::new();
+        Sgr::from_attrs(&plain, &ColorPalette::default()).write(&mut out);
+        assert!(out.starts_with("\x1b[0;38;2;"), "{out}");
     }
 
     #[test]
@@ -2443,7 +2584,7 @@ mod tests {
     #[test]
     fn default_attrs_reset_only() {
         let mut out = String::new();
-        Sgr::from_attrs(&CellAttributes::default()).write(&mut out);
+        Sgr::from_attrs(&CellAttributes::default(), &ColorPalette::default()).write(&mut out);
         assert_eq!(out, "\x1b[0m");
     }
 
