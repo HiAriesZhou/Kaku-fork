@@ -118,6 +118,8 @@ enum RemoteAction {
         /// The id `kaku remote devices` shows
         id: String,
     },
+    /// Turn remote access off; open web sessions end within seconds
+    Off,
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -336,7 +338,17 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
             println!("Removed {id}. Its open sessions end within a few seconds.");
             return Ok(());
         }
+        Some(RemoteAction::Off) => {
+            if !config_tui::set_remote_enabled(false)? {
+                anyhow::bail!("Your kaku.lua sets other remote options; set `enabled = false` in its `config.remote` yourself.");
+            }
+            println!("Remote access is off. Open web sessions end within a few seconds.");
+            return Ok(());
+        }
         None => {}
+    }
+    if !config::configuration().remote.enabled {
+        turn_remote_on()?;
     }
     let identity = if reset {
         kaku_remote::reset_identity()?
@@ -363,6 +375,34 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
         "Open this link in the browser to pair. It works once, for {} minutes.",
         kaku_remote::OFFER_LIFETIME.as_secs() / 60
     );
+    Ok(())
+}
+
+/// Ask before turning remote access on, write it to kaku.lua, and wait for
+/// the running Kaku to pick it up from its config reload.
+#[cfg(feature = "remote")]
+fn turn_remote_on() -> anyhow::Result<()> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("Remote access is off. Run `kaku remote` in a terminal to turn it on.");
+    }
+    println!("Remote access lets a browser on another device use this Mac's terminals, through Kaku's relay.");
+    print!("Turn it on? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
+        anyhow::bail!("Remote access stays off.");
+    }
+    if !config_tui::set_remote_enabled(true)? {
+        anyhow::bail!("Your kaku.lua sets other remote options; set `enabled = true` in its `config.remote` yourself.");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while kaku_remote::read_state().is_err() {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("Remote access is on. Open Kaku, then run `kaku remote` again.");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     Ok(())
 }
 
@@ -507,6 +547,8 @@ fn run() -> anyhow::Result<()> {
                 println!("Saved. Kaku uses it from its next connection to the relay.");
                 return Ok(());
             }
+            // Read the user's config: whether remote access is on, and where.
+            init_config(&opts)?;
             run_remote(reset, action)
         }
         SubCommand::SetCwd(cmd) => cmd.run(),

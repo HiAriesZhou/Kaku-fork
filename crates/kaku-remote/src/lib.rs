@@ -360,15 +360,84 @@ const DEFAULT_RELAY: &str = "wss://r.kaku.fun";
 /// the relay, which only forwards ciphertext and redirects old links here.
 const DEFAULT_PAGE: &str = "https://t.kaku.fun";
 
+/// Whether the bridge is serving; it follows `remote.enabled` on reload.
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WEB_DIRTY: std::sync::OnceLock<web::WebDirty> = std::sync::OnceLock::new();
+
+/// Called once at GUI startup. Remote access stays off until the user turns
+/// it on (`kaku remote` writes `remote.enabled`); the bridge then starts on
+/// that config reload, and stops, ending every web session, when it is
+/// turned off again.
 pub fn start() {
     // install_default() returns Err if a provider is already installed; that is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cfg = configuration();
-    if !cfg.remote.enabled {
+    WEB_DIRTY.get_or_init(|| {
+        let web_dirty: web::WebDirty = Arc::new(Mutex::new(HashMap::new()));
+        let web_dirty_for_sub = web_dirty.clone();
+        if let Some(mux) = Mux::try_get() {
+            mux.subscribe(move |notification| {
+                match notification {
+                    MuxNotification::PaneOutput(pane_id) => {
+                        web::notify_output(&web_dirty_for_sub, (*pane_id).into());
+                    }
+                    MuxNotification::AssignClipboard {
+                        pane_id,
+                        clipboard: Some(text),
+                        ..
+                    } => {
+                        web::publish_clipboard((*pane_id).into(), text.clone());
+                    }
+                    MuxNotification::Alert {
+                        pane_id,
+                        alert: wezterm_term::Alert::ToastNotification { title, body, .. },
+                    } => {
+                        web::publish_notification((*pane_id).into(), title.as_deref(), body);
+                    }
+                    MuxNotification::PaneRemoved(pane_id) => {
+                        web::pane_removed(&web_dirty_for_sub, (*pane_id).into());
+                    }
+                    _ => {}
+                }
+                true
+            });
+        }
+        web_dirty
+    });
+
+    // Kept for the life of the process.
+    std::mem::forget(config::subscribe_to_config_reload(|| {
+        follow_config();
+        true
+    }));
+    follow_config();
+}
+
+/// Start the bridge if remote access is on and it is not running.
+fn follow_config() {
+    use std::sync::atomic::Ordering;
+    if !configuration().remote.enabled {
+        if !RUNNING.load(Ordering::SeqCst) {
+            // A state file left by an earlier run would tell `kaku remote`
+            // that sharing is on.
+            let _ = std::fs::remove_file(state_path());
+        }
         return;
     }
+    if !RUNNING.swap(true, Ordering::SeqCst) {
+        launch();
+    }
+}
 
+/// Resolves once remote access is turned off.
+async fn turned_off() {
+    while configuration().remote.enabled {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+fn launch() {
+    let cfg = configuration();
     let port = cfg.remote.port;
     let tunnel = cfg.remote.tunnel;
     let tunnel_url = match cfg.remote.tunnel_url.trim() {
@@ -376,39 +445,9 @@ pub fn start() {
         url => url.to_string(),
     };
     let token = get_or_init_token();
+    let web_dirty = WEB_DIRTY.get().expect("start() sets it").clone();
 
     log::info!("kaku-remote: starting on 127.0.0.1:{}", port);
-
-    let web_dirty: web::WebDirty = Arc::new(Mutex::new(HashMap::new()));
-    let web_dirty_for_sub = web_dirty.clone();
-
-    if let Some(mux) = Mux::try_get() {
-        mux.subscribe(move |notification| {
-            match notification {
-                MuxNotification::PaneOutput(pane_id) => {
-                    web::notify_output(&web_dirty_for_sub, (*pane_id).into());
-                }
-                MuxNotification::AssignClipboard {
-                    pane_id,
-                    clipboard: Some(text),
-                    ..
-                } => {
-                    web::publish_clipboard((*pane_id).into(), text.clone());
-                }
-                MuxNotification::Alert {
-                    pane_id,
-                    alert: wezterm_term::Alert::ToastNotification { title, body, .. },
-                } => {
-                    web::publish_notification((*pane_id).into(), title.as_deref(), body);
-                }
-                MuxNotification::PaneRemoved(pane_id) => {
-                    web::pane_removed(&web_dirty_for_sub, (*pane_id).into());
-                }
-                _ => {}
-            }
-            true
-        });
-    }
 
     let tunnel_relay_opt: Option<String> = if tunnel { Some(tunnel_url) } else { None };
     std::thread::Builder::new()
@@ -420,48 +459,71 @@ pub fn start() {
                 .build()
                 .expect("kaku-remote tokio runtime");
 
+            let relay_for_status = tunnel_relay_opt.clone();
             rt.block_on(async move {
-                if let Some(relay_url) = tunnel_relay_opt.clone() {
-                    tokio::spawn(share::run(relay_url, web_dirty.clone()));
-                }
-
-                let app = Router::new()
-                    .route("/", get(web::route_index))
-                    .route("/assets/{name}", get(web::route_asset))
-                    .route("/web/ws", get(web::route_ws))
-                    .with_state(web_dirty)
-                    .layer(axum::middleware::from_fn_with_state(port, require_own_host));
-
-                // The relay link does not depend on the local listener, so a
-                // busy port must not take it down with this task.
-                let addr = SocketAddr::from(([127, 0, 0, 1], port));
-
-                log::info!("kaku-remote: listening on http://{}", addr);
-                write_state(port, token, tunnel_relay_opt.as_deref());
-
-                // Keystrokes and frames are small writes; Nagle would hold one
-                // back until the previous is acknowledged, as the relay
-                // already avoids on its own sockets.
-                let listener = match tokio::net::TcpListener::bind(addr).await {
-                    Ok(l) => l.tap_io(|tcp| {
-                        let _ = tcp.set_nodelay(true);
-                    }),
-                    Err(e) => {
-                        log::error!("kaku-remote: failed to bind {addr}: {e}");
-                        return std::future::pending().await;
-                    }
-                };
-                if let Err(e) = axum::serve(
-                    listener,
-                    app.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                {
-                    log::error!("kaku-remote: server error: {e}");
+                tokio::select! {
+                    _ = serve_all(port, token, tunnel_relay_opt, web_dirty) => {}
+                    _ = turned_off() => log::info!("kaku-remote: remote access turned off"),
                 }
             });
+            // Dropping the runtime ends the relay link and every session.
+            drop(rt);
+            let _ = std::fs::remove_file(state_path());
+            if let Some(relay) = relay_for_status {
+                record_relay_status(&relay, false, Some("remote access is off".into()));
+            }
+            RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            // Turned back on while this one was stopping.
+            follow_config();
         })
         .expect("spawn kaku-remote thread");
+}
+
+async fn serve_all(
+    port: u16,
+    token: &'static str,
+    tunnel_relay_opt: Option<String>,
+    web_dirty: web::WebDirty,
+) {
+    if let Some(relay_url) = tunnel_relay_opt.clone() {
+        tokio::spawn(share::run(relay_url, web_dirty.clone()));
+    }
+
+    let app = Router::new()
+        .route("/", get(web::route_index))
+        .route("/assets/{name}", get(web::route_asset))
+        .route("/web/ws", get(web::route_ws))
+        .with_state(web_dirty)
+        .layer(axum::middleware::from_fn_with_state(port, require_own_host));
+
+    // The relay link does not depend on the local listener, so a busy port
+    // must not take it down with this task.
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+    log::info!("kaku-remote: listening on http://{}", addr);
+    write_state(port, token, tunnel_relay_opt.as_deref());
+
+    // Keystrokes and frames are small writes; Nagle would hold one back
+    // until the previous is acknowledged, as the relay already avoids on its
+    // own sockets.
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l.tap_io(|tcp| {
+            let _ = tcp.set_nodelay(true);
+        }),
+        Err(e) => {
+            log::error!("kaku-remote: failed to bind {addr}: {e}");
+            return std::future::pending().await;
+        }
+    };
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    {
+        log::error!("kaku-remote: server error: {e}");
+    }
+    std::future::pending().await
 }
 
 #[cfg(test)]
