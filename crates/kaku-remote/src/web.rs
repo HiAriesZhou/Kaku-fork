@@ -21,10 +21,11 @@ use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
-use termwiz::color::ColorAttribute;
+use termwiz::color::{ColorAttribute, LinearRgba};
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 use tokio::sync::{broadcast, mpsc};
+use wezterm_term::color::ColorPalette;
 use wezterm_term::image::{ImageData, ImageDataType};
 use wezterm_term::{MouseButton, MouseEvent, MouseEventKind, TerminalSize};
 
@@ -1383,12 +1384,13 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
 
     let (_, lines) = pane.get_lines(top..top + rows as isize);
 
+    let palette = pane.palette();
     let mut rendered = Vec::with_capacity(rows);
     for row in 0..rows {
         let mut out = String::with_capacity(dims.cols + 16);
         let _ = write!(out, "\x1b[{};1H", row + 1);
         if let Some(line) = lines.get(row) {
-            render_cells(line, dims.cols, &mut out);
+            render_cells(line, dims.cols, &palette, &mut out);
         }
         // Clear the rest of the row with the default background.
         out.push_str("\x1b[0m\x1b[K");
@@ -1427,14 +1429,14 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
 }
 
 /// One row's cells as SGR runs, at most `cols` wide.
-fn render_cells(line: &Line, cols: usize, out: &mut String) {
+fn render_cells(line: &Line, cols: usize, palette: &ColorPalette, out: &mut String) {
     let mut current: Option<Sgr> = None;
     let mut col = 0;
     for cell in line.visible_cells() {
         if col >= cols {
             break;
         }
-        let sgr = Sgr::from_attrs(cell.attrs());
+        let sgr = Sgr::from_attrs(cell.attrs(), palette);
         if current.as_ref() != Some(&sgr) {
             sgr.write(out);
             current = Some(sgr);
@@ -1466,11 +1468,12 @@ fn history_rows(pane: &Arc<dyn Pane>, end: Option<isize>) -> (isize, isize, Vec<
     let end = end.unwrap_or(bottom).clamp(dims.scrollback_top, bottom);
     let top = (end - HISTORY_PAGE).max(dims.scrollback_top);
     let (_, lines) = pane.get_lines(top..end);
+    let palette = pane.palette();
     let rows = lines
         .iter()
         .map(|line| {
             let mut out = String::new();
-            render_cells(line, dims.cols, &mut out);
+            render_cells(line, dims.cols, &palette, &mut out);
             out
         })
         .collect();
@@ -1677,12 +1680,33 @@ struct Sgr {
     invisible: bool,
 }
 
+/// What the Mac window does to dim (half intensity) text: its color times
+/// 0.75 in linear light (`HALF_INTENSITY_DIM_FACTOR` in kaku-gui).
+const HALF_INTENSITY_DIM_FACTOR: f32 = 0.75;
+
 impl Sgr {
-    fn from_attrs(attrs: &CellAttributes) -> Self {
+    fn from_attrs(attrs: &CellAttributes, palette: &ColorPalette) -> Self {
+        // xterm.js draws dim text at half opacity over the background, after
+        // swapping for reverse video; the Mac window darkens the foreground a
+        // quarter, before the swap. Claude Code's selected chips (reverse and
+        // dim) came out grey on light blue, unreadable, where the app shows
+        // dark text on blue. Send the Mac's color instead of the flag.
+        let (fg, intensity) = match attrs.intensity() {
+            Intensity::Half => {
+                let (r, g, b, a) = palette.resolve_fg(attrs.foreground()).to_linear().tuple();
+                let f = HALF_INTENSITY_DIM_FACTOR;
+                let dimmed = LinearRgba(r * f, g * f, b * f, a).to_srgb();
+                (
+                    ColorAttribute::TrueColorWithDefaultFallback(dimmed),
+                    Intensity::Normal,
+                )
+            }
+            other => (attrs.foreground(), other),
+        };
         Self {
-            fg: attrs.foreground(),
+            fg,
             bg: attrs.background(),
-            intensity: attrs.intensity(),
+            intensity,
             underline: attrs.underline(),
             blink: attrs.blink(),
             italic: attrs.italic(),
@@ -2501,8 +2525,31 @@ mod tests {
         attrs.set_intensity(Intensity::Bold);
         attrs.set_reverse(true);
         let mut out = String::new();
-        Sgr::from_attrs(&attrs).write(&mut out);
+        Sgr::from_attrs(&attrs, &ColorPalette::default()).write(&mut out);
         assert_eq!(out, "\x1b[0;1;7;38;5;2;48;2;255;0;127m");
+    }
+
+    /// Dim text as the Mac window draws it: the foreground darkened a quarter
+    /// in linear light, sent as a color, never as xterm's half-opacity dim,
+    /// which after a reverse swap turned Claude Code's chips grey on blue.
+    #[test]
+    fn dim_text_is_sent_as_the_macs_darkened_color() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(
+            1.0, 1.0, 1.0, 1.0,
+        )));
+        attrs.set_intensity(Intensity::Half);
+        attrs.set_reverse(true);
+        let mut out = String::new();
+        Sgr::from_attrs(&attrs, &ColorPalette::default()).write(&mut out);
+        // White at 0.75 linear is 224 in sRGB; no SGR 2, reverse kept.
+        assert_eq!(out, "\x1b[0;7;38;2;224;224;224m");
+        // The default foreground resolves through the pane's palette first.
+        let mut plain = CellAttributes::default();
+        plain.set_intensity(Intensity::Half);
+        let mut out = String::new();
+        Sgr::from_attrs(&plain, &ColorPalette::default()).write(&mut out);
+        assert!(out.starts_with("\x1b[0;38;2;"), "{out}");
     }
 
     #[test]
@@ -2537,7 +2584,7 @@ mod tests {
     #[test]
     fn default_attrs_reset_only() {
         let mut out = String::new();
-        Sgr::from_attrs(&CellAttributes::default()).write(&mut out);
+        Sgr::from_attrs(&CellAttributes::default(), &ColorPalette::default()).write(&mut out);
         assert_eq!(out, "\x1b[0m");
     }
 
