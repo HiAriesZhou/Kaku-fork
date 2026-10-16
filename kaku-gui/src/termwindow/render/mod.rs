@@ -108,23 +108,96 @@ pub struct LineToEleShapeCacheKey {
 }
 
 pub(crate) fn forces_opaque_kaku_tui_background(pane: &Arc<dyn Pane>) -> bool {
-    let Some(info) = pane.get_foreground_process_info(mux::pane::CachePolicy::AllowStale) else {
-        return false;
-    };
+    kaku_tui_background_for_process(
+        pane.get_foreground_process_name(mux::pane::CachePolicy::AllowStale)
+            .as_deref(),
+        || {
+            let Some(info) = pane.get_foreground_process_info(mux::pane::CachePolicy::AllowStale)
+            else {
+                return false;
+            };
 
-    let executable = info
-        .executable
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned());
-    if executable.as_deref() != Some("kaku") {
-        return false;
+            let executable = info
+                .executable
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            if executable.as_deref() != Some("kaku") {
+                return false;
+            }
+
+            info.argv
+                .iter()
+                .skip(1)
+                .map(String::as_str)
+                .any(|arg| matches!(arg, "ai" | "config"))
+        },
+    )
+}
+
+fn kaku_tui_background_for_process(
+    process_name: Option<&str>,
+    check_process_args: impl FnOnce() -> bool,
+) -> bool {
+    // The cached leader path avoids a system-wide process scan on ordinary paints.
+    let is_kaku = process_name
+        .and_then(|path| std::path::Path::new(path).file_name())
+        .is_some_and(|name| name == "kaku");
+    is_kaku && check_process_args()
+}
+
+#[cfg(test)]
+mod kaku_tui_process_tests {
+    use super::kaku_tui_background_for_process;
+
+    #[test]
+    fn other_foreground_processes_never_fetch_process_tree() {
+        for name in [
+            None,
+            Some("/bin/zsh"),
+            Some("/bin/bash"),
+            Some("/usr/bin/tmux"),
+            Some("/opt/bin/claude"),
+            Some("/opt/bin/codex"),
+            Some("/opt/bin/opencode"),
+            Some("/opt/bin/kaku-gui"),
+            Some("/opt/bin/not-kaku"),
+        ] {
+            assert!(!kaku_tui_background_for_process(name, || panic!(
+                "unexpected process tree lookup for {:?}",
+                name
+            )));
+        }
     }
 
-    info.argv
-        .iter()
-        .skip(1)
-        .map(String::as_str)
-        .any(|arg| matches!(arg, "ai" | "config"))
+    #[test]
+    fn kaku_still_requires_process_argument_confirmation() {
+        for name in ["kaku", "/Applications/Kaku.app/Contents/MacOS/kaku"] {
+            assert!(kaku_tui_background_for_process(Some(name), || true));
+            assert!(!kaku_tui_background_for_process(Some(name), || false));
+        }
+    }
+
+    #[test]
+    fn entering_and_leaving_kaku_does_not_latch_opaque_background() {
+        let lookups = std::cell::Cell::new(0);
+        for (name, args_match, expected) in [
+            ("/bin/zsh", false, false),
+            ("/opt/bin/kaku", true, true),
+            // The leader path can be stale after exit; argv must still confirm.
+            ("/opt/bin/kaku", false, false),
+            ("/bin/zsh", false, false),
+            ("/opt/bin/kaku", true, true),
+        ] {
+            assert_eq!(
+                kaku_tui_background_for_process(Some(name), || {
+                    lookups.set(lookups.get() + 1);
+                    args_match
+                }),
+                expected
+            );
+        }
+        assert_eq!(lookups.get(), 3);
+    }
 }
 
 pub(crate) fn forces_opaque_kaku_tui_window_background(panes: &[PositionedPane]) -> bool {
