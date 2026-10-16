@@ -336,7 +336,7 @@ test('Cmd+clicking a Mac path downloads the file in acknowledged chunks', async 
   assert.deepEqual(errors, []);
 });
 
-test('local LAN token stays tab-only', async t => {
+test('local token stays tab-only', async t => {
   const { p } = await page(t);
   assert.equal(await p.evaluate(() => localStorage.getItem('kaku.link:/')), null);
   assert.ok(await p.evaluate(() => sessionStorage.getItem('kaku.link:/')));

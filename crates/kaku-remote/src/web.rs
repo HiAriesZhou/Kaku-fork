@@ -10,6 +10,7 @@ use crate::{check_token, WsQuery};
 use axum::extract::{ws, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use mux::pane::{CloseReason, Pane, PaneId};
 use mux::Mux;
@@ -24,7 +25,6 @@ use termwiz::color::ColorAttribute;
 use termwiz::input::{KeyCode, Modifiers};
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 use tokio::sync::{broadcast, mpsc};
-use base64::Engine as _;
 use wezterm_term::image::{ImageData, ImageDataType};
 use wezterm_term::{MouseButton, MouseEvent, MouseEventKind, TerminalSize};
 
@@ -1281,7 +1281,9 @@ fn image_placements(lines: &[Line]) -> (Vec<ImagePlacement>, HashMap<String, Arc
     let round = |v: f32| (v * 1000.0).round() / 1000.0;
     for (row, line) in lines.iter().enumerate() {
         for cell in line.visible_cells() {
-            let Some(images) = cell.attrs().images() else { continue };
+            let Some(images) = cell.attrs().images() else {
+                continue;
+            };
             for image in images {
                 let (tl, br) = (image.top_left(), image.bottom_right());
                 let du = *br.x - *tl.x;
@@ -1336,8 +1338,18 @@ fn image_file(image: &ImageData) -> Option<(&'static str, Vec<u8>)> {
     let file = match &*image.data() {
         ImageDataType::EncodedFile(bytes) => sniff(bytes.clone()),
         ImageDataType::EncodedLease(lease) => sniff(lease.get_data().ok()?),
-        ImageDataType::Rgba8 { data, width, height, .. } => png(*width, *height, data),
-        ImageDataType::AnimRgba8 { width, height, frames, .. } => png(*width, *height, frames.first()?),
+        ImageDataType::Rgba8 {
+            data,
+            width,
+            height,
+            ..
+        } => png(*width, *height, data),
+        ImageDataType::AnimRgba8 {
+            width,
+            height,
+            frames,
+            ..
+        } => png(*width, *height, frames.first()?),
     }?;
     (file.1.len() <= MAX_IMAGE_BYTES).then_some(file)
 }
@@ -2366,7 +2378,10 @@ mod tests {
         };
         let (whole, files) = image_placements(&[line_with((0.0, 0.0), (0.5, 0.5))]);
         assert_eq!(whole.len(), 1);
-        assert_eq!((whole[0].col, whole[0].row, whole[0].cols, whole[0].rows), (3.0, 0.0, 2.0, 2.0));
+        assert_eq!(
+            (whole[0].col, whole[0].row, whole[0].cols, whole[0].rows),
+            (3.0, 0.0, 2.0, 2.0)
+        );
         let (scrolled, _) = image_placements(&[line_with((0.0, 0.5), (0.5, 1.0))]);
         assert_eq!((scrolled[0].col, scrolled[0].row), (3.0, -1.0));
         let (mime, png) = image_file(&files[&whole[0].id]).unwrap();

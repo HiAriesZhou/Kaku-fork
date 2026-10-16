@@ -1076,8 +1076,8 @@ pub struct RemoteConfig {
     #[dynamic(default = "default_remote_port")]
     pub port: u16,
 
-    /// The address to bind. Use "0.0.0.0" for all interfaces (LAN access)
-    /// or "127.0.0.1" for local-only.
+    /// Deprecated and ignored: the local page listens on 127.0.0.1 only.
+    /// Kept so configs that still set it load.
     #[dynamic(default = "default_remote_bind")]
     pub bind: String,
 

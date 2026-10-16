@@ -207,13 +207,13 @@
 <script>
 (async () => {
   const params = new URLSearchParams(location.hash.slice(1));
-  // #t=<token>: this Mac or the LAN, plain WebSocket to Kaku.
+  // #t=<token>: a page on this Mac, plain WebSocket to Kaku on loopback.
   // Through the relay a browser is paired: #p=<one-time secret>&m=<the Mac's
   // public key> from `kaku remote` pairs it once, and the browser keeps its
   // own signing key, which it cannot export, in IndexedDB. Fragments are
   // never sent to servers, and are erased from the address at once.
   const supplied = params.has("t") || params.has("p") || params.has("k");
-  // A LAN token lives in this tab only (it changes with every Kaku launch),
+  // A local token lives in this tab only (it changes with every Kaku launch),
   // so a reload finds it there. Relay links from before pairing kept a key
   // in the same slot; it no longer opens anything, so it is dropped.
   const LINK_SLOT = "kaku.link:" + location.pathname;
