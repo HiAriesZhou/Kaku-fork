@@ -50,6 +50,7 @@ The AI config TUI lives in the `kaku` CLI crate and shares terminal UI primitive
 - The current `config_version` is whatever `assets/shell-integration/config_version.txt` says; never trust a number written in a doc. Any version bump must update bundled config, release checks, docs, and migration expectations together, and add a row to `docs/config-versions.md`.
 - New config fields are user-facing behavior. Keep them out of pure cleanup/refactor patches unless the maintainer explicitly approved the product change, and update bundled defaults plus documentation in the same change when they do land.
 - Keep alternate-screen wheel scroll behavior configurable; terminal and GUI defaults must not diverge.
+- Config rewrite guards must validate every assignment the writer can replace, using the same match predicate. A later Lua override can contain user-owned settings even when the first assignment contains only a managed flag; `remote_access_checks_every_assignment_before_rewriting` covers this boundary in `kaku/src/config_tui/mod.rs`.
 
 ## Bundled kaku.lua Pitfalls
 
