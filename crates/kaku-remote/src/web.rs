@@ -2060,6 +2060,8 @@ pub(crate) async fn run_session(
     let mut last_heard = std::time::Instant::now();
     let mut tab_changes = TABS_CHANGED.subscribe();
     let mut tabs_due: Option<tokio::time::Instant> = None;
+    // A tab this browser asked for: the tabs it saw before, until it shows.
+    let mut follow_new: Option<(HashSet<usize>, std::time::Instant)> = None;
 
     loop {
         let pane_update = async {
@@ -2215,6 +2217,10 @@ pub(crate) async fn run_session(
                     dirty_frame = true;
                     continue;
                 }
+                if matches!(msg, WebClientMsg::NewTab) {
+                    let seen = last_tabs.iter().flatten().map(|t| t.tab_id).collect();
+                    follow_new = Some((seen, std::time::Instant::now() + Duration::from_secs(5)));
+                }
                 let Some(pane) = attached.and_then(lookup_pane) else { continue };
                 handle_input(&pane, msg, &mut view);
                 dirty_frame = true;
@@ -2266,6 +2272,26 @@ pub(crate) async fn run_session(
                 tabs_due = None;
                 if send_tabs(&mut last_tabs, &outbox).await.is_err() {
                     break;
+                }
+                // The tab this browser opened: view it now and send its first
+                // frame right behind the list, rather than a round trip later
+                // when the page asks for it.
+                if let Some((seen, until)) = &follow_new {
+                    let fresh = last_tabs.iter().flatten().find(|t| !seen.contains(&t.tab_id)).map(|t| t.pane_id);
+                    if let Some(pane_id) = fresh {
+                        follow_new = None;
+                        attached = Some(pane_id);
+                        view.claimed = None;
+                        updates = Some(subscribe(&dirty, pane_id));
+                        view.pinned_top = None;
+                        view.seen_at = None;
+                        mark_seen(pane_id, &mut view);
+                        shown = Shown::default();
+                        dirty_frame = true;
+                        next_render = tokio::time::Instant::now();
+                    } else if std::time::Instant::now() > *until {
+                        follow_new = None;
+                    }
                 }
             }
             _ = tokio::time::sleep_until(next_render), if dirty_frame && (!flow_control || frames_sent - frames_acked < 4) => {
