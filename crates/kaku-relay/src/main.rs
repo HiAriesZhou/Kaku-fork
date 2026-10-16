@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tracing::info;
 
@@ -32,6 +32,14 @@ const MAX_BROWSERS_PER_ADDR: usize = 4;
 /// Registrations kept per id: the serving one and one standby (a second
 /// Kaku on the same Mac). A newer one pushes the oldest out.
 const MAX_REGISTRATIONS_PER_ID: usize = 2;
+/// Macs one address may keep registered at once; an office NAT can hold a
+/// few dozen Kaku users.
+const MAX_HOSTS_PER_ADDR: usize = 32;
+/// New relay sockets (Macs and browsers) one address may open per minute.
+const CONNECTS_PER_MINUTE: u32 = 120;
+/// Wrong access codes one address may try before it waits out the window.
+const ACCESS_FAILURES: u32 = 10;
+const ACCESS_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// A Mac sends frames of a whole screen; a page sends keys, pastes capped at
 /// 64 KB and 64 KB upload chunks.
 const MAX_HOST_MESSAGE: usize = 4 << 20;
@@ -161,6 +169,8 @@ struct Host {
     evicted: tokio::sync::Notify,
     browsers: Mutex<HashMap<u32, BrowserLink>>,
     next_id: AtomicU32,
+    /// The client address it registered from (`MAX_HOSTS_PER_ADDR`).
+    addr: String,
 }
 
 fn message_len(msg: &ws::Message) -> usize {
@@ -213,6 +223,9 @@ struct AppState {
     /// and whether a Mac without a valid one is turned away. Unset, every
     /// Mac registers as before.
     tokens: Option<Arc<TokenPolicy>>,
+    /// The access code a Mac must present to register; unset, none is asked.
+    access: Option<Arc<AccessCode>>,
+    limits: Arc<Mutex<AddrLimits>>,
     /// Bytes queued toward every socket (`GLOBAL_QUEUE_BYTES`).
     queued_bytes: Arc<AtomicUsize>,
 }
@@ -366,6 +379,99 @@ impl TokenPolicy {
     }
 }
 
+/// The access code Macs present to register (`KAKU_RELAY_ACCESS_CODE`, a
+/// fly secret), kept as its SHA-256 and compared in constant time.
+struct AccessCode {
+    digest: Vec<u8>,
+}
+
+impl AccessCode {
+    fn new(code: &str) -> Self {
+        Self {
+            digest: ring::digest::digest(&ring::digest::SHA256, code.trim().as_bytes())
+                .as_ref()
+                .to_vec(),
+        }
+    }
+
+    fn from_env() -> Option<Self> {
+        let code = std::env::var("KAKU_RELAY_ACCESS_CODE").ok()?;
+        (!code.trim().is_empty()).then(|| Self::new(&code))
+    }
+
+    fn admits(&self, presented: &str) -> bool {
+        let digest = ring::digest::digest(&ring::digest::SHA256, presented.trim().as_bytes());
+        digest
+            .as_ref()
+            .iter()
+            .zip(&self.digest)
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+    }
+}
+
+/// Per-address budgets: new sockets per minute, and wrong access codes per
+/// `ACCESS_WINDOW`. Local runs have no client address (`-`) and are not
+/// limited, so tests can open as many sockets as they need.
+#[derive(Default)]
+struct AddrLimits {
+    connects: HashMap<String, (Instant, u32)>,
+    failures: HashMap<String, (Instant, u32)>,
+}
+
+impl AddrLimits {
+    fn count(
+        map: &mut HashMap<String, (Instant, u32)>,
+        addr: &str,
+        window: Duration,
+        now: Instant,
+    ) -> u32 {
+        if map.len() > 10_000 {
+            map.retain(|_, (start, _)| now.duration_since(*start) < window);
+        }
+        let entry = map.entry(addr.to_string()).or_insert((now, 0));
+        if now.duration_since(entry.0) >= window {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        entry.1
+    }
+
+    fn allow_connect(&mut self, addr: &str, now: Instant) -> bool {
+        addr == "-"
+            || Self::count(&mut self.connects, addr, Duration::from_secs(60), now)
+                <= CONNECTS_PER_MINUTE
+    }
+
+    fn access_locked(&self, addr: &str, now: Instant) -> bool {
+        addr != "-"
+            && self.failures.get(addr).is_some_and(|(start, n)| {
+                now.duration_since(*start) < ACCESS_WINDOW && *n >= ACCESS_FAILURES
+            })
+    }
+
+    fn note_access_failure(&mut self, addr: &str, now: Instant) {
+        if addr != "-" {
+            Self::count(&mut self.failures, addr, ACCESS_WINDOW, now);
+        }
+    }
+}
+
+/// Fly puts the real client address in `fly-client-ip`; without it (local
+/// runs) every client shares the `-` bucket.
+fn client_addr(headers: &HeaderMap) -> String {
+    headers
+        .get("fly-client-ip")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string()
+}
+
+/// A refusal the Mac shows its user: the status and why, as plain text.
+fn refuse(status: StatusCode, why: &'static str) -> Response {
+    (status, why).into_response()
+}
+
 async fn host_ws(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -379,6 +485,25 @@ async fn host_ws(
     if !valid_id(&id) || !owns(&id, secret) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let addr = client_addr(&headers);
+    let now = Instant::now();
+    if !state.limits.lock().allow_connect(&addr, now) {
+        return refuse(StatusCode::TOO_MANY_REQUESTS, "too many connections");
+    }
+    if let Some(access) = &state.access {
+        if state.limits.lock().access_locked(&addr, now) {
+            return refuse(StatusCode::TOO_MANY_REQUESTS, "too many wrong access codes");
+        }
+        match headers.get("x-kaku-access").and_then(|v| v.to_str().ok()) {
+            None => return refuse(StatusCode::UNAUTHORIZED, "access code required"),
+            Some(code) if !access.admits(code) => {
+                state.limits.lock().note_access_failure(&addr, now);
+                info!(host = short(&id), "wrong access code");
+                return refuse(StatusCode::UNAUTHORIZED, "wrong access code");
+            }
+            Some(_) => {}
+        }
+    }
     if let Some(policy) = &state.tokens {
         let presented = headers.get("x-kaku-token").and_then(|v| v.to_str().ok());
         let now = std::time::SystemTime::now()
@@ -386,18 +511,37 @@ async fn host_ws(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if !policy.admits(&id, presented, now) {
-            return StatusCode::UNAUTHORIZED.into_response();
+            return refuse(StatusCode::UNAUTHORIZED, "registration token refused");
         }
     }
-    if state.hosts.lock().len() >= MAX_HOSTS && state.host(&id).is_none() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    {
+        let hosts = state.hosts.lock();
+        if hosts.len() >= MAX_HOSTS && !hosts.contains_key(&id) {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        let from_addr = hosts
+            .iter()
+            .filter(|(other, all)| *other != &id && all.iter().any(|h| h.addr == addr))
+            .count();
+        if addr != "-" && from_addr >= MAX_HOSTS_PER_ADDR {
+            return refuse(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many Macs from this address",
+            );
+        }
     }
     upgrade
         .max_message_size(MAX_HOST_MESSAGE)
-        .on_upgrade(move |socket| serve_host(socket, id, edge(&headers), state))
+        .on_upgrade(move |socket| serve_host(socket, id, edge(&headers), addr, state))
 }
 
-async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppState) {
+async fn serve_host(
+    socket: ws::WebSocket,
+    id: String,
+    edge: String,
+    addr: String,
+    state: AppState,
+) {
     let (mut sink, mut stream) = socket.split();
     let (to_host, mut outgoing) = mpsc::channel::<ws::Message>(QUEUE);
     let host = Arc::new(Host {
@@ -407,6 +551,7 @@ async fn serve_host(socket: ws::WebSocket, id: String, edge: String, state: AppS
         evicted: tokio::sync::Notify::new(),
         browsers: Mutex::new(HashMap::new()),
         next_id: AtomicU32::new(1),
+        addr,
     });
     // The newest registration serves; the previous one stays connected as a
     // standby, and its browsers reconnect to this one.
@@ -579,16 +724,13 @@ async fn browser_ws(
     headers: HeaderMap,
     upgrade: ws::WebSocketUpgrade,
 ) -> Response {
+    let addr = client_addr(&headers);
+    if !state.limits.lock().allow_connect(&addr, Instant::now()) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
     let Some(host) = state.host(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // Fly puts the real client address here; without it (local runs) every
-    // browser shares one bucket.
-    let addr = headers
-        .get("fly-client-ip")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
     upgrade
         .max_message_size(MAX_BROWSER_MESSAGE)
         .on_upgrade(move |socket| async move {
@@ -781,8 +923,13 @@ async fn main() {
             "registration tokens are checked"
         );
     }
+    let access = AccessCode::from_env().map(Arc::new);
+    if access.is_some() {
+        info!("Macs need the access code to register");
+    }
     let state = AppState {
         tokens,
+        access,
         ..AppState::default()
     };
     if let Err(e) = axum::serve(listener, app(state)).await {
@@ -856,6 +1003,7 @@ mod tests {
             evicted: tokio::sync::Notify::new(),
             browsers: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
+            addr: "-".into(),
         })
     }
 
@@ -1012,6 +1160,41 @@ mod tests {
         assert!(!policy.admits("id", None, 50));
         assert!(!policy.admits("id", Some(&valid), 150));
         assert!(!policy.admits("id", Some("bad"), 50));
+    }
+
+    #[test]
+    fn the_access_code_matches_whole_and_trimmed() {
+        let code = AccessCode::new("open sesame");
+        assert!(code.admits("open sesame"));
+        assert!(code.admits(" open sesame\n"));
+        assert!(!code.admits("open sesam"));
+        assert!(!code.admits("open sesame2"));
+        assert!(!code.admits(""));
+    }
+
+    #[test]
+    fn an_address_is_held_to_its_budgets_and_freed_after_the_window() {
+        let mut limits = AddrLimits::default();
+        let start = Instant::now();
+        for _ in 0..CONNECTS_PER_MINUTE {
+            assert!(limits.allow_connect("1.2.3.4", start));
+        }
+        assert!(!limits.allow_connect("1.2.3.4", start));
+        // Another address and local runs are not affected.
+        assert!(limits.allow_connect("5.6.7.8", start));
+        for _ in 0..1000 {
+            assert!(limits.allow_connect("-", start));
+        }
+        assert!(limits.allow_connect("1.2.3.4", start + Duration::from_secs(61)));
+
+        for _ in 0..ACCESS_FAILURES - 1 {
+            limits.note_access_failure("1.2.3.4", start);
+        }
+        assert!(!limits.access_locked("1.2.3.4", start));
+        limits.note_access_failure("1.2.3.4", start);
+        assert!(limits.access_locked("1.2.3.4", start));
+        assert!(!limits.access_locked("5.6.7.8", start));
+        assert!(!limits.access_locked("1.2.3.4", start + ACCESS_WINDOW));
     }
 
     #[test]

@@ -344,6 +344,9 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
         kaku_remote::load_or_create_identity()?
     };
     let state = kaku_remote::read_state()?;
+    if state.tunnel_relay.is_some() {
+        ensure_relay_access()?;
+    }
     let Some(relay) = &state.tunnel_relay else {
         // Without the relay the page is only reachable on this Mac, and its
         // token changes with every Kaku launch.
@@ -361,6 +364,79 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
         kaku_remote::OFFER_LIFETIME.as_secs() / 60
     );
     Ok(())
+}
+
+/// When the relay turned this Mac away for its access code, ask for the
+/// code, save it, and wait for the running Kaku to try it.
+#[cfg(feature = "remote")]
+fn ensure_relay_access() -> anyhow::Result<()> {
+    let current = || kaku_remote::read_relay_status().filter(|s| s.is_current());
+    // Kaku records its first attempt a moment after it starts.
+    let first = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while current().is_none() && std::time::Instant::now() < first {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let mut asked = false;
+    loop {
+        let Some(status) = current() else {
+            return Ok(());
+        };
+        if status.last_error.contains("too many wrong access codes") {
+            anyhow::bail!(
+                "Too many wrong access codes from this network. Try again in 10 minutes."
+            );
+        }
+        if !status.needs_access_code() {
+            return Ok(());
+        }
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "The relay asks for an access code. Run `kaku remote` in a terminal to enter it."
+            );
+        }
+        if asked {
+            println!("That access code was not accepted.");
+        }
+        let code = read_hidden_line("Access code: ")?;
+        if code.trim().is_empty() {
+            anyhow::bail!("No access code entered.");
+        }
+        kaku_remote::save_access_code(&code)?;
+        asked = true;
+        let saved = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            match current() {
+                Some(s) if s.checked >= saved => break,
+                Some(_) if std::time::Instant::now() < deadline => continue,
+                _ => anyhow::bail!("Kaku did not reach the relay in time; see `kaku doctor`."),
+            }
+        }
+    }
+}
+
+/// Read a line from the terminal without echoing it.
+#[cfg(feature = "remote")]
+fn read_hidden_line(prompt: &str) -> anyhow::Result<String> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let fd = std::io::stdin().as_raw_fd();
+    let original = termios::Termios::from_fd(fd)?;
+    let mut quiet = original;
+    quiet.c_lflag &= !termios::ECHO;
+    termios::tcsetattr(fd, termios::TCSANOW, &quiet)?;
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    termios::tcsetattr(fd, termios::TCSANOW, &original)?;
+    println!();
+    read?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 fn main() {

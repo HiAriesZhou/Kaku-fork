@@ -19,7 +19,9 @@ mod share;
 mod web;
 
 pub use pairing::{list_devices, revoke_device, Device, OFFER_LIFETIME};
-pub use share::{load_or_create_identity, reset_identity, save_token, ShareIdentity};
+pub use share::{
+    load_or_create_identity, reset_identity, save_access_code, save_token, ShareIdentity,
+};
 pub use web::{
     publish_tab_title, release_web_size, set_tab_action_handler, tab_is_web_sized,
     window_relayout_resizes_tab, TabAction, TabActionHandler,
@@ -258,9 +260,18 @@ pub struct RelayStatus {
     /// The Kaku that wrote it; the file outlives it when it quits.
     #[serde(default)]
     pub pid: u32,
+    /// Unix seconds of the attempt this records, so `kaku remote` can tell
+    /// that the bridge tried again after a new access code was saved.
+    #[serde(default)]
+    pub checked: u64,
 }
 
 impl RelayStatus {
+    /// Whether the relay turned this Mac away for its access code.
+    pub fn needs_access_code(&self) -> bool {
+        !self.connected && self.last_error.contains(share::ACCESS_REFUSAL)
+    }
+
     /// Whether the Kaku that wrote this is still running.
     pub fn is_current(&self) -> bool {
         // SAFETY: signal 0 only checks that the process exists.
@@ -316,6 +327,7 @@ fn next_relay_status(
         since,
         last_error: error.unwrap_or_default(),
         pid,
+        checked: now,
     }
 }
 
@@ -480,6 +492,34 @@ mod relay_status_tests {
             next_relay_status(Some(&down), "wss://x", false, None, 300, 7).since,
             300
         );
+    }
+
+    #[test]
+    fn an_access_code_refusal_is_told_apart() {
+        let refused = |why: &str| {
+            next_relay_status(
+                None,
+                "wss://r",
+                false,
+                Some(format!("relay refused this Mac (401 Unauthorized): {why}")),
+                1,
+                7,
+            )
+        };
+        assert!(refused("access code required").needs_access_code());
+        assert!(refused("wrong access code").needs_access_code());
+        assert!(!refused("registration token refused").needs_access_code());
+        assert!(!next_relay_status(None, "wss://r", true, None, 1, 7).needs_access_code());
+        // Every attempt is stamped, even one that changes nothing else.
+        let again = next_relay_status(
+            Some(&refused("wrong access code")),
+            "wss://r",
+            false,
+            Some("x".into()),
+            9,
+            7,
+        );
+        assert_eq!(again.checked, 9);
     }
 
     #[test]
