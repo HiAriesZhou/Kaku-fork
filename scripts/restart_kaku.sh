@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Restarts Kaku the way an in-app update does: TERM every running Kaku GUI
-# process, force-kill any left after 20s, then open the given app. Tabs and
+# Restarts Kaku the way an in-app update does: TERM the snapshot owner,
+# force-kill any remaining GUI processes, then open the given app. Tabs and
 # working directories come back from the session snapshot Kaku saves while it
 # runs. A normal quit is not used because it stops at the quit confirmation
 # whenever a program such as Claude Code is running.
@@ -60,7 +60,7 @@ target_pids() {
 }
 
 sleep "$delay"
-before="$(ps -o pid=,args= -p "$(gui_pids | paste -sd, -)" 2>/dev/null | awk '{print $1, $2}' | paste -sd ';' -)"
+before="$(gui_pids | tr '\n' ' ')"
 note "restart into $app; running: ${before:-none}"
 
 # Every Kaku under this HOME saves the same session file when it quits, so
@@ -68,7 +68,7 @@ note "restart into $app; running: ${before:-none}"
 # directory) gets TERM and saves; the others are killed after it, unsaved,
 # so a stray copy cannot replace the tabs. Without an owner, all get TERM.
 session="${XDG_CONFIG_HOME:-$HOME/.config}/kaku/last_session.json"
-owner="$(sed -n 's/.*"content_dir"[[:space:]]*:[[:space:]]*"session-\([0-9][0-9]*\)-.*/\1/p' "$session" 2>/dev/null | head -1)"
+owner="$(sed -n 's/.*"content_dir"[[:space:]]*:[[:space:]]*"session-\([0-9][0-9]*\)-.*/\1/p' "$session" 2>/dev/null | head -1 || true)"
 running="$(gui_pids)"
 # Not `gui_pids | grep -q`: grep stops at the first match, gui_pids then dies
 # of SIGPIPE, and pipefail would read the match as a failure.
