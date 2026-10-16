@@ -10,6 +10,16 @@ source "$SCRIPT_DIR/common.sh"
 # the flavor instead of the test fixtures.
 unset KAKU_CONFIG_FILE KAKU_CONFIG_DIR
 
+# Both installers generate their own wrapper; run the same behavior suite for each.
+if [[ "$#" -eq 0 ]]; then
+  for shell_variant in zsh fish; do
+    bash "$0" "$shell_variant"
+  done
+  exit 0
+fi
+shell_variant="$1"
+case "$shell_variant" in zsh | fish) ;; *) exit 1 ;; esac
+
 fail() {
 	echo "yazi_theme: $*" >&2
 	exit 1
@@ -55,7 +65,7 @@ run_setup() {
 	KAKU_SKIP_TOOL_BOOTSTRAP=1 \
 	KAKU_SKIP_TERMINFO_BOOTSTRAP=1 \
 	KAKU_VENDOR_DIR="$tmp_dir/vendor" \
-	bash "$REPO_ROOT/assets/shell-integration/setup_zsh.sh" --update-only >/dev/null
+	bash "$REPO_ROOT/assets/shell-integration/setup_${shell_variant}.sh" --update-only >/dev/null
 }
 
 expected_auto_flavor() {
@@ -80,7 +90,7 @@ run_setup "$home_new"
 theme_new="$home_new/.config/yazi/theme.toml"
 dark_new="$home_new/.config/yazi/flavors/kaku-dark.yazi/flavor.toml"
 light_new="$home_new/.config/yazi/flavors/kaku-light.yazi/flavor.toml"
-wrapper_new="$home_new/.config/kaku/zsh/bin/yazi"
+wrapper_new="$home_new/.config/kaku/${shell_variant}/bin/yazi"
 
 [[ -f "$theme_new" ]]
 [[ -f "$dark_new" ]]
@@ -94,13 +104,18 @@ assert_file_contains '{ url = "*/", fg = "#205ea6" }' "$light_new"
 
 home_legacy="$tmp_dir/home-legacy"
 mkdir -p "$home_legacy/.config/yazi"
-cat <<'EOF' >"$home_legacy/.config/yazi/theme.toml"
+# The old fish theme used empty padding; zsh used powerline glyphs.
+legacy_open="" legacy_close=""
+if [[ "$shell_variant" == zsh ]]; then
+  legacy_open="" legacy_close=""
+fi
+cat <<EOF >"$home_legacy/.config/yazi/theme.toml"
 [mgr]
 border_symbol = "│"
 border_style = { fg = "#555555" }
 
 [indicator]
-padding = { open = "", close = "" }
+padding = { open = "$legacy_open", close = "$legacy_close" }
 EOF
 
 run_setup "$home_legacy"
@@ -173,11 +188,11 @@ echo "real-yazi $*"
 EOF
 chmod +x "$tmp_dir/realbin/yazi"
 
-wrapper_light="$home_light/.config/kaku/zsh/bin/yazi"
+wrapper_light="$home_light/.config/kaku/${shell_variant}/bin/yazi"
 theme_light="$home_light/.config/yazi/theme.toml"
 output="$(
   HOME="$home_light" \
-  PATH="$home_light/.config/kaku/zsh/bin:$tmp_dir/realbin:$PATH" \
+  PATH="$home_light/.config/kaku/${shell_variant}/bin:$tmp_dir/realbin:$PATH" \
   "$wrapper_light" --version
 )"
 [[ "$output" == "real-yazi --version" ]]
@@ -230,12 +245,74 @@ prepend_keymap = []
 EOF
 output="$(
   HOME="$home_light" \
-  PATH="$home_light/.config/kaku/zsh/bin:$tmp_dir/realbin:$PATH" \
+  PATH="$home_light/.config/kaku/${shell_variant}/bin:$tmp_dir/realbin:$PATH" \
   "$wrapper_light" --version
 )"
 [[ "$output" == "real-yazi --version" ]]
 assert_file_contains '#:schema https://yazi-rs.github.io/schemas/keymap.json' "$home_light/.config/yazi/keymap.toml"
 assert_file_not_contains '$schema' "$home_light/.config/yazi/keymap.toml"
+
+# the wrapper's theme sync keeps a symlinked theme.toml a symlink
+home_linked="$tmp_dir/home-linked"
+mkdir -p "$home_linked/.config/kaku" "$tmp_dir/linked-dotfiles"
+cp "$home_light/.config/kaku/kaku.lua" "$home_linked/.config/kaku/kaku.lua"
+run_setup "$home_linked"
+theme_linked="$home_linked/.config/yazi/theme.toml"
+theme_linked_target="$tmp_dir/linked-dotfiles/theme.toml"
+cat <<'EOF' >"$theme_linked_target"
+[mgr]
+border_symbol = "x"
+
+# ===== Kaku Yazi Flavor (managed) =====
+[flavor]
+dark = "old-flavor"
+light = "old-flavor"
+# ===== End Kaku Yazi Flavor (managed) =====
+EOF
+chmod 0644 "$theme_linked_target"
+rm -f "$theme_linked"
+ln -s "$theme_linked_target" "$theme_linked"
+output="$(
+  HOME="$home_linked" \
+  PATH="$home_linked/.config/kaku/${shell_variant}/bin:$tmp_dir/realbin:$PATH" \
+  "$home_linked/.config/kaku/${shell_variant}/bin/yazi" --version
+)"
+[[ "$output" == "real-yazi --version" ]] || fail "wrapper did not launch yazi with a linked theme.toml"
+[[ -L "$theme_linked" ]] || fail "wrapper replaced the theme.toml symlink with a regular file"
+assert_file_contains 'dark = "kaku-light"' "$theme_linked_target"
+assert_file_not_contains 'old-flavor' "$theme_linked_target"
+assert_file_contains 'border_symbol = "x"' "$theme_linked_target"
+
+# the wrapper's theme sync replaces a regular theme.toml by rename: new inode
+home_regular="$tmp_dir/home-regular"
+mkdir -p "$home_regular/.config/kaku"
+cp "$home_light/.config/kaku/kaku.lua" "$home_regular/.config/kaku/kaku.lua"
+run_setup "$home_regular"
+theme_regular="$home_regular/.config/yazi/theme.toml"
+rm -f "$theme_regular"
+cat <<'EOF' >"$theme_regular"
+[mgr]
+border_symbol = "x"
+
+# ===== Kaku Yazi Flavor (managed) =====
+[flavor]
+dark = "old-flavor"
+light = "old-flavor"
+# ===== End Kaku Yazi Flavor (managed) =====
+EOF
+theme_regular_inode="$(stat -f %i "$theme_regular")"
+output="$(
+  HOME="$home_regular" \
+  PATH="$home_regular/.config/kaku/${shell_variant}/bin:$tmp_dir/realbin:$PATH" \
+  "$home_regular/.config/kaku/${shell_variant}/bin/yazi" --version
+)"
+[[ "$output" == "real-yazi --version" ]] || fail "wrapper did not launch yazi with a regular theme.toml"
+[[ ! -L "$theme_regular" && -f "$theme_regular" ]] || fail "wrapper left theme.toml something other than a regular file"
+assert_file_contains 'dark = "kaku-light"' "$theme_regular"
+assert_file_not_contains 'old-flavor' "$theme_regular"
+assert_file_contains 'border_symbol = "x"' "$theme_regular"
+[[ "$(stat -f %i "$theme_regular")" != "$theme_regular_inode" ]] \
+	|| fail "wrapper rewrote the regular theme.toml in place (inode $theme_regular_inode kept) instead of replacing it"
 
 # When a real yazi is installed, gate the generated configs through its parser.
 real_yazi=""
@@ -252,4 +329,4 @@ if [[ -n "$real_yazi" ]]; then
 		|| fail "migrated yazi config rejected by $real_yazi"
 fi
 
-echo "yazi_theme smoke test passed"
+echo "yazi_theme ($shell_variant) smoke test passed"
