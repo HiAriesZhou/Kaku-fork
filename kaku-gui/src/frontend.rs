@@ -336,6 +336,11 @@ pub fn check_for_updates_from_menu() {
     if crate::update::staged_update_available().is_some() {
         confirm_and_apply_update();
     } else {
+        if config::configuration().restore_previous_session {
+            if let Err(err) = crate::session_restore::save_session_checkpoint() {
+                log::error!("failed to save session snapshot before update: {err:#}");
+            }
+        }
         run_kaku_update_in_tab(/* auto_confirm */ false);
     }
 }
@@ -384,6 +389,11 @@ pub fn confirm_and_apply_update() {
 /// Uses the staged fast-path when available, else the terminal-tab flow with
 /// auto-confirm (user already approved the restart in the overlay).
 pub(crate) fn apply_update_now() {
+    if config::configuration().restore_previous_session {
+        if let Err(err) = crate::session_restore::save_session_checkpoint() {
+            log::error!("failed to save session snapshot before update: {err:#}");
+        }
+    }
     if crate::update::staged_update_available().is_some() {
         restart_to_update();
     } else {
@@ -2189,6 +2199,88 @@ mod tests {
         assert!(
             frontend.contains("if subcommand == \"update\" && auto_confirm"),
             "AUTO_CONFIRM must require auto_confirm flag, not every update tab"
+        );
+    }
+
+    #[test]
+    fn confirmed_update_saves_the_session_before_replacing_the_app() {
+        let source = include_str!("frontend.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let apply = source
+            .split("pub(crate) fn apply_update_now()")
+            .nth(1)
+            .unwrap()
+            .split("pub fn restart_to_update()")
+            .next()
+            .unwrap();
+        let save = apply
+            .find("crate::session_restore::save_session_checkpoint()")
+            .expect("applying a confirmed update must save the session first");
+        let gate = apply
+            .find("restore_previous_session")
+            .expect("the save must follow the restore_previous_session setting");
+        assert!(
+            gate < save,
+            "the save must sit behind the restore_previous_session setting"
+        );
+        let restart = apply.find("restart_to_update()").unwrap();
+        let tab = apply.find("run_kaku_update_in_tab(").unwrap();
+        assert!(
+            save < restart,
+            "the session must be saved before the app is replaced"
+        );
+        assert!(
+            save < tab,
+            "the session must be saved before the update tab starts"
+        );
+    }
+
+    fn check_for_updates_from_menu_body() -> &'static str {
+        include_str!("frontend.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .split("pub fn check_for_updates_from_menu()")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn menu_update_check_saves_the_session_before_the_update_tab() {
+        let body = check_for_updates_from_menu_body();
+        let gate = body
+            .find("restore_previous_session")
+            .expect("the save must follow the restore_previous_session setting");
+        let save = body
+            .find("crate::session_restore::save_session_checkpoint()")
+            .expect("checking for updates must save the session before the update tab");
+        let tab = body
+            .find("run_kaku_update_in_tab(")
+            .expect("checking for updates opens the update tab");
+        assert!(
+            gate < save,
+            "the save must sit behind the restore_previous_session setting"
+        );
+        assert!(
+            save < tab,
+            "the session must be saved before the update tab starts"
+        );
+    }
+
+    #[test]
+    fn menu_update_check_with_staged_update_asks_before_saving() {
+        let body = check_for_updates_from_menu_body();
+        let confirm = body
+            .find("confirm_and_apply_update()")
+            .expect("a staged update must go through the confirmation overlay");
+        assert!(
+            !body[..confirm].contains("crate::session_restore::save_session_checkpoint()"),
+            "the staged path saves only after the user confirms"
         );
     }
 }
