@@ -394,6 +394,63 @@ static TOKEN_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+// `debug_key_events` logs every key, so a bundle would carry whatever was
+// typed, a password at a sudo prompt included. Printable characters, the
+// physical keys behind them and composed text are hidden. Keys held with Ctrl
+// or Cmd stay readable, since those are what key bug reports are about, and so
+// do control characters such as Enter.
+static KEY_LOG_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"key_event |send to pane|: sending |DeadKeyStatus|native-line-editor|-> perform ")
+        .unwrap()
+});
+static SHORTCUT_MODS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:LEFT_|RIGHT_)?(?:CTRL|SUPER)\b").unwrap());
+static TYPED_CHAR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"Char\('(?:[^'\\]|\\['"\\])'\)"#).unwrap());
+static PHYSICAL_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(phys_code: Some\(|Physical\()\w+\)").unwrap());
+static RAW_KEY_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"raw_code: \d+").unwrap());
+static TYPED_STRING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"((?:sending |string=|original: |Composing\()")((?:[^"\\]|\\.)*)""#).unwrap()
+});
+static CONTROL_ESCAPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\u\{[0-9a-fA-F]+\}|\\[rnt0]").unwrap());
+static LINE_EDITOR_INPUT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" bytes=.*").unwrap());
+
+fn redact_typed_input(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| {
+            if !KEY_LOG_LINE.is_match(line) {
+                return line.to_string();
+            }
+            let (body, end) = match line.strip_suffix('\n') {
+                Some(body) => (body, "\n"),
+                None => (line, ""),
+            };
+            let mut out = TYPED_STRING
+                .replace_all(body, |caps: &regex::Captures| {
+                    if CONTROL_ESCAPE.replace_all(&caps[2], "").is_empty() {
+                        caps[0].to_string()
+                    } else {
+                        format!("{}<typed>\"", &caps[1])
+                    }
+                })
+                .into_owned();
+            if out.contains("native-line-editor") {
+                out = LINE_EDITOR_INPUT
+                    .replace(&out, " bytes=<typed>")
+                    .into_owned();
+            }
+            if !SHORTCUT_MODS.is_match(&out) {
+                out = TYPED_CHAR.replace_all(&out, "Char(_)").into_owned();
+                out = PHYSICAL_KEY.replace_all(&out, "${1}_)").into_owned();
+                out = RAW_KEY_CODE.replace_all(&out, "raw_code: _").into_owned();
+            }
+            out + end
+        })
+        .collect()
+}
+
 impl Redactor {
     fn for_this_machine() -> Self {
         Self {
@@ -407,7 +464,7 @@ impl Redactor {
     }
 
     fn redact(&self, text: &str) -> String {
-        let mut out = text.to_string();
+        let mut out = redact_typed_input(text);
         if self.home.len() > 1 {
             out = out.replace(&self.home, "~");
             out = out.replace(&self.home.replace('/', "\\/"), "~");
@@ -461,6 +518,47 @@ Authorization: Bearer abcdefghijklmnopqrstuvwxyz
         }
         assert!(out.contains("cwd ~/code"));
         assert!(out.contains("config.api_key = \"<redacted>\""));
+    }
+
+    #[test]
+    fn hides_what_was_typed_but_keeps_shortcuts() {
+        // Line shapes as `debug_key_events` writes them.
+        let input = r#"key_event RawKeyEvent { key: Char('h'), modifiers: NONE, leds: (empty), phys_code: Some(H), raw_code: 4, repeat_count: 1, key_is_down: true, handled: Handled(false) }
+key_event KeyEvent { key: Char('\''), modifiers: SHIFT, leds: (empty), repeat_count: 1, key_is_down: false, raw: Some(RawKeyEvent { key: Char('\''), modifiers: SHIFT, leds: (empty), phys_code: Some(Quote), raw_code: 39, repeat_count: 1, key_is_down: false, handled: Handled(false) }) }
+send to pane DOWN key=Char('u') mods=NONE
+key_down: sending "u", Char('u') NONE
+DeadKeyStatus now: Composing("nihao")
+send to pane string="你好"
+native-line-editor shortcut key=Char('w') mods=ALT bytes="\u{1b}w" selection=Some(Selection { text: "hunter" })
+key_down: sending "\u{3}", Char('c') CTRL
+Char('v') SUPER -> perform PasteFrom(Clipboard)
+key_down: sending "\r", Char('\r') NONE
+"#;
+        let out = redactor().redact(input);
+        for leaked in [
+            "Char('h')",
+            "Some(H)",
+            "raw_code: 4",
+            "Char('\\'')",
+            "Some(Quote)",
+            "Char('u')",
+            "sending \"u\"",
+            "nihao",
+            "你好",
+            "hunter",
+        ] {
+            assert!(!out.contains(leaked), "leaked {:?} in:\n{}", leaked, out);
+        }
+        // Shortcuts and control keys are what key bug reports are about.
+        for kept in [
+            "sending \"\\u{3}\", Char('c') CTRL",
+            "Char('v') SUPER -> perform PasteFrom(Clipboard)",
+            "sending \"\\r\", Char('\\r') NONE",
+            "key_is_down: true",
+            "modifiers: SHIFT",
+        ] {
+            assert!(out.contains(kept), "lost {:?} in:\n{}", kept, out);
+        }
     }
 
     #[test]
