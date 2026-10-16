@@ -269,8 +269,10 @@ impl AppState {
     }
 
     /// Make `host` the one serving `id`; returns the one it displaced.
-    fn register(&self, id: &str, host: Arc<Host>) -> Option<Arc<Host>> {
+    /// Admission and insertion share the lock, including after an upgrade.
+    fn register(&self, id: &str, host: Arc<Host>) -> Result<Option<Arc<Host>>, StatusCode> {
         let mut hosts = self.hosts.lock();
+        Self::check_registration(&hosts, id, &host.addr)?;
         let all = hosts.entry(id.to_string()).or_default();
         let displaced = all.last().cloned();
         all.push(host);
@@ -278,7 +280,25 @@ impl AppState {
             let oldest = all.remove(0);
             oldest.evicted.notify_one();
         }
-        displaced
+        Ok(displaced)
+    }
+
+    fn check_registration(
+        hosts: &HashMap<String, Vec<Arc<Host>>>,
+        id: &str,
+        addr: &str,
+    ) -> Result<(), StatusCode> {
+        if hosts.len() >= MAX_HOSTS && !hosts.contains_key(id) {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let from_addr = hosts
+            .iter()
+            .filter(|(other, all)| other.as_str() != id && all.iter().any(|h| h.addr == addr))
+            .count();
+        if addr != "-" && from_addr >= MAX_HOSTS_PER_ADDR {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        Ok(())
     }
 
     /// Drop this registration; returns how many remain for `id`.
@@ -383,16 +403,32 @@ struct TokenPolicy {
 }
 
 impl TokenPolicy {
-    fn from_env() -> Option<Self> {
-        let key = std::env::var("KAKU_RELAY_TOKEN_KEY").ok()?;
-        let Some(public_key) = token::decode_key(&key) else {
-            tracing::warn!("KAKU_RELAY_TOKEN_KEY is not base64url; tokens are not checked");
-            return None;
+    fn from_env() -> Result<Option<Self>, &'static str> {
+        Self::from_settings(
+            std::env::var("KAKU_RELAY_TOKEN_KEY").ok().as_deref(),
+            std::env::var("KAKU_RELAY_REQUIRE_TOKEN").as_deref() == Ok("1"),
+        )
+    }
+
+    fn from_settings(key: Option<&str>, required: bool) -> Result<Option<Self>, &'static str> {
+        let public_key = key
+            .and_then(token::decode_key)
+            .filter(|key| key.len() == 32);
+        let Some(public_key) = public_key else {
+            if required {
+                return Err(
+                    "KAKU_RELAY_REQUIRE_TOKEN=1 needs a valid 32-byte KAKU_RELAY_TOKEN_KEY",
+                );
+            }
+            if key.is_some() {
+                tracing::warn!("KAKU_RELAY_TOKEN_KEY is invalid; tokens are not checked");
+            }
+            return Ok(None);
         };
-        Some(Self {
+        Ok(Some(Self {
             public_key,
-            required: std::env::var("KAKU_RELAY_REQUIRE_TOKEN").as_deref() == Ok("1"),
-        })
+            required,
+        }))
     }
 
     /// Whether a Mac presenting `presented` may register as `id` at `now`.
@@ -544,21 +580,12 @@ async fn host_ws(
             return refuse(StatusCode::UNAUTHORIZED, "registration token refused");
         }
     }
-    {
-        let hosts = state.hosts.lock();
-        if hosts.len() >= MAX_HOSTS && !hosts.contains_key(&id) {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-        let from_addr = hosts
-            .iter()
-            .filter(|(other, all)| *other != &id && all.iter().any(|h| h.addr == addr))
-            .count();
-        if addr != "-" && from_addr >= MAX_HOSTS_PER_ADDR {
-            return refuse(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many Macs from this address",
-            );
-        }
+    if let Err(status) = AppState::check_registration(&state.hosts.lock(), &id, &addr) {
+        return if status == StatusCode::TOO_MANY_REQUESTS {
+            refuse(status, "too many Macs from this address")
+        } else {
+            status.into_response()
+        };
     }
     upgrade
         // A frame is buffered whole before the message cap is checked, so
@@ -588,8 +615,14 @@ async fn serve_host(
     });
     // The newest registration serves; the previous one stays connected as a
     // standby, and its browsers reconnect to this one.
-    if let Some(old) = state.register(&id, host.clone()) {
-        old.browsers.lock().clear();
+    match state.register(&id, host.clone()) {
+        Ok(Some(old)) => old.browsers.lock().clear(),
+        Ok(None) => {}
+        Err(_) => {
+            // Other handshakes can consume the last slot during the upgrade.
+            let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.send(browser_close(4413))).await;
+            return;
+        }
     }
     info!("host {} registered via edge {}", short(&id), edge);
 
@@ -1020,7 +1053,13 @@ async fn main() {
             tracing::warn!("set_nodelay failed: {e}");
         }
     });
-    let tokens = TokenPolicy::from_env().map(Arc::new);
+    let tokens = match TokenPolicy::from_env() {
+        Ok(policy) => policy.map(Arc::new),
+        Err(error) => {
+            eprintln!("kaku-relay: {error}");
+            std::process::exit(2);
+        }
+    };
     if let Some(policy) = &tokens {
         info!(
             required = policy.required,
@@ -1056,6 +1095,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn required_tokens_reject_missing_malformed_and_wrong_length_keys() {
+        for key in [None, Some("not!base64"), Some(""), Some("AA")] {
+            assert!(
+                TokenPolicy::from_settings(key, true).is_err(),
+                "key={key:?}"
+            );
+        }
+        assert!(TokenPolicy::from_settings(None, false).unwrap().is_none());
+        let (_, public) = token::generate().unwrap();
+        let policy = TokenPolicy::from_settings(Some(&public), true)
+            .unwrap()
+            .unwrap();
+        assert!(!policy.admits("id", None, 0));
+    }
+
+    #[test]
+    fn concurrent_host_registration_cannot_exceed_the_address_budget() {
+        let state = AppState::default();
+        std::thread::scope(|scope| {
+            let barrier = Arc::new(std::sync::Barrier::new(64));
+            for n in 0..64 {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    let mut host = test_host(&state);
+                    Arc::get_mut(&mut host).unwrap().addr = "192.0.2.1".into();
+                    barrier.wait();
+                    let _ = state.register(&format!("host-{n}"), host);
+                });
+            }
+        });
+        assert_eq!(state.hosts.lock().len(), MAX_HOSTS_PER_ADDR);
+        let id = state.hosts.lock().keys().next().unwrap().clone();
+        let mut replacement = test_host(&state);
+        Arc::get_mut(&mut replacement).unwrap().addr = "192.0.2.1".into();
+        let displaced = state.register(&id, replacement.clone()).unwrap().unwrap();
+        assert_eq!(state.hosts.lock().len(), MAX_HOSTS_PER_ADDR);
+        assert_eq!(state.unregister(&id, replacement.generation), 1);
+        assert_eq!(state.host(&id).unwrap().generation, displaced.generation);
+        assert_eq!(state.unregister(&id, displaced.generation), 0);
+        let mut new_host = test_host(&state);
+        Arc::get_mut(&mut new_host).unwrap().addr = "192.0.2.1".into();
+        assert!(state
+            .register("after-disconnect", new_host)
+            .unwrap()
+            .is_none());
+        assert_eq!(state.hosts.lock().len(), MAX_HOSTS_PER_ADDR);
+    }
+
+    #[test]
+    fn global_host_budget_still_allows_replacement_and_standby() {
+        let state = AppState::default();
+        let first = test_host(&state);
+        for n in 0..MAX_HOSTS {
+            state
+                .hosts
+                .lock()
+                .insert(format!("host-{n}"), vec![first.clone()]);
+        }
+        let _ = state.register("extra", test_host(&state));
+        assert_eq!(state.hosts.lock().len(), MAX_HOSTS);
+        let second = test_host(&state);
+        let _ = state.register("host-0", second.clone());
+        assert_eq!(state.host("host-0").unwrap().generation, second.generation);
+        assert_eq!(state.unregister("host-0", second.generation), 1);
+        assert_eq!(state.host("host-0").unwrap().generation, first.generation);
+    }
+
+    #[test]
     fn rejection_code_reaches_the_browser_without_arbitrary_reason_text() {
         let ws::Message::Close(Some(frame)) = browser_close(4403) else {
             panic!("close frame")
@@ -1086,7 +1194,7 @@ mod tests {
         let page_for = |state: AppState| rt.block_on(page(Path(id.clone()), State(state)));
         // Away: the offline notice, as a 404 the open page can recognize.
         assert_eq!(page_for(state.clone()).status(), StatusCode::NOT_FOUND);
-        state.register(&id, test_host(&state));
+        state.register(&id, test_host(&state)).unwrap();
         let shown = page_for(state.clone());
         assert_eq!(shown.status(), StatusCode::OK);
         assert_eq!(shown.headers()[header::CACHE_CONTROL], "no-cache");
@@ -1155,7 +1263,7 @@ mod tests {
             away.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
             "https://t.kaku.fun"
         );
-        state.register(&id, test_host(&state));
+        state.register(&id, test_host(&state)).unwrap();
         assert_eq!(status(&state).status(), StatusCode::OK);
     }
 
@@ -1179,7 +1287,7 @@ mod tests {
         let state = AppState::default();
         let hosts: Vec<_> = (0..3).map(|_| test_host(&state)).collect();
         for h in &hosts {
-            state.register("id", h.clone());
+            state.register("id", h.clone()).unwrap();
         }
         let kept: Vec<u64> = state.hosts.lock()["id"]
             .iter()
@@ -1263,9 +1371,10 @@ mod tests {
         let state = AppState::default();
         let first = test_host(&state);
         let second = test_host(&state);
-        assert!(state.register("id", first.clone()).is_none());
+        assert!(state.register("id", first.clone()).unwrap().is_none());
         let displaced = state
             .register("id", second.clone())
+            .unwrap()
             .expect("first displaced");
         assert_eq!(displaced.generation, first.generation);
         assert_eq!(state.host("id").unwrap().generation, second.generation);
