@@ -196,7 +196,11 @@ async fn require_own_host(
 /// name, then renamed over the target.
 pub(crate) fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
+    // One name per writer: the GUI and the CLI may write the same file at
+    // once, and a shared name let one delete the other's half-written copy.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);

@@ -325,31 +325,67 @@ pub fn list_devices() -> Vec<Device> {
         .unwrap_or_default()
 }
 
-fn save_devices(devices: &[Device]) -> anyhow::Result<()> {
-    let path = devices_path();
+/// Read, change and write the devices file at `path` under an exclusive
+/// lock. The GUI updates it on every sign-in while `kaku remote revoke` edits
+/// it from another process; without the lock the GUI could write back a list
+/// read before the revoke and bring the device back. `change` returns whether
+/// to save.
+fn update_devices_at<T>(
+    path: &std::path::Path,
+    change: impl FnOnce(&mut Vec<Device>) -> (bool, T),
+) -> anyhow::Result<T> {
+    use std::os::unix::io::AsRawFd;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).context("create data dir")?;
     }
-    let json = serde_json::to_string_pretty(devices)?;
-    crate::write_private(&path, json.as_bytes()).context("save paired devices")
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))
+        .context("open devices lock")?;
+    // SAFETY: flock on a file descriptor we own; released when `lock` closes.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        anyhow::bail!("lock paired devices: {}", std::io::Error::last_os_error());
+    }
+    let mut devices: Vec<Device> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default();
+    let (save, out) = change(&mut devices);
+    if save {
+        let json = serde_json::to_string_pretty(&devices)?;
+        crate::write_private(path, json.as_bytes()).context("save paired devices")?;
+    }
+    drop(lock);
+    Ok(out)
+}
+
+fn update_devices<T>(change: impl FnOnce(&mut Vec<Device>) -> (bool, T)) -> anyhow::Result<T> {
+    update_devices_at(&devices_path(), change)
+}
+
+fn revoke_at(path: &std::path::Path, id: &str) -> anyhow::Result<bool> {
+    update_devices_at(path, |devices| {
+        let before = devices.len();
+        devices.retain(|d| d.id != id);
+        let removed = devices.len() != before;
+        (removed, removed)
+    })
 }
 
 /// Remove a paired device; its open sessions end within seconds. Returns
 /// whether it was paired.
 pub fn revoke_device(id: &str) -> anyhow::Result<bool> {
-    let mut devices = list_devices();
-    let before = devices.len();
-    devices.retain(|d| d.id != id);
-    if devices.len() == before {
-        return Ok(false);
-    }
-    save_devices(&devices)?;
-    Ok(true)
+    revoke_at(&devices_path(), id)
 }
 
 /// Forget every device and any pending pairing link.
 pub fn forget_all_devices() -> anyhow::Result<()> {
-    save_devices(&[])?;
+    update_devices(|devices| {
+        devices.clear();
+        (true, ())
+    })?;
     let _ = std::fs::remove_file(offer_path());
     Ok(())
 }
@@ -374,26 +410,39 @@ pub(crate) fn new_offer() -> anyhow::Result<String> {
     Ok(offer.secret)
 }
 
+fn seen_at(path: &std::path::Path, id: &str, public_key: &str) -> Option<Device> {
+    update_devices_at(path, |devices| {
+        match devices
+            .iter_mut()
+            .find(|d| d.id == id && d.public_key == public_key)
+        {
+            Some(device) => {
+                let found = device.clone();
+                device.last_seen = now();
+                (true, Some(found))
+            }
+            None => (false, None),
+        }
+    })
+    .ok()
+    .flatten()
+}
+
 /// The devices file and offer file in Kaku's data dir.
 pub(crate) struct DiskStore;
 
 impl DeviceStore for DiskStore {
     fn seen(&mut self, id: &str, public_key: &str) -> Option<Device> {
-        let mut devices = list_devices();
-        let device = devices
-            .iter_mut()
-            .find(|d| d.id == id && d.public_key == public_key)?;
-        let found = device.clone();
-        device.last_seen = now();
-        let _ = save_devices(&devices);
-        Some(found)
+        seen_at(&devices_path(), id, public_key)
     }
 
     fn add(&mut self, device: Device) {
-        let mut devices = list_devices();
-        devices.retain(|d| d.id != device.id);
-        devices.push(device);
-        if let Err(e) = save_devices(&devices) {
+        let added = update_devices(|devices| {
+            devices.retain(|d| d.id != device.id);
+            devices.push(device);
+            (true, ())
+        });
+        if let Err(e) = added {
             log::warn!("kaku-share: {e:#}");
         }
     }
@@ -676,6 +725,46 @@ pub(crate) mod tests {
             store.devices[&device_id(key.public_key())].public_key,
             b64(paired.public_key())
         );
+    }
+
+    /// A sign-in that read the list before a revoke must not write the
+    /// device back after it.
+    #[test]
+    fn a_revoked_device_stays_revoked_while_it_keeps_signing_in() {
+        let dir = std::env::temp_dir().join(format!("kaku-devices-{}", std::process::id()));
+        let path = dir.join("remote-devices.json");
+        let device = Device {
+            id: "abcd1234".into(),
+            public_key: "key".into(),
+            name: "Chrome".into(),
+            paired_at: 0,
+            last_seen: 0,
+        };
+        for _ in 0..200 {
+            update_devices_at(&path, |devices| {
+                devices.clear();
+                devices.push(device.clone());
+                (true, ())
+            })
+            .unwrap();
+            let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let toucher = {
+                let (path, busy) = (path.clone(), busy.clone());
+                std::thread::spawn(move || {
+                    while busy.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = seen_at(&path, "abcd1234", "key");
+                    }
+                })
+            };
+            assert!(revoke_at(&path, "abcd1234").unwrap());
+            busy.store(false, std::sync::atomic::Ordering::SeqCst);
+            toucher.join().unwrap();
+            assert!(
+                seen_at(&path, "abcd1234", "key").is_none(),
+                "the revoked device came back"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
