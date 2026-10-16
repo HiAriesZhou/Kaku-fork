@@ -147,6 +147,7 @@ When a check needs clicks on the built app, hand the maintainer an isolated laun
 - Notification actions that call back into Kaku should resolve bundled executables relative to the running app, not an assumed system path.
 - Known high-regression zones: theme/config TUI initialization (`kaku/src/ai_config/tui/`), macOS window geometry (`window/src/os/macos/window.rs`, `kaku-gui/src/termwindow/resize.rs`), and menubar initialization timing (`window/src/os/macos/menu.rs`). Changes touching these must ship with a regression test or assertion.
 - `assets/shell-integration` scripts run in the user's shell, not just at build time. Bash heredocs that generate zsh (e.g. `setup_zsh.sh` writing `kaku.zsh`) expand backticks and `$(...)` at generation time, so escape any that must reach the output literally (#450), and never put `local` outside a function (#432/#441). CI gates this: shellcheck (`--severity=error`, catches SC2168) over the bash scripts plus a `zsh -n` parse check of the generated `kaku.zsh` in the setup smoke.
+- User-owned configuration symlinks must survive updates, and failed writes must leave their targets unchanged. Resolve the final target and finish a sibling temporary file before replacing it; preserve target permissions. The shell `write_through` helper has four copies across the zsh/fish installers and their generated Yazi wrappers. Test all four under a real write failure, not only successful linked-file updates (#581, #582).
 
 ## Release Notes
 
