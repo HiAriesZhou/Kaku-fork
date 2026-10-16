@@ -1433,10 +1433,18 @@
   // the last row took no writes and kept stale text: the ghost rows seen
   // while scrolling on a phone. A reset clears that; what follows a size
   // change is always a full frame (or a snapshot), so nothing is lost.
+  // Resize only, and clear in the same write as the new content (CLEAR), so
+  // the old screen stays up until the new one is drawn, in one frame. A
+  // term.reset() here blanked the screen at once and the content came two
+  // frames later: every tab switch flashed empty. RIS (ESC c) in the write
+  // is no better: xterm.js also wipes what follows it in the same write.
+  // Nothing else needs resetting: Kaku encodes keys and mouse for the pane,
+  // and its frames place every row, so this xterm holds no modes of its own.
   const resizeTerm = (cols, rows) => {
-    term.resize(cols, rows);
-    term.reset();
+    if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows);
   };
+  const CLEAR = "\x1b[0m\x1b[2J\x1b[3J";
+  let clearPending = false;
   const snapshots = new Map();
   const NO_WRAP = "\x1b[?7l";
   // The cursor blinks only once the screen is still. Every frame repeats the
@@ -1523,7 +1531,12 @@
       size = { cols: saved.cols, rows: saved.rows };
       resizeTerm(saved.cols, saved.rows);
       fit();
-      term.write(NO_WRAP + "\x1b[?25l\x1b[0m\x1b[2J" + steadyCursor(saved.data));
+      clearPending = false;
+      // Parse it now, as xterm does after a keystroke. Otherwise its parse
+      // waits on a timer, which Chrome runs only after the frame that
+      // follows a click, and the tab showed one frame late.
+      term._core?._writeBuffer?.handleUserInput?.();
+      term.write(NO_WRAP + "\x1b[?25l" + CLEAR + steadyCursor(saved.data));
     }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     renderTabs();
@@ -2056,6 +2069,7 @@
         size = { cols: msg.cols, rows: msg.rows };
       resizeTerm(msg.cols, msg.rows);
       fit();
+      clearPending = true;
     }
     localScroll = !!msg.local_scroll;
     if (!localScroll) closePast();
@@ -2064,7 +2078,9 @@
     // disagree on) must overwrite its last cell, not wrap. Wrapping on the
     // last row scrolled the whole screen, and every later frame then drew
     // over a shifted copy: stale rows stayed until a reload.
-    term.write(NO_WRAP + steadyCursor(msg.data), () => {
+    const clear = clearPending ? CLEAR : "";
+    clearPending = false;
+    term.write(clear + NO_WRAP + steadyCursor(msg.data), () => {
       if (ws !== socket) return;
       if (msg.pane_id === paneId) markFound();
       if (msg.seq) send({ type: "frame_ack", seq: msg.seq });

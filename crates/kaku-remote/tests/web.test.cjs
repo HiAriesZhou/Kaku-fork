@@ -363,6 +363,28 @@ test('returning to a cached tab attaches before claiming its new size', async t 
   assert.ok(commands.some(m => m.type === 'resize'));
 });
 
+test('clicking back to a cached tab shows it in the next frame, never blank', async t => {
+  const { p } = await page(t);
+  await screen(p, 'first');
+  await p.evaluate(() => probe.attach({ pane_id: 2, tab_id: 2 }));
+  await screen(p, 'second', 2);
+  await p.evaluate(() => {
+    const rows = () => document.querySelector('.xterm-rows').textContent;
+    window.__states = [];
+    new MutationObserver(() => window.__states.push(rows().trim()))
+      .observe(document.querySelector('.xterm-rows'), { subtree: true, childList: true, characterData: true });
+    // After the tab's own click handler: what the first frame after it shows.
+    window.addEventListener('click', () => requestAnimationFrame(() => { window.__firstFrame = rows(); }), { once: true });
+  });
+  await p.locator('#bar .tab').first().click();
+  await p.waitForFunction(() => window.__firstFrame !== undefined);
+  // xterm parses a write on a timer, which Chrome runs only after the frame
+  // following a click; the snapshot then showed a frame late, and a
+  // term.reset() before it blanked the screen in between.
+  assert.ok(await p.evaluate(() => window.__firstFrame.includes('first')));
+  assert.ok(!(await p.evaluate(() => window.__states.some(s => s === ''))));
+});
+
 test('renaming from a menu opened before the tab bar was rebuilt still edits the tab', async t => {
   const { p } = await page(t);
   await screen(p);
