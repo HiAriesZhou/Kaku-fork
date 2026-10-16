@@ -157,6 +157,31 @@ struct BrowserLink {
     queued: Arc<Queued>,
     close: watch::Sender<Option<u64>>,
     addr: String,
+    /// The Mac admitted it (`{"t":"ok"}`): a paired browser, not a socket
+    /// that only knows the id.
+    admitted: bool,
+}
+
+/// Make room for one more browser of a host at `MAX_BROWSERS_PER_HOST`:
+/// the oldest socket the Mac has not admitted is let go (4413), so sockets
+/// that only know the id cannot hold every slot and lock the owner out.
+/// False when every slot holds an admitted browser.
+fn make_room(browsers: &mut HashMap<u32, BrowserLink>) -> bool {
+    if browsers.len() < MAX_BROWSERS_PER_HOST {
+        return true;
+    }
+    let Some(oldest) = browsers
+        .iter()
+        .filter(|(_, b)| !b.admitted)
+        .map(|(c, _)| *c)
+        .min()
+    else {
+        return false;
+    };
+    if let Some(link) = browsers.remove(&oldest) {
+        let _ = link.close.send(Some(4413));
+    }
+    true
 }
 
 struct Host {
@@ -611,8 +636,16 @@ async fn serve_host(
                 }
             }
             ws::Message::Text(text) => {
-                // The Mac rejected a browser (its key did not match).
+                // The Mac rejected a browser (its key did not match), or
+                // admitted one.
                 if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(text.as_str()) {
+                    if map.get("t").and_then(|t| t.as_str()) == Some("ok") {
+                        if let Some(c) = map.get("c").and_then(|c| c.as_u64()) {
+                            if let Some(link) = host.browsers.lock().get_mut(&(c as u32)) {
+                                link.admitted = true;
+                            }
+                        }
+                    }
                     if map.get("t").and_then(|t| t.as_str()) == Some("close") {
                         if let Some(c) = map.get("c").and_then(|c| c.as_u64()) {
                             if let Some(tx) = host.browsers.lock().remove(&(c as u32)) {
@@ -838,7 +871,7 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
     let accepted = {
         let mut browsers = host.browsers.lock();
         let from_addr = browsers.values().filter(|b| b.addr == addr).count();
-        if browsers.len() >= MAX_BROWSERS_PER_HOST || from_addr >= MAX_BROWSERS_PER_ADDR {
+        if from_addr >= MAX_BROWSERS_PER_ADDR || !make_room(&mut browsers) {
             false
         } else {
             browsers.insert(
@@ -848,6 +881,7 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
                     queued: queued.clone(),
                     close,
                     addr,
+                    admitted: false,
                 },
             );
             true
@@ -1179,6 +1213,7 @@ mod tests {
             queued: Arc::new(Queued::new(BROWSER_QUEUE_BYTES, global)),
             close: watch::channel(None).0,
             addr: String::new(),
+            admitted: false,
         }
     }
 
@@ -1328,6 +1363,48 @@ mod tests {
         assert!(limits.access_locked("1.2.3.4", start));
         assert!(!limits.access_locked("5.6.7.8", start));
         assert!(!limits.access_locked("1.2.3.4", start + ACCESS_WINDOW));
+    }
+
+    #[test]
+    fn sockets_the_mac_never_admitted_cannot_hold_every_slot() {
+        let state = AppState::default();
+        let host = test_host(&state);
+        let link = |admitted: bool| {
+            let (data, rx) = mpsc::channel(QUEUE);
+            std::mem::forget(rx);
+            let (close, closing) = watch::channel(None);
+            (
+                BrowserLink {
+                    data,
+                    queued: Arc::new(Queued::new(BROWSER_QUEUE_BYTES, &host.queued.global)),
+                    close,
+                    addr: "-".into(),
+                    admitted,
+                },
+                closing,
+            )
+        };
+        let mut browsers = HashMap::new();
+        let (owner, _) = link(true);
+        browsers.insert(1, owner);
+        let mut squatters = Vec::new();
+        for c in 2..=MAX_BROWSERS_PER_HOST as u32 {
+            let (squatter, closing) = link(false);
+            browsers.insert(c, squatter);
+            squatters.push(closing);
+        }
+        // Full: the next browser pushes out the oldest unadmitted socket,
+        // never the admitted one.
+        assert!(make_room(&mut browsers));
+        assert!(browsers.contains_key(&1) && !browsers.contains_key(&2));
+        assert_eq!(*squatters[0].borrow(), Some(4413));
+        // Every slot admitted: no room.
+        for b in browsers.values_mut() {
+            b.admitted = true;
+        }
+        let (extra, _) = link(true);
+        browsers.insert(99, extra);
+        assert!(!make_room(&mut browsers));
     }
 
     #[test]

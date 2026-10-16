@@ -675,6 +675,10 @@ async fn serve(
                                     // Kaku's own signature was message 0.
                                     *inbox = Some(start_session(c, keys.clone(), 1, dirty.clone(), to_relay.clone()));
                                 }
+                                // Tell the relay this socket is a paired browser, so
+                                // sockets that only know the id cannot push it out.
+                                let ok = serde_json::json!({ "t": "ok", "c": c }).to_string();
+                                let _ = to_relay.try_send(Message::Text(ok.into()));
                                 continue;
                             }
                             Step::Input(text) => text,
