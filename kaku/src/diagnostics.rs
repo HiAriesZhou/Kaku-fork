@@ -411,7 +411,8 @@ static PHYSICAL_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(phys_code: Some\(|Physical\()\w+\)").unwrap());
 static RAW_KEY_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"raw_code: \d+").unwrap());
 static TYPED_STRING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"((?:sending |string=|original: |Composing\()")((?:[^"\\]|\\.)*)""#).unwrap()
+    Regex::new(r#"((?:sending |string=|original: |Compos(?:ing|ed)\()")((?:[^"\\]|\\.)*)""#)
+        .unwrap()
 });
 static CONTROL_ESCAPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\u\{[0-9a-fA-F]+\}|\\[rnt0]").unwrap());
@@ -558,6 +559,19 @@ key_down: sending "\r", Char('\r') NONE
             "modifiers: SHIFT",
         ] {
             assert!(out.contains(kept), "lost {:?} in:\n{}", kept, out);
+        }
+    }
+
+    #[test]
+    fn hides_committed_composed_text_in_key_events() {
+        for text in ["你好隐私内容", r#"quoted \"private\" text"#, "emoji 👩‍💻"] {
+            let input = format!(
+                "key_event KeyEvent {{ key: Composed({text:?}), modifiers: NONE, raw: None }}\n"
+            );
+            let out = redactor().redact(&input);
+            assert!(out.contains("Composed(\"<typed>\")"), "{}", out);
+            assert!(!out.contains(text), "{}", out);
+            assert!(out.contains("modifiers: NONE, raw: None"));
         }
     }
 
