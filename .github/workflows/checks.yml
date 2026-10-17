@@ -227,6 +227,7 @@ jobs:
             assets/shell-integration/tests/tmux_integration_smoke.sh
             assets/shell-integration/tests/config_update_highlights_smoke.sh
             assets/shell-integration/tests/first_run_state_smoke.sh
+            assets/shell-integration/tests/compinit_cache_smoke.sh
           )
           for test_script in "${tests[@]}"; do
             echo "::group::Running ${test_script}"

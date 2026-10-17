@@ -1333,8 +1333,14 @@ fi
 # - If completion system is already initialized by user config/plugin manager, skip.
 # - Otherwise use cache and only rebuild when needed.
 autoload -Uz compinit
+# The (#q...) age test needs EXTENDED_GLOB; without it the test is always
+# true and every shell rebuilds. Scope the option so it does not leak.
+_kaku_zcompdump_stale() {
+    setopt local_options extended_glob
+    [[ -n "\${ZDOTDIR:-\$HOME}/.zcompdump"(#qN.mh+24) ]]
+}
 if ! (( \${+functions[_main_complete]} )) || ! (( \${+_comps} )); then
-    if [[ -n "\${ZDOTDIR:-\$HOME}/.zcompdump"(#qN.mh+24) ]]; then
+    if _kaku_zcompdump_stale; then
         # Rebuild completion cache if older than 24 hours
         compinit
     else
