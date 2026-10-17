@@ -846,7 +846,17 @@ mod tests {
         );
         let fragment = pairing::pairing_fragment(mac.public_key(), "c2VjcmV0");
         let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-        assert_eq!(fragment, format!("#p=c2VjcmV0&m={}", b64(mac.public_key())));
+        let key = mac.public_key();
+        assert_eq!(key.len(), 65);
+        assert_eq!(
+            fragment,
+            format!("#p=c2VjcmV0&m={}", b64(&pairing::compressed_point(key)))
+        );
+        // The x coordinate and the parity of y, which the page expands back.
+        let compressed = pairing::compressed_point(key);
+        assert_eq!(compressed.len(), 33);
+        assert_eq!(compressed[0], 0x02 | (key[64] & 1));
+        assert_eq!(&compressed[1..], &key[1..33]);
         assert!(!fragment.contains(&a.secret) && !fragment.contains(&a.mac_key));
     }
 

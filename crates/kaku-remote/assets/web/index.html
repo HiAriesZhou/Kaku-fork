@@ -261,6 +261,34 @@
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   const fromBase64Url = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  // Kaku sends its key as a compressed P-256 point to keep the link short;
+  // WebCrypto imports only the full point, so restore y from
+  // x and its parity, and refuse an x that is not on the curve.
+  const P256 = 2n ** 256n - 2n ** 224n + 2n ** 192n + 2n ** 96n - 1n;
+  const P256_B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn;
+  const modPow = (base, exp, mod) => {
+    let out = 1n;
+    for (base %= mod; exp > 0n; exp >>= 1n) {
+      if (exp & 1n) out = (out * base) % mod;
+      base = (base * base) % mod;
+    }
+    return out;
+  };
+  const fullPoint = (bytes) => {
+    if (bytes.length === 65 && bytes[0] === 4) return bytes;
+    if (bytes.length !== 33 || (bytes[0] !== 2 && bytes[0] !== 3)) throw new Error("not a P-256 point");
+    const hexOf = (b) => [...b].map((v) => v.toString(16).padStart(2, "0")).join("");
+    const x = BigInt("0x" + hexOf(bytes.subarray(1)));
+    const rhs = (((x * x * x - 3n * x + P256_B) % P256) + P256) % P256;
+    let y = modPow(rhs, (P256 + 1n) / 4n, P256);
+    if (x >= P256 || (y * y) % P256 !== rhs) throw new Error("not a P-256 point");
+    if (Number(y & 1n) !== (bytes[0] & 1)) y = P256 - y;
+    const out = new Uint8Array(65);
+    out[0] = 4;
+    out.set(bytes.subarray(1), 1);
+    out.set(Uint8Array.from(y.toString(16).padStart(64, "0").match(/../g), (h) => parseInt(h, 16)), 33);
+    return out;
+  };
   const sameBytes = (a, b) => !!a && !!b && a.length === b.length && a.every((v, i) => v === b[i]);
   const toBase64Url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   // This Mac's relay id, which both sides sign over.
@@ -300,7 +328,7 @@
     if (params.has("p") && params.has("m")) {
       let macPub, secret;
       try {
-        macPub = fromBase64Url(params.get("m"));
+        macPub = fullPoint(fromBase64Url(params.get("m")));
         secret = fromBase64Url(params.get("p"));
         if (macPub.length !== 65 || secret.length !== 16) throw new Error();
       } catch (_) {

@@ -273,7 +273,10 @@ async function until(fn, ms = 15000) {
     // way the page does with WebCrypto: Kaku's signature checks out against
     // the key the pairing link carries, a device Kaku never paired is
     // refused, and nothing recorded or out of place reaches a session.
-    const macPub = Buffer.from(new URLSearchParams(new URL(link).hash.slice(1)).get('m'), 'base64url');
+    // The link carries the key compressed; expand it as the page does.
+    const linkPub = Buffer.from(new URLSearchParams(new URL(link).hash.slice(1)).get('m'), 'base64url');
+    assert.equal(linkPub.length, 33);
+    const macPub = crypto.ECDH.convertKey(linkPub, 'prime256v1', undefined, undefined, 'uncompressed');
     const rawPub = key => { const jwk = key.export({ format: 'jwk' }); return Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]); };
     const aadFor = (label, seq) => { const out = Buffer.alloc(label.length + 8); Buffer.from(label).copy(out); out.writeBigUInt64BE(BigInt(seq), label.length); return out; };
     const sealWith = (key, label, seq, json) => {

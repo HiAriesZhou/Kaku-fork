@@ -516,7 +516,21 @@ pub(crate) fn announce_return(device: &Device) {
 
 /// The page link that pairs one more browser, valid for `OFFER_LIFETIME`.
 pub(crate) fn pairing_fragment(mac_public: &[u8], secret: &str) -> String {
-    format!("#p={secret}&m={}", b64(mac_public))
+    format!("#p={secret}&m={}", b64(&compressed_point(mac_public)))
+}
+
+/// The Mac's key as a compressed P-256 point, 33 bytes instead of 65, which
+/// keeps the link short; the page restores the full point.
+pub(crate) fn compressed_point(public: &[u8]) -> Vec<u8> {
+    match public {
+        [0x04, rest @ ..] if rest.len() == 64 => {
+            let mut out = Vec::with_capacity(33);
+            out.push(0x02 | (rest[63] & 1));
+            out.extend_from_slice(&rest[..32]);
+            out
+        }
+        _ => public.to_vec(),
+    }
 }
 
 #[cfg(test)]

@@ -89,6 +89,9 @@ async function newMac() {
   };
 }
 const pairingLink = (mac, secret) => `#p=${secret.toString('base64url')}&m=${mac.pub.toString('base64url')}`;
+// The form Kaku prints: the key as a compressed point, 33 bytes.
+const compressedLink = (mac, secret) => `#p=${secret.toString('base64url')}&m=${
+  require('node:crypto').ECDH.convertKey(mac.pub, 'prime256v1', undefined, undefined, 'compressed').toString('base64url')}`;
 
 // Act as Kaku on the page's newest relay connection: exchange keys, sign the
 // exchange as `signer`, read the page's proof, and (if `admit`) answer it
@@ -191,6 +194,31 @@ test('a pairing link proves itself once and the device signs in afterwards', asy
   assert.equal(again.proof.proof, undefined);
   assert.deepEqual(await storedDevice(next.p), kept);
   assert.deepEqual([...errors, ...next.errors], []);
+});
+
+test('a link with the compressed key pairs the same device as the full key', async t => {
+  const mac = await newMac();
+  const secret = Buffer.alloc(16, 5);
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  const { p, errors } = await page(t, compressedLink(mac, secret), {}, context);
+  const first = await handshake(p, mac, { secret });
+  assert.equal(first.signed, true);
+  assert.equal(first.paired, true);
+  // The full point is what the browser keeps, so it signs in with no link.
+  const next = await page(t, '', {}, context);
+  const again = await handshake(next.p, mac);
+  assert.equal(again.proof.type, 'auth');
+  assert.equal(again.signed, true);
+  assert.deepEqual([...errors, ...next.errors], []);
+});
+
+test('a compressed key whose x is not on the curve is refused as incomplete', async t => {
+  // x = 1 has no point on P-256 (node's convertKey refuses it too).
+  const off = Buffer.concat([Buffer.from([2]), Buffer.alloc(31), Buffer.from([1])]).toString('base64url');
+  const { p, errors } = await page(t, `#p=${Buffer.alloc(16, 1).toString('base64url')}&m=${off}`);
+  await p.waitForFunction(() => /incomplete/.test(document.body.innerText));
+  assert.deepEqual(errors, []);
 });
 
 test('a page proves nothing to a Mac that is not the one it paired with', async t => {
