@@ -395,9 +395,8 @@ fn print_pairing(url: &str) {
     println!("{url}");
     println!();
     for note in [
-        format!("The link works once, for {minutes} minutes. Whoever opens it first gets this Mac's terminals, so keep it to yourself."),
-        "A paired browser comes back from its bookmark, without a new link.".to_string(),
-        "Made for a desktop browser; phone screens are too small for now.".to_string(),
+        format!("Works once, within {minutes} minutes. Whoever opens it first gets your terminals, so keep it private."),
+        "Desktop browsers only for now. Have fun!".to_string(),
     ] {
         println!("{}", paint(GRAY, &note));
     }
