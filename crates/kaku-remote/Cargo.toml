@@ -15,7 +15,6 @@ image.workspace = true
 libc.workspace = true
 futures-util.workspace = true
 log.workspace = true
-qrcode.workspace = true
 ring = "0.17"
 mux.workspace = true
 parking_lot.workspace = true

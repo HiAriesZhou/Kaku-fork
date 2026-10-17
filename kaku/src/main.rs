@@ -367,32 +367,52 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
         // Without the relay the page is only reachable on this Mac, and its
         // token changes with every Kaku launch.
         let url = format!("http://127.0.0.1:{}/#t={}", state.port, state.token);
-        println!("{}", qr_for_stdout(&url));
+        println!("{url}");
         return Ok(());
     };
     if reset {
         println!("Every paired browser was removed.");
     }
-    let url = identity.pairing_link(relay)?;
-    println!("{}", qr_for_stdout(&url));
-    println!(
-        "Open this link in the browser to pair. It works once, for {} minutes.",
-        kaku_remote::OFFER_LIFETIME.as_secs() / 60
-    );
+    print_pairing(&identity.pairing_link(relay)?);
     Ok(())
 }
 
-/// Inside Kaku the QR code goes out as an image, square and a few rows tall
-/// whatever the line height; elsewhere (tmux, a pipe, another terminal) as
-/// block characters.
-fn qr_for_stdout(url: &str) -> String {
-    let in_kaku = std::env::var("TERM_PROGRAM").as_deref() == Ok("Kaku")
-        && std::env::var_os("TMUX").is_none()
-        && std::io::stdout().is_terminal();
-    in_kaku
-        .then(|| kaku_remote::render_qr_inline(url))
-        .flatten()
-        .unwrap_or_else(|| kaku_remote::render_qr_terminal(url))
+/// The one-time pairing link, what to know about it, and the commands that
+/// manage what it pairs, styled like the main menu when shown in a terminal.
+#[cfg(feature = "remote")]
+fn print_pairing(url: &str) {
+    let color = std::io::stdout().is_terminal();
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("{code}{text}{RESET}")
+        } else {
+            text.to_string()
+        }
+    };
+    let minutes = kaku_remote::OFFER_LIFETIME.as_secs() / 60;
+    println!();
+    println!("{}", paint(PURPLE_BOLD, "Pair a browser with this Mac"));
+    println!("{url}");
+    println!();
+    for note in [
+        format!("The link works once, for {minutes} minutes. Whoever opens it first gets this Mac's terminals, so keep it to yourself."),
+        "A paired browser comes back from its bookmark, without a new link.".to_string(),
+        "Made for a desktop browser; phone screens are too small for now.".to_string(),
+    ] {
+        println!("{}", paint(GRAY, &note));
+    }
+    println!();
+    for (command, what) in [
+        ("kaku remote devices", "List paired browsers"),
+        ("kaku remote revoke <id>", "Remove one"),
+        ("kaku remote off", "Turn remote access off"),
+    ] {
+        println!(
+            "{}  {}",
+            paint(GREEN, &format!("{command:<23}")),
+            paint(GRAY, what)
+        );
+    }
 }
 
 /// Ask before turning remote access on, write it to kaku.lua, and wait for
@@ -593,14 +613,14 @@ fn should_show_main_menu(opts: &Opt) -> bool {
         && std::io::stdout().is_terminal()
 }
 
+const GREEN: &str = "\x1b[0;32m";
+const PURPLE_BOLD: &str = "\x1b[1;35m";
+const GRAY: &str = "\x1b[0;90m";
+const RESET: &str = "\x1b[0m";
+
 fn select_main_menu_command() -> anyhow::Result<Option<SubCommand>> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-
-    const GREEN: &str = "\x1b[0;32m";
-    const PURPLE_BOLD: &str = "\x1b[1;35m";
-    const GRAY: &str = "\x1b[0;90m";
-    const RESET: &str = "\x1b[0m";
 
     #[derive(Clone, Copy)]
     enum MenuChoice {

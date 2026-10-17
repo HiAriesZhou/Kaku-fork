@@ -68,7 +68,6 @@ todo = "warn"
 ahash = "0.8"
 axum = { version = "0.8", features = ["ws"] }
 kaku-remote = { path = "crates/kaku-remote" }
-qrcode = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 anyhow = "1.0"
