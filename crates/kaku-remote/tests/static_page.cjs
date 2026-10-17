@@ -89,9 +89,11 @@ function serveLikeVercel(dir, listenPort) {
     assert.equal((await status()).headers.get('access-control-allow-origin'), origin);
 
     // This smoke reads DOM rows; --disable-gpu alone still permits WebGL.
+    // Headless Helium on the GPU aborts later page loads at random (the
+    // bookmark visits below, before any response), so it is off as well.
     // The dedicated browser suite covers WebGL rendering and recovery.
     browser = await chromium.launch({
-      args: ['--disable-webgl', '--disable-3d-apis'],
+      args: ['--disable-gpu', '--disable-webgl', '--disable-3d-apis'],
       ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}),
     });
     const context = await browser.newContext();
