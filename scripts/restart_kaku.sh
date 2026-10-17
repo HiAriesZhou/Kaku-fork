@@ -15,6 +15,18 @@
 
 set -euo pipefail
 
+# The detached run is marked with an argument, not an environment variable:
+# `open` passes its environment on to the app, so a variable set here ended
+# up in the reopened Kaku and in every shell inside it, and the next restart
+# from there skipped detaching and died with Kaku. Clear the variable older
+# versions set so it stops spreading.
+unset KAKU_RESTART_DETACHED
+detached=0
+if [[ "${1:-}" == --detached ]]; then
+	detached=1
+	shift
+fi
+
 app="${1:-/Applications/Kaku.app}"
 app="${app%/}"
 gui="$app/Contents/MacOS/kaku-gui"
@@ -26,12 +38,12 @@ delay="${KAKU_RESTART_DELAY:-5}"
 	exit 1
 }
 
-if [[ "${KAKU_RESTART_DETACHED:-}" != 1 ]]; then
+if [[ "$detached" != 1 ]]; then
 	self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 	# A new session, so closing Kaku's terminals (SIGHUP to their sessions)
 	# does not reach this script.
-	KAKU_RESTART_DETACHED=1 /usr/bin/nohup /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' \
-		/bin/bash "$self" "$app" >>"$log" 2>&1 </dev/null &
+	/usr/bin/nohup /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' \
+		/bin/bash "$self" --detached "$app" >>"$log" 2>&1 </dev/null &
 	echo "Restarting $app in ${delay}s; log: $log"
 	exit 0
 fi

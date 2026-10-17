@@ -4,19 +4,21 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class RestartTests(unittest.TestCase):
-    def run_fixture(self, pids, owner=None):
+    def run_fixture(self, pids, owner=None, detached=True, extra_env=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             gui = root / "Kaku.app/Contents/MacOS/kaku-gui"
             gui.parent.mkdir(parents=True)
             gui.touch()
             gui.chmod(0o755)
+            (root / "Library/Logs").mkdir(parents=True)
             (root / "running").write_text("".join(f"{pid}\n" for pid in pids))
             if owner is not None:
                 session = root / ".config/kaku/last_session.json"
@@ -27,6 +29,8 @@ class RestartTests(unittest.TestCase):
             source = (ROOT / "scripts/restart_kaku.sh").read_text()
             self.assertEqual(source.count('/usr/bin/open "$app"'), 1)
             source = source.replace('/usr/bin/open "$app"', 'fixture_open "$app"')
+            self.assertEqual(source.count("/usr/bin/nohup "), 1)
+            source = source.replace("/usr/bin/nohup ", "fixture_nohup ")
             mocks = r'''
 ps() {
     if [[ "$*" == *"-p "* ]]; then
@@ -47,14 +51,24 @@ fixture_open() {
     echo open >> "$HOME/calls"
     echo 999 > "$HOME/running"
 }
+fixture_nohup() {
+    printf 'detach env=%s args=%s\n' "${KAKU_RESTART_DETACHED:-unset}" "${*: -2}" >> "$HOME/calls"
+}
 '''
             script = root / "restart.sh"
             script.write_text(mocks + source)
             env = dict(os.environ, HOME=str(root), XDG_CONFIG_HOME=str(root / ".config"),
-                       FIXTURE_APP=str(gui.parents[2]), KAKU_RESTART_DETACHED="1",
-                       KAKU_RESTART_DELAY="0")
-            result = subprocess.run(["bash", str(script), str(gui.parents[2])],
+                       FIXTURE_APP=str(gui.parents[2]), KAKU_RESTART_DELAY="0",
+                       **(extra_env or {}))
+            args = ["--detached"] if detached else []
+            result = subprocess.run(["bash", str(script), *args, str(gui.parents[2])],
                                     env=env, capture_output=True, text=True, timeout=5)
+            if not detached:
+                # The detach launcher runs in the background; give it a moment.
+                for _ in range(40):
+                    if (root / "calls").exists():
+                        break
+                    time.sleep(0.05)
             calls = (root / "calls").read_text().splitlines() if (root / "calls").exists() else []
             return result, calls
 
@@ -77,6 +91,17 @@ fixture_open() {
         result, calls = self.run_fixture([101, 102], owner=103)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(calls, ["-TERM 101", "-TERM 102", "open"])
+
+    def test_leaked_detach_variable_still_detaches(self):
+        # `open` hands its environment to the app, so Kaku reopened by an
+        # older version of this script carries KAKU_RESTART_DETACHED=1 into
+        # every shell. That must not skip detaching, and must not be passed on.
+        result, calls = self.run_fixture([101], detached=False,
+                                         extra_env={"KAKU_RESTART_DETACHED": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Restarting", result.stdout)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertTrue(calls[0].startswith("detach env=unset args=--detached "), calls)
 
 
 if __name__ == "__main__":
