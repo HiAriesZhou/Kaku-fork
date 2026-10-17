@@ -24,6 +24,7 @@ use wezterm_escape_parser::csi::{
     EraseInLine, Mode, Sgr, TabulationClear, TerminalMode, TerminalModeCode, Window, XtSmGraphics,
     XtSmGraphicsAction, XtSmGraphicsItem, XtSmGraphicsStatus, XtermKeyModifierResource,
 };
+use wezterm_escape_parser::osc::ProgramState;
 use wezterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 
@@ -396,6 +397,9 @@ pub struct TerminalState {
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
     progress: Progress,
+    /// The last OSC 7501 state of the root record, kept so a program that
+    /// repeats a report does not notify twice.
+    program_status: Option<ProgramState>,
 
     palette: Option<ColorPalette>,
     /// Mode 2031 is pane-local. A snapshot also handles live config providers
@@ -655,6 +659,7 @@ impl TerminalState {
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
+            program_status: None,
             primary_peek: false,
             last_command_status: None,
             last_command_output_start: None,

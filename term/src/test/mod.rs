@@ -1939,3 +1939,82 @@ fn notification_bodies_keep_semicolons() {
         ]
     );
 }
+
+#[test]
+fn program_status_query_is_answered_before_da1() {
+    // Claude Code sends `OSC 7501 ; ?` and then DA1; it only reports its
+    // state when the 7501 reply arrives first.
+    let writer = SharedWriter::default();
+    let mut term = TestTerm::new_with_writer(5, 10, 100, Box::new(writer.clone()));
+    term.print("\x1b]7501;?\x07\x1b[c");
+    wait_for_writer_output(&writer, b"\x1b]7501;?\x1b\\\x1b[?65;4;6;18;22;52c");
+}
+
+#[test]
+fn program_status_reports_notify_once_per_state() {
+    let mut term = TestTerm::new(3, 20, 0);
+    let alerts = RecordingAlerts::default();
+    term.set_notification_handler(Box::new(alerts.clone()));
+
+    term.print("\x1b]7501;state=working:app=claude-code\x07");
+    // "Fix the build" in base64, without padding.
+    term.print(
+        "\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=Rml4IHRoZSBidWlsZA\x07",
+    );
+    // Repeating a state does not notify again.
+    term.print("\x1b]7501;state=blocked:app=claude-code:kind=permission\x07");
+    // Child records (sub-agents) are not surfaced.
+    term.print("\x1b]7501;state=done:id=agent-1:app=claude-code\x07");
+    term.print("\x1b]7501;state=working:app=claude-code\x07");
+    term.print("\x1b]7501;state=done:app=claude-code\x07");
+    term.print("\x1b]7501;state=clear\x07");
+    term.print("\x1b]7501;state=error:app=codex\x07");
+    // A new shell prompt does not forget done or error, so a stray repeat
+    // is still deduplicated.
+    term.print("\x1b]133;A\x07");
+    term.print("\x1b]7501;state=error:app=codex\x07");
+
+    let toasts: Vec<Alert> = alerts
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|alert| matches!(alert, Alert::ToastNotification { .. }))
+        .cloned()
+        .collect();
+    let toast = |title: &str, body: &str| Alert::ToastNotification {
+        title: Some(title.to_string()),
+        body: body.to_string(),
+        focus: true,
+    };
+    assert_eq!(
+        toasts,
+        vec![
+            toast("Claude Code", "Fix the build"),
+            toast("Claude Code", "Done"),
+            toast("Codex", "Stopped with an error"),
+        ]
+    );
+}
+
+#[test]
+fn program_status_blocked_notifies_again_after_a_new_prompt() {
+    // A program that died while blocked leaves no clear behind; the next
+    // run asking again must still reach the user.
+    let mut term = TestTerm::new(3, 20, 0);
+    let alerts = RecordingAlerts::default();
+    term.set_notification_handler(Box::new(alerts.clone()));
+
+    term.print("\x1b]7501;state=blocked:app=claude-code:kind=question\x07");
+    term.print("\x1b]133;A\x07");
+    term.print("\x1b]7501;state=blocked:app=claude-code:kind=question\x07");
+
+    let count = alerts
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|alert| matches!(alert, Alert::ToastNotification { .. }))
+        .count();
+    assert_eq!(count, 2);
+}

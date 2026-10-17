@@ -153,7 +153,7 @@ brew install --cask kaku
 
 First check that macOS allows them: choose Kaku > Notification Settings... and turn on Allow Notifications. macOS never asks again after a denial, so when a notification gets dropped for this reason Kaku tells you the next time you switch back to it.
 
-Claude Code only notifies terminals it recognizes and does not recognize Kaku yet, so its default `auto` channel sends nothing here. Kaku understands the sequence Claude Code sends to Ghostty, so set this in `~/.claude/settings.json`:
+Claude Code 2.1.295 and later tell Kaku whether they are working, waiting on you or done through the program status protocol (OSC 7501), and Kaku turns waiting, done and errors into a notification and the tab's attention dot with no setting needed. Check with `claude --version`, and leave `preferredNotifChannel` at its default `auto`, since `ghostty` there makes Claude Code post a second notification of its own. Older versions only notify terminals they recognize and send nothing to Kaku, so on those set this in `~/.claude/settings.json`:
 
 ```json
 { "preferredNotifChannel": "ghostty" }

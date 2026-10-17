@@ -24,7 +24,8 @@ use wezterm_escape_parser::csi::{
 };
 use wezterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
-    ITermUnicodeVersionOp, Selection,
+    ITermUnicodeVersionOp, ProgramBlockedKind, ProgramState, ProgramStatus, ProgramStatusReport,
+    Selection,
 };
 use wezterm_escape_parser::{
     Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
@@ -804,6 +805,7 @@ impl<'a> Performer<'a> {
                 self.suppress_initial_title_change = false;
                 self.accumulating_title.take();
                 self.progress = Progress::default();
+                self.program_status = None;
 
                 self.screen.full_reset();
                 self.screen.activate_alt_screen(seqno);
@@ -966,6 +968,7 @@ impl<'a> Performer<'a> {
                 // between the end of the previous command and the start of the next.
                 self.last_command_status = None;
                 self.last_command_output_start = None;
+                self.drop_live_program_status();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::StartPrompt(_),
@@ -973,6 +976,7 @@ impl<'a> Performer<'a> {
                 self.pen.set_semantic_type(SemanticType::Prompt);
                 self.last_command_status = None;
                 self.last_command_output_start = None;
+                self.drop_live_program_status();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfCommandWithFreshLine { .. },
@@ -1208,6 +1212,74 @@ impl<'a> Performer<'a> {
                     }
                 }
             }
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::Query) => {
+                // Programs such as Claude Code only send reports once this is
+                // answered. Replies go out in the order the queries arrived, so
+                // this one lands before the DA1 reply the program asks for next.
+                self.write_fmt_to_pty(
+                    "osc program status query response",
+                    format_args!(
+                        "{}",
+                        OperatingSystemCommand::ProgramStatus(ProgramStatus::Query)
+                    ),
+                );
+                self.flush_pty("osc program status query response");
+            }
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::Report(report)) => {
+                self.program_status_report(report);
+            }
+        }
+    }
+
+    /// A program reaching blocked, done or error becomes the same
+    /// notification as OSC 9, so the tab gets its attention dot and the
+    /// system notification follows `notification_handling`.
+    fn program_status_report(&mut self, report: ProgramStatusReport) {
+        // Only the root record speaks for the program as a whole; child
+        // records (sub-agents, background tasks) are not surfaced.
+        if report.id.is_some() {
+            return;
+        }
+        let previous = match report.state {
+            ProgramState::Clear => self.program_status.take(),
+            state => self.program_status.replace(state),
+        };
+        if previous == Some(report.state) {
+            return;
+        }
+        let default_body = match (report.state, report.kind) {
+            (ProgramState::Blocked, Some(ProgramBlockedKind::Permission)) => {
+                "Needs your permission"
+            }
+            (ProgramState::Blocked, Some(ProgramBlockedKind::Question)) => "Has a question for you",
+            (ProgramState::Blocked, Some(ProgramBlockedKind::Auth)) => "Needs you to sign in",
+            (ProgramState::Blocked, None) => "Waiting for you",
+            (ProgramState::Done, _) => "Done",
+            (ProgramState::Error, _) => "Stopped with an error",
+            _ => return,
+        };
+        let title = report.app.as_deref().map(|app| match app {
+            "claude-code" => "Claude Code".to_string(),
+            "codex" => "Codex".to_string(),
+            app => app.to_string(),
+        });
+        if let Some(handler) = self.alert_handler.as_mut() {
+            handler.alert(Alert::ToastNotification {
+                title,
+                body: report.msg.unwrap_or_else(|| default_body.to_string()),
+                focus: true,
+            });
+        }
+    }
+
+    /// A new prompt means the program that reported working or blocked has
+    /// gone; done and error stay until the program replaces them.
+    fn drop_live_program_status(&mut self) {
+        if matches!(
+            self.program_status,
+            Some(ProgramState::Working | ProgramState::Blocked)
+        ) {
+            self.program_status = None;
         }
     }
 }
