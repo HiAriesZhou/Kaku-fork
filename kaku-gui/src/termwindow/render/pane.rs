@@ -275,9 +275,9 @@ impl crate::TermWindow {
             // Calculate the height - respect bottom padding
             let height = if pos.top + pos.height >= self.terminal_size.rows as usize {
                 // Bottom-most pane: extend to split center but respect window padding.
-                // effective_vertical_padding already accounts for bottom tab bar height
-                // (it subtracts tab_bar_height from bottom padding), so we should not
-                // subtract bottom_bar_height again here to avoid a gap.
+                // With a bottom tab bar the bottom padding is the gap above the
+                // bar; the bar paints over the rest, so bottom_bar_height is not
+                // subtracted again.
                 // When tab bar is at bottom, it covers the bottom border area, so
                 // don't subtract border.bottom which would create a gap.
                 // Same as the right edge: fill the bottom padding unless a

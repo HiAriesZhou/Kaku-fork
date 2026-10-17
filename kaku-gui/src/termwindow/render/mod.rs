@@ -320,7 +320,12 @@ pub struct ComputeCellFgBgResult {
     pub cursor_shape: Option<CursorShape>,
 }
 
-fn edge_to_edge_top_gap(vertical_gap: f32, border_top: f32, border_bottom: f32) -> f32 {
+/// Top share of the space left after whole rows; the bottom gets the rest.
+fn split_row_slack(vertical_gap: f32) -> f32 {
+    (vertical_gap / 2.).floor().max(0.)
+}
+
+fn row_slack_inside_os_borders(vertical_gap: f32, border_top: f32, border_bottom: f32) -> f32 {
     (vertical_gap - border_top - border_bottom).max(0.)
 }
 
@@ -513,11 +518,24 @@ impl crate::TermWindow {
         };
         let top_gap = if self.layout_uses_edge_to_edge_padding() {
             let border = self.get_os_border();
-            edge_to_edge_top_gap(
+            row_slack_inside_os_borders(
                 vertical_gap,
                 border.top.get() as f32,
                 border.bottom.get() as f32,
             )
+        } else if self.config.window_content_alignment.vertical
+            == VerticalWindowContentAlignment::Top
+            && !super::resize::user_has_custom_window_padding_assignment()
+        {
+            // Rows rarely fill the height exactly. Managed padding splits the
+            // leftover evenly so content sits as far from the top edge as
+            // from the bottom edge or tab bar, in a window or fullscreen.
+            let border = self.get_os_border();
+            split_row_slack(row_slack_inside_os_borders(
+                vertical_gap,
+                border.top.get() as f32,
+                border.bottom.get() as f32,
+            ))
         } else {
             match self.config.window_content_alignment.vertical {
                 VerticalWindowContentAlignment::Top => 0.,
@@ -1094,14 +1112,26 @@ fn dim_color_for_half_intensity(attrs: &CellAttributes, color: LinearRgba) -> Li
 
 #[cfg(test)]
 mod tests {
-    use super::{dim_color_for_half_intensity, edge_to_edge_top_gap, resolve_fg_color_attr};
+    use super::{
+        dim_color_for_half_intensity, resolve_fg_color_attr, row_slack_inside_os_borders,
+        split_row_slack,
+    };
     use config::{configuration, use_test_configuration, TextStyle};
     use wezterm_term::color::{ColorAttribute, ColorPalette};
     use wezterm_term::{CellAttributes, Intensity};
 
     #[test]
-    fn edge_to_edge_top_gap_excludes_os_borders() {
-        assert_eq!(edge_to_edge_top_gap(18.0, 2.0, 2.0), 14.0);
+    fn row_slack_splits_between_top_and_bottom() {
+        // A 58px row leaves 0..57px; neither edge takes it all.
+        assert_eq!(split_row_slack(0.), 0.);
+        assert_eq!(split_row_slack(40.), 20.);
+        assert_eq!(split_row_slack(57.), 28.);
+        assert_eq!(split_row_slack(-3.), 0.);
+    }
+
+    #[test]
+    fn row_slack_excludes_os_borders() {
+        assert_eq!(row_slack_inside_os_borders(18.0, 2.0, 2.0), 14.0);
     }
 
     #[test]

@@ -149,47 +149,6 @@ fn should_normalize_fullscreen_state_on_resize(
         && (!is_focused || dimensions_unchanged)
 }
 
-fn should_rebalance_top_tab_visible_bottom_gap(
-    user_has_custom_padding: bool,
-    show_tab_bar: bool,
-    tab_bar_at_bottom: bool,
-    is_fullscreen: bool,
-) -> bool {
-    !user_has_custom_padding && show_tab_bar && !tab_bar_at_bottom && !is_fullscreen
-}
-
-fn should_rebalance_bottom_tab_quantization_slack(
-    user_has_custom_padding: bool,
-    tab_bar_at_bottom: bool,
-) -> bool {
-    !user_has_custom_padding && tab_bar_at_bottom
-}
-
-fn should_rebalance_maximized_quantization_slack(
-    user_has_custom_padding: bool,
-    uses_edge_to_edge_padding: bool,
-) -> bool {
-    // When maximized (edge-to-edge padding), absorb any quantization slack
-    // into top padding so terminal content fills to the bottom edge.
-    // This applies regardless of tab bar configuration.
-    !user_has_custom_padding && uses_edge_to_edge_padding
-}
-
-fn rebalance_top_padding_for_bottom_gap(
-    padding_top: usize,
-    padding_bottom: usize,
-    row_quantization_slack: usize,
-    max_bottom_gap: usize,
-) -> (usize, usize) {
-    let bottom_gap = padding_bottom.saturating_add(row_quantization_slack);
-    if bottom_gap <= max_bottom_gap {
-        return (padding_top, 0);
-    }
-
-    let shift = bottom_gap - max_bottom_gap;
-    (padding_top.saturating_add(shift), shift)
-}
-
 fn should_preserve_terminal_cells_on_scale_change(
     font_scale_changed: bool,
     simple_dpi_change: bool,
@@ -555,7 +514,6 @@ impl super::TermWindow {
         // change to the tab size.
 
         let config = &self.config;
-        let uses_edge_to_edge_padding = self.layout_uses_edge_to_edge_padding();
         let user_has_custom_padding = self.window_state.contains(WindowState::HOTKEY_WINDOW)
             || user_has_custom_window_padding_assignment();
 
@@ -673,7 +631,7 @@ impl super::TermWindow {
             let padding_left = effective_window_padding(config, self.window_state)
                 .left
                 .evaluate_as_pixels(h_context) as usize;
-            let (mut padding_top, mut padding_bottom) = effective_vertical_padding_with_policy(
+            let (padding_top, mut padding_bottom) = effective_vertical_padding_with_policy(
                 config,
                 v_context,
                 self.show_tab_bar,
@@ -710,40 +668,6 @@ impl super::TermWindow {
             let cell_height = self.render_metrics.cell_size.height as usize;
             let rows = avail_height / cell_height;
             let cols = avail_width / self.render_metrics.cell_size.width as usize;
-
-            let row_quantization_slack = avail_height.saturating_sub(rows * cell_height);
-
-            if should_rebalance_maximized_quantization_slack(
-                user_has_custom_padding,
-                uses_edge_to_edge_padding,
-            ) {
-                // Maximized windows use edge-to-edge layout: absorb all slack into top.
-                padding_top = padding_top.saturating_add(row_quantization_slack);
-            } else if should_rebalance_top_tab_visible_bottom_gap(
-                user_has_custom_padding,
-                self.show_tab_bar,
-                self.config.tab_bar_at_bottom,
-                self.layout_is_effective_fullscreen(),
-            ) {
-                let (rebalanced_top, _) = rebalance_top_padding_for_bottom_gap(
-                    padding_top,
-                    padding_bottom,
-                    row_quantization_slack,
-                    TOP_TAB_VISIBLE_BOTTOM_GAP,
-                );
-                padding_top = rebalanced_top;
-            } else if should_rebalance_bottom_tab_quantization_slack(
-                user_has_custom_padding,
-                self.config.tab_bar_at_bottom,
-            ) {
-                let (rebalanced_top, _) = rebalance_top_padding_for_bottom_gap(
-                    padding_top,
-                    padding_bottom,
-                    row_quantization_slack,
-                    BOTTOM_TAB_VISIBLE_MIN_GAP,
-                );
-                padding_top = rebalanced_top;
-            }
 
             let size = TerminalSize {
                 rows,
@@ -1221,26 +1145,6 @@ pub(super) fn load_persisted_font_scale(
 
 /// Visual spacing adjustment for tab bar layouts.
 const VISUAL_SPACING: usize = 4;
-/// When the top tab bar is visible, slightly tighten the top content gap so
-/// the first terminal row doesn't feel too far from the tab strip.
-const TOP_TAB_VISIBLE_TOP_TIGHTENING: usize = 6;
-/// Bottom gap for top-tab layouts when the tab bar is **hidden** (single-tab,
-/// hide-if-only-one-tab mode). A larger value gives comfortable breathing room
-/// when no bar occupies the top of the window.
-/// We set this to 10 to keep single-tab top-tab mode from feeling too tight.
-const TOP_TAB_HIDDEN_BOTTOM_GAP: usize = 10;
-/// Bottom gap for top-tab layouts when the tab bar is visible.
-/// Match the hidden-tab baseline so top-tab windows keep the same content
-/// inset whether the bar is visible or not.
-const TOP_TAB_VISIBLE_BOTTOM_GAP: usize = TOP_TAB_HIDDEN_BOTTOM_GAP;
-/// Minimum gap kept between terminal content and the bottom tab bar while the
-/// bar is visible. Kept small so the bar still feels visually attached to the
-/// content.
-const BOTTOM_TAB_VISIBLE_MIN_GAP: usize = 2;
-/// Baseline gap used when the bottom tab bar is hidden. This avoids the
-/// content feeling glued to the window edge in single-tab mode.
-const BOTTOM_TAB_HIDDEN_GAP: usize = 16;
-
 #[derive(Clone)]
 struct UserPaddingCache {
     path: PathBuf,
@@ -1275,7 +1179,7 @@ fn user_custom_window_padding_config_path() -> PathBuf {
     config::config_file_override().unwrap_or_else(config::user_config_path)
 }
 
-fn user_has_custom_window_padding_assignment() -> bool {
+pub(crate) fn user_has_custom_window_padding_assignment() -> bool {
     static CACHE: OnceLock<Mutex<Option<UserPaddingCache>>> = OnceLock::new();
 
     let path = user_custom_window_padding_config_path();
@@ -1326,10 +1230,8 @@ pub(crate) fn padding_pixel_max(
     }
 }
 
-/// Computes vertical padding used for layout.
-/// Bottom-tab layouts subtract the tab bar height from bottom padding so the
-/// content block remains stable. Top-tab layouts preserve the full top padding
-/// so the gap below the tab bar matches the no-tab baseline.
+/// Computes vertical padding used for layout. Rows rarely fill the height
+/// exactly; `padding_left_top` splits the leftover between top and bottom.
 pub fn effective_vertical_padding(
     config: &Config,
     context: DimensionContext,
@@ -1368,59 +1270,41 @@ fn effective_vertical_padding_with_policy(
     let is_edge_to_edge = window_state.contains(WindowState::MAXIMIZED);
     let base_top = config.window_padding.top.evaluate_as_pixels(context) as usize;
     let base_bottom = config.window_padding.bottom.evaluate_as_pixels(context) as usize;
+    let bottom_tab_visible = show_tab_bar && tab_bar_at_bottom;
+
+    // Explicit user padding is used as written; a bottom tab bar sits
+    // inside it.
+    if user_has_custom_padding {
+        let bottom = if bottom_tab_visible {
+            base_bottom.saturating_sub(tab_bar_height)
+        } else {
+            base_bottom
+        };
+        return (base_top, bottom);
+    }
+
+    // Managed padding derives every vertical gap from the top padding: the
+    // window edges keep all of it, and content keeps half of it from a
+    // visible tab bar, top or bottom, so the bar never touches the output.
     let default_top = config::WindowPadding::default()
         .top
         .evaluate_as_pixels(context) as usize;
+    let outer = effective_top_padding(base_top, default_top);
+    let tab_bar_gap = outer / 2;
 
-    // Respect explicit user padding and only apply Kaku's visual heuristics
-    // for the managed/default padding path.
-    let mut top = if user_has_custom_padding {
-        base_top
+    let top = if show_tab_bar && !tab_bar_at_bottom {
+        tab_bar_gap
     } else {
-        effective_top_padding(base_top, default_top)
+        outer
     };
-
-    // When maximized/fullscreen, eliminate bottom padding so terminal content
-    // fills to the window bottom edge. The quantization slack is redistributed
-    // to the top in the render path (padding_left_top).
-    let mut bottom = if is_edge_to_edge && !user_has_custom_padding {
+    let bottom = if bottom_tab_visible {
+        tab_bar_gap
+    } else if is_edge_to_edge {
+        // Maximized windows run content to the bottom edge.
         0
     } else {
-        base_bottom
+        base_bottom.max(outer)
     };
-
-    // Top-tab visible mode uses a slightly tighter top gap than hidden mode.
-    if !user_has_custom_padding && show_tab_bar && !tab_bar_at_bottom {
-        top = top.saturating_sub(TOP_TAB_VISIBLE_TOP_TIGHTENING);
-    }
-
-    // Bottom-tab layouts subtract the tab bar height from bottom padding to
-    // keep the content block stable. For top-tab layouts we intentionally keep
-    // the full top padding so the tab bar gets the same breathing room as the
-    // no-tab case.
-    if show_tab_bar && tab_bar_at_bottom {
-        bottom = bottom.saturating_sub(tab_bar_height);
-    }
-
-    if !is_edge_to_edge && !user_has_custom_padding && !tab_bar_at_bottom {
-        let gap = if show_tab_bar {
-            TOP_TAB_VISIBLE_BOTTOM_GAP
-        } else {
-            TOP_TAB_HIDDEN_BOTTOM_GAP
-        };
-        bottom = bottom.max(gap);
-    }
-
-    // Keep a tiny baseline gap in bottom-tab layouts so hidden/visible tab-bar
-    // transitions cannot collapse pane content onto the window bottom edge.
-    if !is_edge_to_edge && !user_has_custom_padding && tab_bar_at_bottom {
-        let min_gap = if show_tab_bar {
-            BOTTOM_TAB_VISIBLE_MIN_GAP
-        } else {
-            BOTTOM_TAB_HIDDEN_GAP
-        };
-        bottom = bottom.max(min_gap);
-    }
 
     (top, bottom)
 }
@@ -1448,13 +1332,12 @@ mod tests {
         clear_deferred_font_scale_pty_resize, effective_top_padding,
         effective_vertical_padding_with_policy, finish_deferred_font_scale_pty_resize,
         has_deferred_font_scale_pty_resize, mark_deferred_font_scale_pty_resize,
-        note_deferred_font_scale_pty_resize, rebalance_top_padding_for_bottom_gap,
-        should_defer_screen_change_scale_update, should_normalize_fullscreen_state_on_resize,
-        should_preserve_terminal_cells_on_scale_change,
-        should_rebalance_top_tab_visible_bottom_gap, user_custom_window_padding_config_path,
+        note_deferred_font_scale_pty_resize, should_defer_screen_change_scale_update,
+        should_normalize_fullscreen_state_on_resize,
+        should_preserve_terminal_cells_on_scale_change, user_custom_window_padding_config_path,
     };
     use ::window::WindowState;
-    use config::{Config, ConfigHandle, DimensionContext};
+    use config::{Config, DimensionContext};
     use std::path::PathBuf;
 
     fn context() -> DimensionContext {
@@ -1850,13 +1733,6 @@ mod tests {
         );
     }
 
-    fn base_vertical_padding(config: &ConfigHandle) -> (usize, usize) {
-        (
-            config.window_padding.top.evaluate_as_pixels(context()) as usize,
-            config.window_padding.bottom.evaluate_as_pixels(context()) as usize,
-        )
-    }
-
     #[test]
     fn deferred_font_scale_resize_throttles_pty_like_tmux() {
         let window_id = usize::MAX - 407;
@@ -1943,18 +1819,6 @@ mod tests {
     }
 
     #[test]
-    fn top_tab_mode_adjusts_top_even_when_tab_bar_hidden() {
-        let config = ConfigHandle::default_config();
-        let (base_top, base_bottom) = base_vertical_padding(&config);
-
-        let (top, bottom) = effective_vertical_padding(&config, context(), false, false, 24, false);
-
-        assert_eq!(top, base_top + 4);
-        // Tab bar is hidden → use the larger hidden gap.
-        assert_eq!(bottom, base_bottom.max(super::TOP_TAB_HIDDEN_BOTTOM_GAP));
-    }
-
-    #[test]
     fn explicit_top_padding_can_disable_visual_spacing() {
         assert_eq!(effective_top_padding(0, 8), 0);
         assert_eq!(effective_top_padding(12, 8), 12);
@@ -1991,41 +1855,6 @@ mod tests {
     }
 
     #[test]
-    fn top_tab_bar_visible_adjusts_top_and_bottom_padding() {
-        let config = ConfigHandle::default_config();
-        let tab_bar_height = 24;
-        let (base_top, base_bottom) = base_vertical_padding(&config);
-
-        let (with_tab_top, with_tab_bottom) =
-            effective_vertical_padding(&config, context(), true, false, tab_bar_height, false);
-
-        assert_eq!(
-            with_tab_top,
-            base_top + super::VISUAL_SPACING - super::TOP_TAB_VISIBLE_TOP_TIGHTENING
-        );
-        assert_eq!(
-            with_tab_bottom,
-            base_bottom.max(super::TOP_TAB_VISIBLE_BOTTOM_GAP)
-        );
-    }
-
-    #[test]
-    fn top_tab_bar_visible_has_tighter_top_padding_than_hidden() {
-        let config = ConfigHandle::default_config();
-
-        let (hidden_top, hidden_bottom) =
-            effective_vertical_padding(&config, context(), false, false, 24, false);
-        let (visible_top, visible_bottom) =
-            effective_vertical_padding(&config, context(), true, false, 24, false);
-
-        assert_eq!(
-            visible_top + super::TOP_TAB_VISIBLE_TOP_TIGHTENING,
-            hidden_top
-        );
-        assert_eq!(visible_bottom, hidden_bottom);
-    }
-
-    #[test]
     fn top_tab_bar_visible_preserves_explicit_large_bottom_padding() {
         let mut config = Config::default_config();
         config.window_padding.bottom = config::Dimension::Pixels(20.0);
@@ -2042,15 +1871,6 @@ mod tests {
 
         let (_, bottom) =
             effective_vertical_padding_user_custom(&config, context(), false, false, 24, false);
-
-        assert_eq!(bottom, 0);
-    }
-
-    #[test]
-    fn edge_to_edge_top_tab_bar_visible_eliminates_bottom_padding() {
-        let config = ConfigHandle::default_config();
-
-        let (_, bottom) = effective_vertical_padding(&config, context(), true, false, 24, true);
 
         assert_eq!(bottom, 0);
     }
@@ -2078,108 +1898,52 @@ mod tests {
     }
 
     #[test]
-    fn edge_to_edge_top_tab_hidden_eliminates_bottom_padding() {
-        let config = ConfigHandle::default_config();
-
-        let normal = effective_vertical_padding(&config, context(), false, false, 24, false);
-        let edge = effective_vertical_padding(&config, context(), false, false, 24, true);
-
-        // Top padding stays the same; bottom drops to 0.
-        assert_eq!(edge.0, normal.0);
-        assert_eq!(edge.1, 0);
-    }
-
-    #[test]
-    fn edge_to_edge_top_tab_visible_eliminates_bottom_padding() {
-        let config = ConfigHandle::default_config();
-
-        let normal = effective_vertical_padding(&config, context(), true, false, 24, false);
-        let edge = effective_vertical_padding(&config, context(), true, false, 24, true);
-
-        // Top padding stays the same; bottom drops to 0.
-        assert_eq!(edge.0, normal.0);
-        assert_eq!(edge.1, 0);
-    }
-
-    #[test]
-    fn bottom_tab_bar_adjusts_padding_even_when_hidden() {
-        let config = ConfigHandle::default_config();
-        let (base_top, base_bottom) = base_vertical_padding(&config);
-        let (with_bottom_top, with_bottom_bottom) =
-            effective_vertical_padding(&config, context(), false, true, 24, false);
-
-        assert_eq!(with_bottom_top, base_top + 4);
-        assert_eq!(
-            with_bottom_bottom,
-            base_bottom.max(super::BOTTOM_TAB_HIDDEN_GAP)
-        );
-    }
-
-    #[test]
-    fn bottom_tab_bar_hidden_with_zero_padding_keeps_min_gap() {
+    fn managed_padding_derives_every_gap_from_the_top_padding() {
         let mut config = Config::default_config();
-        config.window_padding.bottom = config::Dimension::Pixels(0.0);
-        let (_, bottom) = effective_vertical_padding(&config, context(), false, true, 24, false);
-        assert_eq!(bottom, super::BOTTOM_TAB_HIDDEN_GAP);
+        config.window_padding = config::WindowPadding {
+            left: config::Dimension::Pixels(40.0),
+            right: config::Dimension::Pixels(40.0),
+            top: config::Dimension::Pixels(40.0),
+            bottom: config::Dimension::Pixels(0.0),
+        };
+        let pad = |show, at_bottom, maximized| {
+            effective_vertical_padding(&config, context(), show, at_bottom, 58, maximized)
+        };
+
+        // No tab bar: the bottom edge matches the top edge.
+        assert_eq!(pad(false, true, false), (40, 40));
+        assert_eq!(pad(false, false, false), (40, 40));
+        // A visible bar keeps half the padding from the output, top or bottom.
+        assert_eq!(pad(true, true, false), (40, 20));
+        assert_eq!(pad(true, false, false), (20, 40));
+        // Maximized windows run to the bottom edge, but never into a bar.
+        assert_eq!(pad(false, true, true), (40, 0));
+        assert_eq!(pad(true, true, true), (40, 20));
+        assert_eq!(pad(true, false, true), (20, 0));
     }
 
     #[test]
-    fn edge_to_edge_bottom_tab_bar_hidden_eliminates_bottom_padding() {
+    fn managed_padding_keeps_a_larger_explicit_bottom() {
         let mut config = Config::default_config();
-        config.window_padding.bottom = config::Dimension::Pixels(0.0);
-        let (_, bottom) = effective_vertical_padding(&config, context(), false, true, 24, true);
-        assert_eq!(bottom, 0);
+        config.window_padding.top = config::Dimension::Pixels(40.0);
+        config.window_padding.bottom = config::Dimension::Pixels(60.0);
+
+        let (_, bottom) = effective_vertical_padding(&config, context(), false, true, 58, false);
+
+        assert_eq!(bottom, 60);
     }
 
     #[test]
-    fn bottom_tab_bar_visible_zero_height_keeps_min_gap() {
+    fn custom_padding_puts_a_bottom_tab_bar_inside_the_bottom_padding() {
         let mut config = Config::default_config();
-        config.window_padding.bottom = config::Dimension::Pixels(0.0);
-        let (_, bottom) = effective_vertical_padding(&config, context(), true, true, 0, false);
-        assert_eq!(bottom, super::BOTTOM_TAB_VISIBLE_MIN_GAP);
-    }
+        config.window_padding.bottom = config::Dimension::Pixels(40.0);
 
-    #[test]
-    fn bottom_tab_bar_enforces_min_gap() {
-        let tab_bar_height = 24;
-
-        // Default config: saturating_sub gives 0, min-gap floor kicks in.
-        let config = ConfigHandle::default_config();
         let (_, bottom) =
-            effective_vertical_padding(&config, context(), true, true, tab_bar_height, false);
-        assert_eq!(bottom, super::BOTTOM_TAB_VISIBLE_MIN_GAP);
-
-        // Edge-to-edge: bottom drops to 0 (no min gap enforcement).
-        let (_, bottom_edge) =
-            effective_vertical_padding(&config, context(), true, true, tab_bar_height, true);
-        assert_eq!(bottom_edge, 0);
-
-        // Explicit large value: user gets their residual (already above the floor).
-        let mut config2 = Config::default_config();
-        config2.window_padding.bottom = config::Dimension::Pixels(40.0);
-        let (_, bottom2) =
-            effective_vertical_padding(&config2, context(), true, true, tab_bar_height, false);
-        assert_eq!(bottom2, 40usize.saturating_sub(tab_bar_height)); // 16px
-    }
-
-    #[test]
-    fn edge_to_edge_bottom_tab_bar_explicit_zero_eliminates_padding() {
-        let mut config = Config::default_config();
-        config.window_padding.bottom = config::Dimension::Pixels(0.0);
-
-        let (_, bottom) = effective_vertical_padding(&config, context(), true, true, 24, true);
-
-        assert_eq!(bottom, 0);
-    }
-
-    #[test]
-    fn edge_to_edge_bottom_tab_bar_explicit_small_eliminates_padding() {
-        let mut config = Config::default_config();
-        config.window_padding.bottom = config::Dimension::Pixels(2.0);
-
-        let (_, bottom) = effective_vertical_padding(&config, context(), true, true, 24, true);
-
-        assert_eq!(bottom, 0);
+            effective_vertical_padding_user_custom(&config, context(), true, true, 24, false);
+        assert_eq!(bottom, 16);
+        let (_, bottom) =
+            effective_vertical_padding_user_custom(&config, context(), true, true, 24, true);
+        assert_eq!(bottom, 16);
     }
 
     #[test]
@@ -2238,46 +2002,6 @@ mod tests {
     }
 
     #[test]
-    fn rebalance_top_padding_caps_visible_top_tab_bottom_gap() {
-        let (top, shifted) =
-            rebalance_top_padding_for_bottom_gap(18, 4, 12, super::TOP_TAB_VISIBLE_BOTTOM_GAP);
-
-        assert_eq!(top, 24);
-        assert_eq!(shifted, 6);
-    }
-
-    #[test]
-    fn rebalance_top_padding_noop_when_bottom_gap_within_limit() {
-        let (top, shifted) =
-            rebalance_top_padding_for_bottom_gap(18, 4, 4, super::TOP_TAB_VISIBLE_BOTTOM_GAP);
-
-        assert_eq!(top, 18);
-        assert_eq!(shifted, 0);
-    }
-
-    #[test]
-    fn rebalance_applies_only_for_managed_top_tab_visible_non_fullscreen() {
-        assert!(should_rebalance_top_tab_visible_bottom_gap(
-            false, // managed padding
-            true,  // tab bar visible
-            false, // top-tab
-            false, // not fullscreen
-        ));
-        assert!(!should_rebalance_top_tab_visible_bottom_gap(
-            true, true, false, false
-        ));
-        assert!(!should_rebalance_top_tab_visible_bottom_gap(
-            false, false, false, false
-        ));
-        assert!(!should_rebalance_top_tab_visible_bottom_gap(
-            false, true, true, false
-        ));
-        assert!(!should_rebalance_top_tab_visible_bottom_gap(
-            false, true, false, true
-        ));
-    }
-
-    #[test]
     fn screen_change_disables_terminal_size_preservation_for_simple_dpi_change() {
         assert!(!should_preserve_terminal_cells_on_scale_change(
             false, true, false
@@ -2324,42 +2048,5 @@ mod tests {
         assert!(!should_stabilize_transition_dpi(
             false, false, false, 72, 144
         ));
-    }
-
-    #[test]
-    fn bottom_tab_rebalance_applies_only_for_managed_bottom_tab() {
-        use super::should_rebalance_bottom_tab_quantization_slack;
-        assert!(should_rebalance_bottom_tab_quantization_slack(
-            false, // managed padding
-            true,  // bottom-tab
-        ));
-        assert!(!should_rebalance_bottom_tab_quantization_slack(
-            true, // user custom padding
-            true,
-        ));
-        assert!(!should_rebalance_bottom_tab_quantization_slack(
-            false, // managed padding
-            false, // top-tab - handled by top-tab rebalance
-        ));
-    }
-
-    #[test]
-    fn bottom_tab_rebalance_absorbs_quantization_slack_into_top_padding() {
-        // Simulate: cell_height=23, avail_height=1372, rows=59, slack=15
-        // padding_bottom=2 (BOTTOM_TAB_VISIBLE_MIN_GAP), padding_top=36
-        // bottom_gap = 2 + 15 = 17 > BOTTOM_TAB_VISIBLE_MIN_GAP(2)
-        // shift = 17 - 2 = 15 → padding_top increases by 15, bottom strip eliminated
-        let (top, shifted) =
-            rebalance_top_padding_for_bottom_gap(36, 2, 15, super::BOTTOM_TAB_VISIBLE_MIN_GAP);
-        assert_eq!(shifted, 15);
-        assert_eq!(top, 51);
-    }
-
-    #[test]
-    fn bottom_tab_rebalance_noop_when_no_slack() {
-        let (top, shifted) =
-            rebalance_top_padding_for_bottom_gap(36, 2, 0, super::BOTTOM_TAB_VISIBLE_MIN_GAP);
-        assert_eq!(shifted, 0);
-        assert_eq!(top, 36);
     }
 }
