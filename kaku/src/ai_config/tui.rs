@@ -2458,19 +2458,7 @@ impl App {
         if !field.editable {
             if field.key == "Auth" || (field.value.starts_with('✓') && !field.key.contains(" ▸ "))
             {
-                let cmd = match tool.tool {
-                    Tool::KakuAssistant => None,
-                    Tool::Gemini => Some("gemini auth login"),
-                    Tool::Codex => Some("codex auth login"),
-                    Tool::Kimi => Some("kimi login"),
-                    Tool::Antigravity => Some("open -a Antigravity"),
-                    Tool::Copilot => Some("gh auth login"),
-                    Tool::FactoryDroid => Some("droid"),
-                    Tool::ClaudeCode => Some("claude auth login"),
-                    Tool::OpenClaw => None,
-                };
-
-                if let Some(auth_cmd) = cmd {
+                if let Some(auth_cmd) = reauth_command(tool.tool) {
                     self.open_in_terminal(auth_cmd);
                 } else if tool.tool == Tool::OpenClaw {
                     self.set_status("OpenClaw uses API keys, check config file");
@@ -2746,6 +2734,23 @@ impl App {
             Ok(_) => self.set_status("Opening in new terminal window..."),
             Err(_) => self.set_status(format!("Failed to open terminal. Run '{}' manually", cmd)),
         }
+    }
+}
+
+/// The command opened in a terminal to sign in again from an auth field. Each
+/// must be a real subcommand: an unknown word such as `codex auth` is taken as
+/// a prompt and starts a session instead of a login.
+fn reauth_command(tool: Tool) -> Option<&'static str> {
+    match tool {
+        Tool::KakuAssistant | Tool::OpenClaw => None,
+        // Gemini CLI has no auth subcommand; it signs in when launched.
+        Tool::Gemini => Some("gemini"),
+        Tool::Codex => Some("codex login"),
+        Tool::Kimi => Some("kimi login"),
+        Tool::Antigravity => Some("open -a Antigravity"),
+        Tool::Copilot => Some("gh auth login"),
+        Tool::FactoryDroid => Some("droid"),
+        Tool::ClaudeCode => Some("claude auth login"),
     }
 }
 
@@ -3373,6 +3378,16 @@ mod tests {
     use super::*;
     use base64::Engine;
     use tempfile::tempdir;
+
+    #[test]
+    fn reauth_commands_use_real_login_subcommands() {
+        // `codex auth login` and `gemini auth login` are not subcommands; both
+        // CLIs read the words as a prompt and start a session instead.
+        assert_eq!(reauth_command(Tool::Codex), Some("codex login"));
+        assert_eq!(reauth_command(Tool::Gemini), Some("gemini"));
+        assert_eq!(reauth_command(Tool::ClaudeCode), Some("claude auth login"));
+        assert_eq!(reauth_command(Tool::KakuAssistant), None);
+    }
 
     fn encode_varint(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();
