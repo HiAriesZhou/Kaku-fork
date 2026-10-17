@@ -367,19 +367,32 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
         // Without the relay the page is only reachable on this Mac, and its
         // token changes with every Kaku launch.
         let url = format!("http://127.0.0.1:{}/#t={}", state.port, state.token);
-        println!("{}", kaku_remote::render_qr_terminal(&url));
+        println!("{}", qr_for_stdout(&url));
         return Ok(());
     };
     if reset {
         println!("Every paired browser was removed.");
     }
     let url = identity.pairing_link(relay)?;
-    println!("{}", kaku_remote::render_qr_terminal(&url));
+    println!("{}", qr_for_stdout(&url));
     println!(
         "Open this link in the browser to pair. It works once, for {} minutes.",
         kaku_remote::OFFER_LIFETIME.as_secs() / 60
     );
     Ok(())
+}
+
+/// Inside Kaku the QR code goes out as an image, square and a few rows tall
+/// whatever the line height; elsewhere (tmux, a pipe, another terminal) as
+/// block characters.
+fn qr_for_stdout(url: &str) -> String {
+    let in_kaku = std::env::var("TERM_PROGRAM").as_deref() == Ok("Kaku")
+        && std::env::var_os("TMUX").is_none()
+        && std::io::stdout().is_terminal();
+    in_kaku
+        .then(|| kaku_remote::render_qr_inline(url))
+        .flatten()
+        .unwrap_or_else(|| kaku_remote::render_qr_terminal(url))
 }
 
 /// Ask before turning remote access on, write it to kaku.lua, and wait for

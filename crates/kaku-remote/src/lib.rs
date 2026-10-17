@@ -360,6 +360,74 @@ pub fn render_qr_terminal(url: &str) -> String {
     format!("{}\n{}", rendered.trim_end(), url)
 }
 
+/// Columns the inline QR code spans; its height follows, so it stays square.
+const QR_IMAGE_COLS: u32 = 24;
+
+/// A QR code for `url` as an iTerm2 inline image, followed by the url, for
+/// Kaku itself to show. Block characters fill whole cells, so line_height
+/// stretches them into a tall code as wide as the module count; an image
+/// keeps its aspect at a set width.
+pub fn render_qr_inline(url: &str) -> Option<String> {
+    use base64::Engine;
+    let png = qr_png(&QrCode::new(url.as_bytes()).ok()?)?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&png);
+    Some(format!(
+        "\x1b]1337;File=inline=1;size={};width={QR_IMAGE_COLS};preserveAspectRatio=1:{data}\x07\n{url}",
+        png.len()
+    ))
+}
+
+/// Dark modules on white with a two-module quiet zone, eight pixels each.
+fn qr_png(qr: &QrCode) -> Option<Vec<u8>> {
+    const SCALE: u32 = 8;
+    const QUIET: u32 = 2;
+    let side = qr.width() as u32;
+    let colors = qr.to_colors();
+    let px = (side + QUIET * 2) * SCALE;
+    let img = image::GrayImage::from_fn(px, px, |x, y| {
+        let (mx, my) = (x / SCALE, y / SCALE);
+        let inside = (QUIET..side + QUIET).contains(&mx) && (QUIET..side + QUIET).contains(&my);
+        let dark =
+            inside && colors[((my - QUIET) * side + (mx - QUIET)) as usize] == qrcode::Color::Dark;
+        image::Luma([if dark { 0 } else { 255 }])
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
+}
+
+#[cfg(test)]
+mod qr_tests {
+    use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn the_inline_qr_code_is_a_square_image_at_a_set_width() {
+        let url = "https://r.kaku.fun/0123456789abcdef0123456789abcdef/#p=x&m=y";
+        let out = render_qr_inline(url).unwrap();
+        let (head, rest) = out.split_once(':').unwrap();
+        assert!(
+            head.starts_with("\x1b]1337;File=inline=1;size="),
+            "{head:?}"
+        );
+        assert!(
+            head.ends_with(";width=24;preserveAspectRatio=1"),
+            "{head:?}"
+        );
+        let (data, tail) = rest.split_once('\x07').unwrap();
+        assert_eq!(tail, format!("\n{url}"));
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        let img = image::load_from_memory(&png).unwrap().to_luma8();
+        let side = QrCode::new(url.as_bytes()).unwrap().width() as u32;
+        assert_eq!(img.dimensions(), ((side + 4) * 8, (side + 4) * 8));
+        // The quiet zone is white; the top-left finder starts dark after it.
+        assert_eq!(img.get_pixel(0, 0).0, [255]);
+        assert_eq!(img.get_pixel(16, 16).0, [0]);
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// The relay when `remote.tunnel_url` is empty. It lives here, not in the
