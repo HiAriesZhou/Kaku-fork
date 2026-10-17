@@ -1,0 +1,57 @@
+name: Blog Publish
+
+# The kaku.fun blog lives on the `vercel` branch with a queue of written posts
+# in content/blog/index.json. Once a day this dates the next queued post and
+# pushes, and Vercel deploys the push. Scheduled workflows only run from the
+# default branch, which is why this file lives on main while it works on
+# `vercel`. A day that already has a post, or an empty queue, pushes nothing.
+on:
+  schedule:
+    # 01:00 UTC is 09:00 Beijing, the date the post carries.
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: blog-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout site
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: vercel
+          fetch-depth: 0
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet markdown pygments pillow
+
+      - name: Publish the next post
+        id: publish
+        run: |
+          slug=$("$RUNNER_TEMP/venv/bin/python" scripts/publish_next_post.py)
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+          echo "published: ${slug:-nothing}"
+
+      - name: Check generated files
+        if: steps.publish.outputs.slug != ''
+        run: |
+          for s in build_blog.py build_markdown.py build_feed.py highlight.py check_sitemap.py; do
+            "$RUNNER_TEMP/venv/bin/python" "scripts/$s" $([ "$s" = check_sitemap.py ] || echo --check)
+          done
+
+      - name: Commit and push
+        if: steps.publish.outputs.slug != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "blog: publish ${{ steps.publish.outputs.slug }}"
+          git push origin HEAD:vercel
