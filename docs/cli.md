@@ -60,7 +60,7 @@ kaku reset --shell fish # use fish for restart and restore guidance
 
 ## kaku remote
 
-Use this Mac's terminals from a browser on another device, through Kaku's relay. Remote access is off until you turn it on, and it is free while it is in testing.
+Use this Mac's terminals from a browser on another device, through Kaku's relay. Remote access is off until you turn it on.
 
 ```bash
 kaku remote               # turn remote access on (asks first) and print a pairing link
