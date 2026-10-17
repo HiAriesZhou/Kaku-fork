@@ -192,6 +192,8 @@ pub(crate) struct MouseInputState {
     /// The right click a finished long press turns into, delivered right
     /// after the release that ended it.
     pub long_press_replay: Option<MouseEvent>,
+    /// Set while that right click runs, so its menu opens at touch size.
+    pub menu_from_long_press: bool,
 }
 
 impl Default for MouseInputState {
@@ -207,6 +209,7 @@ impl Default for MouseInputState {
             touch_band_press: None,
             long_press: None,
             long_press_replay: None,
+            menu_from_long_press: false,
         }
     }
 }
@@ -1544,6 +1547,7 @@ impl super::TermWindow {
                     }
                     menu.add_item(&pane_action_menu_item(title, action, pane_id));
                 }
+                self.size_menu_for_touch(&menu);
                 context.show_context_menu(menu, event.screen_coords);
                 return;
             }
@@ -2438,6 +2442,7 @@ impl super::TermWindow {
                         for (title, action) in terminal_context_menu_actions(has_selection) {
                             menu.add_item(&pane_action_menu_item(title, action, pane_id));
                         }
+                        self.size_menu_for_touch(&menu);
                         context.show_context_menu(menu, event.screen_coords);
                         return;
                     }

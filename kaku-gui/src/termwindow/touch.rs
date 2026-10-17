@@ -15,8 +15,14 @@ use std::time::{Duration, Instant};
 use window::{MouseButtons, MouseEvent, MouseEventKind, MousePress, WindowOps};
 
 /// Clicks from UU measured 0.07 to 0.13s. A full second felt slow over UU
-/// (a 0.9s press missed), so 600ms, still well above a hesitant click.
-const LONG_PRESS: Duration = Duration::from_millis(600);
+/// (a 0.9s press missed) and 600ms still read as a wait, so 450ms, above a
+/// hesitant desktop click of about 300ms.
+const LONG_PRESS: Duration = Duration::from_millis(450);
+/// Menus opened by a long press draw their items at this size instead of
+/// the 13pt system size, for fingers on a remote desktop. NSMenu keeps its
+/// row height nearly fixed (3 items: 69pt at 13pt, 75pt at 18pt), so this
+/// mostly makes the titles easier to read and aim at.
+pub(super) const LONG_PRESS_MENU_FONT_PT: f64 = 18.;
 /// Finger jitter allowed before a press counts as a drag. 8pt cancelled
 /// ordinary long presses over UU, where a resting finger drifts further.
 const LONG_PRESS_SLOP_PT: f32 = 24.;
@@ -176,10 +182,20 @@ impl TermWindow {
             return;
         };
         let mut release = right.clone();
+        self.mouse.menu_from_long_press = true;
         self.mouse_event_impl(right, context);
+        self.mouse.menu_from_long_press = false;
         release.kind = MouseEventKind::Release(MousePress::Right);
         release.mouse_buttons = MouseButtons::NONE;
         self.mouse_event_impl(release, context);
+    }
+
+    /// Enlarges a context menu when a long press opened it; a mouse right
+    /// click keeps the system size.
+    pub(super) fn size_menu_for_touch(&self, menu: &window::os::macos::menu::Menu) {
+        if self.mouse.menu_from_long_press {
+            menu.set_font_size(LONG_PRESS_MENU_FONT_PT);
+        }
     }
 
     /// Records the tab a press reached through the bottom bar's touch band.
@@ -282,8 +298,14 @@ mod tests {
             false,
             false
         ));
+        assert!(long_press_as_right_click(
+            Duration::from_millis(450),
+            false,
+            false,
+            false
+        ));
         assert!(!long_press_as_right_click(
-            Duration::from_millis(400),
+            Duration::from_millis(300),
             false,
             false,
             false

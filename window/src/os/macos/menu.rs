@@ -29,6 +29,14 @@ impl Menu {
         self.menu.autorelease()
     }
 
+    /// Draws the items at `points` instead of the system menu font size.
+    pub fn set_font_size(&self, points: f64) {
+        unsafe {
+            let font: id = msg_send![class!(NSFont), menuFontOfSize: points];
+            let _: () = msg_send![*self.menu, setFont: font];
+        }
+    }
+
     /// Display this menu at a point in global screen coordinates.
     pub fn pop_up_at_screen_point(&self, x: isize, y: isize) {
         unsafe {
