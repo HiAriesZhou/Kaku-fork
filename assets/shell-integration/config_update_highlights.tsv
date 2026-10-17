@@ -100,3 +100,5 @@
 38	程序隐藏光标后退出，回到提示符时光标会自动恢复
 38	Dotfiles kept as symlinks stay linked when Kaku updates them
 38	用符号链接管理的配置文件在 Kaku 更新时保持链接不变
+39	Run kaku remote to use this Mac's terminals from a desktop browser on another computer
+39	运行 kaku remote，可以在另一台电脑的浏览器里使用这台 Mac 的终端
