@@ -70,7 +70,7 @@ kaku remote off           # turn remote access off
 kaku remote --reset       # new identity, every paired browser removed
 ```
 
-Open the link on the other device to pair it. A link works once, for 10 minutes, so run `kaku remote` again for each device. After pairing, bookmark the page: the browser keeps its own key and comes back without a new link. What you type and see is encrypted between the browser and Kaku, and the relay only forwards it. Kaku posts a notification when a new browser pairs, and when a paired one returns after a while. `kaku doctor` shows whether Kaku is connected to the relay.
+The page is made for desktop browsers for now. Open the link in the browser you want to pair. A link works once, for 10 minutes, so run `kaku remote` again for each device. After pairing, bookmark the page: the browser keeps its own key and comes back without a new link. What you type and see is encrypted between the browser and Kaku, and the relay only forwards it. Kaku posts a notification when a new browser pairs, and when a paired one returns after a while. `kaku doctor` shows whether Kaku is connected to the relay.
 
 ## kaku init
 
