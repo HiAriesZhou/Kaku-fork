@@ -6,6 +6,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHELL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$SHELL_DIR/../.." && pwd)"
 
+# A shell inside Kaku exports KAKU_CONFIG_FILE, which would point the theme
+# lookup at the real config instead of the scratch HOME's kaku.lua.
+unset KAKU_CONFIG_FILE XDG_CONFIG_HOME
+
 fail() {
   echo "FAIL: $*" >&2
   exit 1
