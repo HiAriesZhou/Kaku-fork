@@ -88,17 +88,20 @@ async function newMac() {
     pub: Buffer.from(await webcrypto.subtle.exportKey('raw', keys.publicKey)),
   };
 }
-const pairingLink = (mac, secret) => `#p=${secret.toString('base64url')}&m=${mac.pub.toString('base64url')}`;
-// The form Kaku prints: the key as a compressed point, 33 bytes.
-const compressedLink = (mac, secret) => `#p=${secret.toString('base64url')}&m=${
-  require('node:crypto').ECDH.convertKey(mac.pub, 'prime256v1', undefined, undefined, 'compressed').toString('base64url')}`;
+// The form Kaku prints: only the one-time secret. Kaku sends its key in the
+// handshake.
+const pairingLink = (mac, secret) => `#${secret.toString('base64url')}`;
+// Earlier Kaku put its key in the link too.
+const legacyLink = (mac, secret) => `#p=${secret.toString('base64url')}&m=${mac.pub.toString('base64url')}`;
 
 // Act as Kaku on the page's newest relay connection: exchange keys, sign the
-// exchange as `signer`, read the page's proof, and (if `admit`) answer it
-// as Kaku does once a device is in. Returns the proof and whether its
-// signature, and its pairing proof for `secret`, check out.
-async function handshake(p, signer, { admit = true, secret = null } = {}) {
-  return p.evaluate(async ({ pkcs8, secret, admit }) => {
+// exchange as `signer`, send its key with a tag under `tag` (Kaku holds the
+// link's secret while the link is fresh; defaults to `secret`), read the
+// page's proof, and (if `admit`) answer it as Kaku does once a device is in.
+// Returns the proof and whether its signature, and its pairing proof for
+// `secret`, check out.
+async function handshake(p, signer, { admit = true, secret = null, tag = secret } = {}) {
+  return p.evaluate(async ({ pkcs8, pub, secret, tag, admit }) => {
     const sub = crypto.subtle, enc = new TextEncoder(), dec = new TextDecoder();
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -131,7 +134,15 @@ async function handshake(p, signer, { admit = true, secret = null } = {}) {
       socket.onmessage({ data: frame.buffer });
     };
     const signing = await sub.importKey('pkcs8', unb64(pkcs8.replace(/\+/g, '-').replace(/\//g, '_')), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
-    await deliver({ type: 'mac_auth', sig: b64(await sub.sign({ name: 'ECDSA', hash: 'SHA-256' }, signing, transcript)) }, 0);
+    const macAuth = { type: 'mac_auth', sig: b64(await sub.sign({ name: 'ECDSA', hash: 'SHA-256' }, signing, transcript)), key: pub };
+    if (tag) {
+      const label = enc.encode('kaku-remote mac key'), key = unb64(pub);
+      const tagged = new Uint8Array(label.length + transcript.length + key.length);
+      tagged.set(label); tagged.set(transcript, label.length); tagged.set(key, label.length + transcript.length);
+      const hmac = await sub.importKey('raw', unb64(tag), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      macAuth.tag = b64(await sub.sign('HMAC', hmac, tagged));
+    }
+    await deliver(macAuth, 0);
     for (let i = 0; i < 100 && sent() < 2; i++) await sleep(5);
     if (sent() < 2) return { proof: null };
     const frame = socket.binary[1];
@@ -147,7 +158,7 @@ async function handshake(p, signer, { admit = true, secret = null } = {}) {
     if (admit) await deliver({ type: 'pong' }, 1);
     await sleep(50);
     return { proof, signed, paired };
-  }, { pkcs8: signer.pkcs8, secret: secret && secret.toString('base64url'), admit });
+  }, { pkcs8: signer.pkcs8, pub: signer.pub.toString('base64url'), secret: secret && secret.toString('base64url'), tag: tag && tag.toString('base64url'), admit });
 }
 const storedDevice = p => p.evaluate(() => new Promise(resolve => {
   const open = indexedDB.open('kaku', 1);
@@ -196,16 +207,16 @@ test('a pairing link proves itself once and the device signs in afterwards', asy
   assert.deepEqual([...errors, ...next.errors], []);
 });
 
-test('a link with the compressed key pairs the same device as the full key', async t => {
+test('a link from earlier Kaku with the key in it still pairs', async t => {
   const mac = await newMac();
   const secret = Buffer.alloc(16, 5);
   const context = await browser.newContext();
   t.after(() => context.close());
-  const { p, errors } = await page(t, compressedLink(mac, secret), {}, context);
-  const first = await handshake(p, mac, { secret });
+  const { p, errors } = await page(t, legacyLink(mac, secret), {}, context);
+  assert.equal(await p.evaluate(() => location.hash), '');
+  const first = await handshake(p, mac, { secret, tag: null });
   assert.equal(first.signed, true);
   assert.equal(first.paired, true);
-  // The full point is what the browser keeps, so it signs in with no link.
   const next = await page(t, '', {}, context);
   const again = await handshake(next.p, mac);
   assert.equal(again.proof.type, 'auth');
@@ -213,18 +224,46 @@ test('a link with the compressed key pairs the same device as the full key', asy
   assert.deepEqual([...errors, ...next.errors], []);
 });
 
-test('a compressed key whose x is not on the curve is refused as incomplete', async t => {
-  // x = 1 has no point on P-256 (node's convertKey refuses it too).
-  const off = Buffer.concat([Buffer.from([2]), Buffer.alloc(31), Buffer.from([1])]).toString('base64url');
-  const { p, errors } = await page(t, `#p=${Buffer.alloc(16, 1).toString('base64url')}&m=${off}`);
-  await p.waitForFunction(() => /incomplete/.test(document.body.innerText));
-  assert.deepEqual(errors, []);
+test('a key the link secret did not vouch for is refused', async t => {
+  const mac = await newMac();
+  const impostor = await newMac();
+  // The relay can stand in as a Mac but never sees the secret, so its tag is
+  // under some other secret, or missing, which reads as a used link.
+  for (const [tag, notice] of [[Buffer.alloc(16, 9), /Could not verify the Mac/], [null, /expired/]]) {
+    const { p, errors } = await page(t, pairingLink(mac, Buffer.alloc(16, 4)));
+    const result = await handshake(p, impostor, { tag });
+    assert.equal(result.proof, null);
+    assert.equal(await p.evaluate(() => connections.at(-1).readyState), 3);
+    assert.match(await p.locator('#notice').innerText(), notice);
+    await p.waitForTimeout(700);
+    assert.equal(await p.evaluate(() => connections.length), 1);
+    assert.equal(await storedDevice(p), null);
+    assert.deepEqual(errors, []);
+  }
+});
+
+test('a link from another Mac pairs this browser with a new key', async t => {
+  const mac = await newMac();
+  const other = await newMac();
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  const { p } = await page(t, pairingLink(mac, Buffer.alloc(16, 10)), {}, context);
+  await handshake(p, mac, { secret: Buffer.alloc(16, 10) });
+  const kept = await storedDevice(p);
+  const same = await page(t, pairingLink(mac, Buffer.alloc(16, 11)), {}, context);
+  assert.equal((await handshake(same.p, mac, { secret: Buffer.alloc(16, 11) })).paired, true);
+  assert.deepEqual(await storedDevice(same.p), kept);
+  const next = await page(t, pairingLink(other, Buffer.alloc(16, 12)), {}, context);
+  const paired = await handshake(next.p, other, { secret: Buffer.alloc(16, 12) });
+  assert.equal(paired.signed, true);
+  assert.equal(paired.paired, true);
+  assert.notDeepEqual(await storedDevice(next.p), kept);
 });
 
 test('a page proves nothing to a Mac that is not the one it paired with', async t => {
   const mac = await newMac();
   const impostor = await newMac();
-  const { p, errors } = await page(t, pairingLink(mac, Buffer.alloc(16, 4)));
+  const { p, errors } = await page(t, legacyLink(mac, Buffer.alloc(16, 4)));
   const result = await handshake(p, impostor);
   // The page sent its hello and nothing else: no proof, no input.
   assert.equal(result.proof, null);

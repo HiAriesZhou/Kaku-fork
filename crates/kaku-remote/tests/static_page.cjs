@@ -82,7 +82,7 @@ function serveLikeVercel(dir, listenPort) {
 
     // Wait for the Mac on the relay, through the route the page asks.
     await until(() => fs.existsSync(path.join(home, 'Library/Application Support/kaku/remote-share.json')));
-    const link = cli('remote').split('\n').find(line => line.includes('#p='));
+    const link = cli('remote').split('\n').find(line => /#[A-Za-z0-9_-]{22}$/.test(line));
     const id = /\/([0-9a-f]{32})\//.exec(link)[1];
     const status = () => fetch(`http://127.0.0.1:${relay}/${id}/status`);
     await until(async () => (await status()).ok);
@@ -104,7 +104,7 @@ function serveLikeVercel(dir, listenPort) {
 
     // The link from Kaku still names the relay; the relay sends it on to the
     // page's origin and the browser keeps the fragment.
-    assert.ok(link.startsWith(`http://127.0.0.1:${relay}/${id}/#p=`), link);
+    assert.ok(link.startsWith(`http://127.0.0.1:${relay}/${id}/#`), link);
     await page.goto(link);
     await page.waitForSelector('body.drawn');
     assert.equal(new URL(page.url()).origin, origin);

@@ -93,11 +93,13 @@ impl ShareIdentity {
     /// `pairing::OFFER_LIFETIME`; it replaces any earlier unused one.
     pub fn pairing_link(&self, relay_url: &str) -> anyhow::Result<String> {
         let secret = pairing::new_offer()?;
-        let mac = self.mac_key()?;
+        // The page learns the key in the handshake; refuse to print a link
+        // this Mac could not then answer.
+        self.mac_key()?;
         Ok(format!(
             "{}{}",
             self.page_url(relay_url),
-            pairing::pairing_fragment(mac.public_key(), &secret)
+            pairing::pairing_fragment(&secret)
         ))
     }
 }
@@ -312,11 +314,23 @@ fn advance(
             let Some(sig) = mac_key.sign(&transcript) else {
                 return Step::Close(4403);
             };
-            let auth = serde_json::json!({
+            let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            // The key, for a page that has only the pairing link, with the
+            // tag that lets it check the key against the link's secret.
+            let mut auth = serde_json::json!({
                 "type": "mac_auth",
-                "sig": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig),
-            })
-            .to_string();
+                "sig": b64(&sig),
+                "key": b64(mac_key.public_key()),
+            });
+            if let Some(secret) = store.offer_secret() {
+                auth["tag"] = b64(&pairing::mac_key_tag(
+                    &secret,
+                    &transcript,
+                    mac_key.public_key(),
+                ))
+                .into();
+            }
+            let auth = auth.to_string();
             let Some(sealed) = seal(&keys.from_host, rng, &aad(FROM_HOST, 0), auth.as_bytes())
             else {
                 return Step::Close(4403);
@@ -832,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pairing_fragment_carries_the_mac_key_but_no_secret_of_the_mac() {
+    fn the_pairing_fragment_carries_only_the_one_time_secret() {
         let a = identity();
         let mac = a.mac_key().unwrap();
         assert_eq!(
@@ -844,19 +858,11 @@ mod tests {
             a.page_url("wss://r.kaku.fun"),
             format!("https://t.kaku.fun/{}/", a.id())
         );
-        let fragment = pairing::pairing_fragment(mac.public_key(), "c2VjcmV0");
         let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-        let key = mac.public_key();
-        assert_eq!(key.len(), 65);
-        assert_eq!(
-            fragment,
-            format!("#p=c2VjcmV0&m={}", b64(&pairing::compressed_point(key)))
-        );
-        // The x coordinate and the parity of y, which the page expands back.
-        let compressed = pairing::compressed_point(key);
-        assert_eq!(compressed.len(), 33);
-        assert_eq!(compressed[0], 0x02 | (key[64] & 1));
-        assert_eq!(&compressed[1..], &key[1..33]);
+        // The secret alone; the Mac's key travels in the handshake.
+        let fragment = pairing::pairing_fragment("c2VjcmV0");
+        assert_eq!(fragment, "#c2VjcmV0");
+        assert!(!fragment.contains(&b64(mac.public_key())));
         assert!(!fragment.contains(&a.secret) && !fragment.contains(&a.mac_key));
     }
 
@@ -900,6 +906,8 @@ mod tests {
         transcript: [u8; 32],
         device: MacKey,
         sent: u64,
+        /// Kaku's first message, its signature and key.
+        mac_auth: serde_json::Value,
     }
 
     impl Fixture {
@@ -957,6 +965,7 @@ mod tests {
                 transcript,
                 device,
                 sent: 0,
+                mac_auth: auth,
             }
         }
 
@@ -1058,6 +1067,50 @@ mod tests {
             panic!("the paired browser signs in later");
         };
         assert_eq!((same.id, new), (device.id, false));
+    }
+
+    #[test]
+    fn kaku_vouches_for_its_key_to_the_holder_of_the_pairing_link_only() {
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let mut fx = Fixture::new();
+        // No link out: the key, but nothing a page could check it against.
+        let conn = fx.connect();
+        assert_eq!(conn.mac_auth["key"], b64(fx.mac_key.public_key()));
+        assert!(conn.mac_auth.get("tag").is_none());
+        // A link out: a tag under its secret over this transcript and the key.
+        fx.store.offer = Some((vec![9u8; 16], false));
+        let mut conn = fx.connect();
+        let tag = conn.mac_auth["tag"].as_str().unwrap().to_string();
+        let expect = pairing::mac_key_tag(&[9u8; 16], &conn.transcript, fx.mac_key.public_key());
+        assert_eq!(tag, b64(&expect));
+        // Another secret, another connection, or another key gives another tag.
+        assert_ne!(
+            b64(&pairing::mac_key_tag(
+                &[8u8; 16],
+                &conn.transcript,
+                fx.mac_key.public_key()
+            )),
+            tag
+        );
+        let other = fx.connect();
+        assert_ne!(other.mac_auth["tag"].as_str().unwrap(), tag);
+        let stranger = identity().mac_key().unwrap();
+        assert_ne!(
+            b64(&pairing::mac_key_tag(
+                &[9u8; 16],
+                &conn.transcript,
+                stranger.public_key()
+            )),
+            tag
+        );
+        // Once the link is used, Kaku no longer vouches with it.
+        let Step::Admitted { new: true, .. } = ({
+            let m = join(&conn, &[9u8; 16]);
+            fx.send(&mut conn, &m)
+        }) else {
+            panic!("the link pairs the browser");
+        };
+        assert!(fx.connect().mac_auth.get("tag").is_none());
     }
 
     #[test]

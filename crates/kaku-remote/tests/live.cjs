@@ -165,7 +165,7 @@ async function until(fn, ms = 15000) {
       child.once('error', reject);
       child.once('exit', code => code === 0 ? resolve(out) : reject(new Error(`kaku ${args.join(' ')} exited ${code}: ${out}`)));
     });
-    const pairingLink = async () => (await cli('remote')).split('\n').find(line => line.includes('#p='));
+    const pairingLink = async () => (await cli('remote')).split('\n').find(line => /#[A-Za-z0-9_-]{22}$/.test(line));
     // Without pairing, the page says how to pair and opens no socket.
     const unpaired = await browser.newPage();
     await unpaired.goto(relayBase);
@@ -180,7 +180,7 @@ async function until(fn, ms = 15000) {
       };
     });
     const link = await pairingLink();
-    assert.ok(link.startsWith(relayBase + '#p='), link);
+    assert.ok(link.startsWith(relayBase + '#'), link);
     await encrypted.goto(link);
     await encrypted.waitForSelector('body.drawn');
     assert.equal(new URL(encrypted.url()).hash, '');
@@ -271,12 +271,17 @@ async function until(fn, ms = 15000) {
 
     // A raw browser speaking the pairing protocol with node's crypto, the
     // way the page does with WebCrypto: Kaku's signature checks out against
-    // the key the pairing link carries, a device Kaku never paired is
-    // refused, and nothing recorded or out of place reaches a session.
-    // The link carries the key compressed; expand it as the page does.
-    const linkPub = Buffer.from(new URLSearchParams(new URL(link).hash.slice(1)).get('m'), 'base64url');
-    assert.equal(linkPub.length, 33);
-    const macPub = crypto.ECDH.convertKey(linkPub, 'prime256v1', undefined, undefined, 'uncompressed');
+    // the key the paired page took on the link's word, a device Kaku never
+    // paired is refused, and nothing recorded or out of place reaches a
+    // session.
+    const macPub = Buffer.from(await encrypted.evaluate(() => new Promise(resolve => {
+      const open = indexedDB.open('kaku', 1);
+      open.onsuccess = () => {
+        const req = open.result.transaction('devices').objectStore('devices').get(location.pathname);
+        req.onsuccess = () => resolve(Array.from(req.result.macPub));
+      };
+    })));
+    assert.equal(macPub.length, 65);
     const rawPub = key => { const jwk = key.export({ format: 'jwk' }); return Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]); };
     const aadFor = (label, seq) => { const out = Buffer.alloc(label.length + 8); Buffer.from(label).copy(out); out.writeBigUInt64BE(BigInt(seq), label.length); return out; };
     const sealWith = (key, label, seq, json) => {
@@ -312,6 +317,9 @@ async function until(fn, ms = 15000) {
       const auth = JSON.parse(openWith(keys.fromHost, 'kaku-web h2c', 0, await until(() => inbox[1])));
       const macKey = crypto.createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: macPub.subarray(1, 33).toString('base64url'), y: macPub.subarray(33).toString('base64url') }, format: 'jwk' });
       assert.equal(auth.type, 'mac_auth');
+      assert.equal(auth.key, macPub.toString('base64url'));
+      // The link was used, so Kaku vouches for its key to no one.
+      assert.equal(auth.tag, undefined);
       assert.ok(crypto.verify('sha256', transcript, { key: macKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(auth.sig, 'base64url')), 'Kaku signs the exchange with the paired key');
       return { socket, closed, inbox, keys, transcript };
     };

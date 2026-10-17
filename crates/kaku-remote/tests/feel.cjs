@@ -115,7 +115,7 @@ const WATCH = () => {
     start(path.join(app, 'Contents/MacOS/kaku-gui'), ['--config-file', config, 'start', '--always-new-process'], env);
     await until(() => fs.existsSync(path.join(home, 'Library/Application Support/kaku/remote-share.json')));
     const link = execFileSync(path.join(app, 'Contents/MacOS/kaku'), ['remote'], { env: { ...process.env, ...env } })
-      .toString().split('\n').find(line => line.includes('#p='));
+      .toString().split('\n').find(line => /#[A-Za-z0-9_-]{22}$/.test(line));
     const id = /\/([0-9a-f]{32})\//.exec(link)[1];
     await until(async () => (await fetch(`http://127.0.0.1:${relay}/${id}/status`)).ok);
 

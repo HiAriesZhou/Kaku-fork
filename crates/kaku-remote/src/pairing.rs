@@ -307,6 +307,8 @@ pub(crate) trait DeviceStore {
     fn add(&mut self, device: Device);
     /// Use up the current offer if `check` accepts its secret.
     fn take_offer(&mut self, check: &dyn Fn(&[u8]) -> bool) -> bool;
+    /// The current offer's secret, left in place, if one is out and fresh.
+    fn offer_secret(&mut self) -> Option<Vec<u8>>;
 }
 
 fn devices_path() -> PathBuf {
@@ -448,17 +450,7 @@ impl DeviceStore for DiskStore {
     }
 
     fn take_offer(&mut self, check: &dyn Fn(&[u8]) -> bool) -> bool {
-        let Some(offer) = std::fs::read_to_string(offer_path())
-            .ok()
-            .and_then(|data| serde_json::from_str::<Offer>(&data).ok())
-        else {
-            return false;
-        };
-        if offer.expires_at < now() {
-            let _ = std::fs::remove_file(offer_path());
-            return false;
-        }
-        let Some(secret) = unb64(&offer.secret) else {
+        let Some(secret) = self.offer_secret() else {
             return false;
         };
         if !check(&secret) {
@@ -467,6 +459,17 @@ impl DeviceStore for DiskStore {
         // One device per link.
         let _ = std::fs::remove_file(offer_path());
         true
+    }
+
+    fn offer_secret(&mut self) -> Option<Vec<u8>> {
+        let offer = std::fs::read_to_string(offer_path())
+            .ok()
+            .and_then(|data| serde_json::from_str::<Offer>(&data).ok())?;
+        if offer.expires_at < now() {
+            let _ = std::fs::remove_file(offer_path());
+            return None;
+        }
+        unb64(&offer.secret)
     }
 }
 
@@ -514,23 +517,29 @@ pub(crate) fn announce_return(device: &Device) {
     .detach();
 }
 
-/// The page link that pairs one more browser, valid for `OFFER_LIFETIME`.
-pub(crate) fn pairing_fragment(mac_public: &[u8], secret: &str) -> String {
-    format!("#p={secret}&m={}", b64(&compressed_point(mac_public)))
+/// The page link's fragment that pairs one more browser, valid for
+/// `OFFER_LIFETIME`: the one-time secret alone. The Mac's key is not in it;
+/// Kaku sends the key in its handshake with `mac_key_tag`, which only a
+/// holder of this secret can check, and the relay never sees the fragment.
+pub(crate) fn pairing_fragment(secret: &str) -> String {
+    format!("#{secret}")
 }
 
-/// The Mac's key as a compressed P-256 point, 33 bytes instead of 65, which
-/// keeps the link short; the page restores the full point.
-pub(crate) fn compressed_point(public: &[u8]) -> Vec<u8> {
-    match public {
-        [0x04, rest @ ..] if rest.len() == 64 => {
-            let mut out = Vec::with_capacity(33);
-            out.push(0x02 | (rest[63] & 1));
-            out.extend_from_slice(&rest[..32]);
-            out
-        }
-        _ => public.to_vec(),
-    }
+/// Kept apart from the page's own pairing proof, an HMAC of the transcript
+/// alone under the same secret.
+const MAC_KEY_LABEL: &[u8] = b"kaku-remote mac key";
+
+/// Proves to a page holding the pairing link that `public` is this Mac's
+/// key: an HMAC under the link's secret of the label, this connection's
+/// transcript and the key, so a relay without the secret cannot vouch for
+/// its own key, and a tag from another connection does not match.
+pub(crate) fn mac_key_tag(secret: &[u8], transcript: &[u8], public: &[u8]) -> Vec<u8> {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
+    let mut ctx = hmac::Context::with_key(&key);
+    ctx.update(MAC_KEY_LABEL);
+    ctx.update(transcript);
+    ctx.update(public);
+    ctx.sign().as_ref().to_vec()
 }
 
 #[cfg(test)]
@@ -561,6 +570,12 @@ pub(crate) mod tests {
                     true
                 }
                 _ => false,
+            }
+        }
+        fn offer_secret(&mut self) -> Option<Vec<u8>> {
+            match &self.offer {
+                Some((secret, false)) => Some(secret.clone()),
+                _ => None,
             }
         }
     }
