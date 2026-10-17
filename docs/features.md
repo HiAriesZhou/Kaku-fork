@@ -147,7 +147,7 @@ Kaku ships a curated set of shell plugins that load automatically inside Kaku se
 
 - **z**: Smarter `cd` that learns your most-used directories. Use `z <dir>`, `z -l <dir>` to list matches, `z -t` for recent directories.
 - **zsh-completions**: Extended completions for common CLI tools.
-- **zsh-syntax-highlighting**: Real-time command coloring and error highlighting.
+- **fast-syntax-highlighting**: Live command coloring and error highlighting, with richer colors and faster startup than zsh-syntax-highlighting.
 - **zsh-autosuggestions**: Fish-style history-based completions as you type.
 
 **Fish support**
