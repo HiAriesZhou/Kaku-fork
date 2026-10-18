@@ -533,9 +533,9 @@ impl crate::TermWindow {
             == VerticalWindowContentAlignment::Top
             && !super::resize::user_has_custom_window_padding_assignment()
         {
-            // Rows rarely fill the height exactly. Managed padding splits the
-            // leftover evenly so content sits as far from the top edge as
-            // from the bottom edge or tab bar, in a window or fullscreen.
+            // Rows rarely fill the height exactly. Share the leftover evenly
+            // between the configured top and bottom gaps rather than adding
+            // the entire remainder below the output, fullscreen included.
             let border = self.get_os_border();
             split_row_slack(
                 row_slack_inside_os_borders(
