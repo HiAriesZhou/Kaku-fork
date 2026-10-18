@@ -784,6 +784,16 @@ pub(crate) fn foreground_is_agent_cli(pane: &dyn mux::pane::Pane) -> bool {
     foreground_agent_cli(pane).is_some_and(|program| matches!(program, "claude" | "codex"))
 }
 
+/// The agent and topic the window's top right would show for this tab's
+/// active pane, for the browser's tab bar.
+#[cfg(feature = "remote")]
+fn tab_agent_title(tab: &TabInformation) -> Option<(&'static str, String)> {
+    let pane = Mux::try_get()?.get_pane(tab.active_pane.as_ref()?.pane_id)?;
+    let program = foreground_agent_cli(&*pane)?;
+    let topic = crate::termwindow::render::agent_title::agent_topic(program, &pane.get_title());
+    Some((program, topic))
+}
+
 /// The AI agent CLI running in the pane's foreground, by program name.
 pub(crate) fn foreground_agent_cli(pane: &dyn mux::pane::Pane) -> Option<&'static str> {
     let title = foreground_process_title(pane)?;
@@ -1149,6 +1159,19 @@ impl TabBarState {
                 tab_info[tab_idx].tab_id.into(),
                 &title_plain_text(&tab_title),
             );
+            #[cfg(feature = "remote")]
+            {
+                let agent = config
+                    .show_agent_title
+                    .then(|| tab_agent_title(&tab_info[tab_idx]))
+                    .flatten();
+                kaku_remote::publish_agent_title(
+                    tab_info[tab_idx].tab_id.into(),
+                    agent
+                        .as_ref()
+                        .map(|(program, topic)| (*program, topic.as_str())),
+                );
+            }
             let mut cell_attrs = if active {
                 &active_cell_attrs
             } else {

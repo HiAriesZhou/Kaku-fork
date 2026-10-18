@@ -22,8 +22,9 @@ pub use share::{
     access_fingerprint, load_or_create_identity, reset_identity, save_access_code, ShareIdentity,
 };
 pub use web::{
-    claim_tab_size_on_gui_thread, publish_tab_title, release_web_size, set_tab_action_handler,
-    tab_is_web_sized, window_relayout_resizes_tab, TabAction, TabActionHandler,
+    claim_tab_size_on_gui_thread, publish_agent_title, publish_tab_title, release_web_size,
+    set_ai_chat_open, set_tab_action_handler, tab_is_web_sized, window_relayout_resizes_tab,
+    TabAction, TabActionHandler,
 };
 
 // ── Token ─────────────────────────────────────────────────────────────────────

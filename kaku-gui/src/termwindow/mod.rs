@@ -3295,8 +3295,14 @@ impl TermWindow {
         self.config = config.clone();
         self.palette.take();
         let chat_colors = ai_chat::chat_palette(self.palette());
-        self.ai_chat_overlay_panes
-            .retain(|_, sender| sender.send(chat_colors.clone()).is_ok());
+        self.ai_chat_overlay_panes.retain(|_pane_id, sender| {
+            let open = sender.send(chat_colors.clone()).is_ok();
+            #[cfg(feature = "remote")]
+            if !open {
+                kaku_remote::set_ai_chat_open((*_pane_id).into(), false);
+            }
+            open
+        });
 
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
@@ -6585,6 +6591,10 @@ impl TermWindow {
             }
         }
         let was_chat = self.ai_chat_overlay_panes.remove(&pane_id).is_some();
+        #[cfg(feature = "remote")]
+        if was_chat {
+            kaku_remote::set_ai_chat_open(pane_id.into(), false);
+        }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }

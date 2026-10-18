@@ -78,6 +78,25 @@ pub(crate) type WebDirty = Arc<Mutex<HashMap<usize, broadcast::Sender<()>>>>;
 static TAB_TITLES: LazyLock<Mutex<HashMap<usize, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// The agent title the GUI shows for each tab's active pane (`agent_title.rs`
+/// in kaku-gui), keyed by tab id. Only the GUI knows the agent and strips
+/// its spinner, so the page reuses that instead of the raw pane title.
+static AGENT_TITLES: LazyLock<Mutex<HashMap<usize, AgentInfo>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Panes covered by Kaku Assistant's chat on the Mac. The chat is drawn by
+/// the GUI over the pane and never reaches the mux, so the page would show
+/// and type into the shell underneath; it says the chat is open instead.
+static AI_CHAT_PANES: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[derive(Serialize, Clone, PartialEq, Debug)]
+struct AgentInfo {
+    /// "claude", "codex" or "kimi".
+    program: &'static str,
+    topic: String,
+}
+
 /// Tabs whose size a browser set. That size can be larger than the Mac
 /// window, which then draws the rows that fit rather than over its tab bar.
 static WEB_SIZED_TABS: LazyLock<Mutex<HashSet<usize>>> =
@@ -169,6 +188,41 @@ pub fn publish_tab_title(tab_id: usize, title: &str) {
     }
 }
 
+/// Called by the GUI with each tab's agent title, or None when no agent
+/// runs in it or the title is turned off (`show_agent_title`).
+pub fn publish_agent_title(tab_id: usize, agent: Option<(&'static str, &str)>) {
+    let agent = agent.map(|(program, topic)| AgentInfo {
+        program,
+        topic: topic.trim().to_string(),
+    });
+    let mut titles = AGENT_TITLES.lock();
+    if titles.get(&tab_id) == agent.as_ref() {
+        return;
+    }
+    match agent {
+        Some(agent) => titles.insert(tab_id, agent),
+        None => titles.remove(&tab_id),
+    };
+    drop(titles);
+    tabs_changed(false);
+}
+
+/// Called by the GUI when Kaku Assistant's chat opens or closes over a pane.
+pub fn set_ai_chat_open(pane_id: usize, open: bool) {
+    let changed = if open {
+        AI_CHAT_PANES.lock().insert(pane_id)
+    } else {
+        AI_CHAT_PANES.lock().remove(&pane_id)
+    };
+    if changed {
+        tabs_changed(true);
+    }
+}
+
+fn ai_chat_open(pane_id: usize) -> bool {
+    AI_CHAT_PANES.lock().contains(&pane_id)
+}
+
 pub(crate) fn notify_output(dirty: &WebDirty, pane_id: usize) {
     if let Some(tx) = dirty.lock().get(&pane_id) {
         let _ = tx.send(());
@@ -177,6 +231,7 @@ pub(crate) fn notify_output(dirty: &WebDirty, pane_id: usize) {
 
 pub(crate) fn pane_removed(dirty: &WebDirty, pane_id: usize) {
     dirty.lock().remove(&pane_id);
+    AI_CHAT_PANES.lock().remove(&pane_id);
 }
 
 /// Tabs, windows or panes changed (true) or only a title did (false).
@@ -286,6 +341,12 @@ struct TabInfo {
     /// One pane fills the tab (Cmd+Shift+Enter).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     zoomed: bool,
+    /// The agent working in the active pane, shown at the bar's right end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<AgentInfo>,
+    /// Panes of this tab under Kaku Assistant's chat on the Mac.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ai_chat: Vec<usize>,
 }
 
 #[derive(Serialize, PartialEq)]
@@ -304,6 +365,8 @@ fn collect_tabs() -> Vec<TabInfo> {
         return Vec::new();
     };
     let titles = TAB_TITLES.lock().clone();
+    let agents = AGENT_TITLES.lock().clone();
+    let chats = AI_CHAT_PANES.lock().clone();
     let config = config::configuration();
     let policy = config.tab_close_confirmation;
     let pane_policy = config.pane_close_confirmation;
@@ -351,12 +414,19 @@ fn collect_tabs() -> Vec<TabInfo> {
                     .should_prompt(true, || tab.can_close_without_prompting(CloseReason::Tab)),
                 panes,
                 zoomed: tab.get_zoomed_pane().is_some(),
+                agent: agents.get(&tab_id).cloned(),
+                ai_chat: positioned
+                    .iter()
+                    .map(|p| usize::from(p.pane.pane_id()))
+                    .filter(|id| chats.contains(id))
+                    .collect(),
             });
         }
     }
     // Forget tabs that closed, so these maps stay the size of what is open.
     let live: HashSet<usize> = tabs.iter().map(|t| t.tab_id).collect();
     TAB_TITLES.lock().retain(|id, _| live.contains(id));
+    AGENT_TITLES.lock().retain(|id, _| live.contains(id));
     WEB_SIZED_TABS.lock().retain(|id| live.contains(id));
     tabs
 }
@@ -1045,7 +1115,13 @@ fn handle_upload(
                     },
                 );
             }
-            if let Some(pane) = upload.pane_id.and_then(lookup_pane) {
+            // Under the Mac's AI chat the path would land in the hidden
+            // shell; the file is still saved.
+            if let Some(pane) = upload
+                .pane_id
+                .filter(|id| !ai_chat_open(*id))
+                .and_then(lookup_pane)
+            {
                 let quoted = config::configuration().quote_dropped_files.escape(&shown);
                 if let Err(e) = pane.send_paste(&format!("{quoted} ")) {
                     log::debug!("kaku-remote web: pasting an uploaded path failed: {e:#}");
@@ -1863,6 +1939,11 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             | WebClientMsg::Paste { .. }
             | WebClientMsg::Click { .. }
     );
+    // The Mac shows Kaku Assistant's chat over this pane: typing here would
+    // reach the shell hidden under it. The page says so and holds off.
+    if interactive && ai_chat_open(pane.pane_id().into()) {
+        return;
+    }
     if interactive {
         if let Some((cols, rows)) = view.claimed {
             claim_tab_size(pane.pane_id().into(), cols, rows);
@@ -2695,6 +2776,28 @@ mod tests {
             TAB_TITLES.lock().get(&usize::MAX).map(String::as_str),
             Some("Users/tw93")
         );
+    }
+
+    #[test]
+    fn agent_titles_and_chat_panes_follow_the_gui() {
+        let tab = usize::MAX - 1;
+        publish_agent_title(tab, Some(("claude", "  Fix the padding bug ")));
+        let shown = AGENT_TITLES.lock().get(&tab).cloned();
+        assert_eq!(
+            shown,
+            Some(AgentInfo {
+                program: "claude",
+                topic: "Fix the padding bug".into()
+            })
+        );
+        publish_agent_title(tab, None);
+        assert!(!AGENT_TITLES.lock().contains_key(&tab));
+
+        let pane = usize::MAX - 1;
+        set_ai_chat_open(pane, true);
+        assert!(ai_chat_open(pane), "input to a pane under the chat is held");
+        set_ai_chat_open(pane, false);
+        assert!(!ai_chat_open(pane));
     }
 
     fn frame(cols: usize, lines: &[&str], cursor: &str) -> Frame {

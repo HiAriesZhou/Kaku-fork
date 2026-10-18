@@ -26,6 +26,8 @@ pub(super) fn toggle_overlay(term: &mut TermWindow, pane: &Arc<dyn Pane>) {
     });
     term.assign_overlay_for_pane(pane_id, overlay);
     term.ai_chat_overlay_panes.insert(pane_id, palette_tx);
+    #[cfg(feature = "remote")]
+    kaku_remote::set_ai_chat_open(pane_id.into(), true);
 
     // The AI chat overlay uses tighter bottom padding. Re-run layout so the
     // overlay pane gets the extra row(s) immediately.

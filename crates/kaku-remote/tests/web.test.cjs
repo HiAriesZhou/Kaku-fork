@@ -1454,3 +1454,39 @@ test('offline stops retrying and coming back online reconnects at once', async t
   await p.context().setOffline(false);
   await p.waitForFunction(n => connections.length === n + 1, before, { timeout: 500 });
 });
+
+test('the agent working in a tab shows its mark and still topic', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  const agent = p.locator('#bar .agent');
+  assert.equal(await agent.isVisible(), false, 'no agent, no title');
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [
+    { tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true, agent: { program: 'claude', topic: 'Fix the padding bug' } },
+    { tab_id: 2, pane_id: 2, panes: [], title: 'two', agent: { program: 'codex', topic: 'Other tab' } },
+  ] }));
+  assert.equal(await agent.isVisible(), true);
+  assert.equal(await agent.innerText(), 'Fix the padding bug');
+  assert.ok((await agent.locator('path').getAttribute('d')).startsWith('M'), 'the Claude mark is drawn');
+  // The spinner in the pane title never reaches the browser tab.
+  await p.evaluate(() => probe.handle({ type: 'frame', seq: 2, pane_id: 1, cols: 80, rows: 24, title: '✳ Fix the padding bug', data: '' }));
+  assert.equal(await p.title(), 'Fix the padding bug - Kaku');
+  await p.setViewportSize({ width: 375, height: 600 });
+  assert.equal(await agent.isVisible(), false, 'phones keep the bar for tabs');
+  assert.deepEqual(errors, []);
+});
+
+test('the Mac covering a pane with AI chat dims it and says so', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  const tabs = chat => ({ type: 'tabs', tabs: [
+    { tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true, ...(chat ? { ai_chat: [1] } : {}) },
+    { tab_id: 2, pane_id: 2, panes: [], title: 'two' },
+  ] });
+  await p.evaluate(m => probe.handle(m), tabs(true));
+  assert.match(await p.locator('#notice').innerText(), /AI chat is open on the Mac/);
+  assert.equal(await p.evaluate(() => document.body.classList.contains('stale')), true);
+  await p.evaluate(m => probe.handle(m), tabs(false));
+  assert.equal(await p.locator('#notice').isVisible(), false, 'closing the chat clears the notice');
+  assert.equal(await p.evaluate(() => document.body.classList.contains('stale')), false);
+  assert.deepEqual(errors, []);
+});

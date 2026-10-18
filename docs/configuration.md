@@ -124,7 +124,7 @@ config.window_decorations = "RESIZE"
 
 **Agent title**
 
-While Claude Code, Codex or Kimi runs in the active pane, its mark and current topic show at the top right of the window. To turn it off, choose Off for Agent Title in `kaku config`, or:
+While Claude Code, Codex or Kimi runs in the active pane, its mark and current topic show at the top right of the window, and at the right end of the remote access page's tab bar. To turn it off, choose Off for Agent Title in `kaku config`, or:
 
 ```lua
 config.show_agent_title = false
