@@ -133,7 +133,7 @@ Press `Cmd + Shift + R` to mount the current SSH session's remote filesystem loc
 
 Kaku auto-detects the SSH target from the active pane. The mount lives at `~/Library/Caches/dev.kaku/sshfs/<host>`.
 
-Requirements: `sshfs` installed (`brew install macfuse sshfs`) and passwordless SSH auth (key-based) for the remote host.
+Requirements: `sshfs` installed (`brew install --cask sshfs-mac`) and passwordless SSH auth (key-based) for the remote host.
 
 ## Remote Access
 
