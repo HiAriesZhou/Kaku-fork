@@ -487,9 +487,16 @@ fn with_fallback_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
     objc::rc::autoreleasepool(f)
 }
 
+/// The caption font is the window frame font scaled down, 14pt to 11pt with
+/// the bundled config.
+const CAPTION_FONT_SCALE: f64 = 0.8;
+
 #[derive(PartialEq, Eq)]
 enum Entity {
     Title,
+    /// Small, regular-weight window chrome text, such as the agent title in
+    /// the top strip of an integrated-buttons window.
+    Caption,
     CommandPalette,
     CharSelect,
     PaneSelect,
@@ -508,6 +515,7 @@ struct FontConfigInner {
     font_dirs: RefCell<Arc<FontDatabase>>,
     built_in: RefCell<Arc<FontDatabase>>,
     title_font: RefCell<Option<Rc<LoadedFont>>>,
+    caption_font: RefCell<Option<Rc<LoadedFont>>>,
     pane_select_font: RefCell<Option<Rc<LoadedFont>>>,
     char_select_font: RefCell<Option<Rc<LoadedFont>>>,
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
@@ -530,6 +538,7 @@ impl FontConfigInner {
             locator,
             metrics: RefCell::new(None),
             title_font: RefCell::new(None),
+            caption_font: RefCell::new(None),
             pane_select_font: RefCell::new(None),
             char_select_font: RefCell::new(None),
             command_palette_font: RefCell::new(None),
@@ -549,6 +558,7 @@ impl FontConfigInner {
         fonts.clear();
         self.rescaled.borrow_mut().clear();
         self.title_font.borrow_mut().take();
+        self.caption_font.borrow_mut().take();
         self.pane_select_font.borrow_mut().take();
         self.char_select_font.borrow_mut().take();
         self.command_palette_font.borrow_mut().take();
@@ -638,11 +648,15 @@ impl FontConfigInner {
         entity: Entity,
     ) -> anyhow::Result<Rc<LoadedFont>> {
         let config = self.config.borrow();
-        let make_bold = entity != Entity::CommandPalette;
+        let make_bold = !matches!(entity, Entity::CommandPalette | Entity::Caption);
         let (sys_font, sys_size) = self.compute_title_font(&config, make_bold);
 
         let (font_size, text_style) = match entity {
             Entity::Title => (config.window_frame.font_size.unwrap_or(sys_size), None),
+            Entity::Caption => (
+                config.window_frame.font_size.unwrap_or(sys_size) * CAPTION_FONT_SCALE,
+                None,
+            ),
             Entity::CommandPalette => (
                 config.command_palette_font_size,
                 config.command_palette_font.as_ref(),
@@ -731,6 +745,20 @@ impl FontConfigInner {
         let loaded = self.make_entity_font_impl(myself, Entity::CharSelect)?;
 
         char_select_font.replace(Rc::clone(&loaded));
+
+        Ok(loaded)
+    }
+
+    fn caption_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        let mut caption_font = self.caption_font.borrow_mut();
+
+        if let Some(entry) = caption_font.as_ref() {
+            return Ok(Rc::clone(entry));
+        }
+
+        let loaded = self.make_entity_font_impl(myself, Entity::Caption)?;
+
+        caption_font.replace(Rc::clone(&loaded));
 
         Ok(loaded)
     }
@@ -1063,6 +1091,7 @@ impl FontConfigInner {
             .extend(self.fonts.borrow_mut().drain());
         self.metrics.borrow_mut().take();
         self.title_font.borrow_mut().take();
+        self.caption_font.borrow_mut().take();
 
         (prior_font, prior_dpi)
     }
@@ -1183,6 +1212,10 @@ impl FontConfiguration {
 
     pub fn command_palette_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner.command_palette_font(&self.inner)
+    }
+
+    pub fn caption_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.caption_font(&self.inner)
     }
 
     pub fn pane_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {

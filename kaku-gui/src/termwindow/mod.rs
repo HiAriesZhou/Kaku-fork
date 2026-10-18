@@ -1176,6 +1176,12 @@ pub struct TermWindow {
     /// once is enough; the generation guards against a config reload
     /// changing the font under a repeated message.
     toast_shaped_width: Option<(String, usize, usize, f32)>,
+    /// Title of the AI agent running in the active pane, drawn in the top
+    /// strip (`render/agent_title.rs`); refreshed with the window title.
+    agent_title: Option<render::agent_title::AgentTitle>,
+    /// `agent_title` cut to fit, keyed by (title, dpi, config generation,
+    /// max width), so a repaint does not reshape unchanged text.
+    agent_title_fitted: Option<(String, usize, usize, usize, String)>,
     selection_copy_disabled_hint_shown: bool,
     last_window_title: String,
 
@@ -1856,6 +1862,8 @@ impl TermWindow {
             opengl_info: None,
             toast: None,
             toast_shaped_width: None,
+            agent_title: None,
+            agent_title_fitted: None,
             selection_copy_disabled_hint_shown: false,
             last_window_title: String::new(),
             ai_chat_overlay_panes: HashMap::new(),
@@ -3776,6 +3784,14 @@ impl TermWindow {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();
             self.invalidate_modal();
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+
+        let agent_title = self.active_agent_title();
+        if agent_title != self.agent_title {
+            self.agent_title = agent_title;
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
             }

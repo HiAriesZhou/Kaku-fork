@@ -107,7 +107,7 @@ fn has_format_tab_title_callback(lua: &mlua::Lua) -> mlua::Result<bool> {
 /// The title a fresh terminal reports before any program sets one through
 /// OSC 0/2 (`term/src/terminalstate/mod.rs`). It is a placeholder, not a title
 /// an application chose, so `tab_title_use_pane_title` must fall through it.
-const DEFAULT_PANE_TITLE: &str = "kaku";
+pub(crate) const DEFAULT_PANE_TITLE: &str = "kaku";
 
 /// The pane title an application set through OSC 0/2, when the user opted into
 /// showing it with `tab_title_use_pane_title`.
@@ -781,10 +781,18 @@ fn foreground_process_title(pane: &dyn mux::pane::Pane) -> Option<String> {
 /// Codex): its last full-screen view is the conversation, worth keeping
 /// across a restart, unlike vim or htop.
 pub(crate) fn foreground_is_agent_cli(pane: &dyn mux::pane::Pane) -> bool {
-    foreground_process_title(pane)
-        .as_deref()
-        .and_then(|title| title.split_whitespace().next())
-        .is_some_and(|program| matches!(program, "claude" | "codex"))
+    foreground_agent_cli(pane).is_some_and(|program| matches!(program, "claude" | "codex"))
+}
+
+/// The AI agent CLI running in the pane's foreground, by program name.
+pub(crate) fn foreground_agent_cli(pane: &dyn mux::pane::Pane) -> Option<&'static str> {
+    let title = foreground_process_title(pane)?;
+    match title.split_whitespace().next()? {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "kimi" => Some("kimi"),
+        _ => None,
+    }
 }
 
 fn foreground_process_title_for_pane_info(pane: &PaneInformation) -> Option<String> {

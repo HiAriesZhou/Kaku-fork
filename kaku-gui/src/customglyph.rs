@@ -580,6 +580,11 @@ pub enum PolyCommand {
         control: BlockPoint,
         to: BlockPoint,
     },
+    CubicTo {
+        control1: BlockPoint,
+        control2: BlockPoint,
+        to: BlockPoint,
+    },
     Oval {
         center: BlockPoint,
         radiuses: BlockPoint,
@@ -608,6 +613,18 @@ impl PolyCommand {
             } => pb.quad_to(
                 x1.to_pixel(width, underline_height, width.min(height)),
                 y1.to_pixel(height, underline_height, width.min(height)),
+                x.to_pixel(width, underline_height, width.min(height)),
+                y.to_pixel(height, underline_height, width.min(height)),
+            ),
+            Self::CubicTo {
+                control1: (x1, y1),
+                control2: (x2, y2),
+                to: (x, y),
+            } => pb.cubic_to(
+                x1.to_pixel(width, underline_height, width.min(height)),
+                y1.to_pixel(height, underline_height, width.min(height)),
+                x2.to_pixel(width, underline_height, width.min(height)),
+                y2.to_pixel(height, underline_height, width.min(height)),
                 x.to_pixel(width, underline_height, width.min(height)),
                 y.to_pixel(height, underline_height, width.min(height)),
             ),
@@ -644,6 +661,8 @@ impl PolyCommand {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum PolyStyle {
     Fill,
+    /// Fill where overlapping subpaths cut holes, as SVG `fill-rule="evenodd"`.
+    FillEvenOdd,
     OutlineAlpha,
     OutlineThin,
     // A line with the thickness as underlines
@@ -657,6 +676,9 @@ impl PolyStyle {
         match self {
             PolyStyle::Fill => {
                 pixmap.fill_path(path, paint, FillRule::Winding, Transform::identity(), None);
+            }
+            PolyStyle::FillEvenOdd => {
+                pixmap.fill_path(path, paint, FillRule::EvenOdd, Transform::identity(), None);
             }
 
             PolyStyle::OutlineThin

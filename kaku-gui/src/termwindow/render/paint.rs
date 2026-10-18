@@ -618,6 +618,7 @@ impl crate::TermWindow {
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
         drop(layers);
+        self.paint_agent_title().context("paint_agent_title")?;
         self.paint_modal().context("paint_modal")?;
         self.paint_toast().context("paint_toast")?;
 

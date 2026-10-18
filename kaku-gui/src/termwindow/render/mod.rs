@@ -37,6 +37,8 @@ use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{CellAttributes, Line, StableRowIndex};
 use window::color::LinearRgba;
 
+pub mod agent_marks;
+pub mod agent_title;
 pub mod borders;
 pub mod corners;
 pub mod draw;
