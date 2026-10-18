@@ -2326,9 +2326,10 @@ pub fn default_hyperlink_rules() -> Vec<hyperlink::Rule> {
         // characters is still detected. Full-width CJK punctuation counts as
         // a boundary too, since Chinese and Japanese text runs a path straight
         // on from it with no space ("截图：/tmp/a.png", "（/tmp/a.png）"). A CJK
-        // letter does not, so "中文/English" stays plain text.
+        // letter does not, so "中文/English" stays plain text. The same
+        // punctuation ends the path, so two paths in one sentence stay two.
         hyperlink::Rule::with_highlight(
-            r#"(^|[\s\(\[<`'"：，。、；！？（【「『《“‘])((?:~|\.{1,2}|[[:alnum:]_.-]+)?/[^\s\)\]\}>`'"]*[a-zA-Z0-9_/-])"#,
+            r#"(^|[\s\(\[<`'"：，。、；！？（【「『《“‘])((?:~|\.{1,2}|[[:alnum:]_.-]+)?/[^\s\)\]\}>`'"：，。、；！？（）【】「」『』《》“”‘’]*[a-zA-Z0-9_/-])"#,
             "file://$2",
             2,
         )
@@ -3080,6 +3081,24 @@ mod tests {
                 "{:?} must stay plain text",
                 plain
             );
+        }
+    }
+
+    #[test]
+    fn two_paths_in_one_cjk_sentence_stay_two_links() {
+        let rules = default_hyperlink_rules();
+        for text in [
+            "（/tmp/a.png）和（/tmp/b.png）",
+            "截图：/tmp/a.png，/tmp/b.png",
+            "见「/tmp/a」和「/tmp/b」",
+        ] {
+            let uris: Vec<String> = Rule::match_hyperlinks(text, &rules)
+                .into_iter()
+                .map(|m| m.link.uri().to_string())
+                .collect();
+            assert_eq!(uris.len(), 2, "{:?} gave {:?}", text, uris);
+            assert!(uris[0].starts_with("file:///tmp/a"), "{:?}", uris);
+            assert!(uris[1].starts_with("file:///tmp/b"), "{:?}", uris);
         }
     }
 
