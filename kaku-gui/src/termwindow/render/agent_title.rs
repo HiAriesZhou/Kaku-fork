@@ -73,8 +73,16 @@ pub(crate) fn agent_topic(program: &str, pane_title: &str) -> String {
     let mut rest = pane_title.trim();
     loop {
         if let Some(prefix) = rest.get(..label.len()) {
+            let suffix = &rest[label.len()..];
+            let ends_name = suffix
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || matches!(c, ':' | '|' | '·'));
             if prefix.eq_ignore_ascii_case(label) {
-                rest = rest[label.len()..].trim_start();
+                if !ends_name {
+                    break;
+                }
+                rest = suffix.trim_start();
                 continue;
             }
         }
@@ -328,6 +336,22 @@ mod tests {
             "Fix padding | kaku"
         );
         assert_eq!(agent_topic("claude", "✳ Claude Code · Fix it"), "Fix it");
+    }
+
+    #[test]
+    fn agent_name_prefix_keeps_complete_topic_words() {
+        for (program, topic) in [
+            ("codex", "Codexification refactor"),
+            ("kimi", "Kimimaro parser"),
+            ("claude", "Claude Codebase cleanup"),
+        ] {
+            assert_eq!(agent_topic(program, topic), topic);
+        }
+        assert_eq!(agent_topic("codex", "CODEX | Fix padding"), "Fix padding");
+        assert_eq!(
+            agent_topic("claude", "Claude Code: Fix padding"),
+            "Fix padding"
+        );
     }
 
     #[test]
