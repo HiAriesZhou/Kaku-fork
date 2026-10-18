@@ -832,7 +832,6 @@ EOF
 
 ensure_yazi_edit_opener
 
-# Initialize Yazi keymap tweaks if the user has not created one yet.
 # Add breathing room below the path without replacing user customizations.
 if [[ ! -e "$YAZI_CONFIG_DIR/init.lua" && ! -L "$YAZI_CONFIG_DIR/init.lua" && ! -L "$YAZI_CONFIG_DIR" ]]; then
 	mkdir -p "$YAZI_CONFIG_DIR"
@@ -858,6 +857,7 @@ EOF
 	fi
 fi
 
+# Initialize Yazi keymap tweaks if the user has not created one yet.
 if [[ ! -f "$YAZI_KEYMAP_FILE" ]]; then
 	mkdir -p "$YAZI_CONFIG_DIR"
 	cat <<EOF >"$YAZI_KEYMAP_FILE"

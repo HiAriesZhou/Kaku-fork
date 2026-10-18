@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/common.sh"
 
 # Run inside Kaku, these point at the real config, whose theme then decides
 # the flavor instead of the test fixtures.
-unset KAKU_CONFIG_FILE KAKU_CONFIG_DIR
+unset KAKU_CONFIG_FILE KAKU_CONFIG_DIR XDG_CONFIG_HOME
 
 # Both installers generate their own wrapper; run the same behavior suite for each.
 if [[ "$#" -eq 0 ]]; then
