@@ -239,18 +239,79 @@ pub(crate) fn spawn_job(job_id: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn bundled_lua_section(start: &str, end: &str) -> String {
+        let source = include_str!("../../assets/macos/Kaku.app/Contents/Resources/kaku.lua");
+        let body = source.split_once(start).unwrap().1;
+        format!("{start}{}", body.split_once(end).unwrap().0)
+    }
+
+    #[test]
+    fn inline_summary_preserves_unicode() {
+        use config::lua::mlua::{Function, Lua};
+        let script = format!(
+            "{}\nreturn normalize_ai_summary",
+            bundled_lua_section(
+                "local function trim_surrounding_whitespace",
+                "local function strip_wrapping_quotes"
+            ),
+        );
+        let lua = Lua::new();
+        let normalize: Function = lua.load(&script).eval().unwrap();
+        for punctuation in ["。", "！", "？", ".", "!", "?"] {
+            let expected = format!("先列出目录{punctuation}");
+            let value: String = normalize.call(format!("{expected}然后查看文件。")).unwrap();
+            assert_eq!(value, expected);
+        }
+        for text in ["中".repeat(30), format!("x{}", "🙂".repeat(20))] {
+            let value: String = normalize.call(text.as_str()).unwrap();
+            assert!(text.starts_with(value.trim_end_matches('.')));
+            assert!(value.len() <= 73);
+        }
+    }
+
+    #[test]
+    fn inline_details_preserve_commands() {
+        use config::lua::mlua::Lua;
+        let script = format!(
+            "{}\n{}\nresolve_appearance_color_scheme = function() return 'Kaku Dark' end\n\
+             local output = ''\nlocal sent = ''\n\
+             local pane = {{ inject_output = function(_, text) output = output .. text end,\n\
+             send_text = function(_, text) sent = sent .. text end }}\n\
+             inject_ai_status_and_finalize(pane, ..., true)\nreturn output, sent",
+            bundled_lua_section(
+                "local function trim_surrounding_whitespace",
+                "local function strip_wrapping_quotes"
+            ),
+            bundled_lua_section(
+                "local function finalize_shell_line",
+                "local function clear_ai_fix_suggestion_state"
+            ),
+        );
+        let message =
+            "List files.\n  1. find . -name '*.ts'\n  2. rg --files -g '*.ts'\n保留第二句话。";
+        let (output, sent): (String, String) = config::lua::mlua::Lua::new()
+            .load(&script)
+            .call(message)
+            .unwrap();
+        assert!(output.contains(&message.replace('\n', "\r\n")));
+        assert_eq!(sent, "\n");
+        let (output, _): (String, String) = Lua::new()
+            .load(&script)
+            .call("Safe\u{1b}]52;c;payload\u{7}\u{9b}31m\rtext")
+            .unwrap();
+        assert!(!output.contains("\u{1b}]52"));
+        assert!(!output.contains('\u{7}'));
+        assert!(!output.contains('\u{9b}'));
+        assert!(!output.contains("\rtext"));
+    }
+
     fn assert_bundled_context_utf8(generate: bool, max_bytes: usize) {
         use config::lua::mlua::{Function, Lua, Table};
 
-        let source = include_str!("../../assets/macos/Kaku.app/Contents/Resources/kaku.lua");
-        let section = |start: &str, end: &str| {
-            let body = source.split_once(start).unwrap().1;
-            format!("{start}{}", body.split_once(end).unwrap().0)
-        };
         let script = format!(
             "{}\n{}\nload_prompt = function() return 'test' end\nreturn build_ai_fix_messages, build_ai_generate_messages",
-            section("local function load_prompt(name)", "\nlocal function encode_ai_fix_payload"),
-            section("local function detect_project_type(cwd)", "\n-- Animates or clears"),
+            bundled_lua_section("local function load_prompt(name)", "\nlocal function encode_ai_fix_payload"),
+            bundled_lua_section("local function detect_project_type(cwd)", "\n-- Animates or clears"),
         );
         let lua = Lua::new();
         let (fix, generation): (Function, Function) = lua.load(&script).eval().unwrap();

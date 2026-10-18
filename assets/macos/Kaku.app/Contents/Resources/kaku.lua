@@ -504,17 +504,28 @@ local function normalize_ai_summary(value, fallback)
   text = text:gsub("%s+", " ")
   text = trim_surrounding_whitespace(text)
 
-  local sentence_end = text:find("[%.%!%?。！？]")
-  if sentence_end and sentence_end > 0 then
+  local sentence_start, sentence_end = text:find("[%.!?]")
+  for _, punctuation in ipairs({ "。", "！", "？" }) do
+    local first, last = text:find(punctuation, 1, true)
+    if first and (not sentence_start or first < sentence_start) then
+      sentence_start, sentence_end = first, last
+    end
+  end
+  if sentence_end then
     text = text:sub(1, sentence_end)
   end
 
-  local max_chars = 72
-  if #text > max_chars then
-    local shortened = text:sub(1, max_chars)
+  local max_bytes = 72
+  if #text > max_bytes then
+    local first_excluded = max_bytes + 1
+    while text:byte(first_excluded) >= 0x80 and text:byte(first_excluded) < 0xC0 do
+      first_excluded = first_excluded - 1
+    end
+    local prefix = text:sub(1, first_excluded - 1)
+    local shortened = prefix
     shortened = shortened:gsub("%s+[^%s]*$", "")
     if shortened == "" then
-      shortened = text:sub(1, max_chars)
+      shortened = prefix
     end
     text = trim_surrounding_whitespace(shortened)
   end
@@ -522,7 +533,8 @@ local function normalize_ai_summary(value, fallback)
   if text == "" then
     return "Fix the command and retry."
   end
-  if not text:find("[%.%!%?。！？]$") then
+  local ending = text:sub(-3)
+  if not text:find("[%.!?]$") and ending ~= "。" and ending ~= "！" and ending ~= "？" then
     text = text .. "."
   end
   return text
@@ -1419,15 +1431,20 @@ local function finalize_shell_line(pane)
   end)
 end
 
-local function inject_ai_status(pane, message)
+local function inject_ai_status(pane, message, full_text)
   if not pane then
     return
   end
 
-  local summary = normalize_ai_summary(message or "", "Checking this error now.")
+  -- Model text must not become terminal control sequences.
+  local text = (message or ""):gsub("\r\n", "\n"):gsub("[%z\1-\8\11-\31\127]", ""):gsub("\194[\128-\159]", "")
+  local summary = full_text and trim_surrounding_whitespace(text)
+    or normalize_ai_summary(text, "Checking this error now.")
+  summary = summary:gsub("\n", "\r\n")
   local is_light = resolve_appearance_color_scheme() == 'Kaku Light'
   local label_color = is_light and "\27[38;2;32;94;166m" or "\27[38;5;105m"
-  local summary_color = is_light and "\27[38;5;244m" or "\27[38;5;249m"
+  local summary_color = full_text and "\27[0m"
+    or (is_light and "\27[38;5;244m" or "\27[38;5;249m")
   local line = label_color .. "╰─ Kaku Assistant\27[0m  " .. summary_color .. summary .. "\27[0m"
   local output = "\r\n" .. line .. "\r\n\r\n"
   pcall(function()
@@ -1435,8 +1452,8 @@ local function inject_ai_status(pane, message)
   end)
 end
 
-local function inject_ai_status_and_finalize(pane, message)
-  inject_ai_status(pane, message)
+local function inject_ai_status_and_finalize(pane, message, full_text)
+  inject_ai_status(pane, message, full_text)
   finalize_shell_line(pane)
 end
 
@@ -1748,7 +1765,7 @@ local function poll_ai_generate_job(window, pane, pane_id, job)
     end
     ctrl_ai_generate_spinner(pane, pane_state, true)
     safe_send_clear(pane)
-    inject_ai_status_and_finalize(pane, normalize_ai_summary(body, "No explanation available."))
+    inject_ai_status_and_finalize(pane, body ~= "" and body or "No explanation available.", true)
     return
   end
   if intent == "web_lookup" then
@@ -1776,18 +1793,17 @@ local function poll_ai_generate_job(window, pane, pane_id, job)
     for _, c in ipairs(cands) do
       if not ai_command_injection_risk(c.command) then
         shown = shown + 1
-        local line = "  " .. tostring(shown) .. ". " .. c.command
+        lines[#lines + 1] = "  " .. tostring(shown) .. ". " .. c.command
         if c.why ~= "" then
-          line = line .. "    -- " .. c.why
+          lines[#lines + 1] = "     " .. c.why
         end
-        lines[#lines + 1] = line
       end
     end
     if shown == 0 then
       inject_ai_status_and_finalize(pane, "All candidates were blocked for safety.")
       return
     end
-    inject_ai_status_and_finalize(pane, table.concat(lines, "\n"))
+    inject_ai_status_and_finalize(pane, table.concat(lines, "\n"), true)
     return
   end
 
@@ -1803,7 +1819,8 @@ local function poll_ai_generate_job(window, pane, pane_id, job)
     safe_send_clear(pane)
     inject_ai_status_and_finalize(
       pane,
-      "Blocked: generated command looks like injection. Suggested text: " .. command
+      "Blocked: generated command looks like injection. Suggested text: " .. command,
+      true
     )
     return
   end
