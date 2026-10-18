@@ -47,7 +47,8 @@ brew install --cask kaku
 - **Tabs und Fensterteilung**: Arbeitsbereich flexibel teilen, mit dem Tab Navigator schnell zwischen Tabs wechseln und Fenster, Splits und Arbeitsverzeichnisse beim erneuten Öffnen von Kaku automatisch wiederherstellen
 - **Kontextmenü per Rechtsklick**: Einfügen, Suchen, KI-Chat öffnen, Splits teilen oder schließen, Tabs öffnen oder schließen, ganz ohne Tastenkürzel auswendig lernen zu müssen
 - **Klickbare Links**: `Cmd + Klick` öffnet URLs und Dateipfade direkt; auch durch Zeilenumbrüche getrennte Links bleiben vollständig erhalten
-- **KI-freundlich**: Nutze deine Coding-Tools zusammen mit einem optionalen Assistenten für Befehlsvorschläge und Chat
+- **KI-freundlich**: Oben rechts siehst du, welcher Agent gerade woran arbeitet, Claude Code meldet sich, wenn es dich braucht, und ein optionaler Assistent hilft mit Befehlsvorschlägen und Chat
+- **Fernzugriff**: Mit `kaku remote` nutzt du die Terminals dieses Macs im Browser eines anderen Computers
 - **Shell-Werkzeuge**: Integrierte zsh-Autovervollständigung, Syntaxhervorhebung und Verzeichnisnavigation, mit Tastenkürzeln für optional installiertes Lazygit und Yazi
 - **Lua-Konfiguration**: Passe Schriften, Farbschemata, Tastenkürzel und Terminal-Verhalten flexibel über WezTerms Lua-System an
 

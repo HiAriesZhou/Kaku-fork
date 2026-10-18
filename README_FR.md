@@ -47,7 +47,8 @@ Lancez Kaku pour finaliser la configuration du shell, installez les outils optio
 - **Onglets et volets** : séparez facilement votre espace de travail, passez d'un onglet à l'autre avec le Tab Navigator et restaurez vos fenêtres, volets et répertoires à la réouverture de Kaku
 - **Menu contextuel au clic droit** : coller, rechercher, lancer le chat IA, diviser ou fermer un volet, ouvrir ou fermer des onglets, sans avoir à mémoriser de combinaisons
 - **Liens interactifs** : `Cmd + Clic` ouvre directement les URL et chemins de fichiers ; les liens longs coupés sur plusieurs lignes restent entièrement cliquables
-- **Pensé pour l'IA** : utilisez vos outils de développement avec un assistant optionnel pour suggérer des commandes et dialoguer
+- **Pensé pour l'IA** : l'agent en cours et sa tâche s'affichent en haut à droite, Claude Code vous notifie quand il a besoin de vous, et un assistant optionnel suggère des commandes et dialogue
+- **Accès à distance** : lancez `kaku remote` pour utiliser les terminaux de ce Mac depuis le navigateur d'un autre ordinateur
 - **Suite d'outils shell** : autocomplétion zsh, coloration syntaxique et navigation rapide intégrées, avec des raccourcis pour Lazygit et Yazi, à installer en option
 - **Configuration en Lua** : personnalisez polices, thèmes, raccourcis et comportements grâce au moteur Lua de WezTerm
 

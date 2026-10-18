@@ -47,7 +47,8 @@ Open Kaku to set up shell integration, install missing optional tools with `kaku
 - **Tabs and panes**: Split your workspace, jump between tabs with Tab Navigator, and restore windows, panes, and working directories when you reopen Kaku
 - **Right-click menu**: Paste, search, open AI chat, split or close the clicked pane, and open or close tabs without remembering shortcuts
 - **Clickable links**: `Cmd + Click` opens URLs and file paths, and URLs automatically wrapped by the terminal keep their full address
-- **AI-friendly**: Use your coding tools alongside an optional assistant for command suggestions and chat
+- **AI-friendly**: See which agent is working and on what at the top right, get notified when Claude Code needs you, and use an optional assistant for command suggestions and chat
+- **Remote access**: Run `kaku remote` to use this Mac's terminals from a browser on another computer
 - **Shell tools**: Built-in zsh completion, syntax highlighting, and directory jumping, with shortcuts for optional Lazygit and Yazi installations
 - **Lua configuration**: Customize fonts, themes, shortcuts, and terminal behavior using WezTerm's Lua configuration system
 
