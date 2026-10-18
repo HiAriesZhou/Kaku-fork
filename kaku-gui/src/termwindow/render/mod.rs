@@ -323,7 +323,11 @@ pub struct ComputeCellFgBgResult {
 }
 
 /// Top share of the space left after whole rows; the bottom gets the rest.
-fn split_row_slack(vertical_gap: f32) -> f32 {
+fn split_row_slack(vertical_gap: f32, window_state: window::WindowState) -> f32 {
+    // Drawer padding is explicit, even when ordinary window padding is managed.
+    if window_state.contains(window::WindowState::HOTKEY_WINDOW) {
+        return 0.;
+    }
     (vertical_gap / 2.).floor().max(0.)
 }
 
@@ -533,11 +537,14 @@ impl crate::TermWindow {
             // leftover evenly so content sits as far from the top edge as
             // from the bottom edge or tab bar, in a window or fullscreen.
             let border = self.get_os_border();
-            split_row_slack(row_slack_inside_os_borders(
-                vertical_gap,
-                border.top.get() as f32,
-                border.bottom.get() as f32,
-            ))
+            split_row_slack(
+                row_slack_inside_os_borders(
+                    vertical_gap,
+                    border.top.get() as f32,
+                    border.bottom.get() as f32,
+                ),
+                self.window_state,
+            )
         } else {
             match self.config.window_content_alignment.vertical {
                 VerticalWindowContentAlignment::Top => 0.,
@@ -1125,10 +1132,21 @@ mod tests {
     #[test]
     fn row_slack_splits_between_top_and_bottom() {
         // A 58px row leaves 0..57px; neither edge takes it all.
-        assert_eq!(split_row_slack(0.), 0.);
-        assert_eq!(split_row_slack(40.), 20.);
-        assert_eq!(split_row_slack(57.), 28.);
-        assert_eq!(split_row_slack(-3.), 0.);
+        assert_eq!(split_row_slack(0., window::WindowState::empty()), 0.);
+        assert_eq!(split_row_slack(40., window::WindowState::empty()), 20.);
+        assert_eq!(split_row_slack(57., window::WindowState::empty()), 28.);
+        assert_eq!(split_row_slack(-3., window::WindowState::empty()), 0.);
+    }
+
+    #[test]
+    fn hotkey_row_slack_preserves_explicit_top_padding() {
+        for slack in [0., 4., 40., 57.] {
+            assert_eq!(
+                split_row_slack(slack, window::WindowState::HOTKEY_WINDOW),
+                0.
+            );
+        }
+        assert_eq!(split_row_slack(40., window::WindowState::FULL_SCREEN), 20.);
     }
 
     #[test]
