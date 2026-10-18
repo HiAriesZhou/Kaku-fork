@@ -33,6 +33,9 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install --quiet markdown pygments pillow
 
+      - name: Test the publishing pipeline
+        run: '"$RUNNER_TEMP/venv/bin/python" scripts/test_blog_pipeline.py'
+
       - name: Publish the next post
         id: publish
         run: |
