@@ -23,23 +23,64 @@ pub(super) fn handle_key(key: &KeyEvent, app: &mut App) -> Action {
         app.selecting = false;
     }
 
-    // Handle approval prompt: Enter = approve, Esc = reject, other keys ignored.
-    // Esc is captured here so it rejects the tool call rather than exiting the chat.
-    if let Some((summary, reply_tx)) = app.pending_approval.take() {
-        let is_approve = matches!((&key.key, key.modifiers), (KeyCode::Enter, Modifiers::NONE));
-        let is_reject = matches!((&key.key, key.modifiers), (KeyCode::Escape, _));
-        if is_approve {
-            let _ = reply_tx.send(true);
-            return Action::Continue;
-        } else if is_reject {
-            let _ = reply_tx.send(false);
-            return Action::Continue;
-        } else {
-            // Other key: restore the approval state and ignore the key.
-            app.pending_approval = Some((summary, reply_tx));
+    // Permission details own navigation until an explicit decision.
+    if app.pending_approval.is_some() {
+        match (&key.key, key.modifiers) {
+            (KeyCode::Escape, _) => app.activate_control(ChatControl::Deny),
+            (KeyCode::Enter, Modifiers::NONE) => app.activate_control(ChatControl::Approve),
+            (KeyCode::UpArrow, _) => app.scroll_approval(true, 1),
+            (KeyCode::DownArrow, _) => app.scroll_approval(false, 1),
+            (KeyCode::PageUp, _) => app.scroll_approval(true, app.rows.saturating_sub(4).max(1)),
+            (KeyCode::PageDown, _) => app.scroll_approval(false, app.rows.saturating_sub(4).max(1)),
+            (KeyCode::Home, _) => app.approval_scroll = 0,
+            (KeyCode::End, _) => app.scroll_approval(false, usize::MAX),
+            _ => {}
+        }
+        return Action::Continue;
+    }
+
+    if app.input.is_empty() {
+        if matches!((&key.key, key.modifiers), (KeyCode::Tab, Modifiers::NONE)) {
+            let mut controls = super::layout::control_spans(&app.controls(), app.cols)
+                .into_iter()
+                .map(|(control, _, _)| control)
+                .collect::<Vec<_>>();
+            for (index, line) in app
+                .display_lines()
+                .iter()
+                .enumerate()
+                .skip(app.visible_start())
+                .take(app.msg_area_height())
+            {
+                if let DisplayLine::CodeActions { can_insert, .. } = line {
+                    controls.extend(
+                        super::layout::control_spans(
+                            &super::layout::code_controls(index, *can_insert),
+                            app.cols,
+                        )
+                        .into_iter()
+                        .map(|(control, _, _)| control),
+                    );
+                }
+            }
+            if !controls.is_empty() {
+                let next = app
+                    .focused_control
+                    .and_then(|focused| controls.iter().position(|c| *c == focused))
+                    .map(|i| (i + 1) % controls.len())
+                    .unwrap_or(0);
+                app.focused_control = Some(controls[next]);
+            }
             return Action::Continue;
         }
+        if matches!((&key.key, key.modifiers), (KeyCode::Enter, Modifiers::NONE)) {
+            if let Some(control) = app.focused_control.take() {
+                app.activate_control(control);
+                return Action::Continue;
+            }
+        }
     }
+    app.focused_control = None;
 
     let slash_options = if app.is_streaming {
         Vec::new()
@@ -222,11 +263,21 @@ pub(super) fn handle_key(key: &KeyEvent, app: &mut App) -> Action {
         (KeyCode::UpArrow, _) | (KeyCode::PageUp, _) => {
             let total = app.display_lines().len();
             let max_offset = total.saturating_sub(app.msg_area_height());
-            app.scroll_offset = app.scroll_offset.saturating_add(3).min(max_offset);
+            let amount = if key.key == KeyCode::PageUp {
+                app.msg_area_height().max(1)
+            } else {
+                3
+            };
+            app.scroll_offset = app.scroll_offset.saturating_add(amount).min(max_offset);
             Action::Continue
         }
         (KeyCode::DownArrow, _) | (KeyCode::PageDown, _) => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+            let amount = if key.key == KeyCode::PageDown {
+                app.msg_area_height().max(1)
+            } else {
+                3
+            };
+            app.scroll_offset = app.scroll_offset.saturating_sub(amount);
             Action::Continue
         }
 
@@ -324,6 +375,7 @@ pub(super) fn handle_key(key: &KeyEvent, app: &mut App) -> Action {
             let byte_pos = char_to_byte_pos(&app.input, app.input_cursor);
             app.input.insert(byte_pos, *c);
             app.input_cursor += 1;
+            app.input_clicked_this_stream = true;
             app.attachment_picker_index = 0;
             Action::Continue
         }
@@ -370,15 +422,54 @@ fn handle_key_picker(key: &KeyEvent, app: &mut App) -> Action {
 }
 
 pub(super) fn handle_mouse(event: &MouseEvent, app: &mut App) {
-    // Scroll wheel support
+    if event.mouse_buttons != MouseButtons::NONE {
+        app.focused_control = None;
+    }
     if event.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
-        if event.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) {
-            let total = app.display_lines().len();
-            let max_offset = total.saturating_sub(app.msg_area_height());
+        let up = event.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE);
+        if app.pending_approval.is_some() {
+            app.scroll_approval(up, 2);
+            return;
+        }
+        if let AppMode::ResumePicker { items, cursor } = &mut app.mode {
+            *cursor = if up {
+                cursor.saturating_sub(1)
+            } else {
+                (*cursor + 1).min(items.len().saturating_sub(1))
+            };
+            return;
+        }
+        if up {
+            let max_offset = app
+                .display_lines()
+                .len()
+                .saturating_sub(app.msg_area_height());
             app.scroll_offset = app.scroll_offset.saturating_add(2).min(max_offset);
         } else {
             app.scroll_offset = app.scroll_offset.saturating_sub(2);
         }
+        return;
+    }
+
+    let pressed = event.mouse_buttons.contains(MouseButtons::LEFT);
+    let control = control_at(app, event.x as usize, event.y as usize);
+    if pressed && !app.left_was_pressed {
+        app.pressed_control = control;
+    }
+    if !pressed && app.left_was_pressed {
+        if let Some(origin) = app.pressed_control.take() {
+            app.left_was_pressed = false;
+            if control == Some(origin) {
+                app.activate_control(origin);
+            }
+            return;
+        }
+    }
+    if app.pressed_control.is_some()
+        || app.pending_approval.is_some()
+        || matches!(app.mode, AppMode::ResumePicker { .. })
+    {
+        app.left_was_pressed = pressed;
         return;
     }
 
@@ -387,7 +478,7 @@ pub(super) fn handle_mouse(event: &MouseEvent, app: &mut App) {
     // tracks the separator row (which floats up as input grows).
     let input_visible_h = app.input_visible_rows();
     let msg_row_start = 1usize; // first message row (0 is top border)
-    let msg_row_end = app.rows.saturating_sub(2 + input_visible_h); // exclusive
+    let msg_row_end = 1 + app.msg_area_height(); // exclusive
 
     let mx = event.x as usize;
     let my = event.y as usize;
@@ -395,17 +486,8 @@ pub(super) fn handle_mouse(event: &MouseEvent, app: &mut App) {
 
     // Convert absolute mouse row to display-line index accounting for scroll.
     // Pre-compute the values the closure needs so we avoid a long-lived borrow.
-    let all_lines = app.display_lines().len();
-    let msg_area_h = app.msg_area_height();
-    let scroll_offset = app.scroll_offset;
-    let to_line_idx = |row: usize| -> usize {
-        let visible_start = if all_lines <= msg_area_h {
-            0
-        } else {
-            (all_lines - msg_area_h).saturating_sub(scroll_offset)
-        };
-        visible_start + row.saturating_sub(msg_row_start)
-    };
+    let visible_start = app.visible_start();
+    let to_line_idx = |row: usize| visible_start + row.saturating_sub(msg_row_start);
 
     // termwiz maps both Button1Press and Button1Drag to MouseButtons::LEFT, so
     // we cannot distinguish press from drag by checking the current event alone.
@@ -520,6 +602,7 @@ fn extract_selection_text(app: &App) -> Option<String> {
                 };
                 (format!("{}{}", indent, segments_to_plain(segments)), indent)
             }
+            DisplayLine::CodeActions { .. } => (String::new(), ""),
             DisplayLine::LoadingDot => (String::new(), ""),
             DisplayLine::ThinkingHeader { .. } => (String::new(), ""),
             DisplayLine::Blank => (String::new(), ""),
@@ -568,4 +651,54 @@ pub(super) fn copy_to_clipboard(text: &str) {
         // stdin drop closes the pipe; pbcopy exits naturally.
         let _ = child.wait();
     });
+}
+
+fn control_at(app: &App, x: usize, y: usize) -> Option<ChatControl> {
+    use super::layout::{code_controls, control_spans};
+    if app.pending_approval.is_some() {
+        return (app.cols >= 20 && app.rows >= 6 && y == app.rows - 2)
+            .then(|| {
+                control_spans(&app.controls(), app.cols)
+                    .into_iter()
+                    .find(|(_, _, range)| range.contains(&x))
+                    .map(|(control, _, _)| control)
+            })
+            .flatten();
+    }
+    if let AppMode::ResumePicker { items, cursor } = &app.mode {
+        let height = app.resume_picker_height();
+        let start = cursor.saturating_sub(height.saturating_sub(1));
+        let index = start + y.saturating_sub(1);
+        return (y >= 1 && y <= height && index < items.len())
+            .then_some(ChatControl::Resume(index));
+    }
+    let sep_row = app.rows.saturating_sub(2 + app.input_visible_rows());
+    if y == sep_row {
+        return control_spans(&app.controls(), app.cols)
+            .into_iter()
+            .find(|(_, _, range)| range.contains(&x))
+            .map(|(control, _, _)| control);
+    }
+    let picker_h = app.picker_height();
+    if picker_h > 0 && y >= sep_row.saturating_sub(picker_h) && y < sep_row {
+        let options = app
+            .slash_picker_options()
+            .len()
+            .max(app.attachment_picker_options().len());
+        let first = app
+            .attachment_picker_index
+            .saturating_sub(picker_h.saturating_sub(1));
+        let index = first + y - (sep_row - picker_h);
+        return (index < options).then_some(ChatControl::Pick(index));
+    }
+    if y >= 1 && y <= app.msg_area_height() {
+        let index = app.visible_start() + y - 1;
+        if let Some(DisplayLine::CodeActions { can_insert, .. }) = app.display_lines().get(index) {
+            return control_spans(&code_controls(index, *can_insert), app.cols)
+                .into_iter()
+                .find(|(_, _, range)| range.contains(&x))
+                .map(|(control, _, _)| control);
+        }
+    }
+    None
 }

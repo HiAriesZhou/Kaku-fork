@@ -45,7 +45,7 @@ pub(crate) use types::*;
 
 // Private imports needed by ai_chat_overlay.
 use self::input::{handle_key, handle_mouse};
-use self::layout::char_to_byte_pos;
+
 use self::render::render;
 use self::state::App;
 use crate::ai_client::{AiClient, AssistantConfig};
@@ -80,7 +80,7 @@ use termwiz::color::SrgbaTuple;
 mod tests;
 
 pub fn ai_chat_overlay(
-    _pane_id: PaneId,
+    pane_id: PaneId,
     mut term: TermWizTerminal,
     context: TerminalContext,
     palette_rx: Receiver<ChatPalette>,
@@ -125,6 +125,39 @@ pub fn ai_chat_overlay(
     app.display_lines_dirty = true;
 
     loop {
+        if let Some(command) = app.pending_insert.take() {
+            let result = smol::block_on(promise::spawn::spawn_into_main_thread(async move {
+                let pane = mux::Mux::get()
+                    .get_pane(pane_id)
+                    .ok_or_else(|| anyhow::anyhow!("The terminal pane is closed"))?;
+                let process =
+                    pane.get_foreground_process_name(mux::pane::CachePolicy::FetchImmediate);
+                let shell = process
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|p| p.to_str())
+                    .is_some_and(|name| matches!(name, "zsh" | "bash" | "fish" | "sh"));
+                anyhow::ensure!(
+                    shell && !pane.is_alt_screen_active(),
+                    "Return to a shell before inserting"
+                );
+                anyhow::ensure!(
+                    !command.chars().any(char::is_control),
+                    "Only single-line commands can be inserted"
+                );
+                pane.send_paste(&command)
+            }));
+            match result {
+                Ok(()) => {
+                    app.save_history();
+                    break;
+                }
+                Err(error) => {
+                    app.model_status_flash = Some((format!("{}", error), std::time::Instant::now()))
+                }
+            }
+            needs_redraw = true;
+        }
         if drain_palette_updates(
             &palette_rx,
             &mut app.context.colors,
@@ -201,36 +234,10 @@ pub fn ai_chat_overlay(
                 needs_redraw = true;
             }
             Some(InputEvent::Paste(text)) => {
-                // IME composed text (e.g. Chinese, Japanese) arrives here via
-                // ForwardWriter in TermWizTerminalPane, which converts bytes
-                // written to pane.writer() into InputEvent::Paste events.
-                // Allowed during streaming so the user can stage the next message.
-                //
-                // Shift+Enter / Cmd+Enter may also reach this path: users often
-                // bind those to `SendString('\n')` in kaku.lua, which the
-                // ForwardWriter delivers as `Paste("\n")`. Treat \r and \n as
-                // literal newlines so multi-line composition works regardless
-                // of how the byte stream entered the overlay.
-                let normalized: String = text
-                    .chars()
-                    .filter_map(|c| match c {
-                        '\r' | '\n' => Some('\n'),
-                        c if !c.is_control() => Some(c),
-                        _ => None,
-                    })
-                    .collect();
-                if !normalized.is_empty() {
-                    app.snapshot_input_for_undo();
-                    for c in normalized.chars() {
-                        let byte_pos = char_to_byte_pos(&app.input, app.input_cursor);
-                        app.input.insert(byte_pos, c);
-                        app.input_cursor += 1;
-                    }
-                    app.attachment_picker_index = 0;
-                    app.display_lines_dirty = true;
-                    needs_redraw = true;
-                }
+                app.paste_input(&text);
+                needs_redraw = true;
             }
+
             Some(InputEvent::Mouse(mouse)) => {
                 handle_mouse(&mouse, &mut app);
                 needs_redraw = true;
@@ -248,10 +255,11 @@ pub fn ai_chat_overlay(
                     || app.pending_approval.is_some()
                     || matches!(app.model_fetch, ModelFetch::Loading))
                     && app.try_advance_spinner();
-                if app.is_streaming
-                    || !app.grapheme_queue.is_empty()
-                    || app.stream_pending_done
-                    || spinner_changed
+                if app.pending_approval.is_none()
+                    && (app.is_streaming
+                        || !app.grapheme_queue.is_empty()
+                        || app.stream_pending_done
+                        || spinner_changed)
                 {
                     needs_redraw = true;
                 }

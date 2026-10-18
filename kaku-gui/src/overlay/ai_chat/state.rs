@@ -567,12 +567,17 @@ fn emit_assistant_markdown(
                 }
                 i += 1;
             }
-            MdBlock::CodeLine { lang, .. } => {
+            MdBlock::CodeLine {
+                lang,
+                group,
+                closed,
+                ..
+            } => {
                 let group_lang = lang.clone();
                 let start = i;
                 while i < len {
                     match &blocks[i] {
-                        MdBlock::CodeLine { lang: l, .. } if *l == group_lang => i += 1,
+                        MdBlock::CodeLine { group: g, .. } if g == group => i += 1,
                         _ => break,
                     }
                 }
@@ -583,6 +588,19 @@ fn emit_assistant_markdown(
                         _ => unreachable!(),
                     })
                     .collect();
+                let text = code_lines
+                    .iter()
+                    .map(|(text, _)| *text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let can_insert = *closed
+                    && matches!(
+                        group_lang.as_str(),
+                        "sh" | "bash" | "zsh" | "shell" | "fish"
+                    )
+                    && !text.is_empty()
+                    && !text.chars().any(char::is_control);
+                out.push(DisplayLine::CodeActions { text, can_insert });
                 let highlighted =
                     syntax::highlight_code_block(&code_lines, &group_lang, light_palette);
                 for (spans, diff) in highlighted {
@@ -690,6 +708,13 @@ pub(crate) struct App {
     pub(crate) input_cursor: usize,
     /// Lines scrolled up from the bottom (0 = show the latest messages).
     pub(crate) scroll_offset: usize,
+    pub(crate) viewport_height: usize,
+    pub(crate) display_width: usize,
+    pub(crate) approval_scroll: usize,
+    pub(crate) pending_insert: Option<String>,
+    pub(crate) pressed_control: Option<ChatControl>,
+    pub(crate) focused_control: Option<ChatControl>,
+    pub(crate) drafts: HashMap<String, InputSnapshot>,
     pub(crate) is_streaming: bool,
     /// Ordered list of candidate models for the chat overlay.
     pub(crate) available_models: Vec<String>,
@@ -745,7 +770,7 @@ pub(crate) struct App {
     /// termwiz maps both Button1Press and Button1Drag to MouseButtons::LEFT.
     pub(crate) left_was_pressed: bool,
     /// Pending approval request from the agent: (summary string, response sender).
-    /// When Some, the UI blocks the agent thread until the user responds y/n.
+    /// When Some, the UI blocks the agent thread until the user allows or denies.
     pub(crate) pending_approval: Option<(String, std::sync::mpsc::SyncSender<bool>)>,
     /// ID of the current active conversation in ai_conversations/.
     pub(crate) active_id: String,
@@ -901,6 +926,13 @@ impl App {
             input: String::new(),
             input_cursor: 0,
             scroll_offset: 0,
+            viewport_height: 0,
+            display_width: 0,
+            approval_scroll: 0,
+            pending_insert: None,
+            pressed_control: None,
+            focused_control: None,
+            drafts: HashMap::new(),
             is_streaming: false,
             available_models,
             model_index,
@@ -1194,7 +1226,18 @@ impl App {
 
     /// Rebuild cached_display_lines if dirty.
     pub(crate) fn rebuild_display_cache(&mut self) {
+        if self.display_width != self.cols {
+            self.focused_control = None;
+            self.pressed_control = None;
+            self.selection = None;
+            self.selecting = false;
+            self.drag_origin = None;
+            self.display_width = self.cols;
+        }
+        let old_start = self.visible_start();
+        let was_scrolled = self.scroll_offset > 0;
         if !self.display_lines_dirty {
+            self.restore_viewport(old_start, was_scrolled);
             return;
         }
         let w = self.content_width().max(4);
@@ -1278,7 +1321,13 @@ impl App {
                         } else {
                             // Still streaming: render directly, no point
                             // memoizing content that changes every tick.
+                            let start = lines.len();
                             emit_assistant_markdown(&mut lines, &msg.content, w, is_light);
+                            for line in &mut lines[start..] {
+                                if let DisplayLine::CodeActions { can_insert, .. } = line {
+                                    *can_insert = false;
+                                }
+                            }
                         }
                     }
                 }
@@ -1296,18 +1345,35 @@ impl App {
         }
 
         self.cached_display_lines = lines;
+        self.restore_viewport(old_start, was_scrolled);
         self.assistant_render_memo = next_memo;
         self.display_lines_dirty = false;
     }
 
-    pub(crate) fn content_width(&self) -> usize {
-        self.cols.saturating_sub(4) // 2 border + 2 padding per side
+    fn restore_viewport(&mut self, start: usize, was_scrolled: bool) {
+        self.viewport_height = self.msg_area_height();
+        if was_scrolled {
+            self.scroll_offset = self
+                .cached_display_lines
+                .len()
+                .saturating_sub(self.viewport_height)
+                .saturating_sub(start);
+        }
     }
 
-    /// Width available inside the input box (between the left and right
-    /// border columns). Input wraps at this width.
+    pub(crate) fn visible_start(&self) -> usize {
+        self.cached_display_lines
+            .len()
+            .saturating_sub(self.viewport_height)
+            .saturating_sub(self.scroll_offset)
+    }
+
+    pub(crate) fn content_width(&self) -> usize {
+        self.cols.saturating_sub(4).min(104)
+    }
+
     pub(crate) fn input_wrap_width(&self) -> usize {
-        self.cols.saturating_sub(2)
+        self.cols.saturating_sub(2).max(1)
     }
 
     pub(crate) fn current_input_prompt(&self) -> String {
@@ -1318,28 +1384,189 @@ impl App {
         }
     }
 
-    /// How many rows the input area occupies right now. Grows with wrapped
-    /// input length up to `MAX_INPUT_VISIBLE_ROWS`; the approval banner
-    /// always takes one row.
     pub(crate) fn input_visible_rows(&self) -> usize {
-        if self.pending_approval.is_some() {
-            return 1;
-        }
-        let prompt = self.current_input_prompt();
         let layout = layout_input(
-            &prompt,
+            &self.current_input_prompt(),
             &self.input,
             self.input_cursor,
             self.input_wrap_width(),
         );
-        layout.rows.len().clamp(1, MAX_INPUT_VISIBLE_ROWS)
+        layout
+            .rows
+            .len()
+            .clamp(1, MAX_INPUT_VISIBLE_ROWS)
+            .min(self.rows.saturating_sub(3))
     }
 
-    /// Total visible rows for the message area. Shrinks when the input
-    /// box grows so the chrome (top border + separator + input + bottom
-    /// border) always stays inside `self.rows`.
+    pub(crate) fn picker_height(&self) -> usize {
+        if self.is_streaming || self.pending_approval.is_some() {
+            return 0;
+        }
+        let count = self
+            .slash_picker_options()
+            .len()
+            .max(self.attachment_picker_options().len());
+        count
+            .min(MAX_PICKER_ROWS)
+            .min(self.rows.saturating_sub(self.input_visible_rows() + 3))
+    }
+
+    pub(crate) fn resume_picker_height(&self) -> usize {
+        self.rows.saturating_sub(4)
+    }
+
     pub(crate) fn msg_area_height(&self) -> usize {
-        self.rows.saturating_sub(3 + self.input_visible_rows())
+        self.rows
+            .saturating_sub(3 + self.input_visible_rows() + self.picker_height())
+    }
+
+    pub(crate) fn controls(&self) -> Vec<(ChatControl, &'static str)> {
+        let mut controls = if self.pending_approval.is_some() {
+            vec![(ChatControl::Approve, "Allow"), (ChatControl::Deny, "Deny")]
+        } else if self.is_streaming {
+            vec![(ChatControl::Stop, "Stop")]
+        } else {
+            vec![
+                (ChatControl::History, "History"),
+                (ChatControl::Context, "Context"),
+                (ChatControl::Model, "Model"),
+            ]
+        };
+        if self.pending_approval.is_none() && self.scroll_offset > 0 {
+            controls.insert(0, (ChatControl::Latest, "Latest"));
+        }
+        controls
+    }
+
+    pub(crate) fn activate_control(&mut self, control: ChatControl) {
+        match control {
+            ChatControl::Approve | ChatControl::Deny => {
+                if control == ChatControl::Approve && (self.cols < 20 || self.rows < 6) {
+                    return;
+                }
+                self.pressed_control = None;
+                self.focused_control = None;
+                if let Some((_, tx)) = self.pending_approval.take() {
+                    let _ = tx.send(control == ChatControl::Approve);
+                }
+            }
+            ChatControl::Resume(index) => self.load_conversation_from_picker(index),
+            ChatControl::Pick(index) => {
+                self.attachment_picker_index = index;
+                if !self.attachment_picker_options().is_empty() {
+                    self.accept_attachment_picker();
+                    return;
+                }
+                super::input::handle_key(
+                    &termwiz::input::KeyEvent {
+                        key: termwiz::input::KeyCode::Enter,
+                        modifiers: termwiz::input::Modifiers::NONE,
+                    },
+                    self,
+                );
+            }
+            ChatControl::Stop => self.cancel_stream(),
+            ChatControl::Latest => self.scroll_offset = 0,
+            ChatControl::History => self.enter_resume_picker(),
+            ChatControl::Context => {
+                self.input_cursor = self.input.chars().count();
+                self.paste_input(if self.input.is_empty() { "@" } else { " @" });
+            }
+            ChatControl::Model => {
+                super::input::handle_key(
+                    &termwiz::input::KeyEvent {
+                        key: termwiz::input::KeyCode::Tab,
+                        modifiers: termwiz::input::Modifiers::SHIFT,
+                    },
+                    self,
+                );
+            }
+            ChatControl::CopyCode(index) | ChatControl::InsertCode(index) => {
+                if let Some(DisplayLine::CodeActions { text, can_insert }) =
+                    self.display_lines().get(index)
+                {
+                    if matches!(control, ChatControl::CopyCode(_)) {
+                        super::input::copy_to_clipboard(text);
+                        self.model_status_flash = Some(("Copied".into(), Instant::now()));
+                    } else if *can_insert && !self.is_streaming {
+                        self.pending_insert = Some(text.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn approval_lines(&self) -> Vec<String> {
+        let text = self
+            .pending_approval
+            .as_ref()
+            .map(|(s, _)| s.as_str())
+            .unwrap_or("");
+        layout_input("", text, 0, self.cols.saturating_sub(6).max(1)).rows
+    }
+
+    pub(crate) fn scroll_approval(&mut self, up: bool, amount: usize) {
+        let max = self
+            .approval_lines()
+            .len()
+            .saturating_sub(self.rows.saturating_sub(4));
+        self.approval_scroll = if up {
+            self.approval_scroll.saturating_sub(amount)
+        } else {
+            self.approval_scroll.saturating_add(amount).min(max)
+        };
+    }
+
+    pub(crate) fn paste_input(&mut self, text: &str) {
+        if self.pending_approval.is_some() || !matches!(self.mode, AppMode::Chat) {
+            return;
+        }
+        let normalized: String = text
+            .replace("\r\n", "\n")
+            .chars()
+            .filter_map(|c| match c {
+                '\r' | '\n' => Some('\n'),
+                '\t' => Some(' '),
+                c if !c.is_control() => Some(c),
+                _ => None,
+            })
+            .collect();
+        if normalized.is_empty() {
+            return;
+        }
+        self.snapshot_input_for_undo();
+        let byte = char_to_byte_pos(&self.input, self.input_cursor);
+        self.input.insert_str(byte, &normalized);
+        self.input_cursor += normalized.chars().count();
+        self.input_clicked_this_stream = true;
+        self.focused_control = None;
+        self.attachment_picker_index = 0;
+    }
+
+    pub(crate) fn remember_draft(&mut self) {
+        self.drafts.insert(
+            self.active_id.clone(),
+            InputSnapshot {
+                input: self.input.clone(),
+                cursor: self.input_cursor,
+            },
+        );
+    }
+
+    pub(crate) fn restore_draft(&mut self) {
+        self.selection = None;
+        self.selecting = false;
+        self.drag_origin = None;
+        self.focused_control = None;
+        self.pressed_control = None;
+        let draft = self.drafts.remove(&self.active_id);
+        self.input = draft.as_ref().map(|d| d.input.clone()).unwrap_or_default();
+        self.input_cursor = draft
+            .map(|d| d.cursor)
+            .unwrap_or(0)
+            .min(self.input.chars().count());
+        self.input_undo_stack.clear();
+        self.attachment_picker_index = 0;
     }
 
     /// Submit the current input as a user message and kick off an agent loop.
@@ -1651,6 +1878,9 @@ impl App {
                             &strings::approval_notification_title(),
                             &short,
                         );
+                        self.approval_scroll = 0;
+                        self.pressed_control = None;
+                        self.focused_control = None;
                         self.pending_approval = Some((summary, reply_tx));
                         changed = true;
                         // Stop draining; wait for user to respond before processing more.
@@ -1825,6 +2055,15 @@ impl App {
         self.stream_pending_done = false;
         self.stream_pending_err = None;
         self.pending_responses_items.clear();
+        // Keep the answer already displayed when the user stops generation.
+        for message in &mut self.messages {
+            if !message.is_tool()
+                && (!message.content.is_empty() || !message.reasoning_content.is_empty())
+            {
+                message.complete = true;
+            }
+        }
+        self.display_lines_dirty = true;
     }
 
     /// Return the cached flat list of display lines.
@@ -2202,8 +2441,8 @@ impl App {
         };
         let Some(meta) = items.get(idx) else { return };
         let meta = meta.clone();
-        self.input.clear();
-        self.input_cursor = 0;
+        self.remember_draft();
+        self.save_history();
 
         // Spawn async summary for the outgoing active conversation if non-empty.
         let current = self.collect_persisted_messages();
@@ -2224,8 +2463,9 @@ impl App {
         match ai_conversations::switch_active(&meta.id) {
             Ok(loaded) => {
                 self.active_id = meta.id.clone();
+                self.restore_draft();
                 self.messages.clear();
-                let mut restored: Vec<Message> = loaded
+                let restored: Vec<Message> = loaded
                     .into_iter()
                     .map(|p| {
                         if p.role == "user" {
@@ -2248,9 +2488,6 @@ impl App {
                         }
                     })
                     .collect();
-                if !restored.is_empty() {
-                    restored.push(Message::text(Role::Assistant, "", true, true));
-                }
                 self.messages = restored;
                 self.messages.push(Message::text(
                     Role::Assistant,

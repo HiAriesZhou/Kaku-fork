@@ -38,7 +38,7 @@ mod markdown_tests {
         }
     }
 
-    fn test_context() -> TerminalContext {
+    pub(super) fn test_context() -> TerminalContext {
         TerminalContext {
             cwd: "/tmp".to_string(),
             remote_host: None,
@@ -875,5 +875,477 @@ mod undo_tests {
         assert_eq!(snap.cursor, 2);
         let snap = stack.pop().expect("non-empty");
         assert_eq!(snap.input, "a");
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::super::state::App;
+    use super::super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn app() -> App {
+        let context = super::markdown_tests::test_context();
+        let messages = vec![];
+        let cols = 80;
+        let rows = 24;
+        let available_models = vec!["test".to_string()];
+        let model_index = 0;
+        let model_fetch = ModelFetch::Loaded;
+        let model_fetch_rx = None;
+        let active_id = String::new();
+        let onboarding_pending = false;
+        let client = AiClient::new(AssistantConfig {
+            api_key: String::new(),
+            chat_model: "test".into(),
+            chat_model_choices: vec![],
+            base_url: "http://127.0.0.1:1/v1".into(),
+            custom_headers: vec![],
+            provider: "test".into(),
+            api_mode: crate::ai_client::ApiMode::Responses,
+            auth_type: "api_key".into(),
+            chat_tools_enabled: true,
+            native_web_search: false,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_script: None,
+            fast_model: None,
+            memory_curator_model: None,
+        });
+        App {
+            mode: AppMode::Chat,
+            messages,
+            input: String::new(),
+            input_cursor: 0,
+            scroll_offset: 0,
+            viewport_height: 0,
+            display_width: 0,
+            approval_scroll: 0,
+            pending_insert: None,
+            pressed_control: None,
+            focused_control: None,
+            drafts: HashMap::new(),
+            is_streaming: false,
+            available_models,
+            model_index,
+            model_fetch,
+            model_fetch_rx,
+            suggest_rx: None,
+            model_status_flash: None,
+            token_rx: None,
+            grapheme_queue: VecDeque::new(),
+            stream_pending_done: false,
+            stream_pending_err: None,
+            pending_responses_items: Vec::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            client,
+            cols,
+            rows,
+            context,
+            cached_display_lines: Vec::new(),
+            display_lines_dirty: true,
+            assistant_render_memo: HashMap::new(),
+            selection: None,
+            selecting: false,
+            drag_origin: None,
+            left_was_pressed: false,
+            pending_approval: None,
+            active_id,
+            attachment_picker_index: 0,
+            spinner_frame: 0,
+            spinner_tick: Instant::now(),
+            onboarding_pending,
+            input_clicked_this_stream: false,
+            input_undo_stack: Vec::new(),
+            stream_is_transient: false,
+            next_assistant_is_context: false,
+            show_thinking: false,
+        }
+    }
+
+    #[test]
+    fn reading_position_stays_fixed_when_stream_appends_lines() {
+        let mut app = app();
+        app.messages.push(Message::text(
+            Role::Assistant,
+            (0..60).map(|i| format!("line {i}\n")).collect::<String>(),
+            false,
+            false,
+        ));
+        app.rebuild_display_cache();
+        app.scroll_offset = 12;
+        let before = app.display_lines().len() - app.msg_area_height() - app.scroll_offset;
+        app.messages[0]
+            .content
+            .push_str("another line\nanother line\n");
+        app.display_lines_dirty = true;
+        app.rebuild_display_cache();
+        let after = app.display_lines().len() - app.msg_area_height() - app.scroll_offset;
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn picker_rows_are_excluded_from_message_hit_area() {
+        let mut app = app();
+        app.input = "/".into();
+        let picker = app.slash_picker_options().len().min(MAX_PICKER_ROWS);
+        assert_eq!(
+            app.msg_area_height() + app.input_visible_rows() + picker + 3,
+            app.rows
+        );
+    }
+    #[test]
+    fn paste_preserves_composed_text_and_normalizes_crlf_once() {
+        let mut app = app();
+        app.input = "before after".into();
+        app.input_cursor = 7;
+        app.is_streaming = true;
+        app.paste_input("中文🙂\r\nnext\rline\tend\u{1b}");
+        assert_eq!(app.input, "before 中文🙂\nnext\nline endafter");
+        assert!(app.input_clicked_this_stream);
+        app.undo_input();
+        assert_eq!(app.input, "before after");
+        assert_eq!(app.input_cursor, 7);
+    }
+
+    #[test]
+    fn permission_details_scroll_to_end_and_paste_cannot_change_draft() {
+        let mut app = app();
+        app.cols = 32;
+        app.rows = 8;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let text = format!("delete: /tmp/{}END.txt", "目录/".repeat(80));
+        app.pending_approval = Some((text.clone(), tx));
+        app.input = "draft".into();
+        app.paste_input("unwanted");
+        assert_eq!(app.input, "draft");
+        let lines = app.approval_lines();
+        assert_eq!(lines.concat(), text);
+        super::super::input::handle_key(
+            &termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::End,
+                modifiers: termwiz::input::Modifiers::NONE,
+            },
+            &mut app,
+        );
+        assert_eq!(app.approval_scroll + app.rows - 4, lines.len());
+        assert!(lines.last().unwrap().ends_with("END.txt"));
+        app.activate_control(ChatControl::Deny);
+        assert!(!rx.recv().unwrap());
+        assert!(app.pending_approval.is_none());
+    }
+
+    #[test]
+    fn permission_cannot_be_approved_in_an_unreadable_pane() {
+        let mut app = app();
+        app.cols = 10;
+        app.rows = 4;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.pending_approval = Some(("delete target".into(), tx));
+        super::super::input::handle_key(
+            &termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::Enter,
+                modifiers: termwiz::input::Modifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(rx.try_recv().is_err());
+        super::super::input::handle_key(
+            &termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::Escape,
+                modifiers: termwiz::input::Modifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(!rx.recv().unwrap());
+    }
+
+    #[test]
+    fn code_actions_keep_original_lines_and_separate_adjacent_fences() {
+        let mut app = app();
+        app.cols = 28;
+        let long = format!("printf '{}'", "x".repeat(120));
+        app.messages.push(Message::text(
+            Role::Assistant,
+            format!("```sh\n{long}\n```\n```sh\necho second\n```\n```sh\necho one\necho two\n```"),
+            true,
+            false,
+        ));
+        app.rebuild_display_cache();
+        let blocks: Vec<_> = app
+            .display_lines()
+            .iter()
+            .filter_map(|line| match line {
+                DisplayLine::CodeActions { text, can_insert } => Some((text.as_str(), *can_insert)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            blocks,
+            vec![
+                (long.as_str(), true),
+                ("echo second", true),
+                ("echo one\necho two", false)
+            ]
+        );
+        app.messages[0].complete = false;
+        app.display_lines_dirty = true;
+        app.rebuild_display_cache();
+        assert!(app.display_lines().iter().all(|line| !matches!(
+            line,
+            DisplayLine::CodeActions {
+                can_insert: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn conversation_drafts_restore_cursor_without_crossing_undo_history() {
+        let mut app = app();
+        app.active_id = "one".into();
+        app.input = "中文 draft".into();
+        app.input_cursor = 2;
+        app.remember_draft();
+        app.active_id = "two".into();
+        app.restore_draft();
+        assert!(app.input.is_empty());
+        app.input = "second".into();
+        app.input_cursor = 3;
+        app.remember_draft();
+        app.active_id = "one".into();
+        app.restore_draft();
+        assert_eq!(app.input, "中文 draft");
+        assert_eq!(app.input_cursor, 2);
+        assert!(app.input_undo_stack.is_empty());
+    }
+
+    #[test]
+    fn viewport_tracks_bottom_until_user_scrolls_and_survives_input_growth() {
+        let mut app = app();
+        app.messages.push(Message::text(
+            Role::Assistant,
+            "line\n".repeat(60),
+            false,
+            false,
+        ));
+        app.rebuild_display_cache();
+        let start = app.visible_start();
+        app.messages[0].content.push_str("more\n");
+        app.display_lines_dirty = true;
+        app.rebuild_display_cache();
+        assert!(app.visible_start() > start);
+        assert_eq!(app.scroll_offset, 0);
+        app.scroll_offset = 8;
+        let start = app.visible_start();
+        app.input = "draft\n".repeat(8);
+        app.rebuild_display_cache();
+        assert_eq!(app.visible_start(), start);
+    }
+
+    #[test]
+    fn small_panes_reserve_input_and_picker_inside_the_viewport() {
+        for cols in [24, 40, 80, 180] {
+            for rows in [6, 8, 12, 36] {
+                let mut app = app();
+                app.cols = cols;
+                app.rows = rows;
+                app.input = "/".into();
+                assert!(
+                    app.msg_area_height() + app.picker_height() + app.input_visible_rows() + 3
+                        <= rows
+                );
+                for (_, _, span) in super::super::layout::control_spans(&app.controls(), cols) {
+                    assert!(span.end < cols);
+                }
+            }
+        }
+    }
+    #[test]
+    fn approval_click_requires_press_and_release_on_same_control() {
+        use termwiz::input::{Modifiers, MouseButtons, MouseEvent};
+        let mut app = app();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.pending_approval = Some(("delete target".into(), tx));
+        let click = |app: &mut App, x, buttons| {
+            super::super::input::handle_mouse(
+                &MouseEvent {
+                    x,
+                    y: (app.rows - 2) as u16,
+                    mouse_buttons: buttons,
+                    modifiers: Modifiers::NONE,
+                },
+                app,
+            )
+        };
+        click(&mut app, 3, MouseButtons::LEFT);
+        click(&mut app, 12, MouseButtons::NONE);
+        assert!(rx.try_recv().is_err());
+        click(&mut app, 3, MouseButtons::LEFT);
+        click(&mut app, 3, MouseButtons::NONE);
+        assert!(rx.recv().unwrap());
+    }
+
+    #[test]
+    fn keyboard_can_focus_controls_without_sending_a_message() {
+        use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+        let mut app = app();
+        super::super::input::handle_key(
+            &KeyEvent {
+                key: KeyCode::Tab,
+                modifiers: Modifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(app.focused_control == Some(ChatControl::History));
+        super::super::input::handle_key(
+            &KeyEvent {
+                key: KeyCode::Tab,
+                modifiers: Modifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(app.focused_control == Some(ChatControl::Context));
+        super::super::input::handle_key(
+            &KeyEvent {
+                key: KeyCode::Enter,
+                modifiers: Modifiers::NONE,
+            },
+            &mut app,
+        );
+        assert_eq!(app.input, "@");
+        assert!(app.messages.is_empty());
+    }
+    #[test]
+    fn resize_cannot_retarget_a_focused_code_action() {
+        let mut app = app();
+        app.cols = 104;
+        app.messages.push(Message::text(
+            Role::Assistant,
+            &format!(
+                "{}\n```sh\necho first\n```\n```sh\necho second\n```",
+                "x".repeat(100)
+            ),
+            true,
+            false,
+        ));
+        app.rebuild_display_cache();
+        let index = app
+            .display_lines()
+            .iter()
+            .rposition(|l| matches!(l, DisplayLine::CodeActions { .. }))
+            .unwrap();
+        app.focused_control = Some(ChatControl::InsertCode(index));
+        app.cols = 38;
+        app.display_lines_dirty = true;
+        app.rebuild_display_cache();
+        assert!(app.focused_control.is_none());
+    }
+
+    #[test]
+    fn attachment_click_never_submits_exact_match() {
+        let mut app = app();
+        // Unknown /model selection avoids network or persistence if this regresses.
+        app.input = "/model @cwd".into();
+        app.input_cursor = app.input.chars().count();
+        assert!(!app.attachment_picker_options().is_empty());
+        app.activate_control(ChatControl::Pick(0));
+        assert_eq!(app.input, "/model @cwd ");
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn an_approval_press_cannot_cross_requests() {
+        use termwiz::input::{KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
+        for key in [KeyCode::Escape, KeyCode::Enter] {
+            let mut app = app();
+            let mouse = |app: &mut App, buttons| {
+                super::super::input::handle_mouse(
+                    &MouseEvent {
+                        x: 3,
+                        y: (app.rows - 2) as u16,
+                        mouse_buttons: buttons,
+                        modifiers: Modifiers::NONE,
+                    },
+                    app,
+                )
+            };
+            let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+            app.pending_approval = Some(("request A".into(), tx));
+            mouse(&mut app, MouseButtons::LEFT);
+            super::super::input::handle_key(
+                &KeyEvent {
+                    key,
+                    modifiers: Modifiers::NONE,
+                },
+                &mut app,
+            );
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            app.pending_approval = Some(("request B".into(), tx));
+            mouse(&mut app, MouseButtons::LEFT);
+            mouse(&mut app, MouseButtons::NONE);
+            assert!(rx.try_recv().is_err());
+            mouse(&mut app, MouseButtons::LEFT);
+            mouse(&mut app, MouseButtons::NONE);
+            assert!(rx.recv().unwrap());
+        }
+    }
+
+    #[test]
+    fn stopping_keeps_partial_answer_but_never_inserts_unclosed_code() {
+        let mut app = app();
+        app.is_streaming = true;
+        app.messages.push(Message::text(
+            Role::Assistant,
+            "Partial answer\n```sh\necho unfinished",
+            false,
+            false,
+        ));
+        app.cancel_stream();
+        app.rebuild_display_cache();
+        assert_eq!(app.collect_persisted_messages().len(), 1);
+        assert!(app.display_lines().iter().any(|l| matches!(
+            l,
+            DisplayLine::CodeActions {
+                can_insert: false,
+                ..
+            }
+        )));
+    }
+    #[test]
+    fn history_geometry_ignores_hidden_draft_and_switch_clears_selection() {
+        let mut app = app();
+        app.rows = 8;
+        app.cols = 40;
+        app.input = "one\ntwo\nthree\nfour\nfive".into();
+        app.input_cursor = app.input.chars().count();
+        assert_eq!(app.msg_area_height(), 0);
+        assert_eq!(app.resume_picker_height(), 4);
+        app.selection = Some((0, 0, 1, 1));
+        app.selecting = true;
+        app.drag_origin = Some((0, 0));
+        app.restore_draft();
+        assert!(app.selection.is_none());
+        assert!(!app.selecting);
+        assert!(app.drag_origin.is_none());
+    }
+    #[test]
+    fn passive_pointer_motion_preserves_keyboard_focus() {
+        use termwiz::input::{Modifiers, MouseButtons, MouseEvent};
+        let mut app = app();
+        app.focused_control = Some(ChatControl::Context);
+        super::super::input::handle_mouse(
+            &MouseEvent {
+                x: 1,
+                y: 1,
+                mouse_buttons: MouseButtons::NONE,
+                modifiers: Modifiers::NONE,
+            },
+            &mut app,
+        );
+        assert!(app.focused_control == Some(ChatControl::Context));
     }
 }

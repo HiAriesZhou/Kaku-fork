@@ -18,6 +18,7 @@ pub(crate) fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
     let lines: Vec<&str> = content.split('\n').collect();
     let mut out = Vec::new();
     let mut fence_lang: Option<String> = None;
+    let mut group = 0;
     let mut i = 0;
     while i < lines.len() {
         if fence_lang.is_none() {
@@ -33,6 +34,19 @@ pub(crate) fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
         // Fence open/close: ``` or ~~~ on their own (possibly with info string).
         if trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~") {
             if fence_lang.is_some() {
+                for block in out.iter_mut().rev() {
+                    if let MdBlock::CodeLine {
+                        group: id, closed, ..
+                    } = block
+                    {
+                        if *id != group {
+                            break;
+                        }
+                        *closed = true;
+                    } else {
+                        break;
+                    }
+                }
                 fence_lang = None;
             } else {
                 let tag = trimmed_start
@@ -40,6 +54,7 @@ pub(crate) fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                     .trim_start_matches('~')
                     .trim()
                     .to_lowercase();
+                group += 1;
                 fence_lang = Some(tag);
             }
             continue;
@@ -54,6 +69,8 @@ pub(crate) fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 text: line.to_string(),
                 diff,
                 lang: lang.clone(),
+                group,
+                closed: false,
             });
             continue;
         }

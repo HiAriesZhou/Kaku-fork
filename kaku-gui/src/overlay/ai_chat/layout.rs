@@ -180,3 +180,37 @@ pub(super) fn pad_to_visual_width(s: &str, target_cols: usize) -> String {
     }
     out
 }
+
+/// Shared geometry for rendering and activating the same controls.
+pub(super) fn control_spans(
+    controls: &[(super::types::ChatControl, &'static str)],
+    width: usize,
+) -> Vec<(
+    super::types::ChatControl,
+    &'static str,
+    std::ops::Range<usize>,
+)> {
+    let mut x = 3;
+    let mut result = Vec::new();
+    for &(control, label) in controls {
+        let end = x + label.len();
+        if end + 2 > width {
+            break;
+        }
+        result.push((control, label, x..end));
+        x = end + 3;
+    }
+    result
+}
+
+pub(super) fn code_controls(
+    index: usize,
+    can_insert: bool,
+) -> Vec<(super::types::ChatControl, &'static str)> {
+    use super::types::ChatControl;
+    let mut items = vec![(ChatControl::CopyCode(index), "Copy")];
+    if can_insert {
+        items.push((ChatControl::InsertCode(index), "Insert"));
+    }
+    items
+}

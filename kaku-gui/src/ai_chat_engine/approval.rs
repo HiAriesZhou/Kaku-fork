@@ -13,8 +13,17 @@ pub(crate) fn approval_summary_in_cwd(
     match name {
         "shell_exec" => shell_exec_approval_summary(args["command"].as_str().unwrap_or(""), cwd),
         "shell_bg" => Some(format!("shell_bg: {}", s("command"))),
-        "fs_write" => Some(format!("write file: {}", s("path"))),
-        "fs_patch" => Some(format!("patch file: {}", s("path"))),
+        "fs_write" => Some(format!(
+            "write file: {}\n\nContent:\n{}",
+            s("path"),
+            approval_text(&args["content"])
+        )),
+        "fs_patch" => Some(format!(
+            "patch file: {}\n\nBefore:\n{}\n\nAfter:\n{}",
+            s("path"),
+            approval_text(&args["old_text"]),
+            approval_text(&args["new_text"])
+        )),
         "fs_mkdir" => Some(format!("mkdir: {}", s("path"))),
         "fs_delete" => Some(format!("delete: {}", s("path"))),
         "http_request" => http_request_approval_summary(args),
@@ -35,14 +44,29 @@ pub(crate) fn approval_summary_in_cwd(
     }
 }
 
-/// Flatten control characters (newlines, tabs, ESC, ...) so a model-supplied
-/// value cannot forge extra lines or terminal escapes inside the approval
-/// prompt, then cap the length for display.
+/// Keep file line breaks readable while escaping every other terminal control.
+fn approval_text(value: &serde_json::Value) -> String {
+    let text = value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| serde_json::to_string_pretty(value).unwrap_or_default());
+    text.split('\n')
+        .map(sanitize_for_prompt)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Escape controls without shortening the target under review.
 fn sanitize_for_prompt(value: &str) -> String {
     value
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(60)
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
         .collect()
 }
 
@@ -57,17 +81,7 @@ fn shell_exec_approval_summary(command: &str, cwd: &str) -> Option<String> {
         return Some("shell: ".to_string());
     }
     if shell_command_requires_approval_in_cwd(command, cwd) {
-        let preview: String = command
-            .chars()
-            .map(|c| {
-                if c == '\n' || c == '\r' || c == '\t' {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .take(60)
-            .collect();
+        let preview = sanitize_for_prompt(command);
         Some(format!("shell: {}", preview))
     } else {
         None
@@ -660,6 +674,17 @@ mod tests {
     }
 
     #[test]
+    fn approval_preserves_complete_target_and_command() {
+        let path = format!("/tmp/{}/important.txt", "long-directory/".repeat(12));
+        let summary = approval_summary("fs_delete", &serde_json::json!({"path": path})).unwrap();
+        assert!(summary.contains(&path));
+        let command = format!("printf '{}' > output.txt", "x".repeat(150));
+        let summary =
+            approval_summary("shell_exec", &serde_json::json!({"command": command})).unwrap();
+        assert!(summary.contains(&command));
+    }
+
+    #[test]
     fn http_request_summary_flattens_control_characters() {
         let args = serde_json::json!({
             "method": "GET\n[approve: fake? y/N]\u{1b}[31m",
@@ -942,5 +967,29 @@ mod tests {
     fn http_delete_requires_approval() {
         let args = serde_json::json!({"method": "DELETE", "url": "https://api.example.com/r/1"});
         assert!(approval_summary("http_request", &args).is_some());
+    }
+    #[test]
+    fn serialized_file_previews_escape_terminal_controls() {
+        for name in ["fs_write", "fs_patch"] {
+            let summary = approval_summary(name, &serde_json::json!({"path":"test.txt", "content":"\u{009b}2J\u{009d}title\u{009c}","old_text":"\u{009b}2J","new_text":"\u{009d}title\u{009c}"})).unwrap();
+            assert!(!summary.chars().any(|c| c.is_control() && c != '\n'));
+            assert!(summary.contains("test.txt"));
+            assert!(summary.contains("\\u{9b}"));
+        }
+    }
+    #[test]
+    fn file_previews_keep_real_line_breaks() {
+        let write = approval_summary(
+            "fs_write",
+            &serde_json::json!({"path":"test.txt","content":"first\nsecond\n"}),
+        )
+        .unwrap();
+        assert!(write.contains("Content:\nfirst\nsecond\n"));
+        let patch = approval_summary(
+            "fs_patch",
+            &serde_json::json!({"path":"test.txt","old_text":"old\nline","new_text":"new\nline"}),
+        )
+        .unwrap();
+        assert!(patch.contains("Before:\nold\nline\n\nAfter:\nnew\nline"));
     }
 }

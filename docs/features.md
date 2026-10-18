@@ -77,6 +77,10 @@ When `auth_type = "codex"`, `base_url`, `api_key`, and `api_mode` do not define 
 
 Press `Cmd + L` to open the built-in AI chat panel. It streams Markdown answers, highlights code blocks, can include terminal context, and can use approved tools for project files, shell commands, web search, and memory. Press `Shift + Tab` inside the panel to toggle between the Simple Model and Deep Model when they are different.
 
+Use History, Context, and Model above the input to browse saved conversations, attach terminal context, and switch models. With an empty input, Tab focuses these controls and code actions, and Enter activates the focused action. Shift+Enter inserts a newline. During a reply, Esc or Stop cancels generation and keeps the partial answer; Enter with a draft interrupts and sends it. Scrolling up keeps your reading position while more text arrives; Latest returns to the response. Drafts survive switching conversations within the open panel.
+
+Code blocks offer Copy without adding visual line wraps. Completed, single-line shell blocks also offer Insert, which pastes into the original shell without executing it. Tool permission requests open a scrollable review of the complete target and parameters. Enter allows, Esc denies, and the wheel or Page Up/Page Down scrolls the details.
+
 From a shell, use `k` or `kaku chat` for the same conversation store:
 
 ```bash

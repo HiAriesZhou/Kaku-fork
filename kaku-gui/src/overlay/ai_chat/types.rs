@@ -417,6 +417,10 @@ pub(crate) enum BlockStyle {
 
 #[derive(Clone)]
 pub(crate) enum DisplayLine {
+    CodeActions {
+        text: String,
+        can_insert: bool,
+    },
     Header {
         role: Role,
         /// Tool calls attached to this AI header row. Always empty for User headers.
@@ -471,6 +475,8 @@ pub(crate) enum MdBlock {
         text: String,
         diff: DiffKind,
         lang: String,
+        group: usize,
+        closed: bool,
     },
     Hr,
 }
@@ -480,4 +486,19 @@ pub(crate) enum MdBlock {
 pub(crate) enum Action {
     Continue,
     Quit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatControl {
+    History,
+    Context,
+    Model,
+    Stop,
+    Latest,
+    Approve,
+    Deny,
+    CopyCode(usize),
+    InsertCode(usize),
+    Resume(usize),
+    Pick(usize),
 }

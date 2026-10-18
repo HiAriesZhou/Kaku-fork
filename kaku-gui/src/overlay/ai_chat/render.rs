@@ -5,7 +5,10 @@ use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::surface::{Change, CursorShape, CursorVisibility, Position};
 use termwiz::terminal::Terminal;
 
-use super::layout::{byte_pos_at_visual_col, layout_input, pad_to_visual_width, truncate};
+use super::layout::{
+    byte_pos_at_visual_col, code_controls, control_spans, layout_input, pad_to_visual_width,
+    truncate,
+};
 use super::state::App;
 use super::strings;
 use super::types::*;
@@ -166,6 +169,14 @@ fn build_line_runs(
 ) -> Vec<(CellAttributes, String)> {
     let mut runs: Vec<(CellAttributes, String)> = Vec::new();
     match line {
+        DisplayLine::CodeActions { can_insert, .. } => {
+            let labels = control_spans(&code_controls(0, *can_insert), content_width + 2)
+                .iter()
+                .map(|(_, label, _)| *label)
+                .collect::<Vec<_>>()
+                .join("   ");
+            runs.push((pal.ai_header_cell(), format!("  {}", labels)));
+        }
         DisplayLine::Header {
             role: Role::User, ..
         } => {
@@ -401,9 +412,10 @@ fn render_vertical_picker(
     pal: &ChatPalette,
     options: &[(&str, &str)],
     selected: usize,
+    visible_h: usize,
 ) {
     let len = options.len();
-    let visible_h = len.min(MAX_PICKER_ROWS);
+    let visible_h = len.min(visible_h);
     let scroll_offset = selected
         .saturating_sub(visible_h.saturating_sub(1))
         .min(len.saturating_sub(visible_h));
@@ -426,6 +438,9 @@ fn render_vertical_picker(
 }
 
 fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
+    if app.pending_approval.is_some() {
+        return render_approval(term, app);
+    }
     let cols = app.cols;
     let rows = app.rows;
     let inner_w = cols.saturating_sub(2); // inside left and right borders
@@ -450,19 +465,11 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
         let suffix = match &app.model_fetch {
             ModelFetch::Loading => format!(" · {} loading…", app.spinner_char()),
             ModelFetch::Failed(_) => " · (list failed)".to_string(),
-            ModelFetch::Loaded if app.available_models.len() > 2 => {
-                format!(" ({}/{})", app.model_index + 1, app.available_models.len())
-            }
             _ => String::new(),
         };
         format!("{}{}", app.current_model(), suffix)
     };
-    let has_switch = app.available_models.len() > 1;
-    let title = if has_switch {
-        format!(" Kaku AI • {} · ⇧⇥ switch · ESC exit ", model_display)
-    } else {
-        format!(" Kaku AI • {} · ESC exit ", model_display)
-    };
+    let title = format!(" Kaku AI · {} ", model_display);
     let title_width = unicode_column_width(&title, None);
     let border_fill = inner_w.saturating_sub(title_width);
     let top_line = format!("╭─{}{}─╮", title, "─".repeat(border_fill.saturating_sub(2)));
@@ -477,27 +484,13 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
     let input_visible_h = app.input_visible_rows();
     let slash_options = app.slash_picker_options();
     let attach_options = app.attachment_picker_options();
-    let picker_h = {
-        let opt_len = if !slash_options.is_empty() {
-            slash_options.len()
-        } else if !attach_options.is_empty() {
-            attach_options.len()
-        } else {
-            0
-        };
-        let max_h = rows.saturating_sub(input_visible_h + 3);
-        opt_len.min(MAX_PICKER_ROWS).min(max_h)
-    };
-    let msg_area_h = rows.saturating_sub(3 + input_visible_h + picker_h);
+    let picker_h = app.picker_height();
+    let msg_area_h = app.msg_area_height();
     let all_lines = app.display_lines();
     let total = all_lines.len();
 
     // Determine the slice to show, accounting for scroll.
-    let visible_start = if total <= msg_area_h {
-        0
-    } else {
-        (total - msg_area_h).saturating_sub(app.scroll_offset)
-    };
+    let visible_start = app.visible_start().min(total);
     let visible = &all_lines[visible_start..total.min(visible_start + msg_area_h)];
 
     for (i, line) in visible.iter().enumerate() {
@@ -509,8 +502,12 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
         changes.push(Change::AllAttributes(pal.border_dim_cell()));
         changes.push(Change::Text("│".to_string()));
 
-        let runs = build_line_runs(line, pal, app.spinner_char(), inner_w);
         let line_idx = visible_start + i;
+        let runs = if let DisplayLine::CodeActions { can_insert, .. } = line {
+            control_runs(app, &code_controls(line_idx, *can_insert))
+        } else {
+            build_line_runs(line, pal, app.spinner_char(), inner_w)
+        };
 
         // Determine the selection column range for this line (content columns, 0-based).
         // Terminal col 1 is the first content col (col 0 is the left border │).
@@ -567,14 +564,30 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
         if !slash_options.is_empty() {
             let opts: Vec<(&str, &str)> = slash_options.iter().map(|(l, d)| (*l, *d)).collect();
             let clamped = selected.min(opts.len().saturating_sub(1));
-            render_vertical_picker(&mut changes, picker_start, inner_w, pal, &opts, clamped);
+            render_vertical_picker(
+                &mut changes,
+                picker_start,
+                inner_w,
+                pal,
+                &opts,
+                clamped,
+                picker_h,
+            );
         } else {
             let opts: Vec<(&str, &str)> = attach_options
                 .iter()
                 .map(|o| (o.label, o.description))
                 .collect();
             let clamped = selected.min(opts.len().saturating_sub(1));
-            render_vertical_picker(&mut changes, picker_start, inner_w, pal, &opts, clamped);
+            render_vertical_picker(
+                &mut changes,
+                picker_start,
+                inner_w,
+                pal,
+                &opts,
+                clamped,
+                picker_h,
+            );
         }
     }
     changes.push(Change::CursorPosition {
@@ -582,40 +595,20 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
         y: Position::Absolute(sep_row),
     });
     changes.push(Change::AllAttributes(pal.border_dim_cell()));
-    changes.push(Change::Text(format!(
-        "├{}┤",
-        "─".repeat(inner_w.saturating_sub(0))
-    )));
+    push_picker_row(
+        &mut changes,
+        sep_row,
+        inner_w,
+        pal,
+        control_runs(app, &app.controls()),
+    );
 
     // 5. Input area (one or more rows). Approval banner, when present,
     // always takes a single row.
     let input_top = rows.saturating_sub(1 + input_visible_h);
 
     // Compute cursor state now; apply AFTER bottom border so it's the final position.
-    let cursor_state: Option<(usize, usize)> = if let Some((summary, _)) = &app.pending_approval {
-        // Approval banner uses the AI accent color + a live spinner so it visually
-        // separates from the regular `> ` input row and pulls the user's eye.
-        // Keys are placed first so they remain visible when summary is truncated.
-        let approval_text = format!(
-            "  {} Enter allow · ESC deny   {}",
-            app.spinner_char(),
-            summary
-        );
-        changes.push(Change::CursorPosition {
-            x: Position::Absolute(0),
-            y: Position::Absolute(input_top),
-        });
-        changes.push(Change::AllAttributes(pal.border_dim_cell()));
-        changes.push(Change::Text("│".to_string()));
-        changes.push(Change::AllAttributes(pal.ai_header_cell()));
-        changes.push(Change::Text(truncate(
-            &pad_to_visual_width(&approval_text, inner_w),
-            inner_w,
-        )));
-        changes.push(Change::AllAttributes(pal.border_dim_cell()));
-        changes.push(Change::Text("│".to_string()));
-        None // hidden
-    } else {
+    let cursor_state: Option<(usize, usize)> = {
         // Show a pulsing spinner instead of `>` while streaming so the user
         // sees the response is still in progress.
         let prompt = app.current_input_prompt();
@@ -654,7 +647,7 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
         // Hide the input cursor during streaming until the user deliberately
         // clicks the input row. Keeps visual focus on the AI response and
         // avoids a blinking cursor next to the spinner that reads as noise.
-        if app.is_streaming && !app.input_clicked_this_stream {
+        if app.is_streaming && app.input.is_empty() && !app.input_clicked_this_stream {
             None
         } else if layout.cursor_row >= scroll && layout.cursor_row < scroll + input_visible_h {
             // +1 for the left border column; cap at the last content column so
@@ -675,9 +668,16 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
         y: Position::Absolute(bot_row),
     });
     changes.push(Change::AllAttributes(pal.border_dim_cell()));
+    let hint = if app.is_streaming {
+        " Enter interrupt & send · Esc stop "
+    } else {
+        " Enter send · Shift+Enter newline · Esc close "
+    };
+    let hint = truncate(hint, inner_w);
     changes.push(Change::Text(format!(
-        "╰{}╯",
-        "─".repeat(inner_w.saturating_sub(0))
+        "╰{}{}╯",
+        hint,
+        "─".repeat(inner_w.saturating_sub(unicode_column_width(&hint, None)))
     )));
 
     // Restore cursor to input position AFTER drawing all decorations, so the
@@ -734,8 +734,9 @@ fn render_picker(
     changes.push(Change::AllAttributes(pal.border_dim_cell()));
     changes.push(Change::Text(truncate(&top_line, cols)));
 
-    // List area
-    let msg_area_h = app.msg_area_height();
+    // List area does not reserve the hidden chat composer.
+    let msg_area_h = app.resume_picker_height();
+    let start = cursor.saturating_sub(msg_area_h.saturating_sub(1));
     for i in 0..msg_area_h {
         let row = i + 1;
         changes.push(Change::CursorPosition {
@@ -745,7 +746,7 @@ fn render_picker(
         changes.push(Change::AllAttributes(pal.border_dim_cell()));
         changes.push(Change::Text("│".to_string()));
 
-        if let Some(meta) = items.get(i) {
+        if let Some(meta) = items.get(start + i) {
             let ts = chrono::DateTime::from_timestamp(meta.updated_at, 0)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|| "unknown".to_string());
@@ -757,9 +758,27 @@ fn render_picker(
             } else {
                 meta.summary.chars().take(30).collect::<String>()
             };
-            let line_text = format!(" {} {} ({} msgs)", ts, summary, meta.message_count);
+            let prefix = if inner_w >= 40 {
+                format!(" {} ", ts)
+            } else {
+                " ".into()
+            };
+            let suffix = if inner_w >= 30 {
+                format!(" ({} msgs)", meta.message_count)
+            } else {
+                String::new()
+            };
+            let available = inner_w.saturating_sub(
+                unicode_column_width(&prefix, None) + unicode_column_width(&suffix, None),
+            );
+            let summary = if unicode_column_width(&summary, None) > available && available > 0 {
+                format!("{}…", truncate(&summary, available - 1))
+            } else {
+                truncate(&summary, available)
+            };
+            let line_text = format!("{}{}{}", prefix, summary, suffix);
             let padded = pad_to_visual_width(&line_text, inner_w);
-            if i == cursor {
+            if start + i == cursor {
                 changes.push(Change::AllAttributes(pal.picker_cursor_cell()));
             } else {
                 changes.push(Change::AllAttributes(pal.plain_cell()));
@@ -811,4 +830,95 @@ fn render_picker(
     changes.push(Change::Text("\x1b[?2026l".to_string()));
 
     term.render(&changes)
+}
+
+fn render_approval(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
+    let pal = &app.context.colors;
+    let mut changes = vec![
+        Change::Text("\x1b[?2026h".into()),
+        Change::CursorVisibility(CursorVisibility::Hidden),
+        Change::AllAttributes(pal.plain_cell()),
+        Change::ClearScreen(pal.bg_attr()),
+    ];
+    if app.cols < 20 || app.rows < 6 {
+        changes.push(Change::Text(truncate("Enlarge to review", app.cols)));
+    } else {
+        let inner_w = app.cols - 2;
+        for row in 1..app.rows - 1 {
+            push_picker_row(&mut changes, row, inner_w, pal, Vec::new());
+        }
+        let title = truncate(" Review tool action ", inner_w);
+        changes.push(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(0),
+        });
+        changes.push(Change::AllAttributes(pal.border_dim_cell()));
+        changes.push(Change::Text(format!(
+            "╭{}{}╮",
+            title,
+            "─".repeat(inner_w.saturating_sub(unicode_column_width(&title, None)))
+        )));
+        let lines = app.approval_lines();
+        let height = app.rows - 4;
+        let start = app.approval_scroll.min(lines.len().saturating_sub(height));
+        for (i, line) in lines.iter().skip(start).take(height).enumerate() {
+            push_picker_row(
+                &mut changes,
+                i + 2,
+                inner_w,
+                pal,
+                vec![(pal.plain_cell(), format!("  {}", line))],
+            );
+        }
+        let label = control_spans(&app.controls(), app.cols)
+            .iter()
+            .map(|(_, label, _)| *label)
+            .collect::<Vec<_>>()
+            .join("   ");
+        push_picker_row(
+            &mut changes,
+            app.rows - 2,
+            inner_w,
+            pal,
+            vec![(pal.ai_header_cell(), format!("  {}", label))],
+        );
+        let hint = if lines.len() > height {
+            " Enter allow · Esc deny · PgUp/PgDn scroll "
+        } else {
+            " Enter allow · Esc deny "
+        };
+        let hint = truncate(hint, inner_w);
+        changes.push(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(app.rows - 1),
+        });
+        changes.push(Change::AllAttributes(pal.border_dim_cell()));
+        changes.push(Change::Text(format!(
+            "╰{}{}╯",
+            hint,
+            "─".repeat(inner_w.saturating_sub(unicode_column_width(&hint, None)))
+        )));
+    }
+    changes.push(Change::Text("\x1b[?2026l".into()));
+    term.render(&changes)
+}
+
+fn control_runs(
+    app: &App,
+    controls: &[(ChatControl, &'static str)],
+) -> Vec<(CellAttributes, String)> {
+    let pal = &app.context.colors;
+    let mut runs = vec![(pal.plain_cell(), "  ".into())];
+    for (index, (control, label, _)) in control_spans(controls, app.cols).into_iter().enumerate() {
+        if index > 0 {
+            runs.push((pal.plain_cell(), "   ".into()));
+        }
+        let attrs = if app.focused_control == Some(control) {
+            pal.picker_cursor_cell()
+        } else {
+            pal.ai_header_cell()
+        };
+        runs.push((attrs, label.into()));
+    }
+    runs
 }
