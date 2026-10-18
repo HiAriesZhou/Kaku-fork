@@ -102,3 +102,7 @@
 38	用符号链接管理的配置文件在 Kaku 更新时保持链接不变
 39	Run kaku remote to use this Mac's terminals from a desktop browser on another computer
 39	运行 kaku remote，可以在另一台电脑的浏览器里使用这台 Mac 的终端
+40	While Claude Code, Codex or Kimi works, its mark and topic show at the top right of the window
+40	Claude Code、Codex 或 Kimi 工作时，窗口右上角会显示它的标志和当前话题
+40	Shells start faster by loading completions from cache
+40	补全改从缓存加载，shell 启动更快
