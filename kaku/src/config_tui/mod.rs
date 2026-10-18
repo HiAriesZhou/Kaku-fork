@@ -439,6 +439,15 @@ impl App {
             },
             ConfigField {
                 section: "Window",
+                key: "Agent Title",
+                lua_key: "show_agent_title",
+                value: String::new(),
+                default: "On".into(),
+                options: vec!["On", "Off"],
+                skip_write: false,
+            },
+            ConfigField {
+                section: "Window",
                 key: "Scrollbar",
                 lua_key: "enable_scroll_bar",
                 value: String::new(),
@@ -926,6 +935,7 @@ impl App {
             "copy_on_select"
             | "enable_scroll_bar"
             | "show_new_tab_button_in_tab_bar"
+            | "show_agent_title"
             | "bell_tab_indicator"
             | "bell_dock_badge"
             | "remember_last_cwd"
@@ -1429,6 +1439,7 @@ impl App {
             "copy_on_select"
             | "enable_scroll_bar"
             | "show_new_tab_button_in_tab_bar"
+            | "show_agent_title"
             | "bell_tab_indicator"
             | "bell_dock_badge"
             | "remember_last_cwd"
@@ -1788,6 +1799,24 @@ return config
 
         assert_eq!(field.default, "Off");
         assert_eq!(app.to_lua_value(field), "false");
+    }
+
+    #[test]
+    fn agent_title_field_defaults_on_and_writes_a_bool() {
+        let mut app = test_app();
+        let idx = app
+            .fields
+            .iter()
+            .position(|f| f.lua_key == "show_agent_title")
+            .expect("show_agent_title field to exist");
+
+        assert_eq!(app.fields[idx].default, "On");
+        assert_eq!(
+            App::normalize_value("show_agent_title", "false"),
+            Some("Off".into())
+        );
+        app.fields[idx].value = "Off".into();
+        assert_eq!(app.to_lua_value(&app.fields[idx]), "false");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use config::{Config, ConfigHandle, Dimension, DimensionContext, TabBarColors};
 use window::color::LinearRgba;
 
 const INTEGRATED_BUTTONS_TOP_TAB_INSET_POINTS: f32 = 3.0;
-const INTEGRATED_BUTTONS_TOP_CLEARANCE_POINTS: f32 = 16.0;
+pub(crate) const INTEGRATED_BUTTONS_TOP_CLEARANCE_POINTS: f32 = 16.0;
 
 pub(crate) fn terminal_first_row_offset(top_tab_bar_height: f32, border_top: usize) -> f32 {
     top_tab_bar_height + border_top as f32

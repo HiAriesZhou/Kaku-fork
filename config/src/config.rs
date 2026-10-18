@@ -586,6 +586,11 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub show_new_tab_button_in_tab_bar: bool,
 
+    /// If true, the agent running in the active pane (Claude Code, Codex,
+    /// Kimi) shows its mark and current topic at the top right.
+    #[dynamic(default = "default_true")]
+    pub show_agent_title: bool,
+
     #[dynamic(default = "default_true")]
     pub show_close_tab_button_in_tabs: bool,
 

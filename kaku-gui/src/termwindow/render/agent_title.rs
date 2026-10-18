@@ -10,7 +10,9 @@
 use crate::customglyph::{BlockAlpha, Poly, PolyStyle};
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::agent_marks::{CLAUDE_MARK, CODEX_MARK, KIMI_MARK};
-use crate::termwindow::render::borders::integrated_buttons_top_inset;
+use crate::termwindow::render::borders::{
+    integrated_buttons_top_inset, INTEGRATED_BUTTONS_TOP_CLEARANCE_POINTS,
+};
 use crate::termwindow::{DimensionContext, TermWindowNotif};
 use crate::utilsprites::RenderMetrics;
 use ::window::{WindowOps, WindowState};
@@ -133,6 +135,9 @@ fn fit_with_ellipsis(
 impl crate::TermWindow {
     /// The agent title for the active pane, or None when no agent runs in it.
     pub(crate) fn active_agent_title(&self) -> Option<AgentTitle> {
+        if !self.config.show_agent_title {
+            return None;
+        }
         let pane = self.get_active_pane_no_overlay()?;
         let program = crate::tabbar::foreground_agent_cli(&*pane)?;
         Some(AgentTitle {
@@ -158,8 +163,10 @@ impl crate::TermWindow {
     /// The y the title is vertically centered on, or None where it has no
     /// room: in a window, the line through the traffic-light buttons, which
     /// sit on the strip's bottom edge (16pt down), half over the top padding
-    /// (lifted when that padding is too thin to hold it);
-    /// fullscreen, the middle of the padding above the first row.
+    /// (lifted when that padding is too thin to hold it); fullscreen, the
+    /// same 16pt below the top edge, so the title keeps its window position
+    /// instead of hugging the menu bar (the paint clamp keeps it above the
+    /// first row).
     fn agent_title_center_y(&self) -> Option<f32> {
         if self.show_tab_bar && !self.config.tab_bar_at_bottom {
             return None;
@@ -170,7 +177,9 @@ impl crate::TermWindow {
             .contains(WindowState::FULL_SCREEN)
         {
             let (_, padding_top) = self.padding_left_top();
-            return (padding_top > 0.).then_some(border_top + padding_top / 2.);
+            let clearance =
+                INTEGRATED_BUTTONS_TOP_CLEARANCE_POINTS * self.dimensions.dpi as f32 / 72.;
+            return (padding_top > 0.).then_some(border_top + clearance);
         }
         let inset = integrated_buttons_top_inset(
             &self.config,
@@ -182,6 +191,11 @@ impl crate::TermWindow {
     }
 
     pub fn paint_agent_title(&mut self) -> anyhow::Result<()> {
+        // Checked here too so turning it off hides the title on the reload
+        // repaint, before the next title update clears `agent_title`.
+        if !self.config.show_agent_title {
+            return Ok(());
+        }
         let Some(title) = self.agent_title.clone() else {
             return Ok(());
         };

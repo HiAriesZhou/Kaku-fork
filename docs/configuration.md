@@ -122,6 +122,14 @@ config.window_decorations = "RESIZE"
 
 `RESIZE` preserves the ability to resize the window from its edges and drag it by the tab bar; it only removes the close/minimize/zoom buttons.
 
+**Agent title**
+
+While Claude Code, Codex or Kimi runs in the active pane, its mark and current topic show at the top right of the window. To turn it off, choose Off for Agent Title in `kaku config`, or:
+
+```lua
+config.show_agent_title = false
+```
+
 **Padding**
 
 ```lua
