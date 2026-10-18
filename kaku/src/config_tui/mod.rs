@@ -232,12 +232,12 @@ where
 /// holds settings besides `enabled`, which a whole-line rewrite would lose.
 #[cfg(feature = "remote")]
 pub(crate) fn set_remote_enabled(enabled: bool) -> anyhow::Result<bool> {
-    let path = ensure_editable_config_exists(None)?;
+    let path = ensure_editable_config_exists(Some(&config::effective_config_file_path()))?;
     let content = std::fs::read_to_string(&path)?;
     let Some(updated) = with_remote_enabled(&content, enabled) else {
         return Ok(false);
     };
-    std::fs::write(&path, updated)?;
+    crate::utils::write_atomic(&path, updated.as_bytes())?;
     Ok(true)
 }
 
