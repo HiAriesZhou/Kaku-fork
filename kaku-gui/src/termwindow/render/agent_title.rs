@@ -157,7 +157,8 @@ impl crate::TermWindow {
 
     /// The y the title is vertically centered on, or None where it has no
     /// room: in a window, the line through the traffic-light buttons, which
-    /// sit on the strip's bottom edge (16pt down), half over the top padding;
+    /// sit on the strip's bottom edge (16pt down), half over the top padding
+    /// (lifted when that padding is too thin to hold it);
     /// fullscreen, the middle of the padding above the first row.
     fn agent_title_center_y(&self) -> Option<f32> {
         if self.show_tab_bar && !self.config.tab_bar_at_bottom {
@@ -192,7 +193,7 @@ impl crate::TermWindow {
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let dpi = self.dimensions.dpi as f32;
         let window_width = self.dimensions.pixel_width as f32;
-        let (right_inset, _) = self.padding_left_top();
+        let (right_inset, padding_top) = self.padding_left_top();
         let mark = agent_mark(title.program);
         let mark_size = (metrics.cell_size.height as f32 * MARK_SCALE).round();
         let mark_gap = (metrics.cell_size.width as f32 * 0.6 + 0.5 * dpi / 72.).round();
@@ -207,7 +208,9 @@ impl crate::TermWindow {
         };
         let max_text_width = window_width * MAX_WIDTH_FRACTION - mark_width;
 
-        let generation = self.config.generation();
+        // A fallback font arriving bumps shape_generation and changes the
+        // measured widths, so it invalidates the fit like a config reload.
+        let generation = (self.config.generation(), self.shape_generation);
         let fitted = match &self.agent_title_fitted {
             Some((source, cached_dpi, cached_generation, cached_max, fitted))
                 if *source == title.topic
@@ -302,7 +305,11 @@ impl crate::TermWindow {
             &element,
         )?;
         let x = window_width - right_inset - computed.bounds.width();
-        let y = (center_y - computed.bounds.height() / 2.).max(0.);
+        // With little or no top padding the centered line would cover the
+        // first row; lift it so its bottom stays at the row's top edge.
+        let first_row_top = self.terminal_first_row_offset() + padding_top;
+        let height = computed.bounds.height();
+        let y = (center_y - height / 2.).min(first_row_top - height).max(0.);
         computed.translate(euclid::vec2(
             x - computed.bounds.min_x(),
             y - computed.bounds.min_y(),

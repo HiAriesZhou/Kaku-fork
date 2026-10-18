@@ -1179,9 +1179,10 @@ pub struct TermWindow {
     /// Title of the AI agent running in the active pane, drawn in the top
     /// strip (`render/agent_title.rs`); refreshed with the window title.
     agent_title: Option<render::agent_title::AgentTitle>,
-    /// `agent_title` cut to fit, keyed by (title, dpi, config generation,
-    /// max width), so a repaint does not reshape unchanged text.
-    agent_title_fitted: Option<(String, usize, usize, usize, String)>,
+    /// `agent_title` cut to fit, keyed by (title, dpi, (config generation,
+    /// shape generation), max width), so a repaint does not reshape
+    /// unchanged text.
+    agent_title_fitted: Option<(String, usize, (usize, usize), usize, String)>,
     selection_copy_disabled_hint_shown: bool,
     last_window_title: String,
 
