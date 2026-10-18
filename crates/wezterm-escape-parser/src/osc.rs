@@ -1,6 +1,6 @@
 use crate::color::SrgbaTuple;
 pub use crate::hyperlink::Hyperlink;
-use crate::{Result, bail, ensure, format_err};
+use crate::{bail, ensure, format_err, Result};
 use base64::Engine;
 use bitflags::bitflags;
 use core::fmt::{Display, Error as FmtError, Formatter, Result as FmtResult};
@@ -1010,9 +1010,15 @@ impl ProgramStatus {
             let Some((key, value)) = pair.split_once('=') else {
                 continue;
             };
+            let key = key.trim();
+            let value = value.trim();
             if key.is_empty()
                 || key.len() > PROGRAM_STATUS_MAX_KEY
                 || !key.bytes().all(|b| b.is_ascii_lowercase())
+                || !value.bytes().all(|b| {
+                    b.is_ascii_alphanumeric()
+                        || matches!(b, b'_' | b'.' | b',' | b'+' | b'/' | b'=' | b'-')
+                })
             {
                 continue;
             }
@@ -1039,7 +1045,10 @@ impl ProgramStatus {
         };
         let id = match id.filter(|id| !id.is_empty()) {
             Some(id) => {
-                ensure!(id.len() <= PROGRAM_STATUS_MAX_ID, "program status id too long");
+                ensure!(
+                    id.len() <= PROGRAM_STATUS_MAX_ID,
+                    "program status id too long"
+                );
                 let mut depth = 0;
                 for segment in id.split('/') {
                     depth += 1;
@@ -1095,8 +1104,7 @@ impl ProgramStatus {
 fn is_program_status_name(s: &str, max: usize) -> bool {
     !s.is_empty()
         && s.len() <= max
-        && s
-            .bytes()
+        && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
 }
 
@@ -2031,6 +2039,41 @@ mod test {
     }
 
     #[test]
+    fn program_status_trims_pair_whitespace() {
+        assert_eq!(
+            OperatingSystemCommand::parse(&[
+                b"7501",
+                b" state = done : app = claude-code : msg = SGk= "
+            ]),
+            OperatingSystemCommand::parse(&[b"7501", b"state=done:app=claude-code:msg=SGk="])
+        );
+    }
+
+    #[test]
+    fn program_status_skips_malformed_optional_pairs() {
+        for body in [
+            "state=done:app=bad@name",
+            "state=done:app=claude code",
+            "state=done:msg=!!!",
+            "state=done:kind=bad@kind",
+            "state=done:progress=4@0",
+            "state=done:title=!!!",
+            "state=done:id=bad@id",
+            "state=done:state=bad@state",
+        ] {
+            assert_eq!(
+                OperatingSystemCommand::parse(&[b"7501", body.as_bytes()]),
+                OperatingSystemCommand::parse(&[b"7501", b"state=done"]),
+                "{body}"
+            );
+        }
+        assert_eq!(
+            OperatingSystemCommand::parse(&[b"7501", b"state=done:app=claude-code:app=bad@name"]),
+            OperatingSystemCommand::parse(&[b"7501", b"state=done:app=claude-code"])
+        );
+    }
+
+    #[test]
     fn program_status() {
         assert_eq!(
             parse(&["7501", "?"], "\x1b]7501;?\x1b\\"),
@@ -2084,9 +2127,8 @@ mod test {
         assert!(rejected("state=sleeping"));
         // A control character ("a\x1bb") or broken base64 in the text.
         assert!(rejected("state=done:msg=YRti"));
-        assert!(rejected("state=done:msg=!!!"));
-        // Names outside the allowed set or over the limits.
-        assert!(rejected("state=done:app=claude code"));
+        assert!(rejected("state=done:msg=A"));
+        // Structurally invalid names or reports over the limits.
         assert!(rejected(&format!("state=done:app={}", "a".repeat(33))));
         assert!(rejected("state=done:id=a//b"));
         assert!(rejected(&format!("state=done:id={}", ["a"; 9].join("/"))));
