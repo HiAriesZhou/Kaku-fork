@@ -8,9 +8,12 @@ use std::process::Command;
 const ORIGINAL: &str = "local config = {}\nconfig.remote = { enabled = true }\nreturn config\n";
 
 fn command(home: &Path) -> Command {
+    let temp = home.join("tmp");
+    fs::create_dir_all(&temp).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kaku"));
     command
         .env("HOME", home)
+        .env("TMPDIR", temp)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("XDG_CACHE_HOME", home.join(".cache"))
