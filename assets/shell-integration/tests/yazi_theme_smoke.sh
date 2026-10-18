@@ -102,6 +102,23 @@ assert_file_contains "light = \"$expected_flavor\"" "$theme_new"
 assert_file_contains '{ url = "*/", fg = "#90c9e6" }' "$dark_new"
 assert_file_contains '{ url = "*/", fg = "#205ea6" }' "$light_new"
 
+# Initialize spacing once; custom or linked init scripts belong to the user.
+init_new="$home_new/.config/yazi/init.lua"
+[[ -s "$init_new" ]] || fail "missing default Yazi layout"
+printf '%s\n' '-- custom Yazi layout' >"$tmp_dir/custom-init.lua"
+cp "$tmp_dir/custom-init.lua" "$init_new"
+run_setup "$home_new"
+cmp -s "$tmp_dir/custom-init.lua" "$init_new" || fail "overwrote custom Yazi init"
+rm "$init_new"
+ln -s "$tmp_dir/custom-init.lua" "$init_new"
+run_setup "$home_new"
+[[ -L "$init_new" ]] || fail "replaced linked Yazi init"
+cmp -s "$tmp_dir/custom-init.lua" "$init_new" || fail "modified linked Yazi init"
+rm "$init_new"
+ln -s "$tmp_dir/absent-init.lua" "$init_new"
+run_setup "$home_new"
+[[ -L "$init_new" && ! -e "$tmp_dir/absent-init.lua" ]] || fail "followed dangling Yazi init"
+
 home_legacy="$tmp_dir/home-legacy"
 mkdir -p "$home_legacy/.config/yazi"
 # The old fish theme used empty padding; zsh used powerline glyphs.

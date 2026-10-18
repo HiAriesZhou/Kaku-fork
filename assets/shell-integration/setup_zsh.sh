@@ -833,6 +833,31 @@ EOF
 ensure_yazi_edit_opener
 
 # Initialize Yazi keymap tweaks if the user has not created one yet.
+# Add breathing room below the path without replacing user customizations.
+if [[ ! -e "$YAZI_CONFIG_DIR/init.lua" && ! -L "$YAZI_CONFIG_DIR/init.lua" && ! -L "$YAZI_CONFIG_DIR" ]]; then
+	mkdir -p "$YAZI_CONFIG_DIR"
+	if [[ -w "$YAZI_CONFIG_DIR" ]]; then
+		cat <<'EOF' >"$YAZI_CONFIG_DIR/init.lua"
+-- Leave one row between the path and file columns.
+local root_layout = Root.layout
+function Root:layout()
+  root_layout(self)
+  local body = #self._chunks - 1
+  if self._chunks[body].h < 2 then
+    return
+  end
+  for i = 2, body do
+    local area = self._chunks[i]
+    self._chunks[i] = ui.Rect {
+      x = area.x, y = area.y + 1, w = area.w,
+      h = area.h - (i == body and 1 or 0),
+    }
+  end
+end
+EOF
+	fi
+fi
+
 if [[ ! -f "$YAZI_KEYMAP_FILE" ]]; then
 	mkdir -p "$YAZI_CONFIG_DIR"
 	cat <<EOF >"$YAZI_KEYMAP_FILE"
