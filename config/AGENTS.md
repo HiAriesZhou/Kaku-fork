@@ -50,7 +50,7 @@ The AI config TUI lives in the `kaku` CLI crate and shares terminal UI primitive
 - The current `config_version` is whatever `assets/shell-integration/config_version.txt` says; never trust a number written in a doc. Any version bump must update bundled config, release checks, docs, and migration expectations together, and add a row to `docs/config-versions.md`.
 - New config fields are user-facing behavior. Keep them out of pure cleanup/refactor patches unless the maintainer explicitly approved the product change, and update bundled defaults plus documentation in the same change when they do land.
 - Keep alternate-screen wheel scroll behavior configurable; terminal and GUI defaults must not diverge.
-- Config rewrite guards must validate every assignment the writer can replace, using the same match predicate. A later Lua override can contain user-owned settings even when the first assignment contains only a managed flag; `remote_access_checks_every_assignment_before_rewriting` covers this boundary in `kaku/src/config_tui/mod.rs`.
+- Config rewrite guards must validate every assignment the writer can replace, using the same match predicate. A later Lua override can contain user-owned settings even when the first assignment contains only a managed flag; `remote_access_checks_every_assignment_before_rewriting` covers this boundary in `kaku/src/config_tui/mod.rs`. Remote toggles must edit `effective_config_file_path()` through `kaku::utils::write_atomic`, preserving symlinks, permissions and the original bytes on a partial write failure. `kaku/tests/remote_config.rs` exercises the actual CLI with `--config-file`, a stale inherited `KAKU_CONFIG_FILE`, and a real file-size write limit.
 
 ## Bundled kaku.lua Pitfalls
 
