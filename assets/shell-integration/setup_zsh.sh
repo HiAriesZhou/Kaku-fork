@@ -1341,8 +1341,9 @@ _kaku_zcompdump_stale() {
 }
 if ! (( \${+functions[_main_complete]} )) || ! (( \${+_comps} )); then
     if _kaku_zcompdump_stale; then
-        # Rebuild completion cache if older than 24 hours
-        compinit
+        # Recheck after 24 hours. An unchanged dump keeps its old mtime,
+        # so mark a successful check to use the cache in the next shell.
+        compinit && touch "\${ZDOTDIR:-\$HOME}/.zcompdump"
     else
         # Load from cache (much faster)
         compinit -C
