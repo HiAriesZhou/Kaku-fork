@@ -1016,7 +1016,8 @@ function __kaku_ai_query_execute
                 builtin history append -- $cmd
                 # Only flag the waiting state once the request was actually
                 # emitted, so a failed send never blocks Enter (#511).
-                if __kaku_set_ai_user_var kaku_ai_query "[mode:$mode] $query"
+                # Identical requests still need a fresh user-var change event.
+                if __kaku_set_ai_user_var kaku_ai_query ""; and __kaku_set_ai_user_var kaku_ai_query "[mode:$mode] $query"
                     set -g __kaku_ai_waiting 1
                     set -g __kaku_ai_waiting_ts (date +%s)
                     # Clear the submitted comment immediately so generated commands

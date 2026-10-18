@@ -1665,7 +1665,8 @@ _kaku_ai_query_accept_line() {
         body="\${body# }"
         if [[ -n "\$body" ]]; then
             print -s -- "\${BUFFER}"
-            if _kaku_set_ai_user_var "kaku_ai_query" "[mode:\${mode}] \${body}"; then
+            # Identical requests still need a fresh user-var change event.
+            if _kaku_set_ai_user_var "kaku_ai_query" "" && _kaku_set_ai_user_var "kaku_ai_query" "[mode:\${mode}] \${body}"; then
                 _kaku_ai_waiting=1
                 _kaku_ai_waiting_ts=\$EPOCHSECONDS
                 # Keep # query visible; Lua sends \x15 to clear it when result arrives.

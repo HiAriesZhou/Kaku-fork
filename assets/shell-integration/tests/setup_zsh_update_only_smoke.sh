@@ -101,6 +101,28 @@ if command -v zsh >/dev/null 2>&1; then
     fail "generated kaku.zsh failed 'zsh -n' parse check"
   fi
 
+  repeated_queries="$(HOME="$tmp_home" TERM=xterm-256color TERM_PROGRAM=Kaku zsh -dfc '
+    add-zsh-hook() { :; }
+    source "$HOME/.config/kaku/zsh/kaku.zsh" >/dev/null
+    typeset -g query_seen="" query_deliveries=0
+    _kaku_set_ai_user_var() {
+      [[ "$1" == "kaku_ai_query" ]] || return 1
+      if [[ "$query_seen" != "$2" && -n "$2" ]]; then
+        (( ++query_deliveries ))
+      fi
+      query_seen="$2"
+      return 0
+    }
+    zle() { :; }
+    for round in 1 2; do
+      BUFFER="# list files"
+      _kaku_ai_waiting=0
+      _kaku_ai_query_accept_line
+    done
+    print -r -- "$query_deliveries"
+  ')"
+  [[ "$repeated_queries" == "2" ]] || fail "identical AI queries did not emit two changes"
+
   # Execute the generated prompt hook, not a source-text match (#551).
   mouse_reset="$(HOME="$tmp_home" TERM=xterm-256color TERM_PROGRAM=Kaku zsh -dfc '
     add-zsh-hook() { :; }

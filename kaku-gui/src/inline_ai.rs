@@ -239,6 +239,83 @@ pub(crate) fn spawn_job(job_id: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn assert_bundled_context_utf8(generate: bool, max_bytes: usize) {
+        use config::lua::mlua::{Function, Lua, Table};
+
+        let source = include_str!("../../assets/macos/Kaku.app/Contents/Resources/kaku.lua");
+        let section = |start: &str, end: &str| {
+            let body = source.split_once(start).unwrap().1;
+            format!("{start}{}", body.split_once(end).unwrap().0)
+        };
+        let script = format!(
+            "{}\n{}\nload_prompt = function() return 'test' end\nreturn build_ai_fix_messages, build_ai_generate_messages",
+            section("local function load_prompt(name)", "\nlocal function encode_ai_fix_payload"),
+            section("local function detect_project_type(cwd)", "\n-- Animates or clears"),
+        );
+        let lua = Lua::new();
+        let (fix, generation): (Function, Function) = lua.load(&script).eval().unwrap();
+        let mut outputs = vec!["short output".to_string(), "x".repeat(max_bytes + 1)];
+        for glyph in ["中", "\u{f418}", "🙂"] {
+            for remaining in 1..=glyph.len() {
+                outputs.push(format!(
+                    "prefix{glyph}{}",
+                    "x".repeat(max_bytes - remaining)
+                ));
+            }
+        }
+        for output in outputs {
+            let messages: Table = if generate {
+                generation.call(("list files", "", "", output.as_str(), "auto"))
+            } else {
+                fix.call(("ls missing", 1, "", "", output.as_str()))
+            }
+            .unwrap();
+            let message: Table = messages.get(2).unwrap();
+            let content: config::lua::mlua::String = message.get("content").unwrap();
+            let content = content.to_str().expect("context must remain valid UTF-8");
+            let tail = content
+                .split_once("---UNTRUSTED OUTPUT START---\n")
+                .unwrap()
+                .1
+                .strip_suffix("\n---UNTRUSTED OUTPUT END---")
+                .unwrap();
+            assert!(tail.len() <= max_bytes);
+            assert!(output.ends_with(tail));
+            if output.len() <= max_bytes {
+                assert_eq!(tail, output);
+            } else {
+                assert!(max_bytes - tail.len() < 4);
+            }
+        }
+    }
+
+    #[test]
+    fn inline_context_generation_preserves_utf8() {
+        assert_bundled_context_utf8(true, 1500);
+    }
+
+    #[test]
+    fn inline_context_fix_preserves_utf8() {
+        assert_bundled_context_utf8(false, 2000);
+    }
+
+    #[test]
+    fn request_start_failure_clears_query_before_finalizing() {
+        let source = include_str!("../../assets/macos/Kaku.app/Contents/Resources/kaku.lua");
+        let branch = source
+            .split_once("local ok, err = request_ai_generate_async(")
+            .unwrap()
+            .1
+            .split_once("\n  else\n    ctrl_ai_generate_spinner")
+            .unwrap()
+            .0;
+        let clear = branch.find("\n    safe_send_clear(pane)\n").unwrap();
+        let finish = branch
+            .find("\n    inject_ai_status_and_finalize(pane,")
+            .unwrap();
+        assert!(clear < finish);
+    }
+
     #[test]
     fn auth_accepts_codex_without_api_key() {
         assert!(auth_is_configured("codex", ""));

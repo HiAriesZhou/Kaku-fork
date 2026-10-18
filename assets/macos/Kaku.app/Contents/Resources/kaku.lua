@@ -859,10 +859,15 @@ local function build_ai_fix_messages(failed_command, exit_code, cwd, git_branch,
   end
 
   if terminal_output and terminal_output ~= "" then
-    local max_chars = 2000
+    local max_bytes = 2000
     local trimmed = terminal_output
-    if #trimmed > max_chars then
-      trimmed = trimmed:sub(#trimmed - max_chars + 1)
+    if #trimmed > max_bytes then
+      local first = #trimmed - max_bytes + 1
+      -- A byte limit can land inside a CJK character, emoji, or prompt icon.
+      while first <= #trimmed and trimmed:byte(first) >= 0x80 and trimmed:byte(first) < 0xC0 do
+        first = first + 1
+      end
+      trimmed = trimmed:sub(first)
     end
     context[#context + 1] = "\n---UNTRUSTED OUTPUT START---\n" .. trimmed .. "\n---UNTRUSTED OUTPUT END---"
   end
@@ -1592,10 +1597,15 @@ local function build_ai_generate_messages(query, cwd, git_branch, terminal_outpu
     context[#context + 1] = "Project type: " .. project_type
   end
   if terminal_output and terminal_output ~= "" then
-    local max_chars = 1500
+    local max_bytes = 1500
     local trimmed = terminal_output
-    if #trimmed > max_chars then
-      trimmed = trimmed:sub(#trimmed - max_chars + 1)
+    if #trimmed > max_bytes then
+      local first = #trimmed - max_bytes + 1
+      -- A byte limit can land inside a CJK character, emoji, or prompt icon.
+      while first <= #trimmed and trimmed:byte(first) >= 0x80 and trimmed:byte(first) < 0xC0 do
+        first = first + 1
+      end
+      trimmed = trimmed:sub(first)
     end
     context[#context + 1] = "\n---UNTRUSTED OUTPUT START---\n" .. trimmed .. "\n---UNTRUSTED OUTPUT END---"
   end
@@ -3799,6 +3809,7 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
     pane_state.inflight = false
     pane_state.pending_job_id = nil
     ai_debug_log("ai_generate request start failed err=" .. tostring(err))
+    safe_send_clear(pane)
     inject_ai_status_and_finalize(pane, "Could not generate command right now.")
   else
     ctrl_ai_generate_spinner(pane, pane_state, false)

@@ -106,7 +106,7 @@ function_body="$(
   ' "$kaku_fish"
 )"
 
-[[ "$function_body" == *'if __kaku_set_ai_user_var kaku_ai_query "[mode:$mode] $query"'* ]] \
+[[ "$function_body" == *'if __kaku_set_ai_user_var kaku_ai_query ""; and __kaku_set_ai_user_var kaku_ai_query "[mode:$mode] $query"'* ]] \
   || fail "kaku_ai_query user var is missing or not mode-tagged"
 [[ "$function_body" == *'commandline -r ""'* ]] \
   || fail "submitted # query buffer is not cleared"
@@ -114,7 +114,7 @@ function_body="$(
 sequence_ok="$(
   awk '
     /^function __kaku_ai_query_execute$/ { in_fn = 1 }
-    in_fn && /if __kaku_set_ai_user_var kaku_ai_query "\[mode:\$mode\] \$query"/ { saw_user_var = 1 }
+    in_fn && /if __kaku_set_ai_user_var kaku_ai_query ""; and __kaku_set_ai_user_var kaku_ai_query "\[mode:\$mode\] \$query"/ { saw_user_var = 1 }
     in_fn && saw_user_var && /commandline -r ""/ { saw_clear = 1 }
     in_fn && saw_clear && /commandline -f repaint/ { print "ok"; exit }
     in_fn && /^end$/ { exit }
