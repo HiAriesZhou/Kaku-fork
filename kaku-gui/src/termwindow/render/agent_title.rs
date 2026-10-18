@@ -187,7 +187,7 @@ impl crate::TermWindow {
         let (right_inset, _) = self.padding_left_top();
         let mark = agent_mark(title.program);
         let mark_size = (metrics.cell_size.height as f32 * MARK_SCALE).round();
-        let mark_gap = (metrics.cell_size.width as f32 * 0.6).round();
+        let mark_gap = (metrics.cell_size.width as f32 * 0.6 + 0.5 * dpi / 72.).round();
         // Centering the mark on the line box leaves it above the text, whose
         // ink sits low in the line (measured 1 to 2.5px at 2x); a top margin
         // of twice the shift moves a middle-aligned box down by the shift.
