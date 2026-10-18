@@ -2323,9 +2323,12 @@ pub fn default_hyperlink_rules() -> Vec<hyperlink::Rule> {
         // (backticks, quotes) attached after a path are excluded from the
         // match via regex backtracking. The leading boundary class likewise
         // admits backticks and straight quotes so a path wrapped in those
-        // characters is still detected.
+        // characters is still detected. Full-width CJK punctuation counts as
+        // a boundary too, since Chinese and Japanese text runs a path straight
+        // on from it with no space ("截图：/tmp/a.png", "（/tmp/a.png）"). A CJK
+        // letter does not, so "中文/English" stays plain text.
         hyperlink::Rule::with_highlight(
-            r#"(^|[\s\(\[<`'"])((?:~|\.{1,2}|[[:alnum:]_.-]+)?/[^\s\)\]\}>`'"]*[a-zA-Z0-9_/-])"#,
+            r#"(^|[\s\(\[<`'"：，。、；！？（【「『《“‘])((?:~|\.{1,2}|[[:alnum:]_.-]+)?/[^\s\)\]\}>`'"]*[a-zA-Z0-9_/-])"#,
             "file://$2",
             2,
         )
@@ -3049,6 +3052,35 @@ mod tests {
             "expected exactly one file:// match in {text:?}, got {matches:?}",
         );
         matches.into_iter().next().unwrap().link.uri().to_string()
+    }
+
+    #[test]
+    fn file_hyperlink_starts_after_full_width_punctuation() {
+        assert_eq!(
+            file_uri("三种 agent：/private/tmp/a/m-three.png"),
+            "file:///private/tmp/a/m-three.png"
+        );
+        assert_eq!(
+            file_uri("路径：~/www/kaku/README.md"),
+            "file://~/www/kaku/README.md"
+        );
+        assert_eq!(
+            file_uri("（/private/tmp/a.png）"),
+            "file:///private/tmp/a.png"
+        );
+        assert_eq!(file_uri("「kaku/src/main.rs」"), "file://kaku/src/main.rs");
+        assert_eq!(
+            file_uri("改了，kaku/src/main.rs。"),
+            "file://kaku/src/main.rs"
+        );
+        let rules = default_hyperlink_rules();
+        for plain in ["支持中文/English", "截图在/private/tmp/a.png"] {
+            assert!(
+                Rule::match_hyperlinks(plain, &rules).is_empty(),
+                "{:?} must stay plain text",
+                plain
+            );
+        }
     }
 
     #[test]
