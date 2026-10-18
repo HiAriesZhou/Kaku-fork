@@ -1283,9 +1283,9 @@ fn effective_vertical_padding_with_policy(
         return (base_top, bottom);
     }
 
-    // Managed padding derives every vertical gap from the top padding: the
-    // window edges keep all of it, and content keeps half of it from a
-    // visible tab bar, top or bottom, so the bar never touches the output.
+    // Managed padding derives every vertical gap from the top padding.
+    // Keep the full inset below window chrome and half beside a tab bar or
+    // the bottom edge, so a TUI status row does not float above the edge.
     let default_top = config::WindowPadding::default()
         .top
         .evaluate_as_pixels(context) as usize;
@@ -1303,7 +1303,7 @@ fn effective_vertical_padding_with_policy(
         // Maximized windows run content to the bottom edge.
         0
     } else {
-        base_bottom.max(outer)
+        base_bottom.max(tab_bar_gap)
     };
 
     (top, bottom)
@@ -1906,20 +1906,33 @@ mod tests {
             top: config::Dimension::Pixels(40.0),
             bottom: config::Dimension::Pixels(0.0),
         };
-        let pad = |show, at_bottom, maximized| {
-            effective_vertical_padding(&config, context(), show, at_bottom, 58, maximized)
-        };
-
-        // No tab bar: the bottom edge matches the top edge.
-        assert_eq!(pad(false, true, false), (40, 40));
-        assert_eq!(pad(false, false, false), (40, 40));
-        // A visible bar keeps half the padding from the output, top or bottom.
-        assert_eq!(pad(true, true, false), (40, 20));
-        assert_eq!(pad(true, false, false), (20, 40));
-        // Maximized windows run to the bottom edge, but never into a bar.
-        assert_eq!(pad(false, true, true), (40, 0));
-        assert_eq!(pad(true, true, true), (40, 20));
-        assert_eq!(pad(true, false, true), (20, 0));
+        for state in [
+            WindowState::empty(),
+            WindowState::FULL_SCREEN,
+            WindowState::MAXIMIZED,
+        ] {
+            let pad = |show, at_bottom| {
+                effective_vertical_padding_with_policy(
+                    &config,
+                    context(),
+                    show,
+                    at_bottom,
+                    58,
+                    state,
+                    false,
+                )
+            };
+            let edge = if state.contains(WindowState::MAXIMIZED) {
+                0
+            } else {
+                20
+            };
+            // The bottom edge uses the same compact gap as a visible bar.
+            assert_eq!(pad(false, true), (40, edge), "{state:?}");
+            assert_eq!(pad(false, false), (40, edge), "{state:?}");
+            assert_eq!(pad(true, true), (40, 20), "{state:?}");
+            assert_eq!(pad(true, false), (20, edge), "{state:?}");
+        }
     }
 
     #[test]
