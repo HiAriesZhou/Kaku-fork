@@ -1395,7 +1395,24 @@ impl App {
             .rows
             .len()
             .clamp(1, MAX_INPUT_VISIBLE_ROWS)
-            .min(self.rows.saturating_sub(3))
+            .min(self.rows.saturating_sub(3 + 2 * self.input_padding_rows()))
+    }
+
+    pub(crate) fn input_padding_rows(&self) -> usize {
+        usize::from(self.rows >= 12)
+    }
+
+    pub(crate) fn input_box_top(&self) -> usize {
+        self.rows
+            .saturating_sub(1 + self.input_visible_rows() + 2 * self.input_padding_rows())
+    }
+
+    pub(crate) fn input_text_top(&self) -> usize {
+        self.input_box_top() + self.input_padding_rows()
+    }
+
+    pub(crate) fn controls_row(&self) -> usize {
+        self.input_box_top().saturating_sub(1)
     }
 
     pub(crate) fn picker_height(&self) -> usize {
@@ -1406,9 +1423,10 @@ impl App {
             .slash_picker_options()
             .len()
             .max(self.attachment_picker_options().len());
-        count
-            .min(MAX_PICKER_ROWS)
-            .min(self.rows.saturating_sub(self.input_visible_rows() + 3))
+        count.min(MAX_PICKER_ROWS).min(
+            self.rows
+                .saturating_sub(self.input_visible_rows() + 3 + 2 * self.input_padding_rows()),
+        )
     }
 
     pub(crate) fn resume_picker_height(&self) -> usize {
@@ -1416,8 +1434,9 @@ impl App {
     }
 
     pub(crate) fn msg_area_height(&self) -> usize {
-        self.rows
-            .saturating_sub(3 + self.input_visible_rows() + self.picker_height())
+        self.rows.saturating_sub(
+            3 + self.input_visible_rows() + 2 * self.input_padding_rows() + self.picker_height(),
+        )
     }
 
     pub(crate) fn controls(&self) -> Vec<(ChatControl, &'static str)> {

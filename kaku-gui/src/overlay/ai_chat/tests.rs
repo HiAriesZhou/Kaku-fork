@@ -988,12 +988,45 @@ mod interaction_tests {
     }
 
     #[test]
+    fn composer_reserves_padding_in_regular_panes() {
+        for rows in [12, 24, 40] {
+            let mut app = app();
+            app.rows = rows;
+            for input in ["", "@tab", "first\nsecond\nthird"] {
+                app.input = input.into();
+                assert_eq!(
+                    app.msg_area_height() + app.picker_height() + app.input_visible_rows() + 5,
+                    rows
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn composer_toolbar_click_uses_padded_input_layout() {
+        use termwiz::input::{Modifiers, MouseButtons, MouseEvent};
+        let mut app = app();
+        for buttons in [MouseButtons::LEFT, MouseButtons::NONE] {
+            super::super::input::handle_mouse(
+                &MouseEvent {
+                    x: 14,
+                    y: (app.rows - 5) as u16,
+                    mouse_buttons: buttons,
+                    modifiers: Modifiers::NONE,
+                },
+                &mut app,
+            );
+        }
+        assert_eq!(app.input, "@");
+    }
+
+    #[test]
     fn picker_rows_are_excluded_from_message_hit_area() {
         let mut app = app();
         app.input = "/".into();
         let picker = app.slash_picker_options().len().min(MAX_PICKER_ROWS);
         assert_eq!(
-            app.msg_area_height() + app.input_visible_rows() + picker + 3,
+            app.msg_area_height() + app.input_visible_rows() + picker + 5,
             app.rows
         );
     }
@@ -1155,7 +1188,11 @@ mod interaction_tests {
                 app.rows = rows;
                 app.input = "/".into();
                 assert!(
-                    app.msg_area_height() + app.picker_height() + app.input_visible_rows() + 3
+                    app.msg_area_height()
+                        + app.picker_height()
+                        + app.input_visible_rows()
+                        + 3
+                        + 2 * app.input_padding_rows()
                         <= rows
                 );
                 for (_, _, span) in super::super::layout::control_spans(&app.controls(), cols) {

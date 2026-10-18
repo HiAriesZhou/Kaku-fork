@@ -557,7 +557,7 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
     }
 
     // 4. Vertical picker (above separator) + separator row.
-    let sep_row = rows.saturating_sub(2 + input_visible_h);
+    let sep_row = app.controls_row();
     if picker_h > 0 {
         let picker_start = sep_row.saturating_sub(picker_h);
         let selected = app.attachment_picker_index;
@@ -605,7 +605,7 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
 
     // 5. Input area (one or more rows). Approval banner, when present,
     // always takes a single row.
-    let input_top = rows.saturating_sub(1 + input_visible_h);
+    let input_top = app.input_text_top();
 
     // Compute cursor state now; apply AFTER bottom border so it's the final position.
     let cursor_state: Option<(usize, usize)> = {
@@ -625,21 +625,28 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
             0
         };
 
-        for i in 0..input_visible_h {
-            let abs_row = input_top + i;
+        for abs_row in app.input_box_top()..rows.saturating_sub(1) {
             changes.push(Change::CursorPosition {
                 x: Position::Absolute(0),
                 y: Position::Absolute(abs_row),
             });
             changes.push(Change::AllAttributes(pal.border_dim_cell()));
             changes.push(Change::Text("│".to_string()));
-            changes.push(Change::AllAttributes(pal.input_cell()));
-            let row_text = layout
-                .rows
-                .get(scroll + i)
-                .map(String::as_str)
-                .unwrap_or("");
-            changes.push(Change::Text(pad_to_visual_width(row_text, inner_w)));
+            if (input_top..input_top + input_visible_h).contains(&abs_row) {
+                changes.push(Change::AllAttributes(pal.composer_cell()));
+                let row_text = layout
+                    .rows
+                    .get(scroll + abs_row - input_top)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                changes.push(Change::Text(pad_to_visual_width(row_text, inner_w)));
+            } else {
+                // Half blocks keep the input vertically centered with half-row
+                // padding while cursor and hit testing stay on the cell grid.
+                changes.push(Change::AllAttributes(pal.composer_padding_cell()));
+                let edge = if abs_row < input_top { "▄" } else { "▀" };
+                changes.push(Change::Text(edge.repeat(inner_w)));
+            }
             changes.push(Change::AllAttributes(pal.border_dim_cell()));
             changes.push(Change::Text("│".to_string()));
         }
@@ -688,7 +695,7 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
                 x: Position::Absolute(cx),
                 y: Position::Absolute(cy),
             });
-            changes.push(Change::CursorShape(CursorShape::SteadyBlock));
+            changes.push(Change::CursorShape(CursorShape::BlinkingBar));
             changes.push(Change::CursorVisibility(CursorVisibility::Visible));
         }
         None => {
@@ -915,6 +922,11 @@ fn control_runs(
         }
         let attrs = if app.focused_control == Some(control) {
             pal.picker_cursor_cell()
+        } else if matches!(
+            control,
+            ChatControl::History | ChatControl::Context | ChatControl::Model | ChatControl::Latest
+        ) {
+            pal.toolbar_cell()
         } else {
             pal.ai_header_cell()
         };

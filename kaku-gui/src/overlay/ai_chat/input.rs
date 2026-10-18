@@ -476,7 +476,6 @@ pub(super) fn handle_mouse(event: &MouseEvent, app: &mut App) {
     // Mouse selection: row 0 is the top border, rows 1..msg_row_end are the
     // message area. The input box can span multiple rows now, so msg_row_end
     // tracks the separator row (which floats up as input grows).
-    let input_visible_h = app.input_visible_rows();
     let msg_row_start = 1usize; // first message row (0 is top border)
     let msg_row_end = 1 + app.msg_area_height(); // exclusive
 
@@ -498,7 +497,7 @@ pub(super) fn handle_mouse(event: &MouseEvent, app: &mut App) {
 
     // Input box spans rows [input_top .. bot_row); used to detect clicks
     // anywhere in the (possibly multi-row) input area.
-    let input_top = app.rows.saturating_sub(1 + input_visible_h);
+    let input_top = app.input_box_top();
     let bot_row = app.rows.saturating_sub(1);
 
     match (was_pressed, is_pressed) {
@@ -672,7 +671,7 @@ fn control_at(app: &App, x: usize, y: usize) -> Option<ChatControl> {
         return (y >= 1 && y <= height && index < items.len())
             .then_some(ChatControl::Resume(index));
     }
-    let sep_row = app.rows.saturating_sub(2 + app.input_visible_rows());
+    let sep_row = app.controls_row();
     if y == sep_row {
         return control_spans(&app.controls(), app.cols)
             .into_iter()

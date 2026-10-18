@@ -136,6 +136,21 @@ impl ChatPalette {
     pub fn input_cell(&self) -> CellAttributes {
         self.make_attrs(self.fg_attr(), self.bg_attr())
     }
+    pub fn composer_cell(&self) -> CellAttributes {
+        self.make_attrs(
+            self.fg_attr(),
+            ColorAttribute::TrueColorWithDefaultFallback(palette_blend(self.bg, self.fg, 0.06)),
+        )
+    }
+    pub fn composer_padding_cell(&self) -> CellAttributes {
+        self.make_attrs(self.composer_cell().background(), self.bg_attr())
+    }
+    pub fn toolbar_cell(&self) -> CellAttributes {
+        self.make_attrs(
+            ColorAttribute::TrueColorWithDefaultFallback(palette_blend(self.bg, self.fg, 0.70)),
+            self.bg_attr(),
+        )
+    }
     /// Cursor highlight used in pickers (e.g., resume list, model dropdown).
     /// Uses the accent color as background so it adapts to both dark and light themes.
     pub fn picker_cursor_cell(&self) -> CellAttributes {
