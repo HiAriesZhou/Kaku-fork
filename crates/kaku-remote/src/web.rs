@@ -16,7 +16,7 @@ use mux::pane::{CloseReason, Pane, PaneId};
 use mux::Mux;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
@@ -46,6 +46,11 @@ const ICON_PNG: &[u8] = include_bytes!("../assets/web/icon.png");
 /// once, so a keystroke's echo never waits for a tick; a burst is coalesced
 /// and its trailing edge always flushes, so its last output is never dropped.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Twelve small frames cover 150 ms RTT at 60 Hz without waiting for ACKs.
+const FRAME_WINDOW: usize = 12;
+/// A complete frame and its new images may cross this watermark once, then
+/// rendering waits for ACKs. Large redraws must not deadlock behind a byte cap.
+const FRAME_BYTES_WATERMARK: usize = 512 * 1024;
 /// Re-render this often even without output, to pick up cursor moves,
 /// title changes and resizes that do not produce `PaneOutput`.
 const IDLE_REFRESH: Duration = Duration::from_secs(1);
@@ -133,7 +138,10 @@ pub enum TabAction {
     /// Move the tab holding this pane to `index` in its window.
     Move { pane_id: usize, index: usize },
     /// Focus this pane and toggle its tab's zoom, as Cmd+Shift+Enter does.
-    Zoom { pane_id: usize },
+    Zoom {
+        pane_id: usize,
+        claimed: Option<(usize, usize)>,
+    },
 }
 
 pub type TabActionHandler = Arc<dyn Fn(TabAction) + Send + Sync + 'static>;
@@ -537,6 +545,8 @@ enum WebServerMsg<'a> {
         /// page scrolls locally. Otherwise the program gets the wheel.
         local_scroll: bool,
         data: &'a str,
+        /// Whether each physical row continues into the next one.
+        wrapped: &'a [bool],
         /// Inline images now on screen; absent when they did not change.
         #[serde(skip_serializing_if = "Option::is_none")]
         images: Option<&'a [ImagePlacement]>,
@@ -609,6 +619,7 @@ enum WebServerMsg<'a> {
         first: isize,
         top: isize,
         rows: &'a [String],
+        wrapped: &'a [bool],
     },
 }
 
@@ -732,10 +743,10 @@ struct Download {
     acked: u64,
 }
 
-const DOWNLOAD_CHUNK: usize = 256 << 10;
-/// Bytes sent but not yet acknowledged: the relay holds at most this much
-/// of a file for one browser, well under its per-browser budget.
-const DOWNLOAD_WINDOW: u64 = 1 << 20;
+const DOWNLOAD_CHUNK: usize = 64 << 10;
+/// Unacknowledged raw bytes per file. Small chunks and a shorter window
+/// leave room on the shared socket for terminal input during a download.
+const DOWNLOAD_WINDOW: u64 = 256 << 10;
 const MAX_DOWNLOAD_BYTES: u64 = 50 << 20;
 
 /// Where a path the user clicked points: `~` is the home folder, and a
@@ -1203,46 +1214,53 @@ fn mark_seen(pane_id: usize, view: &mut View) {
 /// thread, where the window's own resizes happen.
 fn claim_tab_size(pane_id: usize, cols: usize, rows: usize) {
     promise::spawn::spawn_into_main_thread(async move {
-        let Some(mux) = Mux::try_get() else {
-            return;
-        };
-        let Some((_, _, tab_id)) = mux.resolve_pane_id(PaneId::from(pane_id)) else {
-            return;
-        };
-        let Some(tab) = mux.get_tab(tab_id) else {
-            return;
-        };
-        let current = tab.get_size();
-        // In a split, the pane is a share of the tab: grow the tab so that
-        // share comes out at the browser's grid. Splits keep their
-        // proportions on resize, so scaling by the share lands within a cell.
-        let (cols, rows) = match tab
-            .iter_panes_ignoring_zoom()
-            .into_iter()
-            .find(|p| p.pane.pane_id() == PaneId::from(pane_id))
-        {
-            Some(p) if p.width < current.cols || p.height < current.rows => (
-                split_share(cols, current.cols, p.width),
-                split_share(rows, current.rows, p.height),
-            ),
-            _ => (cols, rows),
-        };
-        let (cols, rows) = (cols.min(MAX_COLS), rows.min(MAX_ROWS));
-        WEB_SIZED_TABS.lock().insert(tab_id.into());
-        if current.cols == cols && current.rows == rows {
-            return;
-        }
-        let cell_width = current.pixel_width / current.cols.max(1);
-        let cell_height = current.pixel_height / current.rows.max(1);
-        tab.resize(TerminalSize {
-            rows,
-            cols,
-            pixel_width: cell_width * cols,
-            pixel_height: cell_height * rows,
-            dpi: current.dpi,
-        });
+        claim_tab_size_on_gui_thread(pane_id, cols, rows);
     })
     .detach();
+}
+
+/// Apply a browser's grid on the GUI thread, including immediately after
+/// a browser-requested zoom changes the pane's share of its tab.
+/// Callers must already be running on the GUI thread.
+pub fn claim_tab_size_on_gui_thread(pane_id: usize, cols: usize, rows: usize) {
+    let Some(mux) = Mux::try_get() else {
+        return;
+    };
+    let Some((_, _, tab_id)) = mux.resolve_pane_id(PaneId::from(pane_id)) else {
+        return;
+    };
+    let Some(tab) = mux.get_tab(tab_id) else {
+        return;
+    };
+    let current = tab.get_size();
+    // In a split, the pane is a share of the tab: grow the tab so that
+    // share comes out at the browser's grid. Splits keep their
+    // proportions on resize, so scaling by the share lands within a cell.
+    let (cols, rows) = match tab
+        .iter_panes()
+        .into_iter()
+        .find(|p| p.pane.pane_id() == PaneId::from(pane_id))
+    {
+        Some(p) if p.width < current.cols || p.height < current.rows => (
+            split_share(cols, current.cols, p.width),
+            split_share(rows, current.rows, p.height),
+        ),
+        _ => (cols, rows),
+    };
+    let (cols, rows) = (cols.min(MAX_COLS), rows.min(MAX_ROWS));
+    WEB_SIZED_TABS.lock().insert(tab_id.into());
+    if current.cols == cols && current.rows == rows {
+        return;
+    }
+    let cell_width = current.pixel_width / current.cols.max(1);
+    let cell_height = current.pixel_height / current.rows.max(1);
+    tab.resize(TerminalSize {
+        rows,
+        cols,
+        pixel_width: cell_width * cols,
+        pixel_height: cell_height * rows,
+        dpi: current.dpi,
+    });
 }
 
 /// The tab extent that gives a pane holding `part` of `whole` cells a
@@ -1263,6 +1281,7 @@ struct Frame {
     /// One self-contained string per row: it positions itself and starts
     /// from reset attributes, so any subset of rows can be sent alone.
     lines: Vec<String>,
+    wrapped: Vec<bool>,
     /// Cursor position, shape and visibility, applied after the rows.
     cursor: String,
     /// Inline images on these rows (imgcat, kitty, sixel), and their data.
@@ -1419,13 +1438,33 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
         rows,
         title: pane.get_title(),
         scrolled: view.pinned_top.is_some(),
-        local_scroll: !pane.is_alt_screen_active() && !pane.is_mouse_grabbed(),
+        local_scroll: pane_scrolls_locally(pane),
         lines: rendered,
+        wrapped: (0..rows)
+            .map(|row| lines.get(row).is_some_and(Line::last_cell_was_wrapped))
+            .collect(),
         cursor: cursor_out,
         images,
         image_data,
         images_changed: false,
     }
+}
+
+fn local_scroll_allowed(alt_screen: bool, mouse_grabbed: bool, foreground: Option<&str>) -> bool {
+    // Like the native wheel handler, less -X gets arrow keys even though
+    // it uses the normal screen rather than the alternate screen.
+    !alt_screen && !mouse_grabbed && foreground.and_then(|p| p.rsplit('/').next()) != Some("less")
+}
+
+fn pane_scrolls_locally(pane: &Arc<dyn Pane>) -> bool {
+    let alt_screen = pane.is_alt_screen_active();
+    let mouse_grabbed = pane.is_mouse_grabbed();
+    let foreground = if !alt_screen && !mouse_grabbed {
+        pane.get_foreground_process_name(mux::pane::CachePolicy::AllowStale)
+    } else {
+        None
+    };
+    local_scroll_allowed(alt_screen, mouse_grabbed, foreground.as_deref())
 }
 
 /// One row's cells as SGR runs, at most `cols` wide.
@@ -1462,7 +1501,10 @@ fn render_cells(line: &Line, cols: usize, palette: &ColorPalette, out: &mut Stri
 /// Up to `HISTORY_PAGE` rows of the pane ending before `end` (the bottom of
 /// the screen when absent), with the first row's stable index and the
 /// oldest row the pane holds.
-fn history_rows(pane: &Arc<dyn Pane>, end: Option<isize>) -> (isize, isize, Vec<String>) {
+fn history_rows(
+    pane: &Arc<dyn Pane>,
+    end: Option<isize>,
+) -> (isize, isize, Vec<String>, Vec<bool>) {
     let dims = pane.get_dimensions();
     let bottom = dims.physical_top + dims.viewport_rows as isize;
     let end = end.unwrap_or(bottom).clamp(dims.scrollback_top, bottom);
@@ -1477,7 +1519,8 @@ fn history_rows(pane: &Arc<dyn Pane>, end: Option<isize>) -> (isize, isize, Vec<
             out
         })
         .collect();
-    (dims.scrollback_top, top, rows)
+    let wrapped = lines.iter().map(Line::last_cell_was_wrapped).collect();
+    (dims.scrollback_top, top, rows, wrapped)
 }
 
 /// What the browser already shows, so the next frame only carries changes.
@@ -1488,6 +1531,7 @@ struct Shown {
     scrolled: bool,
     local_scroll: bool,
     lines: Vec<String>,
+    wrapped: Vec<bool>,
     cursor: String,
     images: Vec<ImagePlacement>,
     /// For drift reports: the last row move sent, and frames since a full one.
@@ -1542,6 +1586,7 @@ impl Shown {
         }
         let images_changed = self.images != frame.images;
         if !changed
+            && self.wrapped == frame.wrapped
             && !images_changed
             && self.cursor == frame.cursor
             && self.title == frame.title
@@ -1560,6 +1605,7 @@ impl Shown {
         self.local_scroll = frame.local_scroll;
         self.cursor.clone_from(&frame.cursor);
         self.lines.clone_from(&frame.lines);
+        self.wrapped.clone_from(&frame.wrapped);
         Some((frame, data))
     }
 }
@@ -1590,6 +1636,10 @@ fn row_shift(old: &[String], new: &[String]) -> isize {
             .count()
     };
     let in_place = reused(0);
+    // A shift must save two rows. When at most one changed, none can win.
+    if in_place + 2 > rows {
+        return 0;
+    }
     let mut best = (0, in_place);
     for k in 1..=(rows / 2) as isize {
         for shift in [k, -k] {
@@ -1823,9 +1873,7 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
         WebClientMsg::Text { data } => {
             view.pinned_top = None;
             view.found_at = None;
-            pane.writer()
-                .write_all(data.as_bytes())
-                .map_err(anyhow::Error::from)
+            pane.send_text(&data)
         }
         WebClientMsg::Paste { data } => {
             view.pinned_top = None;
@@ -1913,7 +1961,7 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
                     });
                 })
         }
-        WebClientMsg::Scroll { lines } if pane.is_alt_screen_active() => {
+        WebClientMsg::Scroll { lines } if !pane_scrolls_locally(pane) => {
             let key = if lines > 0 {
                 KeyCode::UpArrow
             } else {
@@ -1964,7 +2012,12 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
         }
         WebClientMsg::ZoomPane { pane_id } => {
             if lookup_pane(pane_id).is_some() {
-                dispatch_tab_action(TabAction::Zoom { pane_id });
+                let claimed = if PaneId::from(pane_id) == pane.pane_id() {
+                    view.claimed
+                } else {
+                    None
+                };
+                dispatch_tab_action(TabAction::Zoom { pane_id, claimed });
             }
             Ok(())
         }
@@ -2022,6 +2075,51 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
 }
 
 // ── Session ───────────────────────────────────────────────────────────────────
+
+/// Application-level backpressure, released only after xterm parsed a frame.
+#[derive(Default)]
+struct FrameWindow {
+    sent: u64,
+    acked: u64,
+    enabled: bool,
+    pending: VecDeque<(u64, usize)>,
+}
+
+impl FrameWindow {
+    fn hello(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.acked = self.sent;
+        self.pending.clear();
+    }
+
+    fn ready(&self) -> bool {
+        !self.enabled
+            || (self.pending.len() < FRAME_WINDOW
+                && self.pending.iter().map(|(_, bytes)| bytes).sum::<usize>()
+                    < FRAME_BYTES_WATERMARK)
+    }
+
+    fn record(&mut self, bytes: usize) {
+        self.sent += 1;
+        if self.enabled {
+            self.pending.push_back((self.sent, bytes));
+        }
+    }
+
+    fn acknowledge(&mut self, seq: u64) {
+        if seq > self.sent {
+            return;
+        }
+        self.acked = self.acked.max(seq);
+        while self
+            .pending
+            .front()
+            .is_some_and(|(seq, _)| *seq <= self.acked)
+        {
+            self.pending.pop_front();
+        }
+    }
+}
 
 fn lookup_pane(pane_id: usize) -> Option<Arc<dyn Pane>> {
     Mux::try_get()?.get_pane(PaneId::from(pane_id))
@@ -2081,9 +2179,7 @@ pub(crate) async fn run_session(
     let mut dirty_frame = false;
     // Frames sent this session; a page's verify only counts once it has
     // applied the same number, so frames in flight never read as drift.
-    let mut frames_sent: u64 = 0;
-    let mut frames_acked = 0u64;
-    let mut flow_control = false;
+    let mut frame_window = FrameWindow::default();
     let mut last_frame_at = std::time::Instant::now();
     let mut clipboard = CLIPBOARD.subscribe();
     let mut notifications = NOTIFICATIONS.subscribe();
@@ -2124,11 +2220,11 @@ pub(crate) async fn run_session(
                     continue;
                 }
                 if let WebClientMsg::Hello { frame_ack } = msg {
-                    flow_control = frame_ack;
+                    frame_window.hello(frame_ack);
                     continue;
                 }
                 if let WebClientMsg::FrameAck { seq } = msg {
-                    if seq <= frames_sent { frames_acked = frames_acked.max(seq); }
+                    frame_window.acknowledge(seq);
                     continue;
                 }
                 if matches!(msg, WebClientMsg::Ping) {
@@ -2201,8 +2297,8 @@ pub(crate) async fn run_session(
                 if let WebClientMsg::History { end, request } = msg {
                     let Some(pane_id) = attached else { continue };
                     let Some(pane) = lookup_pane(pane_id) else { continue };
-                    let (first, top, rows) = history_rows(&pane, end);
-                    let reply = WebServerMsg::History { pane_id, request, first, top, rows: &rows };
+                    let (first, top, rows, wrapped) = history_rows(&pane, end);
+                    let reply = WebServerMsg::History { pane_id, request, first, top, rows: &rows, wrapped: &wrapped };
                     let Some(json) = encode(&reply) else { continue };
                     if outbox.send(json).await.is_err() {
                         break;
@@ -2210,7 +2306,7 @@ pub(crate) async fn run_session(
                     continue;
                 }
                 if let WebClientMsg::Verify { frames, rows } = &msg {
-                    if *frames == frames_sent && attached.is_some() {
+                    if *frames == frame_window.sent && attached.is_some() {
                         let drift = drifted_rows(&shown.lines, rows);
                         if !drift.is_empty() {
                             let pane = attached.and_then(lookup_pane);
@@ -2285,7 +2381,7 @@ pub(crate) async fn run_session(
                 }
             }
             _ = idle.tick() => {
-                if flow_control && frames_sent > frames_acked && last_frame_at.elapsed() > Duration::from_secs(90) { break; }
+                if frame_window.enabled && frame_window.sent > frame_window.acked && last_frame_at.elapsed() > Duration::from_secs(90) { break; }
                 if last_heard.elapsed() > SESSION_SILENCE {
                     log::info!("kaku-remote web: no word from the browser for {}s, ending its session", SESSION_SILENCE.as_secs());
                     break;
@@ -2330,7 +2426,7 @@ pub(crate) async fn run_session(
                     }
                 }
             }
-            _ = tokio::time::sleep_until(next_render), if dirty_frame && (!flow_control || frames_sent - frames_acked < 4) => {
+            _ = tokio::time::sleep_until(next_render), if dirty_frame && frame_window.ready() => {
                 dirty_frame = false;
                 let Some(pane_id) = attached else { continue };
                 let Some(pane) = lookup_pane(pane_id) else {
@@ -2350,6 +2446,7 @@ pub(crate) async fn run_session(
                 };
                 let images_changed = frame.images_changed;
                 let mut placed = Vec::new();
+                let mut frame_bytes = 0;
                 if images_changed {
                     for placement in &frame.images {
                         if !sent_images.contains(&placement.id) {
@@ -2358,6 +2455,7 @@ pub(crate) async fn run_session(
                             let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
                             let msg = WebServerMsg::Image { id: &placement.id, mime, data: &encoded };
                             let Some(json) = encode(&msg) else { continue };
+                            frame_bytes += json.len();
                             if outbox.send(json).await.is_err() {
                                 return;
                             }
@@ -2367,7 +2465,7 @@ pub(crate) async fn run_session(
                     }
                 }
                 let msg = WebServerMsg::Frame {
-                    seq: frames_sent + 1,
+                    seq: frame_window.sent + 1,
                     pane_id,
                     cols: frame.cols,
                     rows: frame.rows,
@@ -2375,13 +2473,15 @@ pub(crate) async fn run_session(
                     scrolled: frame.scrolled,
                     local_scroll: frame.local_scroll,
                     data: &data,
+                    wrapped: &frame.wrapped,
                     images: images_changed.then_some(placed.as_slice()),
                 };
                 let Some(json) = encode(&msg) else { continue };
+                frame_bytes += json.len();
                 if outbox.send(json).await.is_err() {
                     break;
                 }
-                frames_sent += 1;
+                frame_window.record(frame_bytes);
                 last_frame_at = std::time::Instant::now();
                 // Only a frame sent starts the interval: input marks the view
                 // dirty before its echo arrives, and that render, which finds
@@ -2605,6 +2705,7 @@ mod tests {
             scrolled: false,
             local_scroll: true,
             lines: lines.iter().map(|l| l.to_string()).collect(),
+            wrapped: vec![false; lines.len()],
             cursor: cursor.into(),
             images: Vec::new(),
             image_data: HashMap::new(),
@@ -2631,6 +2732,107 @@ mod tests {
 
         let (_, resized) = shown.update(frame(12, &["A", "X", "C"], "@2")).unwrap();
         assert_eq!(resized, "\x1b[?25lAXC@2", "a resize redraws everything");
+    }
+
+    #[test]
+    fn frame_window_allows_twelve_small_frames_and_rejects_future_acks() {
+        let mut window = FrameWindow::default();
+        window.hello(true);
+        for _ in 0..12 {
+            assert!(window.ready());
+            window.record(100);
+        }
+        assert!(!window.ready());
+        window.acknowledge(13);
+        assert!(!window.ready(), "a future ACK cannot release backpressure");
+        window.acknowledge(5);
+        assert!(window.ready());
+        assert_eq!(window.pending.len(), 7);
+        window.acknowledge(5);
+        window.acknowledge(3);
+        assert_eq!(
+            window.pending.len(),
+            7,
+            "duplicate and older ACKs do nothing"
+        );
+        window.acknowledge(12);
+        assert!(window.pending.is_empty());
+    }
+
+    #[test]
+    fn frame_window_byte_watermark_pauses_until_ack_and_allows_one_large_frame() {
+        let mut window = FrameWindow::default();
+        window.hello(true);
+        window.record(FRAME_BYTES_WATERMARK - 1);
+        assert!(window.ready());
+        window.record(1);
+        assert!(
+            !window.ready(),
+            "byte backpressure precedes the frame count limit"
+        );
+        window.acknowledge(1);
+        assert!(window.ready());
+        window.record(FRAME_BYTES_WATERMARK * 2);
+        assert!(
+            !window.ready(),
+            "a complete frame may cross the watermark once"
+        );
+        window.acknowledge(2);
+        assert!(!window.ready(), "the large frame still needs its own ACK");
+        window.acknowledge(3);
+        assert!(
+            window.ready(),
+            "large frames cannot permanently stall the window"
+        );
+    }
+
+    #[test]
+    fn frame_window_hello_clears_accounting_without_reusing_sequences() {
+        let mut window = FrameWindow::default();
+        window.hello(true);
+        window.record(FRAME_BYTES_WATERMARK);
+        window.hello(true);
+        assert!(window.ready());
+        assert!(window.pending.is_empty());
+        assert_eq!(window.acked, window.sent);
+        window.record(20);
+        assert_eq!(window.sent, 2);
+        window.hello(false);
+        assert!(window.pending.is_empty());
+        for _ in 0..20 {
+            assert!(window.ready());
+            window.record(20);
+        }
+        assert!(
+            window.pending.is_empty(),
+            "legacy clients retain no byte ledger"
+        );
+        window.hello(true);
+        assert!(window.ready());
+        assert_eq!(window.acked, 22);
+        window.record(20);
+        window.acknowledge(2);
+        assert_eq!(
+            window.pending.len(),
+            1,
+            "an old ACK cannot release new frames"
+        );
+    }
+
+    #[test]
+    fn wrap_only_changes_reach_the_browser() {
+        let mut shown = Shown::default();
+        shown.update(frame(10, &["ABCDEFGHIJ", "K"], "@1"));
+        let mut wrapped = frame(10, &["ABCDEFGHIJ", "K"], "@1");
+        wrapped.wrapped[0] = true;
+        let (sent, _) = shown
+            .update(wrapped)
+            .expect("soft wrap changed with identical row text");
+        assert_eq!(sent.wrapped, [true, false]);
+        let (sent, _) = shown
+            .update(frame(10, &["ABCDEFGHIJ", "K"], "@1"))
+            .expect("hard newline restored");
+        assert_eq!(sent.wrapped, [false, false]);
     }
 
     /// Rows as render_frame writes them: each carries its own position.
@@ -2821,19 +3023,26 @@ mod tests {
         let mut got = Vec::new();
         let take = |got: &mut Vec<u8>, msgs: &[serde_json::Value]| {
             for m in msgs.iter().filter(|m| m["type"] == "file_chunk") {
-                got.extend(
-                    base64::engine::general_purpose::STANDARD
-                        .decode(m["data"].as_str().unwrap())
-                        .unwrap(),
+                let chunk = base64::engine::general_purpose::STANDARD
+                    .decode(m["data"].as_str().unwrap())
+                    .unwrap();
+                assert!(
+                    chunk.len() <= 64 * 1024,
+                    "each chunk leaves room for terminal input"
                 );
+                got.extend(chunk);
             }
         };
         take(&mut got, &first);
         // Nothing past the window goes out before the page acknowledges.
         assert!(got.len() as u64 <= DOWNLOAD_WINDOW);
+        assert!(
+            got.len() <= 256 * 1024,
+            "a file cannot queue a megabyte ahead of typing"
+        );
         assert!(!first.iter().any(|m| m["type"] == "file_end"));
         let mut ended = false;
-        for _ in 0..10 {
+        for _ in 0..bytes.len().div_ceil(DOWNLOAD_WINDOW as usize) {
             let ack = WebClientMsg::DownloadAck {
                 id: 1,
                 received: got.len() as u64,
@@ -3025,12 +3234,16 @@ mod tests {
     fn matching_dimensions_still_record_browser_ownership() {
         let source = include_str!("web.rs");
         let claim = source
-            .split("fn claim_tab_size(")
+            .split("pub fn claim_tab_size_on_gui_thread(")
             .nth(1)
             .unwrap()
             .split("fn split_share(")
             .next()
             .unwrap();
+        assert!(
+            claim.contains(".iter_panes()"),
+            "zoomed panes must use their visible size"
+        );
         assert!(
             claim
                 .find("WEB_SIZED_TABS.lock().insert(tab_id.into());")
@@ -3039,6 +3252,53 @@ mod tests {
                     .find("if current.cols == cols && current.rows == rows {")
                     .unwrap()
         );
+    }
+
+    #[test]
+    fn browser_zoom_carries_only_its_attached_pane_claim() {
+        let source = include_str!("web.rs");
+        let zoom = source
+            .split("WebClientMsg::ZoomPane { pane_id } => {")
+            .nth(1)
+            .unwrap()
+            .split("WebClientMsg::CloseTab")
+            .next()
+            .unwrap();
+        assert!(zoom.contains("if PaneId::from(pane_id) == pane.pane_id() {"));
+        assert!(zoom.contains("view.claimed"));
+        assert!(zoom.contains("} else {\n                    None\n                }"));
+        assert!(zoom.contains("TabAction::Zoom { pane_id, claimed }"));
+    }
+
+    #[test]
+    fn browser_zoom_reclaims_in_the_same_gui_callback() {
+        let source = include_str!("../../../kaku-gui/src/remote_tabs.rs");
+        let zoom = source
+            .split("TabAction::Zoom { claimed, .. } => {")
+            .nth(1)
+            .unwrap()
+            .split("TabAction::Rename")
+            .next()
+            .unwrap();
+        let toggled = zoom.find("tab.toggle_zoom();").unwrap();
+        let reclaimed = zoom
+            .find("claim_tab_size_on_gui_thread(pane_id.into(), cols, rows);")
+            .unwrap();
+        assert!(toggled < reclaimed);
+        assert!(zoom.contains("if let Some((cols, rows)) = claimed {"));
+        assert!(!zoom.contains("spawn"));
+    }
+
+    #[test]
+    fn less_without_alt_screen_receives_scroll_keys() {
+        for process in [Some("less"), Some("/usr/bin/less")] {
+            assert!(!local_scroll_allowed(false, false, process));
+        }
+        for process in [None, Some("/bin/zsh"), Some("/usr/bin/lesspipe")] {
+            assert!(local_scroll_allowed(false, false, process));
+            assert!(!local_scroll_allowed(true, false, process));
+            assert!(!local_scroll_allowed(false, true, process));
+        }
     }
 
     #[test]

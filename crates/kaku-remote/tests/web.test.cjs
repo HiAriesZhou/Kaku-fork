@@ -16,7 +16,9 @@ before(async () => {
 after(async () => { await browser?.close(); });
 
 async function page(t, hash = '#t=fixture', options = {}, context = browser) {
-  const p = await context.newPage({ viewport: { width: 1000, height: 600 }, ...options });
+  const { platform, ...pageOptions } = options;
+  const p = await context.newPage({ viewport: { width: 1000, height: 600 }, ...pageOptions });
+  if (platform) await p.addInitScript(value => Object.defineProperty(navigator, 'platform', { value }), platform);
   t.after(() => p.close());
   const errors = [];
   p.on('pageerror', e => errors.push(e.message));
@@ -548,6 +550,141 @@ test('a late history reply from before the view reopened is dropped', async t =>
   assert.equal(await p.evaluate(() => document.getElementById('past').classList.contains('show')), false);
 });
 
+async function focusHistory(p, select = false) {
+  await p.evaluate(select => {
+    probe.openPast();
+    probe.onHistory({ request: messages.filter(m => m.type === 'history').at(-1).request,
+      pane_id: 1, first: 0, top: 0, rows: ['\x1b[0mhistory text'] });
+    document.body.tabIndex = -1;
+    document.body.focus();
+    if (select) {
+      const range = document.createRange();
+      range.selectNodeContents(document.querySelector('#past .row'));
+      getSelection().removeAllRanges(); getSelection().addRange(range);
+    }
+    messages.length = 0;
+  }, select);
+}
+
+for (const [name, key, expected] of [
+  ['newline', 'Shift+Enter', { type: 'text', data: '\n' }],
+  ['function key', 'F2', { type: 'key', key: 'F2', ctrl: false, alt: false, shift: false }],
+  ['word motion', process.platform === 'darwin' ? 'Alt+ArrowLeft' : 'Control+ArrowLeft', { type: 'key', key: 'b', ctrl: false, alt: true, shift: false }],
+  ['plain character', 'x', { type: 'text', data: 'x' }],
+]) test('history first key preserves ' + name, async t => {
+  const { p, errors } = await page(t); await screen(p); await captureClipboard(p);
+  await focusHistory(p);
+  await p.keyboard.press(key);
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'text' || m.type === 'key')), [expected]);
+  assert.deepEqual(errors, []);
+});
+
+test('history paste keeps the browser default and focuses the terminal', async t => {
+  const { p } = await page(t, '#t=fixture', { platform: 'Linux x86_64' });
+  await screen(p); await captureClipboard(p); await focusHistory(p);
+  const result = await p.evaluate(() => {
+    const ev = new KeyboardEvent('keydown', { key: 'v', code: 'KeyV', ctrlKey: true, bubbles: true, cancelable: true });
+    document.body.dispatchEvent(ev);
+    const focused = document.activeElement.classList.contains('xterm-helper-textarea');
+    const data = new DataTransfer(); data.setData('text/plain', 'paste fixture');
+    document.activeElement.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+    return { prevented: ev.defaultPrevented, focused, inputs: messages.filter(m => ['text', 'key', 'paste'].includes(m.type)) };
+  });
+  assert.deepEqual(result, { prevented: false, focused: true, inputs: [{ type: 'paste', data: 'paste fixture' }] });
+});
+
+test('history first IME key focuses input without cancelling composition', async t => {
+  const { p, errors } = await page(t); await screen(p); await captureClipboard(p); await focusHistory(p);
+  const result = await p.evaluate(() => {
+    const ev = new KeyboardEvent('keydown', { key: 'Unidentified', keyCode: 229, bubbles: true, cancelable: true });
+    document.body.dispatchEvent(ev);
+    return { prevented: ev.defaultPrevented, focused: document.activeElement.classList.contains('xterm-helper-textarea') };
+  });
+  assert.deepEqual(result, { prevented: false, focused: true });
+  const cdp = await p.context().newCDPSession(p);
+  await cdp.send('Input.imeSetComposition', { text: 'nihao', selectionStart: 5, selectionEnd: 5 });
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'text')), []);
+  await cdp.send('Input.insertText', { text: '你好' });
+  await p.waitForTimeout(30);
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'text')), [{ type: 'text', data: '你好' }]);
+  assert.deepEqual(errors, []);
+});
+
+test('queued wheel scrolling cannot follow attachment to another pane', async t => {
+  const { p } = await page(t); await screen(p);
+  await p.evaluate(() => {
+    probe.handle({ type: 'frame', pane_id: 1, cols: 80, rows: 24, local_scroll: false, data: '' });
+    messages.length = 0;
+    document.querySelector('#stage').dispatchEvent(new WheelEvent('wheel', { deltaY: 100, bubbles: true, cancelable: true }));
+    probe.attach({ pane_id: 2, tab_id: 2 }, true);
+  });
+  await p.waitForTimeout(50);
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'scroll')), []);
+});
+
+test('touch fling stops when attachment changes', async t => {
+  const { p } = await page(t, '#t=fixture', { hasTouch: true }); await screen(p);
+  await p.evaluate(() => {
+    probe.handle({ type: 'frame', pane_id: 1, cols: 80, rows: 24, local_scroll: false, data: '' });
+    const stage = document.querySelector('#stage');
+    const touch = y => new Touch({ identifier: 1, target: stage, clientX: 50, clientY: y });
+    stage.dispatchEvent(new TouchEvent('touchstart', { touches: [touch(250)], bubbles: true }));
+    stage.dispatchEvent(new TouchEvent('touchmove', { touches: [touch(50)], bubbles: true, cancelable: true }));
+    stage.dispatchEvent(new TouchEvent('touchend', { touches: [], bubbles: true, cancelable: true }));
+    probe.attach({ pane_id: 2, tab_id: 2 }, true);
+    messages.length = 0;
+  });
+  await p.waitForTimeout(100);
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'scroll' || m.type === 'history')), []);
+});
+
+test('changing a custom font back to the default restores the bundled stack', async t => {
+  const { p } = await page(t); await screen(p);
+  const fonts = await p.evaluate(() => {
+    const initial = probe.term.options.fontFamily;
+    probe.handle({ type: 'config', font_family: 'Menlo' });
+    const custom = probe.term.options.fontFamily;
+    probe.handle({ type: 'config', font_family: 'JetBrains Mono' });
+    return { initial, custom, restored: probe.term.options.fontFamily };
+  });
+  assert.match(fonts.custom, /^"Menlo",/);
+  assert.equal(fonts.restored, fonts.initial);
+});
+
+test('history shortcuts do not duplicate tab actions or leak find keys', async t => {
+  const { p, errors } = await page(t, '#t=fixture', { platform: 'Linux' });
+  await screen(p);
+  await focusHistory(p);
+  await p.keyboard.press('Control+Shift+f');
+  assert.equal(await p.locator('#find').evaluate(el => el.classList.contains('show')), true);
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => ['key', 'text'].includes(m.type))), []);
+  assert.deepEqual(errors, []);
+  const mac = (await page(t, '#t=fixture', { platform: 'MacIntel' })).p;
+  await screen(mac);
+  await focusHistory(mac);
+  await mac.keyboard.press('Meta+2');
+  assert.deepEqual(await mac.evaluate(() => messages.filter(m => m.type === 'attach').map(m => m.pane_id)), [2]);
+});
+
+test('history copy keeps native selection and does not send terminal input', async t => {
+  for (const platform of ['MacIntel', 'Linux']) {
+    const { p } = await page(t, '#t=fixture', { platform });
+    await screen(p);
+    await captureClipboard(p);
+    await focusHistory(p, true);
+    const result = await p.evaluate(mac => {
+      const before = String(getSelection());
+      const ev = new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', metaKey: mac, ctrlKey: !mac, bubbles: true, cancelable: true });
+      document.body.dispatchEvent(ev);
+      return { before, after: String(getSelection()), prevented: ev.defaultPrevented, messages };
+    }, platform === 'MacIntel');
+    assert.ok(result.before);
+    assert.equal(result.after, result.before);
+    assert.equal(result.prevented, false);
+    assert.deepEqual(result.messages, []);
+  }
+});
+
 test('oversized UTF-8 paste is rejected visibly and a normal paste is preserved', async t => {
   const { p } = await page(t);
   await screen(p);
@@ -743,6 +880,138 @@ test('history auto-copy and manual copy preserve Unicode, newlines and virtual g
   });
   assert.equal(result.automatic, result.expected);
   assert.equal(result.manual, result.expected);
+});
+
+test('live copy joins soft wraps and keeps hard breaks across all copy paths and snapshots', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await captureClipboard(p);
+  const result = await p.evaluate(async () => {
+    const drain = () => new Promise(resolve => probe.term.write('', resolve));
+    probe.handle({ type: 'frame', pane_id: 1, cols: 10, rows: 3, local_scroll: true, wrapped: [true, false, false],
+      data: '\x1b[2J\x1b[1;1HABCDEFGHIJ\x1b[2;1HK\x1b[3;1H你好' });
+    await drain();
+    document.querySelector('#stage').dispatchEvent(new PointerEvent('pointerdown', { button: 0, bubbles: true }));
+    probe.term.select(0, 0, 24);
+    window.dispatchEvent(new MouseEvent('mouseup', { button: 0 }));
+    const copy = () => {
+      const data = new DataTransfer();
+      document.querySelector('.xterm-helper-textarea').dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, bubbles: true, cancelable: true }));
+      return data.getData('text/plain');
+    };
+    const automatic = copied.at(-1), manual = copy();
+    document.querySelector('#term').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 100 }));
+    [...document.querySelectorAll('#menu button')].find(b => b.textContent === 'Copy').click();
+    const menu = copied.at(-1);
+    probe.attach({ tab_id: 2, pane_id: 2 });
+    probe.handle({ type: 'frame', pane_id: 2, cols: 10, rows: 3, data: '\x1b[2J\x1b[1;1Hother' });
+    await drain();
+    probe.attach({ tab_id: 1, pane_id: 1 });
+    await drain();
+    probe.term.select(0, 0, 24);
+    return { automatic, manual, menu, cached: copy() };
+  });
+  assert.deepEqual(result, Object.fromEntries(['automatic', 'manual', 'menu', 'cached'].map(k => [k, 'ABCDEFGHIJK\n你好'])));
+  assert.deepEqual(errors, []);
+});
+
+test('copy does not guess soft wraps from a full row when metadata is absent or false', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await captureClipboard(p);
+  for (const wrapped of [undefined, [false, false, false]]) {
+    const selected = await p.evaluate(async wrapped => {
+      probe.handle({ type: 'frame', pane_id: 1, cols: 10, rows: 3, wrapped,
+        data: '\x1b[2J\x1b[1;1HABCDEFGHIJ\x1b[2;1HK' });
+      await new Promise(resolve => probe.term.write('', resolve));
+      probe.term.select(0, 0, 11);
+      const data = new DataTransfer();
+      document.querySelector('.xterm-helper-textarea').dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, bubbles: true, cancelable: true }));
+      return data.getData('text/plain');
+    }, wrapped);
+    assert.equal(selected, 'ABCDEFGHIJ\nK');
+  }
+});
+
+test('history copy preserves soft wraps when older pages are prepended', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await captureClipboard(p);
+  const selected = await p.evaluate(() => {
+    const request = () => messages.filter(m => m.type === 'history').at(-1).request;
+    probe.openPast();
+    probe.onHistory({ request: request(), pane_id: 1, first: 0, top: 2, rows: ['tail', 'hard'], wrapped: [false, false] });
+    probe.pastScroll(1e7);
+    probe.onHistory({ request: request(), pane_id: 1, first: 0, top: 0, rows: ['ABCDEFGHIJ', 'K'], wrapped: [true, true] });
+    const rows = document.querySelectorAll('#past .row');
+    const range = document.createRange();
+    range.setStart(rows[0].querySelector('span span').firstChild, 2);
+    range.setEnd(rows[3].querySelector('span span').firstChild, 4);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    const data = new DataTransfer();
+    document.dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, cancelable: true }));
+    return data.getData('text/plain');
+  });
+  assert.equal(selected, 'CDEFGHIJKtail\nhard');
+});
+
+test('soft-wrap copy keeps spaces and partial endpoints and updates on a metadata-only frame', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  const result = await p.evaluate(async () => {
+    const frame = wrapped => probe.handle({ type: 'frame', pane_id: 1, cols: 10, rows: 3, wrapped,
+      data: '\x1b[2J\x1b[1;1HAB  CDEF  \x1b[2;1H  K' });
+    const copy = async () => {
+      await new Promise(resolve => probe.term.write('', resolve));
+      probe.term.select(2, 0, 11);
+      const data = new DataTransfer();
+      document.querySelector('.xterm-helper-textarea').dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, bubbles: true, cancelable: true }));
+      return data.getData('text/plain');
+    };
+    frame([true, false, false]);
+    const soft = await copy();
+    probe.handle({ type: 'frame', pane_id: 1, cols: 10, rows: 3, wrapped: [false, false, false], data: '' });
+    return { soft, hard: await copy() };
+  });
+  assert.deepEqual(result, { soft: '  CDEF    K', hard: '  CDEF  \n  K' });
+});
+
+test('soft-wrap metadata does not join a rectangular selection', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await captureClipboard(p);
+  await p.evaluate(async () => {
+    probe.handle({ type: 'frame', pane_id: 1, cols: 10, rows: 3, wrapped: [true, false, false],
+      data: '\x1b[2J\x1b[1;1HABCDEFGHIJ\x1b[2;1HTUVWXYZ' });
+    await new Promise(resolve => probe.term.write('', resolve));
+  });
+  const rect = await p.locator('.xterm-screen').boundingBox();
+  await p.keyboard.down('Alt');
+  await p.mouse.move(rect.x + rect.width / 10 * 1.1, rect.y + rect.height / 6);
+  await p.mouse.down();
+  const current = await p.locator('.xterm-screen').boundingBox();
+  await p.mouse.move(current.x + current.width / 10 * 4.1, current.y + current.height / 2, { steps: 3 });
+  await p.mouse.up();
+  await p.keyboard.up('Alt');
+  const result = await p.evaluate(() => {
+    const data = new DataTransfer();
+    document.querySelector('.xterm-helper-textarea').dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, bubbles: true, cancelable: true }));
+    return { selected: probe.term.getSelection(), manual: data.getData('text/plain'), automatic: copied.at(-1) };
+  });
+  assert.equal(result.selected, 'BCD\nUVW');
+  assert.equal(result.manual, result.selected);
+  assert.equal(result.automatic, result.selected);
+  // Shift extends the existing rectangular selection after Alt is released.
+  await p.keyboard.down('Shift');
+  await p.mouse.click(current.x + current.width / 10 * 5.1, current.y + current.height * 5 / 6);
+  await p.keyboard.up('Shift');
+  const extended = await p.evaluate(() => {
+    const data = new DataTransfer();
+    document.querySelector('.xterm-helper-textarea').dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, bubbles: true, cancelable: true }));
+    return { selected: probe.term.getSelection(), manual: data.getData('text/plain') };
+  });
+  assert.match(extended.selected, /\n/);
+  assert.equal(extended.manual, extended.selected);
 });
 
 test('denied auto-copy never queues stale text for a later unrelated click', async t => {
@@ -1005,6 +1274,49 @@ test('a split pane zooms from the menu or Cmd+Shift+Enter, and the menu names th
   await p.evaluate(() => probe.attach({ tab_id: 2, pane_id: 2 }, true));
   await p.locator('.xterm-screen').click({ button: 'right', position: { x: 20, y: 10 } });
   assert.equal(await p.locator('#menu button').getByText(/Zoom Pane/).count(), 0);
+});
+
+for (const entry of ['keyboard', 'menu']) test('browser zoom reclaims its grid after the authoritative frame via ' + entry, async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => document.fonts.ready);
+  await p.waitForTimeout(200);
+  const initial = await p.evaluate(async () => {
+    const grid = messages.filter(m => m.type === 'resize').at(-1);
+    probe.handle({ type: 'frame', pane_id: 1, cols: grid.cols, rows: grid.rows, data: '\x1b[2J\x1b[1;1Hzoom' });
+    await new Promise(resolve => probe.term.write('', resolve));
+    probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, title: 'split', zoomed: false,
+      panes: [{ pane_id: 1 }, { pane_id: 3 }] }] });
+    messages.length = 0;
+    return { grid, font: probe.term.options.fontSize };
+  });
+  const frame = cols => p.evaluate(async ({ cols, rows }) => {
+    probe.handle({ type: 'frame', pane_id: 1, cols, rows, data: '' });
+    await new Promise(resolve => probe.term.write('', resolve));
+    return messages.filter(m => m.type === 'resize');
+  }, { cols, rows: initial.grid.rows });
+  // A resize from native Kaku or another browser does not give this page
+  // permission to take the tab back without its own interaction.
+  assert.deepEqual(await frame(initial.grid.cols * 2), []);
+  await frame(initial.grid.cols);
+  for (const zoomed of [false, true]) {
+    await p.evaluate(zoomed => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, title: 'split', zoomed,
+      panes: [{ pane_id: 1 }, { pane_id: 3 }] }] }), zoomed);
+    await p.evaluate(() => { messages.length = 0; });
+    if (entry === 'keyboard') {
+      await p.locator('.xterm-helper-textarea').focus();
+      await p.keyboard.press('Meta+Shift+Enter');
+    } else {
+      await p.locator('.xterm-screen').click({ button: 'right', position: { x: 20, y: 10 } });
+      await p.locator('#menu button').getByText(zoomed ? 'Unzoom Pane' : 'Zoom Pane', { exact: true }).click();
+    }
+    assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'zoom_pane').length), 1);
+    await p.evaluate(() => { messages.length = 0; });
+    assert.deepEqual(await frame(zoomed ? Math.floor(initial.grid.cols / 2) : initial.grid.cols * 2), [initial.grid]);
+    await frame(initial.grid.cols);
+    assert.equal(await p.evaluate(() => probe.term.options.fontSize), initial.font);
+  }
+  assert.deepEqual(errors, []);
 });
 
 test('terminal menu fits narrow and short viewport corners', async t => {

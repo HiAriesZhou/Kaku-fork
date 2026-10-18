@@ -463,7 +463,10 @@
   const send = (msg) => {
     const socket = ws;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    if (INPUT_TYPES.has(msg.type)) closePast();
+    if (INPUT_TYPES.has(msg.type)) { stopScrolling(); closePast(); }
+    // Zoom changes the pane's share of its tab. Let its next frame reclaim
+    // our grid after the Mac has applied the zoom, even if our size is unchanged.
+    if (msg.type === "zoom_pane" && msg.pane_id === paneId) claimed = "";
     const json = JSON.stringify(msg);
     if (!relay) { socket.send(json); return; }
     const conn = link;
@@ -840,7 +843,7 @@
   };
   window.addEventListener("keydown", (ev) => {
     // Outside the terminal (the tab bar, the page) the same keys still work.
-    if (termEl.contains(ev.target) || dialogEl.contains(ev.target)) return;
+    if (ev.defaultPrevented || termEl.contains(ev.target) || dialogEl.contains(ev.target)) return;
     const k = tabKey(ev);
     if (k) { ev.preventDefault(); runTabKey(k); }
   });
@@ -866,7 +869,7 @@
     return (optionHeld.right && composeOption.right) || (optionHeld.left && composeOption.left);
   };
 
-  term.attachCustomKeyEventHandler((ev) => {
+  const handleTerminalKey = (ev) => {
     if (ev.isComposing || ev.keyCode === 229) return true;
     const tk = tabKey(ev);
     if (tk) {
@@ -920,7 +923,8 @@
     }
     ev.preventDefault();
     return false;
-  });
+  };
+  term.attachCustomKeyEventHandler(handleTerminalKey);
   // Key row for touch keyboards, which have no Esc, Tab, Ctrl or arrows.
   // Ctrl stays down for the next key, typed or tapped. Buttons act on
   // pointerdown and never take focus, so the keyboard stays open.
@@ -1086,6 +1090,7 @@
   let pastFirst = 0;
   let pastCell = null;
   let pastRows = [];
+  let pastWrapped = [];
   let pastSpacer = null;
   const pastRendered = new Map();
   // Stable row nodes preserve native text selection while the visible
@@ -1229,6 +1234,7 @@
     pastEl.classList.remove("show");
     pastEl.textContent = "";
     pastRows = [];
+    pastWrapped = [];
     pastSpacer = null;
     pastRendered.clear();
     showHistoryButton();
@@ -1261,6 +1267,7 @@
       pastEl.style.height = screenEl.offsetHeight + "px";
       pastEl.textContent = "";
       pastRows = msg.rows;
+      pastWrapped = msg.rows.map((_, i) => !!msg.wrapped?.[i]);
       pastSpacer = null;
       pastRendered.clear();
       pastTop = msg.top;
@@ -1279,6 +1286,7 @@
       // Older rows, above what is shown; keep the view where it was.
       const position = pastEl.scrollTop;
       pastRows = msg.rows.concat(pastRows);
+      pastWrapped = msg.rows.map((_, i) => !!msg.wrapped?.[i]).concat(pastWrapped);
       pastTop = msg.top;
       renderPast();
       pastEl.scrollTop = position + msg.rows.length * pastCell.height;
@@ -1362,6 +1370,13 @@
   let touchVel = 0;
   let touchAt = 0;
   let flingFrame = 0;
+  const stopScrolling = () => {
+    cancelAnimationFrame(wheelFrame);
+    cancelAnimationFrame(flingFrame);
+    wheelFrame = flingFrame = 0;
+    wheelRemainder = wheelPending = 0;
+    touchY = null;
+  };
   // Two fingers pinch the text size: the terminal previews the scale under
   // the fingers, and on release the page refits and claims the new grid.
   let pinchFrom = 0;
@@ -1441,6 +1456,7 @@
   }, { passive: true, capture: true });
 
   historyBtn.addEventListener("click", () => {
+    stopScrolling();
     closePast();
     send({ type: "scroll", lines: -1e9 });
     term.focus();
@@ -1448,22 +1464,6 @@
   // A press in the history view selects its text; elsewhere it focuses the
   // terminal.
   stage.addEventListener("mousedown", (ev) => { if (!pastEl.contains(ev.target)) term.focus(); });
-  // Typing while reading history goes back to live, as on the Mac.
-  // Keys pressed while the history view has focus (after selecting in it)
-  // go to the terminal; copying the selection stays the browser's.
-  window.addEventListener("keydown", (ev) => {
-    if (!pastOpen || ev.metaKey || ev.isComposing || termEl.contains(ev.target)) return;
-    if (findEl.contains(ev.target) || dialogEl.contains(ev.target) || ev.target.tagName === "INPUT") return;
-    if (["Shift", "Alt", "Control", "Meta", "CapsLock"].includes(ev.key)) return;
-    if (!IS_MAC && ev.ctrlKey && /^[cC]$/.test(ev.key) && String(window.getSelection())) return;
-    ev.preventDefault();
-    term.focus();
-    if (ev.ctrlKey && /^Key[A-Z]$/.test(ev.code)) send({ type: "key", key: ev.code.slice(3).toLowerCase(), ctrl: true, alt: ev.altKey, shift: ev.shiftKey });
-    else if (ev.key.length === 1 && !ev.ctrlKey) send({ type: "text", data: ev.key });
-    else if (NAMED.has(ev.key)) send({ type: "key", key: ev.key, ctrl: ev.ctrlKey, alt: ev.altKey, shift: ev.shiftKey });
-    else closePast();
-  }, true);
-
   // ── Tabs ───────────────────────────────────────────────────────────────
   let tabs = [];
   // After asking for a new tab, follow it once it shows up, the way Cmd+T
@@ -1491,6 +1491,7 @@
   const CLEAR = "\x1b[0m\x1b[2J\x1b[3J";
   let clearPending = false;
   const snapshots = new Map();
+  let liveWrapped = [];
   const NO_WRAP = "\x1b[?7l";
   // The cursor blinks only once the screen is still. Every frame repeats the
   // cursor's shape (DECSCUSR), and a blinking one restarts its blink on each
@@ -1558,13 +1559,15 @@
       }
       out += "\x1b[0m\x1b[K";
     }
-    return { cols: term.cols, rows: term.rows, data: out };
+    return { cols: term.cols, rows: term.rows, data: out, wrapped: liveWrapped.slice() };
   };
 
   const attach = (tab, focus = false) => {
+    stopScrolling();
     closePast();
     if (paneId !== null && size.cols) snapshots.set(paneId, snapshot());
     paneId = tab.pane_id;
+    liveWrapped = [];
     tabId = tab.tab_id;
     claimed = "";
     imagePlacements = [];
@@ -1581,7 +1584,9 @@
       // waits on a timer, which Chrome runs only after the frame that
       // follows a click, and the tab showed one frame late.
       term._core?._writeBuffer?.handleUserInput?.();
-      term.write(NO_WRAP + "\x1b[?25l" + CLEAR + steadyCursor(saved.data));
+      term.write(NO_WRAP + "\x1b[?25l" + CLEAR + steadyCursor(saved.data), () => {
+        if (paneId === tab.pane_id) liveWrapped = saved.wrapped || [];
+      });
     }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     renderTabs();
@@ -1993,7 +1998,7 @@
     if (TOUCH || paneId === null) return;
     ev.preventDefault();
     const target = paneId;
-    const selected = pastOpen ? historySelection() : term.getSelection();
+    const selected = pastOpen ? historySelection() : liveSelection();
     const items = [];
     if (selected) items.push(["Copy", () => {
       pendingCopy = null;
@@ -2069,8 +2074,8 @@
     (cfg.ansi || []).slice(0, 8).forEach((c, i) => { theme[themeName(i)] = c; });
     (cfg.brights || []).slice(0, 8).forEach((c, i) => { theme[themeName(i + 8)] = c; });
     term.options.theme = theme;
-    if (cfg.font_family && cfg.font_family !== "JetBrains Mono") {
-      term.options.fontFamily = '"' + cfg.font_family + '", ' + FONT_STACK;
+    if (cfg.font_family) {
+      term.options.fontFamily = cfg.font_family === "JetBrains Mono" ? FONT_STACK : '"' + cfg.font_family + '", ' + FONT_STACK;
     }
     if (cfg.line_height) term.options.lineHeight = cfg.line_height;
     document.body.classList.toggle("tabs-bottom", !!cfg.tab_bar_at_bottom);
@@ -2157,7 +2162,10 @@
     clearPending = false;
     term.write(clear + NO_WRAP + steadyCursor(msg.data), () => {
       if (ws !== socket) return;
-      if (msg.pane_id === paneId) markFound();
+      if (msg.pane_id === paneId) {
+        liveWrapped = msg.wrapped || [];
+        markFound();
+      }
       if (msg.seq) send({ type: "frame_ack", seq: msg.seq });
     });
     if (msg.images) imagePlacements = msg.images;
@@ -2204,18 +2212,41 @@
         lines.push(part.toString());
       } else lines.push((pastRows[id - pastTop] || "").replace(SEQ, ""));
     }
-    return lines.join("\n");
+    return lines.map((line, i) => (i && !pastWrapped[first + i - 1 - pastTop] ? "\n" : "") + line).join("");
+  };
+  // Frames position rows with autowrap off. Their wrap bits, not a full
+  // last column, tell a copied soft wrap apart from an explicit newline.
+  let columnSelection = false;
+  const liveSelection = () => {
+    const text = term.getSelection();
+    const range = term.getSelectionPosition();
+    if (!text || !range || columnSelection || !liveWrapped.some(Boolean)) return text;
+    const buf = term.buffer.active;
+    const newline = text.includes("\r\n") ? "\r\n" : "\n";
+    let out = "";
+    for (let y = range.start.y; y <= range.end.y; y++) {
+      if (y > range.start.y && !liveWrapped[y - 1 - buf.viewportY]) out += newline;
+      const start = y === range.start.y ? range.start.x : 0;
+      const end = y === range.end.y ? range.end.x : term.cols;
+      const trim = y === range.end.y || !liveWrapped[y - buf.viewportY];
+      out += buf.getLine(y)?.translateToString(trim, start, end).replace(/\u00a0/g, " ") || "";
+    }
+    return out;
   };
   let selectionGesture = false;
   let lastAutoCopy = "";
   const copySelection = () => {
     if (!copyOnSelect) return;
-    const text = pastOpen ? historySelection() : term.getSelection();
+    const text = pastOpen ? historySelection() : liveSelection();
     if (!text || text === lastAutoCopy) return;
     lastAutoCopy = text;
     pendingCopy = null;
     navigator.clipboard?.writeText(text).catch(() => {});
   };
+  stage.addEventListener("mousedown", ev => {
+    if (ev.button !== 0 || ev.shiftKey && term.hasSelection()) return;
+    columnSelection = ev.detail === 1 && ev.altKey && !(IS_MAC && term.options.macOptionClickForcesSelection);
+  }, true);
   stage.addEventListener("pointerdown", ev => {
     if (ev.button !== 0) return;
     selectionGesture = true;
@@ -2234,14 +2265,15 @@
   document.addEventListener("selectionchange", () => {
     if (TOUCH && pastOpen && !selectionGesture) copySelection();
   });
-  // Absolute-positioned history rows need explicit line breaks, including
-  // rows outside the virtual DOM between the selected endpoints.
+  // Use the same line boundaries for manual and automatic copies, including
+  // history rows outside the virtual DOM between the selected endpoints.
   document.addEventListener("copy", ev => {
-    const text = historySelection();
+    const text = pastOpen ? historySelection() : termEl.contains(ev.target) ? liveSelection() : "";
     if (!text || !ev.clipboardData) return;
     ev.clipboardData.setData("text/plain", text);
     ev.preventDefault();
-  });
+    ev.stopPropagation();
+  }, true);
 
   // While this page is in the background, a Kaku tab that wants attention
   // (a finished task's bell) marks the browser tab's title.
@@ -2266,6 +2298,7 @@
     if (!pendingMark) return;
     const { row, col, len } = pendingMark;
     pendingMark = null;
+    columnSelection = false;
     term.select(col, term.buffer.active.viewportY + row, len);
   };
   const findStep = (older) => {
@@ -2313,6 +2346,19 @@
     (IS_MAC ? ev.metaKey && !ev.ctrlKey && !ev.shiftKey : ev.ctrlKey && ev.shiftKey && !ev.metaKey);
   window.addEventListener("keydown", (ev) => {
     if (isFindKey(ev)) { ev.preventDefault(); ev.stopPropagation(); openFind(); }
+  }, true);
+
+  // Selecting history moves focus outside xterm. Reuse its key policy and
+  // focus its textarea before the browser delivers paste, keypress or IME.
+  window.addEventListener("keydown", (ev) => {
+    if (!pastOpen || ev.defaultPrevented || termEl.contains(ev.target)) return;
+    if (findEl.contains(ev.target) || dialogEl.contains(ev.target) || ev.target.tagName === "INPUT") return;
+    if (["Shift", "Alt", "Control", "Meta", "CapsLock"].includes(ev.key)) return;
+    const copy = /^[cC]$/.test(ev.key) && !ev.altKey &&
+      (IS_MAC ? ev.metaKey : ev.ctrlKey && (ev.shiftKey || String(window.getSelection())));
+    if (copy) return;
+    term.focus();
+    handleTerminalKey(ev);
   }, true);
 
   // Send files to the Mac: drop them on the terminal or paste an image. Each
@@ -2629,6 +2675,7 @@
     socket.onclose = (ev) => {
       if (ws !== socket) return;
       clearTimeout(handshakeTimer);
+      stopScrolling();
       closePast();
       if (ev.code === 4403 || ev.code === 1008) {
         linkRejected = true;

@@ -241,6 +241,56 @@ fn wait_for_writer_output(writer: &SharedWriter, expected: &[u8]) {
     }
 }
 
+#[test]
+fn raw_text_keeps_bytes_and_key_order_with_a_stalled_writer() {
+    use crate::input::{KeyCode, KeyModifiers};
+    use std::sync::mpsc;
+
+    struct StalledWriter {
+        output: SharedWriter,
+        entered: mpsc::Sender<()>,
+        release: Option<mpsc::Receiver<()>>,
+    }
+    impl Write for StalledWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if let Some(release) = self.release.take() {
+                self.entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            self.output.write(data)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let output = SharedWriter::default();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let writer = StalledWriter {
+        output: output.clone(),
+        entered: entered_tx,
+        release: Some(release_rx),
+    };
+    let handle = std::thread::spawn(move || {
+        let mut term = TestTerm::new_with_writer(5, 20, 0, Box::new(writer));
+        term.advance_bytes(b"\x1b[?2004h");
+        term.send_text("raw\r\n\x1b[200~\x1b[201~").unwrap();
+        term.key_down(KeyCode::Char('K'), KeyModifiers::NONE)
+            .unwrap();
+        term.send_text("last").unwrap();
+        done_tx.send(()).unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let returned_while_stalled = done_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+    // Release before asserting, so a regression never leaves a blocked thread.
+    release_tx.send(()).unwrap();
+    handle.join().unwrap();
+    assert!(returned_while_stalled);
+    wait_for_writer_output(&output, b"raw\r\n\x1b[200~\x1b[201~Klast");
+}
+
 impl Deref for TestTerm {
     type Target = Terminal;
 

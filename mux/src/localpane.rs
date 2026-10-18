@@ -59,15 +59,9 @@ struct CachedProcInfo {
     foreground: LocalProcessInfo,
 }
 
-/// This is a bit horrible; it can take 700us to tcgetpgrp, so if we have
-/// 10 tabs open and run the mouse over them, hovering them each in turn,
-/// we can spend 7ms per evaluation of the tab bar state on fetching those
-/// pids alone, which can easily lead to stuttering when moving the mouse
-/// over all of the tabs.
-///
-/// This implements a cache holding that fg process and the often queried
-/// cwd and process path that allows for stale reads to proceed quickly
-/// while the writes can happen in a background thread.
+/// Cache cwd lookups while the tty's foreground group and executable are
+/// unchanged. A group switch, exec or leader exit must refresh immediately
+/// so the next input uses the current foreground program.
 #[cfg(unix)]
 #[derive(Clone)]
 struct CachedLeaderInfo {
@@ -485,6 +479,11 @@ impl Pane for LocalPane {
         }))
     }
 
+    fn send_text(&self, text: &str) -> Result<(), Error> {
+        Mux::get().record_input_for_current_identity();
+        self.terminal.lock().send_text(text)
+    }
+
     fn send_paste(&self, text: &str) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
         if self.tmux_domain.lock().is_some() {
@@ -625,7 +624,23 @@ impl Pane for LocalPane {
             if let Some(path) = &leader.path {
                 return Some(path.to_string_lossy().to_string());
             }
-            return None;
+            // A pipeline's group leader can exit before its pager. Reuse the
+            // cached shell tree, restricted to the group that still owns the tty.
+            // A fresh tree from the previous group is still the wrong snapshot.
+            let policy = if self
+                .proc_list
+                .lock()
+                .as_ref()
+                .map(|info| info.updated < leader.updated)
+                .unwrap_or(false)
+            {
+                CachePolicy::FetchImmediate
+            } else {
+                policy
+            };
+            let info = self.divine_process_list(policy)?;
+            return foreground_group_member(&info.root, leader.pid)
+                .map(|process| process.executable.to_string_lossy().into_owned());
         }
 
         #[allow(unreachable_code)]
@@ -638,11 +653,16 @@ impl Pane for LocalPane {
         // stateful process at an otherwise idle prompt.
         let fg_pgid = self.pty.lock().process_group_leader().map(|p| p as u32);
 
-        if let Some(info) = self.divine_process_list(CachePolicy::FetchImmediate) {
+        // Lua hooks can query this pane again, including its process name.
+        // Release the process cache lock before invoking user code.
+        let process_tree = self
+            .divine_process_list(CachePolicy::FetchImmediate)
+            .map(|info| info.root.clone());
+        if let Some(root) = process_tree {
             log::trace!(
                 "can_close_without_prompting? fg_pgid={:?} procs in pane {:#?}",
                 fg_pgid,
-                info.root
+                root
             );
 
             let hook_result = config::run_immediate_with_lua_config(|lua| {
@@ -652,7 +672,7 @@ impl Pane for LocalPane {
                 };
                 let v = config::lua::emit_sync_callback(
                     &*lua,
-                    ("mux-is-process-stateful".to_string(), (info.root.clone())),
+                    ("mux-is-process-stateful".to_string(), (root.clone())),
                 )?;
                 match v {
                     mlua::Value::Nil => Ok(None),
@@ -698,7 +718,7 @@ impl Pane for LocalPane {
             }
 
             let is_stateful = match hook_result {
-                Ok(None) => default_stateful_check(&info.root, fg_pgid),
+                Ok(None) => default_stateful_check(&root, fg_pgid),
                 Ok(Some(s)) => s,
                 Err(err) => {
                     log::error!(
@@ -706,7 +726,7 @@ impl Pane for LocalPane {
                          hook: {:#}, falling back to default behavior",
                         err
                     );
-                    default_stateful_check(&info.root, fg_pgid)
+                    default_stateful_check(&root, fg_pgid)
                 }
             };
 
@@ -1149,9 +1169,13 @@ impl LocalPane {
         if policy == CachePolicy::FetchImmediate {
             leader.replace(CachedLeaderInfo::new(self.pty.lock().as_raw_fd()));
         } else if let Some(info) = leader.as_mut() {
-            // If stale, queue up some work in another thread to update.
-            // Right now, we'll return the stale data.
-            if info.expired() && info.can_update() {
+            let pid = unsafe { libc::tcgetpgrp(info.fd) } as u32;
+            let path = LocalProcessInfo::executable_path(pid);
+            if pid != info.pid || path != info.path {
+                info.update();
+            } else if info.expired() && info.can_update() {
+                // The same program may still change cwd. Refresh it
+                // asynchronously as before.
                 info.updating = true;
                 let leader_ref = Arc::clone(&self.leader);
                 std::thread::spawn(move || {
@@ -1241,6 +1265,21 @@ impl LocalPane {
     }
 }
 
+fn foreground_group_member(root: &LocalProcessInfo, pgid: u32) -> Option<&LocalProcessInfo> {
+    let member = (root.pgid == pgid
+        && !root.executable.as_os_str().is_empty()
+        && !matches!(
+            root.status,
+            procinfo::LocalProcessStatus::Zombie | procinfo::LocalProcessStatus::Dead
+        ))
+    .then_some(root);
+    root.children
+        .values()
+        .filter_map(|child| foreground_group_member(child, pgid))
+        .chain(member)
+        .max_by_key(|process| (process.start_time, process.pid))
+}
+
 impl Drop for LocalPane {
     fn drop(&mut self) {
         // Avoid lingering zombies if we can, but don't block forever.
@@ -1248,5 +1287,195 @@ impl Drop for LocalPane {
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use procinfo::LocalProcessStatus;
+
+    fn process(pid: u32, pgid: u32, executable: &str) -> LocalProcessInfo {
+        LocalProcessInfo {
+            pid,
+            ppid: 1,
+            pgid,
+            name: String::new(),
+            executable: executable.into(),
+            argv: vec![],
+            cwd: std::path::PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: pid as u64,
+            children: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn foreground_name_survives_an_exited_pipeline_leader() {
+        let mut shell = process(100, 100, "/bin/zsh");
+        // The producer at pid 200 has already exited. Its group still owns
+        // the terminal, and a newer background task must not replace less.
+        shell.children.insert(201, process(201, 200, "/bin/cat"));
+        shell
+            .children
+            .insert(202, process(202, 200, "/usr/bin/less"));
+        shell
+            .children
+            .insert(300, process(300, 300, "/usr/bin/sleep"));
+        let found = foreground_group_member(&shell, 200).expect("the pager is still running");
+        assert_eq!(found.executable, std::path::Path::new("/usr/bin/less"));
+        assert_eq!(foreground_group_member(&shell, 100).unwrap().pid, 100);
+        assert!(foreground_group_member(&shell, 400).is_none());
+    }
+
+    #[test]
+    fn foreground_name_ignores_empty_paths_and_exited_members() {
+        let mut shell = process(100, 100, "/bin/zsh");
+        shell.children.insert(201, process(201, 200, ""));
+        let mut exited = process(202, 200, "/usr/bin/seq");
+        exited.status = LocalProcessStatus::Zombie;
+        shell.children.insert(202, exited);
+        assert!(foreground_group_member(&shell, 200).is_none());
+    }
+
+    fn test_pane(
+        command: portable_pty::CommandBuilder,
+    ) -> (LocalPane, Box<dyn Child + Send + Sync>) {
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize::default())
+            .unwrap();
+        let child = pair.slave.spawn_command(command).unwrap();
+        let pid = child.process_id().unwrap();
+        let terminal = Terminal::new(
+            TerminalSize::default(),
+            Arc::new(config::TermConfig::new()),
+            "test",
+            "test",
+            Box::new(std::io::sink()),
+        );
+        // Keep the child owned by the test rather than starting a mux waiter.
+        let pane = LocalPane {
+            pane_id: PaneId::new(0),
+            terminal: Mutex::new(terminal),
+            process: Mutex::new(ProcessState::Running {
+                child_waiter: bounded(1).1,
+                pid: Some(pid),
+                signaller: child.clone_killer(),
+                killed: false,
+            }),
+            pty: Mutex::new(pair.master),
+            writer: Mutex::new(Box::new(std::io::sink())),
+            domain_id: DomainId::new(0),
+            tmux_domain: Mutex::new(None),
+            proc_list: Mutex::new(None),
+            leader: Arc::new(Mutex::new(None)),
+            foreground_proc: Mutex::new(None),
+            encoding: Arc::new(AtomicU8::new(PaneEncoding::Utf8.to_u8())),
+            command_description: String::new(),
+        };
+        (pane, child)
+    }
+
+    #[test]
+    fn foreground_name_invalidates_changed_identity_but_reuses_same_program() {
+        let (pane, mut child) = test_pane(portable_pty::CommandBuilder::new("/bin/cat"));
+        let pid = child.process_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let actual_path = std::path::PathBuf::from("/bin/cat");
+        while LocalProcessInfo::executable_path(pid).as_ref() != Some(&actual_path)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut leader = CachedLeaderInfo::new(pane.pty.lock().as_raw_fd());
+        leader.pid = pid + 1;
+        leader.path = Some("/stale/shell".into());
+        pane.leader.lock().replace(leader);
+        let switched = pane.get_foreground_process_name(CachePolicy::AllowStale);
+
+        pane.leader.lock().as_mut().unwrap().path = Some("/stale/before-exec".into());
+        let same_group_changed = pane.get_foreground_process_name(CachePolicy::AllowStale);
+        let updated = {
+            let mut cache = pane.leader.lock();
+            let leader = cache.as_mut().unwrap();
+            leader.pid = pid;
+            leader.path = Some(actual_path.clone());
+            leader.updated
+        };
+        let reused = pane.get_foreground_process_name(CachePolicy::AllowStale);
+        let same_updated = pane.leader.lock().as_ref().unwrap().updated;
+        let fast_path_skipped_tree = pane.proc_list.lock().is_none();
+
+        *pane.process.lock() = ProcessState::Dead;
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let expected = Some(actual_path.to_string_lossy().into_owned());
+        assert_eq!(switched, expected);
+        assert_eq!(same_group_changed, expected);
+        assert_eq!(reused, expected);
+        assert_eq!(same_updated, updated);
+        assert!(fast_path_skipped_tree);
+    }
+
+    #[test]
+    fn foreground_name_drops_an_exited_leader_before_the_cache_ttl() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/zsh");
+        command.args(["-f", "-i", "-c", "seq 1 3000 | less -X -M"]);
+        command.env("TERM", "xterm-256color");
+        let (pane, mut child) = test_pane(command);
+        let pid = child.process_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut pager_group = None;
+        while Instant::now() < deadline {
+            if let Some(group) = pane.pty.lock().process_group_leader() {
+                let group = group as u32;
+                if group != pid && LocalProcessInfo::executable_path(group).is_none() {
+                    if let Some(tree) = LocalProcessInfo::with_root_pid(pid) {
+                        if foreground_group_member(&tree, group)
+                            .and_then(|process| process.executable.file_name())
+                            == Some(std::ffi::OsStr::new("less"))
+                        {
+                            pager_group = Some(group);
+                            break;
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut leader = CachedLeaderInfo::new(pane.pty.lock().as_raw_fd());
+        // This is the real observed race: the same foreground group still
+        // owns the tty, but its briefly cached producer has already exited.
+        leader.path = Some("/usr/bin/seq".into());
+        let updated = leader.updated;
+        pane.leader.lock().replace(leader);
+
+        // The shell tree was sampled before the foreground group changed,
+        // even though its normal TTL has not expired yet.
+        pane.proc_list.lock().replace(CachedProcInfo {
+            root: process(pid + 1, pid + 1, "/stale/shell"),
+            foreground: process(pid + 1, pid + 1, "/stale/shell"),
+            updated: updated - Duration::from_millis(1),
+        });
+        let refreshed_tree = pane.get_foreground_process_name(CachePolicy::AllowStale);
+        let tree_updated = pane.proc_list.lock().as_ref().unwrap().updated;
+        let reused_tree = pane.get_foreground_process_name(CachePolicy::AllowStale);
+        let same_tree_updated = pane.proc_list.lock().as_ref().unwrap().updated;
+        *pane.process.lock() = ProcessState::Dead;
+        if let Some(group) = pager_group {
+            // Only the proven descendant pipeline belongs to this test.
+            unsafe { libc::kill(-(group as i32), libc::SIGTERM) };
+        }
+        child.kill().ok();
+        child.wait().unwrap();
+
+        assert!(
+            pager_group.is_some(),
+            "the producer exited and less owns the tty"
+        );
+        assert_eq!(refreshed_tree.as_deref(), Some("/usr/bin/less"));
+        assert_eq!(reused_tree, refreshed_tree);
+        assert_eq!(same_tree_updated, tree_updated);
     }
 }

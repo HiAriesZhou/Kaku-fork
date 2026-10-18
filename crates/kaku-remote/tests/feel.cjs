@@ -86,7 +86,7 @@ const WATCH = () => {
 (async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kf-'));
   const children = [];
-  let browser, server;
+  let browser, server, latencyProxy;
   const start = (file, args, env) => {
     const p = spawn(file, args, { env: { ...process.env, ...env }, stdio: 'ignore' });
     children.push(p); return p;
@@ -96,7 +96,7 @@ const WATCH = () => {
     const relay = await port(), local = await port(), pagePort = await port();
     const rtt = Number(process.env.FEEL_RTT_MS || 0);
     const pageRelay = rtt ? await port() : relay;
-    if (rtt) await delayProxy(pageRelay, relay, rtt);
+    if (rtt) latencyProxy = await delayProxy(pageRelay, relay, rtt);
     report.rtt_ms = rtt;
     const origin = `http://127.0.0.1:${pagePort}`;
     const dir = path.resolve(execFileSync(path.join(root, 'scripts/publish_web_page.sh'), ['--dry-run'], {
@@ -126,7 +126,15 @@ const WATCH = () => {
       ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}),
     });
     const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-    await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin });
+    // Measure the page's copy/paste handlers without reading or replacing
+    // the maintainer's system clipboard.
+    await context.addInitScript(() => {
+      let copied = '';
+      Object.defineProperty(navigator, 'clipboard', { value: {
+        writeText: async text => { copied = text; },
+        readText: async () => copied,
+      } });
+    });
     const page = await context.newPage();
     await page.goto(link);
     await page.waitForSelector('body.drawn');
@@ -188,13 +196,18 @@ const WATCH = () => {
     };
     await page.keyboard.press('Control+U');
 
-    // ── Pasting a block of text (Cmd+V) ───────────────────────────────────
+    // ── Pasting a block of text through the page handler ─────────────────
     await page.keyboard.type('clear; cat\n');
     await sleep(400);
     const block = Array.from({ length: 100 }, (_, i) => `paste line ${String(i).padStart(3, '0')} ${'x'.repeat(28)}`).join('\n') + '\n';
-    await page.evaluate(text => navigator.clipboard.writeText(text), block);
     const pasteAt = await page.evaluate(() => performance.now());
-    await page.keyboard.press('Meta+V');
+    await page.evaluate(text => {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData('text/plain', text);
+      document.querySelector('.xterm-helper-textarea').dispatchEvent(new ClipboardEvent('paste', {
+        clipboardData, bubbles: true, cancelable: true,
+      }));
+    }, block);
     await shows('paste line 099');
     const pasteShown = await page.evaluate(() => performance.now());
     await page.keyboard.press('Control+D');
@@ -239,12 +252,18 @@ const WATCH = () => {
     await sleep(400);
     const firstLine = () => page.evaluate(() => window.__rows().split('\n')[0].trim());
     const top0 = await firstLine();
-    await page.evaluate(() => { window.__wheelStart = performance.now(); window.__changes.length = 0; });
-    for (let i = 0; i < 30; i++) {
-      await page.mouse.wheel(0, 100);
-      await sleep(16);
-    }
-    const wheelEnd = await page.evaluate(() => performance.now());
+    // Generate one wheel event per browser frame. Awaiting Playwright's
+    // wheel and then sleeping halves the offered rate on a 60 Hz display.
+    const wheelEnd = await page.evaluate(async () => {
+      window.__wheelStart = performance.now(); window.__changes.length = 0;
+      for (let i = 0; i < 120; i++) {
+        await new Promise(requestAnimationFrame);
+        document.querySelector('#stage').dispatchEvent(new WheelEvent('wheel', {
+          deltaY: 100, bubbles: true, cancelable: true,
+        }));
+      }
+      return performance.now();
+    });
     await sleep(1500);
     report.alt_scroll = await page.evaluate(({ top0, wheelEnd }) => {
       const start = window.__wheelStart;
@@ -370,6 +389,7 @@ const WATCH = () => {
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (server) server.close();
+    if (latencyProxy) latencyProxy.close();
     for (const c of children) { try { c.kill('SIGKILL'); } catch {} }
     fs.rmSync(home, { recursive: true, force: true });
   }

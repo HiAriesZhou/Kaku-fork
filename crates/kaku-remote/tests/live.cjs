@@ -106,28 +106,106 @@ async function until(fn, ms = 15000) {
     send({ type: 'attach', pane_id: pane });
     // Reset the measurement window after the pane-operation frames.
     send({ type: 'hello', frame_ack: true });
+    await sleep(200);
     const prior = received.filter(m => m.type === 'frame').at(-1);
     const flowStart = received.filter(m => m.type === 'frame').length;
     if (prior) send({ type: 'frame_ack', seq: prior.seq });
-    await sleep(200);
 
     send({ type: 'text', data: 'for i in {1..30}; do echo FLOW-$i; sleep 0.03; done\n' });
     await sleep(1500);
     const frames = received.filter(m => m.type === 'frame').slice(flowStart);
-    assert.equal(frames.length, 4, 'slow consumers receive at most four unacknowledged frames');
+    assert.equal(frames.length, 12, 'slow consumers receive at most twelve unacknowledged frames');
     send({ type: 'frame_ack', seq: 1000000 }); await sleep(100);
-    assert.equal(received.filter(m => m.type === 'frame').length - flowStart, 4, 'future ACK cannot release the window');
+    assert.equal(received.filter(m => m.type === 'frame').length - flowStart, 12, 'future ACK cannot release the window');
     send({ type: 'frame_ack', seq: frames.at(-1).seq });
     const latest = await until(() => received.filter(m => m.type === 'frame').at(-1).seq > frames.at(-1).seq);
     assert.ok(latest);
-    assert.ok(received.filter(m => m.type === 'frame').slice(flowStart + 4).some(m => m.data.includes('FLOW-30')), 'ACK releases the latest coalesced screen');
+    assert.ok(received.filter(m => m.type === 'frame').slice(flowStart + 12).some(m => m.data.includes('FLOW-30')), 'ACK releases the latest coalesced screen');
     // Pages already open before the upgrade still use the old hello.
     send({ type: 'hello' });
     const beforeLegacy = received.filter(m => m.type === 'frame').length;
-    send({ type: 'text', data: 'for i in {1..12}; do echo LEGACY-$i; sleep 0.04; done\n' });
-    await sleep(800);
-    assert.ok(received.filter(m => m.type === 'frame').length - beforeLegacy > 4);
+    send({ type: 'text', data: 'for i in {1..20}; do echo LEGACY-$i; sleep 0.04; done\n' });
+    await sleep(1100);
+    assert.ok(received.filter(m => m.type === 'frame').length - beforeLegacy > 12);
     ws.close();
+
+    // Text must use the same background writer as keys and paste. Two
+    // blocked PTYs used to occupy both Remote workers and freeze a third
+    // session until a program started reading again.
+    const pressureFile = path.join(home, 'read_later.py');
+    fs.writeFileSync(pressureFile, [
+      'import os,termios,tty,time',
+      'saved=termios.tcgetattr(0)',
+      'try:',
+      ' tty.setraw(0)',
+      " os.write(1,b'BLOCK_READY\\r\\n')",
+      ' time.sleep(3)',
+      ' n=0',
+      ' while n<65536: n+=len(os.read(0,65536-n))',
+      'finally:',
+      ' termios.tcsetattr(0,termios.TCSANOW,saved)',
+      "os.write(1,b'BLOCK_DONE\\r\\n')",
+    ].join('\n'));
+    const pressureConnection = async () => {
+      const socket = new WebSocket(`ws://127.0.0.1:${local}/web/ws?token=${state.token}`);
+      sockets.push(socket);
+      const messages = [];
+      const send = msg => socket.send(JSON.stringify(msg));
+      socket.on('message', bytes => {
+        const msg = JSON.parse(bytes);
+        messages.push(msg);
+        if (msg.type === 'frame') send({ type: 'frame_ack', seq: msg.seq });
+      });
+      await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
+      send({ type: 'hello', frame_ack: true });
+      await until(() => messages.some(m => m.type === 'tabs'));
+      return { socket, send, messages };
+    };
+    const observer = await pressureConnection();
+    const pressureTabs = () => observer.messages.filter(m => m.type === 'tabs').at(-1).tabs;
+    const originalTabs = pressureTabs().map(t => t.tab_id);
+    observer.send({ type: 'attach', pane_id: pane });
+    for (let i = 1; i <= 2; i++) {
+      observer.send({ type: 'new_tab' });
+      await until(() => pressureTabs().length === originalTabs.length + i);
+    }
+    const blockedTabs = pressureTabs().filter(t => !originalTabs.includes(t.tab_id));
+    observer.send({ type: 'attach', pane_id: pane });
+    const victims = [await pressureConnection(), await pressureConnection()];
+    for (let i = 0; i < victims.length; i++) {
+      victims[i].send({ type: 'attach', pane_id: blockedTabs[i].pane_id });
+      victims[i].send({ type: 'text', data: `/usr/bin/python3 ${pressureFile}\n` });
+    }
+    const hasFrame = (conn, text) => conn.messages.some(m => m.type === 'frame' && m.data.includes(text));
+    await until(() => victims.every(v => hasFrame(v, 'BLOCK_READY')));
+    for (const v of victims) v.send({ type: 'text', data: 'x'.repeat(65536) });
+    await sleep(150);
+    const pressureAt = Date.now();
+    observer.send({ type: 'text', data: 'echo PRESSURE_OBSERVER\n' });
+    await until(() => hasFrame(observer, 'PRESSURE_OBSERVER'));
+    assert.ok(Date.now() - pressureAt < 1500, 'input does not wait for the three-second PTY stall');
+    assert.ok(victims.every(v => !hasFrame(v, 'BLOCK_DONE')), 'another session responds while both PTYs are still blocked');
+    await until(() => victims.every(v => hasFrame(v, 'BLOCK_DONE')));
+    for (const tab of blockedTabs) observer.send({ type: 'close_tab', tab_id: tab.tab_id });
+    await until(() => pressureTabs().length === originalTabs.length);
+    for (const conn of [observer, ...victims]) conn.socket.close();
+
+    // In a pipeline the process-group leader can exit before less. Wheel
+    // input must still reach the pager when it keeps the normal screen.
+    await page.locator('.xterm-helper-textarea').focus();
+    await page.keyboard.type('seq 1 3000 | less -X -M\n');
+    await page.waitForFunction(() => [...document.querySelectorAll('.xterm-rows > div')].some(row => row.textContent.includes('lines 1-')));
+    const stageBox = await page.locator('#stage').boundingBox();
+    await page.mouse.move(stageBox.x + stageBox.width / 2, stageBox.y + stageBox.height / 2);
+    await page.mouse.wheel(0, 240);
+    await page.waitForFunction(() => {
+      const rows = [...document.querySelectorAll('.xterm-rows > div')].map(row => row.textContent.trim());
+      const status = rows.map(row => /lines (\d+)-\d+/.exec(row)).find(Boolean);
+      // A changed first row alone could be the browser's own scrollback.
+      // The pager must report that it advanced, with the matching first line.
+      return status && Number(status[1]) > 1 && rows[0] === status[1];
+    });
+    await page.keyboard.press('q');
 
     // Real no-echo input must never show, even before the server responds.
     await page.locator('.xterm-helper-textarea').focus();
@@ -390,7 +468,7 @@ async function until(fn, ms = 15000) {
     assert.notEqual(JSON.parse(fs.readFileSync(identityPath)).mac_key, identity.mac_key);
     assert.equal((await cli('remote', 'devices')).includes(' on '), false);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ localTerminal: 'pass', foreignHostRefused: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', pairingLinkOnce: 'pass', unknownDeviceRefused: 'pass', macSignatureVerified: 'pass', idleAuthentication: 'pass', replayRejected: 'pass', oldPageAskedToReload: 'pass', revokeEndsSession: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', downloadByCmdClick: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass', pairedNewTab: 'pass', resetForgetsDevices: 'pass' }));
+    console.log(JSON.stringify({ localTerminal: 'pass', blockedInputIsolation: 'pass', foreignHostRefused: 'pass', frameWindow: frames.length, latestFrameAfterAck: 'pass', hiddenInput: 'pass', encryptedTerminal: 'pass', pairingLinkOnce: 'pass', unknownDeviceRefused: 'pass', macSignatureVerified: 'pass', idleAuthentication: 'pass', replayRejected: 'pass', oldPageAskedToReload: 'pass', revokeEndsSession: 'pass', retiredHost: 'pass', legacyHello: 'pass', encryptedUploadReconnect: 'pass', downloadByCmdClick: 'pass', rejectionWithQueuedInput: 'pass', paneActions: 'pass', pairedNewTab: 'pass', resetForgetsDevices: 'pass' }));
   } finally {
     for (const ws of sockets) ws.terminate();
     await browser?.close();

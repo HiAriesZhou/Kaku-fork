@@ -305,6 +305,11 @@ pub trait Pane: Downcast + Send + Sync {
         Progress::None
     }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
+    /// Already encoded input, without paste framing or newline conversion.
+    fn send_text(&self, text: &str) -> anyhow::Result<()> {
+        self.writer().write_all(text.as_bytes())?;
+        Ok(())
+    }
     fn reader(&self) -> anyhow::Result<Option<PaneReader>>;
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write>;
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()>;

@@ -20,6 +20,8 @@ The `mux` crate owns tab, pane, domain, and mux state management.
 
 ## Practical Rules
 
+- Already encoded input uses `send_text`, without paste framing or newline conversion. Local panes share the terminal's existing `ThreadedWriter` with keys and paste, preserving order without blocking on a full PTY.
+- A foreground process group can outlive its leader (`seq | less -X`). When the leader has no executable path, identify a live member of that same group from the cached shell tree. A foreground-group change, exec or leader exit invalidates the leader immediately and the fallback tree must be sampled after that leader update; checking only PGID misses a producer that exits after being cached. Do not wait for the normal TTL, substitute an unrelated background job, or scan all processes on every frame. Release the tree cache guard before calling Lua hooks that can query the pane again.
 - Keep alert propagation reliable, including `Alert::SetUserVar`, because GUI reload and user-var hooks depend on this path.
 - Preserve pane and overlay invalidation signals consumed by GUI AI/chat overlays when panes split, move, close, or resize.
 

@@ -6,7 +6,7 @@
 use crate::frontend::front_end;
 use crate::termwindow::TermWindowNotif;
 use config::keyassignment::{KeyAssignment, SpawnTabDomain};
-use kaku_remote::{set_tab_action_handler, TabAction};
+use kaku_remote::{claim_tab_size_on_gui_thread, set_tab_action_handler, TabAction};
 use mux::pane::PaneId;
 use mux::Mux;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ fn perform(action: TabAction) {
         | TabAction::Activate { pane_id }
         | TabAction::Rename { pane_id, .. }
         | TabAction::Move { pane_id, .. }
-        | TabAction::Zoom { pane_id } => PaneId::from(*pane_id),
+        | TabAction::Zoom { pane_id, .. } => PaneId::from(*pane_id),
     };
     let mux = Mux::get();
     let Some((_, window_id, tab_id)) = mux.resolve_pane_id(pane_id) else {
@@ -125,7 +125,7 @@ fn perform(action: TabAction) {
                 tx: None,
             });
         }
-        TabAction::Zoom { .. } => {
+        TabAction::Zoom { claimed, .. } => {
             // The browser shows one pane at a time; zooming the one it is on
             // lets that pane take the whole tab, and so the whole page.
             if let (Some(tab), Some(pane)) = (mux.get_tab(tab_id), mux.get_pane(pane_id)) {
@@ -133,6 +133,9 @@ fn perform(action: TabAction) {
                     tab.set_active_pane(&pane);
                 }
                 tab.toggle_zoom();
+                if let Some((cols, rows)) = claimed {
+                    claim_tab_size_on_gui_thread(pane_id.into(), cols, rows);
+                }
             }
         }
         TabAction::Rename { title, .. } => {

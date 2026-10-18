@@ -1028,6 +1028,14 @@ impl TerminalState {
         }
     }
 
+    /// Send already encoded input through the same ordered writer as keys,
+    /// without paste framing or newline conversion.
+    pub fn send_text(&mut self, text: &str) -> Result<(), Error> {
+        self.writer.write_all(text.as_bytes())?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Send text to the terminal that is the result of pasting.
     /// If bracketed paste mode is enabled, the paste is enclosed
     /// in the bracketing, otherwise it is fed to the writer as-is.
