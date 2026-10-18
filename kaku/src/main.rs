@@ -773,6 +773,11 @@ fn select_main_menu_command() -> anyhow::Result<Option<SubCommand>> {
                     let idx = (c as usize) - ('1' as usize);
                     return Ok(Some(to_subcommand(MENU_ITEMS[idx].2)));
                 }
+                KeyCode::Char('q') | KeyCode::Char('Q')
+                    if can_use_menu_char_shortcut(key.modifiers) =>
+                {
+                    return Ok(None);
+                }
                 // Letter shortcuts: first character of each menu item name.
                 KeyCode::Char(c) if can_use_menu_char_shortcut(key.modifiers) => {
                     let lower = c.to_ascii_lowercase();
@@ -782,11 +787,6 @@ fn select_main_menu_command() -> anyhow::Result<Option<SubCommand>> {
                     {
                         return Ok(Some(to_subcommand(*choice)));
                     }
-                }
-                KeyCode::Char('q') | KeyCode::Char('Q')
-                    if can_use_menu_char_shortcut(key.modifiers) =>
-                {
-                    return Ok(None);
                 }
                 KeyCode::Esc => return Ok(None),
                 _ => {}

@@ -125,6 +125,7 @@ For TUI display corruption after interactive CLIs re-render prompts or selection
 | Formatting | `make fmt-check` |
 | Lints | `cargo clippy --locked --all-targets -p kaku -p kaku-gui -p mux -p config -- -D warnings` (`make check` does not run clippy, so a change that passes locally can still turn CI's Clippy job red) |
 | GUI or rendering change | `make app` |
+| CLI main menu input | `make app`, then `python3 scripts/test_main_menu.py` (real PTY, q/Q/Esc exit) |
 | Config release change | `./scripts/check_config_release_readiness.sh` and `./scripts/check_release_config.sh` |
 | Release note change | `./scripts/check_release_notes.sh` |
 | Release-adjacent change | `make fmt && make check && make test`, then `make app` |
