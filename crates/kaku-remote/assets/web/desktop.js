@@ -17,6 +17,7 @@
   body.desktop #bar .tab[aria-current="true"] .close { opacity: 0; pointer-events: none; }
   #desktop canvas { display: block; max-width: none; outline: none; opacity: 0; transition: opacity 0.18s ease-out; touch-action: none; image-rendering: auto; transform-origin: 0 0; }
   #desktop.live canvas { opacity: 1; }
+  #desktop .sink { position: absolute; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; resize: none; }
   #desktop .status { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 24px; text-align: center; pointer-events: none; transition: opacity 0.18s; }
   #desktop.live .status { opacity: 0; }
   #desktop .status .title { color: var(--fg); font-size: 15px; }
@@ -38,6 +39,12 @@
   // instead of scrolling.
   const PINCH_START = 0.12;
   const MAX_ZOOM = 5;
+  // How long a paste waits for the browser's clipboard before pressing
+  // Command-V with whatever the Mac already holds, and a copy for the Mac's.
+  const PASTE_WAIT_MS = 300;
+  const COPY_WAIT_MS = 1500;
+  // Browser messages through the relay are capped at 512 KB once sealed.
+  const MAX_PASTE_BYTES = 256 * 1024;
 
   const init = (api) => {
     const { send, toolsEl, stageEl, isMac, toast, focusTerminal } = api;
@@ -47,9 +54,14 @@
 
     const view = document.createElement("div");
     view.id = "desktop";
-    view.innerHTML = '<canvas tabindex="0" aria-label="Mac screen"></canvas><div class="status"><div class="spin"></div><div class="title"></div><div class="detail"></div></div>';
+    view.innerHTML = '<canvas tabindex="0" aria-label="Mac screen"></canvas><textarea class="sink" tabindex="-1" aria-hidden="true" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea><div class="status"><div class="spin"></div><div class="title"></div><div class="detail"></div></div>';
     stageEl.append(view);
     const canvas = view.querySelector("canvas");
+    // With a keyboard, focus sits in a hidden text field: only an editable
+    // target gets the browser's paste event, which carries its clipboard.
+    // A touch screen keeps focus on the canvas so no soft keyboard opens.
+    const sink = view.querySelector(".sink");
+    const focusView = () => (TOUCH ? canvas : sink).focus({ preventScroll: true });
     const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
     const statusTitle = view.querySelector(".status .title");
     const statusDetail = view.querySelector(".status .detail");
@@ -153,12 +165,14 @@
       syncButton();
       if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
       start();
-      canvas.focus({ preventScroll: true });
+      focusView();
     };
 
     const leave = () => {
       if (!active) return;
       active = false;
+      if (pasting) { clearTimeout(pasting.timer); pasting = null; }
+      if (copyWait) copyWait.reject(new Error("left"));
       releaseButtons();
       send({ type: "desktop_stop" });
       closeDecoder();
@@ -317,7 +331,8 @@
     canvas.addEventListener("pointerdown", (ev) => {
       if (!live()) return;
       ev.preventDefault();
-      canvas.focus({ preventScroll: true });
+      focusView();
+      flushCopy();
       const p = where(ev);
       lastPoint = p;
       if (ev.pointerType === "touch") {
@@ -459,15 +474,83 @@
       if (!active) return false;
       const t = ev.target;
       // A field of the page itself (renaming a tab, a dialog) keeps its keys.
-      if (t && (t.tagName === "INPUT" || (t.tagName === "TEXTAREA" && !t.classList.contains("xterm-helper-textarea")))) return false;
+      if (t && (t.tagName === "INPUT" || (t.tagName === "TEXTAREA" && t !== sink && !t.classList.contains("xterm-helper-textarea")))) return false;
       return true;
     };
+
+    // Clipboard. Command-V (Ctrl-V off a Mac) first puts the browser's
+    // clipboard on the Mac, then presses the keys there. Command-C and
+    // Command-X hand the browser a clipboard entry that fills in once the
+    // Mac reports its copy; that write starts inside the key press, which
+    // browsers require. A copy made on the Mac some other way (a menu, a
+    // right click) is written when the browser allows it, or at the next
+    // click or key press here.
+    let pasting = null;
+    let copyWait = null;
+    let pendingCopy = null;
+    const finishPaste = (text) => {
+      if (!pasting) return;
+      clearTimeout(pasting.timer);
+      const { msg } = pasting;
+      pasting = null;
+      if (!live()) return;
+      if (text) {
+        if (new TextEncoder().encode(text).length > MAX_PASTE_BYTES) {
+          toast("Too much text to paste on the Mac at once");
+          return;
+        }
+        send({ type: "desktop_clipboard", text });
+      }
+      send(msg);
+      send({ ...msg, down: false });
+    };
+    window.addEventListener("paste", (ev) => {
+      if (!pasting) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      finishPaste(ev.clipboardData?.getData("text/plain") || "");
+    }, true);
+    const writeClipboard = (text) => {
+      if (!navigator.clipboard?.writeText) return;
+      navigator.clipboard.writeText(text).then(() => { if (pendingCopy === text) pendingCopy = null; }, () => { pendingCopy = text; });
+    };
+    const flushCopy = () => {
+      if (pendingCopy !== null) writeClipboard(pendingCopy);
+    };
+    const awaitCopy = () => {
+      if (!navigator.clipboard?.write || typeof window.ClipboardItem !== "function") return;
+      if (copyWait) copyWait.reject(new Error("superseded"));
+      const text = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { copyWait = null; reject(new Error("the Mac copied nothing")); }, COPY_WAIT_MS);
+        copyWait = {
+          resolve: (t) => { clearTimeout(timer); copyWait = null; resolve(t); },
+          reject: (e) => { clearTimeout(timer); copyWait = null; reject(e); },
+        };
+      });
+      const blob = text.then((t) => new Blob([t], { type: "text/plain" }));
+      navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]).then(() => { pendingCopy = null; }, () => {});
+    };
+    const onClipboard = (msg) => {
+      if (!active || typeof msg.text !== "string") return;
+      if (copyWait) copyWait.resolve(msg.text);
+      else writeClipboard(msg.text);
+    };
+
     const pressed = new Set();
     const onKey = (down) => (ev) => {
       if (!ownsKeys(ev)) return;
+      const command = (isMac ? ev.metaKey : ev.ctrlKey) && !ev.altKey;
+      if (down && command && ev.code === "KeyV" && !TOUCH && live()) {
+        // Let the browser go on to its paste event.
+        ev.stopImmediatePropagation();
+        if (!pasting) pasting = { msg: keyMessage(ev, true), timer: setTimeout(() => finishPaste(""), PASTE_WAIT_MS) };
+        return;
+      }
       ev.preventDefault();
       ev.stopImmediatePropagation();
       if (!live() || !ev.code) return;
+      if (down) flushCopy();
+      if (down && command && (ev.code === "KeyC" || ev.code === "KeyX") && !ev.repeat) awaitCopy();
       if (down) pressed.add(ev.code); else if (!pressed.delete(ev.code)) return;
       send(keyMessage(ev, down));
     };
@@ -484,6 +567,7 @@
       handle(msg) {
         if (msg.type === "desktop_frame") onFrame(msg);
         else if (msg.type === "desktop_status") onStatus(msg);
+        else if (msg.type === "desktop_clipboard") onClipboard(msg);
       },
       // A new session (a reconnect) has no helper running yet.
       sessionStarted() {

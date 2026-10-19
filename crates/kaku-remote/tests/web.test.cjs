@@ -1827,3 +1827,70 @@ test('on a phone the desktop view pinches to zoom and taps where the zoom shows'
   assert.ok(Math.abs(click.x - expectX) < 0.01 && Math.abs(click.y - 0.5) < 0.01, JSON.stringify(click) + ' vs ' + expectX);
   assert.deepEqual(errors, []);
 });
+
+test('the desktop view carries the clipboard both ways', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => {
+    window.wrote = { text: [], item: [] };
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      writeText: async text => { wrote.text.push(text); },
+      write: async items => { for (const item of items) wrote.item.push(await (await item.getType('text/plain')).text()); },
+    } });
+    probe.handle({ type: 'config', desktop: true });
+  });
+  await p.locator('#bar .tool.desktop').click();
+  await p.evaluate(() => document.getElementById('desktop').classList.add('live'));
+  assert.equal(await p.evaluate(() => document.activeElement.className), 'sink', 'focus can take a paste');
+  const key = (type, code, extra = {}) => p.evaluate(([type, code, extra]) => {
+    const command = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? { metaKey: true } : { ctrlKey: true };
+    document.activeElement.dispatchEvent(new KeyboardEvent(type, { code, key: code.slice(3).toLowerCase(), bubbles: true, cancelable: true, ...command, ...extra }));
+  }, [type, code, extra]);
+  const desktopMessages = () => p.evaluate(() => messages.filter(m => m.type.startsWith('desktop_') && m.type !== 'desktop_start'));
+
+  // Paste: the browser's clipboard goes over first, then the keys.
+  await p.evaluate(() => { messages.length = 0; });
+  await key('keydown', 'KeyV');
+  assert.deepEqual(await desktopMessages(), [], 'nothing pressed before the clipboard is in');
+  await p.evaluate(() => {
+    const data = new DataTransfer();
+    data.setData('text/plain', 'from the browser 中文');
+    document.activeElement.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+  });
+  await key('keyup', 'KeyV');
+  const pasted = await desktopMessages();
+  assert.deepEqual(pasted.map(m => [m.type, m.text ?? m.code, m.down]), [
+    ['desktop_clipboard', 'from the browser 中文', undefined],
+    ['desktop_key', 'KeyV', true],
+    ['desktop_key', 'KeyV', false],
+  ]);
+  assert.ok(pasted[1].meta && !pasted[1].ctrl, 'Command on the Mac');
+  assert.equal(await p.evaluate(() => document.activeElement.value), '', 'nothing lands in the hidden field');
+
+  // A paste the browser never delivers still presses the keys, with
+  // whatever the Mac holds.
+  await p.evaluate(() => { messages.length = 0; });
+  await key('keydown', 'KeyV');
+  await p.waitForTimeout(450);
+  assert.deepEqual((await desktopMessages()).map(m => [m.type, m.code, m.down]), [['desktop_key', 'KeyV', true], ['desktop_key', 'KeyV', false]]);
+
+  // Copy: the browser's clipboard gets what the Mac copied, through an
+  // entry written during the key press, as Safari requires.
+  await p.evaluate(() => { messages.length = 0; });
+  await key('keydown', 'KeyC');
+  assert.ok((await desktopMessages()).some(m => m.type === 'desktop_key' && m.code === 'KeyC' && m.down));
+  await p.evaluate(() => probe.handle({ type: 'desktop_clipboard', text: 'from the Mac' }));
+  await p.waitForFunction(() => wrote.item.includes('from the Mac'));
+  assert.deepEqual(await p.evaluate(() => wrote.text), []);
+
+  // A copy made on the Mac some other way reaches the browser too.
+  await p.evaluate(() => probe.handle({ type: 'desktop_clipboard', text: 'from a menu' }));
+  await p.waitForFunction(() => wrote.text.includes('from a menu'));
+
+  // Back on the terminal, the Mac's clipboard no longer comes through.
+  await p.locator('#bar .tool.desktop').click();
+  await p.evaluate(() => probe.handle({ type: 'desktop_clipboard', text: 'too late' }));
+  await p.waitForTimeout(50);
+  assert.equal(await p.evaluate(() => wrote.text.includes('too late') || wrote.item.includes('too late')), false);
+  assert.deepEqual(errors, []);
+});
