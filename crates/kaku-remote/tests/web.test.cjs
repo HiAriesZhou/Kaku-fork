@@ -1075,11 +1075,24 @@ test('links exclude sentence punctuation and retain balanced paths and Unicode c
     }, source);
     assert.deepEqual(found.opened, [expected]);
     if (source.startsWith('😀')) {
-      // Bundled xterm Unicode table gives this emoji one cell, but two UTF-16 units.
-      assert.equal(found.links[0].range.start.x, 3);
-      assert.equal(found.links[0].range.end.x, 26);
+      // Unicode 11 widths give this emoji two cells, as Kaku does.
+      assert.equal(found.links[0].range.start.x, 4);
+      assert.equal(found.links[0].range.end.x, 27);
     }
   }
+});
+
+test('emoji take the two cells Kaku gives them, so their rows match the Mac', async t => {
+  const { p } = await page(t);
+  const row = await p.evaluate(async () => {
+    probe.term.resize(80, 24);
+    // Kaku pins each run to its column, as the server's frames do.
+    await new Promise(resolve => probe.term.write('\x1b[2J\x1b[H\u2705\x1b[3G done \u26a1\x1b[11G x', resolve));
+    const line = probe.term.buffer.active.getLine(0);
+    return { text: line.translateToString(true), widths: [0, 8].map(x => line.getCell(x).getWidth()) };
+  });
+  assert.equal(row.text, '\u2705 done \u26a1 x');
+  assert.deepEqual(row.widths, [2, 2]);
 });
 
 test('Mac paths stop at Chinese sentence punctuation but keep Chinese file names', async t => {

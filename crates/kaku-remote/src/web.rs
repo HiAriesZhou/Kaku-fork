@@ -36,6 +36,9 @@ const XTERM_CSS: &str = include_str!("../assets/web/xterm.css");
 /// draws the grid on a canvas, so steady output does not rebuild DOM rows or
 /// restart CSS cursor animations.
 const XTERM_WEBGL_JS: &str = include_str!("../assets/web/xterm-webgl.js");
+/// @xterm/addon-unicode11 0.8.0 (MIT, npm integrity verified): Unicode 11
+/// character widths, so emoji take the two cells Kaku gives them.
+const XTERM_UNICODE11_JS: &str = include_str!("../assets/web/xterm-unicode11.js");
 // Kaku's bundled terminal font: Regular for text, Medium for bold, matching
 // the dark-theme weights in the bundled kaku.lua, and the icons of its
 // bundled Symbols Nerd Font. WOFF2 from scripts/build_web_fonts.py.
@@ -305,6 +308,10 @@ pub(crate) fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
         "assets/xterm.js" => ("text/javascript; charset=utf-8", XTERM_JS.as_bytes()),
         "assets/xterm.css" => ("text/css; charset=utf-8", XTERM_CSS.as_bytes()),
         "assets/xterm-webgl.js" => ("text/javascript; charset=utf-8", XTERM_WEBGL_JS.as_bytes()),
+        "assets/xterm-unicode11.js" => (
+            "text/javascript; charset=utf-8",
+            XTERM_UNICODE11_JS.as_bytes(),
+        ),
         "assets/font-regular.woff2" => ("font/woff2", FONT_REGULAR),
         "assets/font-medium.woff2" => ("font/woff2", FONT_MEDIUM),
         "assets/font-symbols.woff2" => ("font/woff2", FONT_SYMBOLS),

@@ -222,6 +222,7 @@
 <div id="keys"></div>
 <script src="assets/xterm.js"></script>
 <script src="assets/xterm-webgl.js"></script>
+<script src="assets/xterm-unicode11.js"></script>
 <script>
 (async () => {
   const params = new URLSearchParams(location.hash.slice(1));
@@ -591,9 +592,17 @@
     // Bold text draws at the regular weight: heavier glyphs read as smeared
     // in the browser.
     fontWeightBold: "normal",
+    // term.unicode, below, is still a proposed API.
+    allowProposedApi: true,
     theme: { background: getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#16161a" },
   });
   term.open(termEl);
+  // Kaku measures characters by Unicode 14, which gives emoji such as ✅ and
+  // ⚡ two cells. xterm.js defaults to Unicode 6 and gives them one, so every
+  // row holding one read as drifted from the Mac and was redrawn every few
+  // seconds. Unicode 11 widths match Kaku for these.
+  term.loadAddon(new Unicode11Addon.Unicode11Addon());
+  term.unicode.activeVersion = "11";
   // WebGL draws the grid on one canvas, so Claude Code redrawing several
   // times a second no longer rebuilds DOM rows and restarts CSS cursor
   // animations. Without WebGL the DOM renderer draws instead.
