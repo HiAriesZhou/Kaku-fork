@@ -526,8 +526,14 @@ impl super::TermWindow {
     }
 
     pub fn raw_key_event_impl(&mut self, key: RawKeyEvent, context: &dyn WindowOps) {
+        // A modifier alone is not typing: switching to Kaku with Cmd+Tab or
+        // a Ctrl+arrow Space swipe delivers one, and taking the tab back
+        // then resized it under the browser on every switch.
         #[cfg(feature = "remote")]
-        if key.key_is_down {
+        if key.key_is_down
+            && !key.key.is_modifier()
+            && !key.phys_code.is_some_and(|code| code.is_modifier())
+        {
             self.reclaim_active_tab_size();
         }
         // The leader key is a kind of modal modifier key.

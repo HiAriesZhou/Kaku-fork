@@ -1785,6 +1785,16 @@ mod tests {
         let keys = include_str!("termwindow/keyevent.rs");
         let mouse = include_str!("termwindow/mouseevent.rs");
         assert!(keys.contains("self.reclaim_active_tab_size();"));
+        // A modifier alone (Cmd+Tab back to Kaku) is not typing.
+        let raw = keys
+            .split("fn raw_key_event_impl(")
+            .nth(1)
+            .unwrap()
+            .split("self.reclaim_active_tab_size();")
+            .next()
+            .unwrap();
+        assert!(raw.contains("!key.key.is_modifier()"));
+        assert!(raw.contains("!key.phys_code.is_some_and(|code| code.is_modifier())"));
         assert!(mouse.contains("self.reclaim_active_tab_size();"));
     }
 
