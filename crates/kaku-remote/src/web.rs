@@ -627,6 +627,46 @@ struct PageView {
     top: usize,
     #[serde(default)]
     alt: bool,
+    /// How the page draws, logged when it changes: font size and cell in
+    /// CSS pixels, the width an icon glyph measures at that size, the
+    /// device pixel ratio, whether WebGL draws and how often its glyph
+    /// atlas was rebuilt, and whether the history view is open.
+    #[serde(default)]
+    font: f32,
+    #[serde(default)]
+    cell_w: f32,
+    #[serde(default)]
+    cell_h: f32,
+    #[serde(default)]
+    icon: f32,
+    #[serde(default)]
+    dpr: f32,
+    #[serde(default)]
+    gl: bool,
+    #[serde(default)]
+    atlas: u32,
+    #[serde(default)]
+    past: bool,
+}
+
+impl PageView {
+    /// One line naming how the page draws, empty for pages that do not say.
+    fn drawing(&self) -> String {
+        if self.font == 0.0 {
+            return String::new();
+        }
+        format!(
+            "font {:.2}px cell {:.2}x{:.2} icon {:.2} dpr {} {} atlas resets {} history {}",
+            self.font,
+            self.cell_w,
+            self.cell_h,
+            self.icon,
+            self.dpr,
+            if self.gl { "webgl" } else { "dom" },
+            self.atlas,
+            if self.past { "open" } else { "closed" },
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -1665,7 +1705,12 @@ struct Shown {
     /// check that waited for none to be pending never ran, so drift stayed
     /// on screen until a reload.
     sent: VecDeque<(u64, Vec<String>)>,
+    /// For drift reports: what the last few frames did, oldest first.
+    recent: VecDeque<String>,
 }
+
+/// Frames named in a drift report.
+const RECENT_KEPT: usize = 8;
 
 /// Frames that can be in flight, with room for the page's check to travel.
 const SENT_KEPT: usize = FRAME_WINDOW * 2;
@@ -1720,6 +1765,7 @@ impl Shown {
             );
             changed = true;
         }
+        let mut resent = 0;
         for (idx, line) in frame.lines.iter().enumerate() {
             let before = if full {
                 None
@@ -1730,6 +1776,7 @@ impl Shown {
             if before.map(|old| row_body(old)) != Some(row_body(line)) {
                 data.push_str(line);
                 changed = true;
+                resent += 1;
             }
         }
         let images_changed = self.images != frame.images;
@@ -1746,6 +1793,16 @@ impl Shown {
             self.images.clone_from(&frame.images);
         }
         frame.images_changed = images_changed;
+        if self.recent.len() == RECENT_KEPT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(if full {
+            format!("full {resent}")
+        } else if moved != 0 {
+            format!("move {moved} rows {resent}")
+        } else {
+            format!("rows {resent}")
+        });
         data.push_str(&frame.cursor);
         self.cols = frame.cols;
         self.title.clone_from(&frame.title);
@@ -1842,6 +1899,42 @@ fn drifted_rows(shown: &[String], page: &[String]) -> Vec<usize> {
             kaku != seen
         })
         .collect()
+}
+
+/// For each drifted row, the first of Kaku's rows the page shows there
+/// instead ("5>23": page row 5 holds Kaku's row 23, "5>?" a row Kaku does
+/// not have, "5>_" a blank). Row numbers only, never text.
+fn page_sources(shown: &[String], page: &[String], drift: &[usize]) -> String {
+    let text = |l: &str| -> String { l.chars().filter(|c| !c.is_whitespace()).collect() };
+    let kaku: Vec<String> = shown.iter().map(|l| row_text(l)).collect();
+    drift
+        .iter()
+        .take(8)
+        .map(|&i| {
+            let seen = page.get(i).map(|l| text(l)).unwrap_or_default();
+            let from = if seen.is_empty() {
+                "_".to_string()
+            } else {
+                kaku.iter()
+                    .position(|k| *k == seen)
+                    .map_or("?".to_string(), |j| j.to_string())
+            };
+            format!("{i}>{from}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Page rows that repeat the non-blank row above them: a screen filled with
+/// one line scores near its height.
+fn repeated_rows(page: &[String]) -> usize {
+    let text = |l: &str| -> String { l.chars().filter(|c| !c.is_whitespace()).collect() };
+    page.windows(2)
+        .filter(|w| {
+            let a = text(&w[0]);
+            !a.is_empty() && a == text(&w[1])
+        })
+        .count()
 }
 
 /// When the drifted rows all show Kaku's rows from `k` rows away, the page
@@ -2349,6 +2442,8 @@ pub(crate) async fn run_session(
     let mut updates: Option<broadcast::Receiver<()>> = None;
     let mut view = View::default();
     let mut shown = Shown::default();
+    // How the page last said it draws, logged when that changes.
+    let mut page_drawing = String::new();
     let mut last_tabs: Option<Vec<TabInfo>> = None;
     let mut dirty_frame = false;
     // Frames sent this session; a page's verify only counts once it has
@@ -2480,6 +2575,11 @@ pub(crate) async fn run_session(
                     continue;
                 }
                 if let WebClientMsg::Verify { frames, rows, seq, view } = &msg {
+                    let drawing = view.as_ref().map(PageView::drawing).unwrap_or_default();
+                    if !drawing.is_empty() && drawing != page_drawing {
+                        log::info!("kaku-remote web: page draws with {drawing}");
+                        page_drawing = drawing;
+                    }
                     let expected = match seq {
                         Some(seq) => shown.rows_after(*seq),
                         None => (*frames == frame_window.sent).then_some(shown.lines.as_slice()),
@@ -2490,7 +2590,7 @@ pub(crate) async fn run_session(
                             let pane = attached.and_then(lookup_pane);
                             let view = view.as_ref();
                             log::warn!(
-                                "kaku-remote web: screen drift in {} of {} rows (last move {}, {} frames since full, scrolled {}, alt screen {}, mouse grabbed {}); rows {:?}, page offset {:?}, page grid {}x{} base {} top {} alt {}; redrawing",
+                                "kaku-remote web: screen drift in {} of {} rows (last move {}, {} frames since full, scrolled {}, alt screen {}, mouse grabbed {}); rows {:?}, page offset {:?}, page shows {}, page repeats {} rows, recent frames [{}], page grid {}x{} base {} top {} alt {}, {}; redrawing",
                                 drift.len(),
                                 shown.lines.len(),
                                 shown.last_move,
@@ -2500,11 +2600,15 @@ pub(crate) async fn run_session(
                                 pane.as_ref().is_some_and(|p| p.is_mouse_grabbed()),
                                 &drift[..drift.len().min(8)],
                                 page_offset(expected, rows, &drift),
+                                page_sources(expected, rows, &drift),
+                                repeated_rows(rows),
+                                shown.recent.iter().cloned().collect::<Vec<_>>().join(", "),
                                 view.map_or(0, |v| v.cols),
                                 view.map_or(0, |v| v.rows),
                                 view.map_or(0, |v| v.base),
                                 view.map_or(0, |v| v.top),
                                 view.is_some_and(|v| v.alt),
+                                view.map(PageView::drawing).unwrap_or_default(),
                             );
                             shown = Shown::default();
                             dirty_frame = true;
@@ -3192,6 +3296,48 @@ mod tests {
         let blank = vec![String::new(); 5];
         let drift = drifted_rows(&shown, &blank);
         assert_eq!(page_offset(&shown, &blank, &drift), None);
+    }
+
+    #[test]
+    fn drift_report_names_rows_the_page_repeats_without_their_text() {
+        let shown = rows(&["a", "b", "c", "d", "prompt"]);
+        // The screen filled with one row, as reported after scrolling.
+        let page: Vec<String> = ["d", "d", "d", "", "nope"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let drift = drifted_rows(&shown, &page);
+        assert_eq!(page_sources(&shown, &page, &drift), "0>3 1>3 2>3 3>_ 4>?");
+        assert_eq!(repeated_rows(&page), 2);
+        assert_eq!(repeated_rows(&rows(&["a", "b"])), 0);
+
+        let mut shown = Shown::default();
+        let texts = ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"];
+        let up = ["l3", "l4", "l5", "l6", "l7", "l8", "n1", "n2"];
+        shown.update(Frame {
+            lines: rows(&texts),
+            ..frame(10, &[], "")
+        });
+        shown.update(Frame {
+            lines: rows(&up),
+            ..frame(10, &[], "")
+        });
+        assert_eq!(Vec::from(shown.recent.clone()), ["full 8", "move 2 rows 2"]);
+        let drawing = PageView {
+            font: 14.0,
+            cell_w: 8.4,
+            cell_h: 18.0,
+            icon: 14.0,
+            dpr: 2.0,
+            gl: true,
+            atlas: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            drawing.drawing(),
+            "font 14.00px cell 8.40x18.00 icon 14.00 dpr 2 webgl atlas resets 3 history closed"
+        );
+        assert_eq!(PageView::default().drawing(), "");
     }
 
     #[test]

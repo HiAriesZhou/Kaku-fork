@@ -1576,6 +1576,15 @@ test('the drift check names the last frame drawn, so it runs while output stream
   assert.equal(last.seq, 4);
   assert.deepEqual([last.view.cols, last.view.rows], [90, 24]);
   assert.equal(last.rows[0].trimEnd(), 'resized');
+  // How the page draws goes along for the Mac's log.
+  assert.ok(last.view.font > 0 && last.view.cell_w > 0 && last.view.cell_h > 0 && last.view.icon > 0, JSON.stringify(last.view));
+  assert.equal(last.view.past, false);
+  const resets = last.view.atlas;
+  await p.evaluate(() => window.dispatchEvent(new Event('focus')));
+  await p.evaluate(() => probe.handle({ type: 'frame', seq: 5, pane_id: 1, cols: 90, rows: 24, data: '\x1b[2;1Hmore' }));
+  await p.waitForTimeout(1400);
+  const after = (await p.evaluate(() => messages.filter(m => m.type === 'verify'))).at(-1);
+  assert.equal(after.view.atlas, after.view.gl ? resets + 1 : resets);
 });
 
 test('the page draws with Kaku\'s font families in their order', async t => {

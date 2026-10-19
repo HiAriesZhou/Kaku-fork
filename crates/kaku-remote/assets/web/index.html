@@ -647,8 +647,10 @@
   // as other glyphs across the newly shown tab (maintainer, 2026-10-16,
   // switching tabs). Rebuild the atlas whenever a different screen comes up
   // or the page comes back, a few milliseconds of re-rasterizing.
+  // Counted for the Mac's log, next to how the page draws.
+  let atlasResets = 0;
   const freshGlyphs = () => {
-    if (webgl && !document.hidden) { try { term.clearTextureAtlas(); } catch (_) {} }
+    if (webgl && !document.hidden) { try { term.clearTextureAtlas(); atlasResets++; } catch (_) {} }
   };
   document.addEventListener("visibilitychange", freshGlyphs);
   window.addEventListener("focus", freshGlyphs);
@@ -1112,6 +1114,15 @@
   let verifyTimer = 0;
   // The periodic check only runs after something changed; idle, it would
   // upload the whole screen every few seconds on a phone's data plan.
+  // How wide a Nerd Font folder icon measures in the terminal's font, for
+  // the Mac's log: wider than a cell, it covers the next character.
+  const iconCanvas = document.createElement("canvas").getContext("2d");
+  const iconWidth = () => {
+    try {
+      iconCanvas.font = `${term.options.fontSize}px ${term.options.fontFamily}`;
+      return iconCanvas.measureText("\u{F024B}").width;
+    } catch (_) { return 0; }
+  };
   let verified = { socket: null, frames: -1 };
   const verify = (force = false) => {
     if (!ws || ws.readyState !== WebSocket.OPEN || paneId === null || !size.cols) return;
@@ -1124,7 +1135,12 @@
         const line = buf.getLine(buf.viewportY + y);
         rows.push(line ? line.translateToString(true) : "");
       }
-      const view = { cols: term.cols, rows: term.rows, base: buf.baseY, top: buf.viewportY, alt: buf.type === "alternate" };
+      const cell = cellSize() || { width: 0, height: 0 };
+      const view = {
+        cols: term.cols, rows: term.rows, base: buf.baseY, top: buf.viewportY, alt: buf.type === "alternate",
+        font: term.options.fontSize, cell_w: cell.width, cell_h: cell.height, icon: iconWidth(),
+        dpr: window.devicePixelRatio, gl: !!webgl, atlas: atlasResets, past: pastOpen,
+      };
       send({ type: "verify", frames: framesSeen, seq: appliedSeq || undefined, rows, view });
     });
   };
