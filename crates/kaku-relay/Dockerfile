@@ -1,5 +1,5 @@
 # Built from the repository root (see crates/AGENTS.md), so the relay can
-# carry the web terminal's page from crates/kaku-remote and the fonts.
+# carry the web terminal's page and fonts from crates/kaku-remote.
 FROM rust:1.95-slim AS builder
 WORKDIR /app
 
@@ -9,7 +9,6 @@ WORKDIR /app
 COPY crates/kaku-relay/Cargo.toml crates/kaku-relay/Cargo.lock crates/kaku-relay/
 COPY crates/kaku-relay/src crates/kaku-relay/src
 COPY crates/kaku-remote/assets/web crates/kaku-remote/assets/web
-COPY assets/fonts/JetBrainsMono-Regular.ttf assets/fonts/JetBrainsMono-Medium.ttf assets/fonts/
 
 WORKDIR /app/crates/kaku-relay
 RUN cargo build --release --locked

@@ -5,5 +5,3 @@
 !crates/kaku-relay/Cargo.lock
 !crates/kaku-relay/src
 !crates/kaku-remote/assets/web
-!assets/fonts/JetBrainsMono-Regular.ttf
-!assets/fonts/JetBrainsMono-Medium.ttf
