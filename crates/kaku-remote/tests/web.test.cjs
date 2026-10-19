@@ -16,7 +16,7 @@ before(async () => {
 after(async () => { await browser?.close(); });
 
 async function page(t, hash = '#t=fixture', options = {}, context = browser) {
-  const { platform, ...pageOptions } = options;
+  const { platform, noConfig, ...pageOptions } = options;
   const p = await context.newPage({ viewport: { width: 1000, height: 600 }, ...pageOptions });
   if (platform) await p.addInitScript(value => Object.defineProperty(navigator, 'platform', { value }), platform);
   t.after(() => p.close());
@@ -50,6 +50,9 @@ async function page(t, hash = '#t=fixture', options = {}, context = browser) {
   });
   await p.goto('http://localhost:9988/' + hash);
   await p.waitForTimeout(100);
+  // Kaku sends its config first on every session; the page claims no size
+  // before it and the bundled font are in.
+  if (!noConfig) await p.evaluate(() => { if (!window.probe) return; probe.handle({ type: 'config' }); return document.fonts.load('16px "Kaku Mono"'); });
   return { p, errors };
 }
 async function screen(p, text = 'Password: ', pane = 1) {
@@ -1524,4 +1527,15 @@ test('a page open across an update reloads into the new one on reconnect, once',
   await reconnect();
   assert.equal(loads, 1, 'the same new version never reloads twice');
   assert.deepEqual(errors, []);
+});
+
+test('no size is claimed before Kaku\'s config and font are in, then one', async t => {
+  const { p } = await page(t, '#t=fixture', { noConfig: true });
+  await screen(p);
+  await p.setViewportSize({ width: 900, height: 560 });
+  await p.waitForTimeout(250);
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'resize')), []);
+  await p.evaluate(() => { probe.handle({ type: 'config', font_size: 14 }); return document.fonts.load('16px "Kaku Mono"'); });
+  await p.waitForTimeout(250);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'resize').length), 1);
 });

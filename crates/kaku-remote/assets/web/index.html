@@ -736,18 +736,25 @@
     const px = Math.floor((baseFontSize * across) / (PHONE_COLS * cell.width) * userScale * 4) / 4;
     return Math.max(8, Math.min(baseFontSize * 1.6, px));
   };
+  let fontReady = false;
   const fit = () => {
-    const availW = stage.clientWidth - MARGIN * 2;
-    const availH = stage.clientHeight - MARGIN * 2;
-    if (availW <= 0 || availH <= 0) return;
+    if (stage.clientWidth <= MARGIN * 2 || stage.clientHeight <= MARGIN * 2) return;
     const want = claimFont();
     setFont(want);
     const base = cellSize();
     if (!base) return;
     // Kaku's tab bar is one terminal row, so on a desktop the page's bar is
-    // too; touch screens keep their finger-sized bar.
+    // too; touch screens keep their finger-sized bar. Measure the stage
+    // after the bar has its height, or the claim is a row off and corrected
+    // a moment later, redrawing the app twice.
     if (!TOUCH) document.documentElement.style.setProperty("--bar-h", Math.round(base.height) + "px");
-    if (ws && ws.readyState === WebSocket.OPEN && paneId !== null) {
+    const availW = stage.clientWidth - MARGIN * 2;
+    const availH = stage.clientHeight - MARGIN * 2;
+    if (availW <= 0 || availH <= 0) return;
+    // No claim until Kaku's font size and the bundled face are in: a size
+    // measured on the fallback face is claimed and then corrected, and each
+    // claim makes a full-screen app such as Claude Code redraw.
+    if (fontReady && ws && ws.readyState === WebSocket.OPEN && paneId !== null) {
       const cols = Math.floor(availW / base.width);
       const rows = Math.floor(availH / base.height);
       const key = cols + "x" + rows;
@@ -2143,6 +2150,7 @@
     // fallback face it saw first; fit() then sets Kaku's size back.
     document.fonts.load('16px "Kaku Mono"').finally(() => {
       setFont(baseFontSize + 1);
+      fontReady = true;
       fit();
     });
   };
