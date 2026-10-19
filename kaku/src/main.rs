@@ -373,14 +373,40 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
     if reset {
         println!("Every paired browser was removed.");
     }
-    print_pairing(&identity.pairing_link(relay)?);
+    // A link printed while this Mac cannot reach the relay only ever opens
+    // to "offline" in the browser; say why here instead.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut down = relay_down_note(kaku_remote::read_relay_status().as_ref(), relay);
+    while down.is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        down = relay_down_note(kaku_remote::read_relay_status().as_ref(), relay);
+    }
+    print_pairing(&identity.pairing_link(relay)?, down.as_deref());
     Ok(())
+}
+
+/// Why the link cannot open yet, when the running Kaku is not connected to
+/// `relay`. None when it is, or when no running Kaku has tried yet.
+#[cfg(feature = "remote")]
+fn relay_down_note(status: Option<&kaku_remote::RelayStatus>, relay: &str) -> Option<String> {
+    let status = status.filter(|s| s.relay == relay && s.is_current())?;
+    if status.connected {
+        return None;
+    }
+    let reason = if status.last_error.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", status.last_error)
+    };
+    Some(format!(
+        "This Mac is not connected to the relay right now{reason}, so the link shows offline until it is. Check this network, proxy or VPN; `kaku doctor` shows more."
+    ))
 }
 
 /// The one-time pairing link, what to know about it, and the commands that
 /// manage what it pairs, styled like the main menu when shown in a terminal.
 #[cfg(feature = "remote")]
-fn print_pairing(url: &str) {
+fn print_pairing(url: &str, relay_down: Option<&str>) {
     let color = std::io::stdout().is_terminal();
     let paint = |code: &str, text: &str| {
         if color {
@@ -391,20 +417,44 @@ fn print_pairing(url: &str) {
     };
     let minutes = kaku_remote::OFFER_LIFETIME.as_secs() / 60;
     println!();
-    println!("{}", paint(PURPLE_BOLD, "Pair a browser with this Mac"));
+    println!(
+        "{}",
+        paint(
+            PURPLE_BOLD,
+            "Open this link in a browser on another computer"
+        )
+    );
     println!("{url}");
     println!();
-    for note in [
-        format!("Works once, within {minutes} minutes. Whoever opens it first gets your terminals, so keep it private."),
-        "Desktop browsers only for now. Have fun!".to_string(),
-    ] {
-        println!("{}", paint(GRAY, &note));
+    if let Some(note) = relay_down {
+        println!("{}", paint(YELLOW, note));
+        println!();
+    }
+    for (step, note) in [
+        format!("It works once, within {minutes} minutes. Whoever opens it first gets your terminals, so keep it private."),
+        "Bookmark the page it opens. That browser stays paired, so next time open the bookmark, no new link needed.".to_string(),
+        "Keep Kaku open on this Mac; the page shows offline while it is closed or cannot reach the relay.".to_string(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        println!("{}", paint(GRAY, &format!("{}. {note}", step + 1)));
     }
     println!();
+    println!("{}", paint(GRAY, "Later, to manage access:"));
     for (command, what) in [
-        ("kaku remote devices", "List paired browsers"),
-        ("kaku remote revoke <id>", "Remove one"),
-        ("kaku remote off", "Turn remote access off"),
+        (
+            "kaku remote devices",
+            "See which browsers can open your terminals",
+        ),
+        (
+            "kaku remote revoke <id>",
+            "Unpair one, using an id from devices",
+        ),
+        (
+            "kaku remote off",
+            "Turn remote access off for every browser",
+        ),
     ] {
         println!(
             "{}  {}",
@@ -615,6 +665,8 @@ fn should_show_main_menu(opts: &Opt) -> bool {
 const GREEN: &str = "\x1b[0;32m";
 const PURPLE_BOLD: &str = "\x1b[1;35m";
 const GRAY: &str = "\x1b[0;90m";
+#[cfg(feature = "remote")]
+const YELLOW: &str = "\x1b[0;33m";
 const RESET: &str = "\x1b[0m";
 
 fn select_main_menu_command() -> anyhow::Result<Option<SubCommand>> {
@@ -863,4 +915,37 @@ fn resolve_gui_executable(exe_name: &str) -> anyhow::Result<PathBuf> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("unable to resolve GUI executable path"))
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod remote_tests {
+    use super::relay_down_note;
+    use kaku_remote::RelayStatus;
+
+    fn status(connected: bool, error: &str, pid: u32) -> RelayStatus {
+        RelayStatus {
+            relay: "wss://r.example".to_string(),
+            connected,
+            last_error: error.to_string(),
+            pid,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn kaku_remote_says_why_a_link_would_open_offline() {
+        let me = std::process::id();
+        let relay = "wss://r.example";
+        assert_eq!(relay_down_note(None, relay), None);
+        assert_eq!(relay_down_note(Some(&status(true, "", me)), relay), None);
+        let down = relay_down_note(Some(&status(false, "connect timed out", me)), relay).unwrap();
+        assert!(down.contains("not connected to the relay"), "{}", down);
+        assert!(down.contains("(connect timed out)"), "{}", down);
+        // Another relay, or a Kaku that has quit, says nothing about this one.
+        assert_eq!(
+            relay_down_note(Some(&status(false, "x", me)), "wss://other"),
+            None
+        );
+        assert_eq!(relay_down_note(Some(&status(false, "x", 0)), relay), None);
+    }
 }
