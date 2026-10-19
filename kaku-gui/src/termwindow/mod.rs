@@ -808,6 +808,8 @@ pub struct PaneState {
     pub has_unread_bell: bool,
     pub has_unread_notification: bool,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
+    /// The pane's visible seqno when its output last repainted the window.
+    last_output_visible_seqno: Option<SequenceNo>,
 }
 
 /// The trailing tab cell only reports attention, never a running state:
@@ -2692,7 +2694,9 @@ impl TermWindow {
                     }
                 }
                 MuxNotification::PaneOutput(pane_id) => {
-                    self.mux_pane_output_event(pane_id);
+                    if self.pane_output_changes_display(pane_id) {
+                        self.mux_pane_output_event(pane_id);
+                    }
                 }
                 MuxNotification::WindowInvalidated(_) => {
                     window.invalidate();
@@ -2900,6 +2904,27 @@ impl TermWindow {
                 .as_ref()
                 .is_some_and(|o| o.pane.pane_id() == pane_id)
         })
+    }
+
+    /// Output made only of titles, user vars, the working directory or
+    /// progress draws nothing in the pane, so it needs no repaint here:
+    /// what shows those repaints through its alert and `update_title`
+    /// (#585). Panes that cannot tell, such as overlays and remote panes,
+    /// always repaint. Other callers of `mux_pane_output_event` are not
+    /// filtered.
+    fn pane_output_changes_display(&mut self, pane_id: PaneId) -> bool {
+        let Some(pane) = Mux::get().get_pane(pane_id) else {
+            return true;
+        };
+        let Some(seqno) = pane.get_visible_seqno() else {
+            return true;
+        };
+        let mut state = self.pane_state(pane_id);
+        if state.last_output_visible_seqno == Some(seqno) {
+            return false;
+        }
+        state.last_output_visible_seqno = Some(seqno);
+        true
     }
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
@@ -3793,8 +3818,13 @@ impl TermWindow {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();
             self.invalidate_modal();
-            if let Some(window) = self.window.as_ref() {
-                window.invalidate();
+            // A hidden tab bar draws nothing, so a title or progress change in
+            // it needs no repaint (#585). Showing the bar later relayouts and
+            // repaints through the visibility sync at the end of this function.
+            if self.show_tab_bar {
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
             }
         }
 

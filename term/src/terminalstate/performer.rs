@@ -87,6 +87,28 @@ fn log_pty_write_error_throttled(
     }
 }
 
+/// Whether performing `action` can change what the terminal draws.
+/// Only sequences that reach the GUI through an alert are excluded:
+/// titles, user vars, the working directory and progress all trigger
+/// `update_title`, which repaints whatever shows them (#585). Everything
+/// else, including cursor movement and palette changes, counts as visible.
+pub(crate) fn action_changes_display(action: &Action) -> bool {
+    match action {
+        Action::OperatingSystemCommand(osc) => !matches!(
+            **osc,
+            OperatingSystemCommand::SetIconName(_)
+                | OperatingSystemCommand::SetIconNameSun(_)
+                | OperatingSystemCommand::SetWindowTitle(_)
+                | OperatingSystemCommand::SetWindowTitleSun(_)
+                | OperatingSystemCommand::SetIconNameAndWindowTitle(_)
+                | OperatingSystemCommand::CurrentWorkingDirectory(_)
+                | OperatingSystemCommand::ConEmuProgress(_)
+                | OperatingSystemCommand::ITermProprietary(ITermProprietary::SetUserVar { .. })
+        ),
+        _ => true,
+    }
+}
+
 impl<'a> Deref for Performer<'a> {
     type Target = TerminalState;
 
@@ -327,6 +349,9 @@ impl<'a> Performer<'a> {
 
     pub fn perform(&mut self, action: Action) {
         debug!("perform {:?}", action);
+        if action_changes_display(&action) {
+            self.visible_seqno = self.seqno;
+        }
         if self.suppress_initial_title_change {
             if let Action::OperatingSystemCommand(osc) = &action {
                 if let OperatingSystemCommand::SetIconNameAndWindowTitle(_) = **osc {

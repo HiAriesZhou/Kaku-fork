@@ -429,6 +429,9 @@ pub struct TerminalState {
 
     kitty_img: KittyImageState,
     seqno: SequenceNo,
+    /// The seqno of the last batch of output that could change what the
+    /// terminal draws; see `action_changes_display`.
+    visible_seqno: SequenceNo,
 
     /// The unicode version that is in effect
     unicode_version: UnicodeVersion,
@@ -648,6 +651,7 @@ impl TerminalState {
             user_vars: HashMap::new(),
             kitty_img: Default::default(),
             seqno,
+            visible_seqno: seqno,
             unicode_version,
             unicode_version_stack: vec![],
             suppress_initial_title_change: false,
@@ -677,6 +681,13 @@ impl TerminalState {
 
     pub fn increment_seqno(&mut self) {
         self.seqno += 1;
+    }
+
+    /// The seqno of the last output that could change what is drawn.
+    /// Output made only of titles, user vars, the working directory or
+    /// progress leaves it alone, so a renderer can skip repainting for it.
+    pub fn visible_seqno(&self) -> SequenceNo {
+        self.visible_seqno
     }
 
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {

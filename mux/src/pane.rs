@@ -242,6 +242,13 @@ pub trait Pane: Downcast + Send + Sync {
 
     fn get_current_seqno(&self) -> SequenceNo;
 
+    /// The seqno of the last output that could change what this pane
+    /// draws, or None when the pane cannot tell, in which case every
+    /// output repaints.
+    fn get_visible_seqno(&self) -> Option<SequenceNo> {
+        None
+    }
+
     /// Returns misc metadata that is pane-specific
     fn get_metadata(&self) -> Value {
         Value::Null

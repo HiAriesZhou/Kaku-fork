@@ -2068,3 +2068,61 @@ fn program_status_blocked_notifies_again_after_a_new_prompt() {
         .count();
     assert_eq!(count, 2);
 }
+
+/// Titles, user vars, the working directory and progress draw nothing in
+/// the pane, so they must leave the visible seqno alone; anything that can
+/// change what is drawn, cursor movement and palette changes included,
+/// must move it (#585).
+#[test]
+fn visible_seqno_ignores_metadata_only_output() {
+    let mut term = TestTerm::new(3, 10, 0);
+    term.print("hello");
+
+    let metadata_only = [
+        "\x1b]0;both\x07",
+        "\x1b]1;icon\x07",
+        "\x1b]2;1 working\x07",
+        "\x1b]2;1 working\x07",
+        "\x1b]1337;SetUserVar=foo=YmFy\x07",
+        "\x1b]7;file://host/tmp\x07",
+        "\x1b]9;4;1;50\x07",
+        "\x1b]2;a\x07\x1b]2;b\x07",
+    ];
+    for seq in metadata_only {
+        let before = term.visible_seqno();
+        term.print(seq);
+        assert!(
+            term.current_seqno() > before,
+            "{:?} still advances seqno",
+            seq
+        );
+        assert_eq!(
+            term.visible_seqno(),
+            before,
+            "{:?} must not count as visible",
+            seq
+        );
+    }
+
+    let visible = [
+        "x",
+        "\x1b[1;1H",
+        "\x1b[?25l",
+        "\x1b]4;1;rgb:ff/00/00\x07",
+        "\x1b]11;rgb:00/00/00\x07",
+        "\x1b]8;;https://example.com\x07",
+        "\x07",
+        "\x1b]2;title\x07y",
+        "y\x1b]2;title\x07",
+    ];
+    for seq in visible {
+        let before = term.visible_seqno();
+        term.print(seq);
+        assert!(
+            term.visible_seqno() > before,
+            "{:?} must count as visible",
+            seq
+        );
+        assert_eq!(term.visible_seqno(), term.current_seqno(), "{:?}", seq);
+    }
+}

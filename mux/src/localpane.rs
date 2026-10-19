@@ -202,6 +202,10 @@ impl Pane for LocalPane {
         self.terminal.lock().current_seqno()
     }
 
+    fn get_visible_seqno(&self) -> Option<SequenceNo> {
+        Some(self.terminal.lock().visible_seqno())
+    }
+
     fn get_changed_since(
         &self,
         lines: Range<StableRowIndex>,
