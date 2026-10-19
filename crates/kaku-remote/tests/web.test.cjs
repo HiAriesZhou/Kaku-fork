@@ -1490,3 +1490,36 @@ test('the Mac covering a pane with AI chat dims it and says so', async t => {
   assert.equal(await p.evaluate(() => document.body.classList.contains('stale')), false);
   assert.deepEqual(errors, []);
 });
+
+test('a page open across an update reloads into the new one on reconnect, once', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  const reconnect = async () => {
+    const before = await p.evaluate(() => connections.length);
+    await p.evaluate(() => connections.at(-1).close());
+    await p.waitForFunction(n => connections.length > n, before);
+    await p.evaluate(() => connections.at(-1).onmessage({ data: '{"type":"pong"}' }));
+    await p.waitForTimeout(300);
+  };
+  let loads = 0;
+  p.on('load', () => loads++);
+  // The first message only counts as a reconnect after an earlier session.
+  await p.evaluate(() => connections.at(-1).onmessage({ data: '{"type":"pong"}' }));
+  await reconnect();
+  assert.equal(loads, 0, 'the same script never reloads');
+
+  // The address now serves a new script, but a stale cache keeps handing
+  // the reload the old page: it reloads once and then stays put.
+  const served = fs.readFileSync(path.join(root, 'crates/kaku-remote/assets/web/index.html'), 'utf8')
+    .replace('<script>', '<script>window.newPage = true;');
+  await p.route('http://localhost:9988/', route => route.request().resourceType() === 'fetch'
+    ? route.fulfill({ contentType: 'text/html', body: served })
+    : route.fallback());
+  await reconnect();
+  await p.waitForFunction(() => window.probe);
+  assert.equal(loads, 1, 'a changed script reloads the page');
+  await p.evaluate(() => connections.at(-1).onmessage({ data: '{"type":"pong"}' }));
+  await reconnect();
+  assert.equal(loads, 1, 'the same new version never reloads twice');
+  assert.deepEqual(errors, []);
+});

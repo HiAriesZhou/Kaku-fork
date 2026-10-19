@@ -47,7 +47,7 @@ csp = "; ".join([
     "style-src 'self' 'unsafe-inline'",
     "font-src 'self'",
     "img-src 'self' data: blob:",
-    "connect-src %s %s" % (relay, http),
+    "connect-src 'self' %s %s" % (relay, http),
     "base-uri 'none'",
     "form-action 'none'",
     "frame-ancestors 'none'",

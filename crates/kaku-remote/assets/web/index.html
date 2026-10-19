@@ -2678,6 +2678,28 @@
       setNotice("No connection", "Check this device's network. Retrying.", { stale: true });
     });
   };
+  // A page left open across a Kaku update or a new page release keeps
+  // running its old script. After a reconnect, compare that script with the
+  // one this address serves now and reload into the new one, once per
+  // version so a stale cache cannot loop, and never mid-upload.
+  const PAGE_SCRIPT = document.querySelector("script:not([src])")?.textContent || "";
+  const checkPageFresh = () => {
+    fetch(location.pathname, { cache: "no-store" })
+      .then((res) => (res.ok ? res.text() : ""))
+      .then((html) => {
+        const served = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1];
+        if (!served || served === PAGE_SCRIPT || uploadAcks.size) return;
+        let sum = 0;
+        for (let i = 0; i < served.length; i++) sum = (sum * 31 + served.charCodeAt(i)) | 0;
+        const version = served.length + "." + sum;
+        try {
+          if (sessionStorage.getItem("kaku.reloaded") === version) return;
+          sessionStorage.setItem("kaku.reloaded", version);
+        } catch (_) { return; }
+        location.reload();
+      })
+      .catch(() => {});
+  };
   let reconnectTimer = 0;
   let linkRejected = false;
   let handshakeTimer = 0;
@@ -2687,6 +2709,7 @@
     if (linkRejected) return;
     if (!everConnected) setNotice("Connecting to Kaku", "", { delay: 400 });
     const socket = new WebSocket(wsUrl());
+    let checkedPage = false;
     socket.binaryType = "arraybuffer";
     ws = socket;
     handshakeTimer = setTimeout(() => { if (ws === socket) socket.close(); }, 20000);
@@ -2712,6 +2735,10 @@
         if (msg.type === "config" || msg.type === "tabs" || msg.type === "frame" || msg.type === "pong") {
           clearTimeout(handshakeTimer);
           retry = 0;
+          if (everConnected && !checkedPage) {
+            checkedPage = true;
+            checkPageFresh();
+          }
           everConnected = true;
           clearNotice();
           finishPairing();
