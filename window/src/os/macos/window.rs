@@ -4126,6 +4126,14 @@ extern "C" {
 
     static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
 
+    #[cfg(test)]
+    fn TISCreateInputSourceList(
+        properties: core_foundation::dictionary::CFDictionaryRef,
+        include_all_installed: u8,
+    ) -> core_foundation::array::CFArrayRef;
+    #[cfg(test)]
+    static kTISPropertyInputSourceID: CFStringRef;
+
     fn UCKeyTranslate(
         layout: *const UCKeyboardLayout,
         virtualKeyCode: u16,
@@ -4146,6 +4154,8 @@ extern "C" {
 enum TranslateStatus {
     Composing(String),
     Composed(String),
+    /// Text to send, then a new dead key that is pending.
+    ComposedThenComposing(String, String),
     NotDead,
 }
 
@@ -4188,7 +4198,29 @@ impl Keyboard {
     pub fn new() -> Self {
         let _kbd =
             unsafe { InputSource::wrap_under_create_rule(TISCopyCurrentKeyboardInputSource()) };
+        Self::from_input_source(_kbd)
+    }
 
+    /// Look up an installed keyboard layout by id (eg:
+    /// `com.apple.keylayout.SwissFrench`) without selecting it, so tests can
+    /// translate keys on a layout the machine is not using.
+    #[cfg(test)]
+    fn from_input_source_id(id: &str) -> Option<Self> {
+        use core_foundation::array::CFArray;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::string::CFString;
+        let key = unsafe { CFString::wrap_under_get_rule(kTISPropertyInputSourceID) };
+        let filter = CFDictionary::from_CFType_pairs(&[(key, CFString::new(id))]);
+        let list = unsafe { TISCreateInputSourceList(filter.as_concrete_TypeRef(), 1) };
+        if list.is_null() {
+            return None;
+        }
+        let list: CFArray<InputSource> = unsafe { CFArray::wrap_under_create_rule(list) };
+        let source = list.get(0)?.clone();
+        Some(Self::from_input_source(source))
+    }
+
+    fn from_input_source(_kbd: InputSource) -> Self {
         let layout_data = unsafe {
             let data = TISGetInputSourceProperty(
                 _kbd.as_concrete_TypeRef(),
@@ -4275,81 +4307,183 @@ impl Inner {
         modifier_flags: NSEventModifierFlags,
         force_dead_keys: bool,
     ) -> anyhow::Result<TranslateStatus> {
-        let keyboard = Keyboard::new();
-
-        let mods = key_modifiers(modifier_flags);
-
         let config = &self.config;
+        let use_dead_keys = dead_keys_enabled(
+            config.use_dead_keys,
+            force_dead_keys,
+            key_modifiers(modifier_flags),
+            config.send_composed_key_when_left_alt_is_pressed,
+            config.send_composed_key_when_right_alt_is_pressed,
+        );
+        translate_dead_key_sequence(
+            &Keyboard::new(),
+            &mut self.dead_pending,
+            virtual_key_code,
+            modifier_flags,
+            use_dead_keys,
+        )
+    }
+}
 
-        let use_dead_keys = if !config.use_dead_keys {
-            false
-        } else if force_dead_keys {
-            true
-        } else if mods.contains(Modifiers::LEFT_ALT) {
-            config.send_composed_key_when_left_alt_is_pressed
-        } else if mods.contains(Modifiers::RIGHT_ALT) {
-            config.send_composed_key_when_right_alt_is_pressed
-        } else {
-            true
-        };
+/// Whether a key press may start a dead-key sequence. `force_dead_keys` is set
+/// when AppKit produced no characters for the press, i.e. the layout itself
+/// made it a dead key; that wins over Option-as-Meta so layouts that put `~`
+/// on an Option dead key still type it (#139).
+fn dead_keys_enabled(
+    use_dead_keys: bool,
+    force_dead_keys: bool,
+    mods: Modifiers,
+    send_composed_key_when_left_alt_is_pressed: bool,
+    send_composed_key_when_right_alt_is_pressed: bool,
+) -> bool {
+    if !use_dead_keys {
+        false
+    } else if force_dead_keys {
+        true
+    } else if mods.contains(Modifiers::LEFT_ALT) {
+        send_composed_key_when_left_alt_is_pressed
+    } else if mods.contains(Modifiers::RIGHT_ALT) {
+        send_composed_key_when_right_alt_is_pressed
+    } else {
+        true
+    }
+}
 
-        if let Some(DeadKeyState { dead_state }) = self.dead_pending.take() {
-            let result = keyboard.translate(TranslateParams {
+fn translate_dead_key_sequence(
+    keyboard: &Keyboard,
+    dead_pending: &mut Option<DeadKeyState>,
+    virtual_key_code: u16,
+    modifier_flags: NSEventModifierFlags,
+    use_dead_keys: bool,
+) -> anyhow::Result<TranslateStatus> {
+    if let Some(DeadKeyState { dead_state }) = dead_pending.take() {
+        // Key-down (not display) translation is what the layout types: a key
+        // that combines gives the composed character (`~` then `a` is `ã`), and
+        // any other key gets the accent in front (`~` then `/` is `~/`), the
+        // way Terminal.app types it. Display translation dropped the accent (#560).
+        let result = keyboard.translate(TranslateParams {
+            virtual_key_code,
+            modifier_flags,
+            dead_state,
+            ignore_dead_keys: false,
+            display: false,
+        })?;
+
+        // Escape, Return, Delete and other non-text keys keep sending only
+        // their control byte, as before #560, so Escape still cancels the
+        // accent instead of typing it.
+        if result
+            .text
+            .chars()
+            .any(|c| (c as u32) < 0x20 || c as u32 == 0x7f)
+        {
+            return legacy_dead_key_resolution(
+                keyboard,
                 virtual_key_code,
                 modifier_flags,
                 dead_state,
-                ignore_dead_keys: false,
-                display: true,
-            })?;
-
-            // If length == 0 it means that they double-pressed the dead key.
-            // We treat that the same as the dead key disabled state:
-            // we want to clock through a space keypress so that we clear
-            // the state and output the original keypress.
-            let generate_space = !use_dead_keys || result.text.len() == 0;
-
-            if generate_space {
-                // synthesize a SPACE press to
-                // elicit the underlying key code and get out
-                // of the dead key state
-                let result = keyboard.translate(TranslateParams {
-                    virtual_key_code,
-                    modifier_flags,
-                    dead_state: result.dead_state,
-                    ignore_dead_keys: false,
-                    display: false,
-                })?;
-                Ok(TranslateStatus::Composed(result.text))
-            } else {
-                Ok(TranslateStatus::Composed(result.text))
-            }
-        } else if use_dead_keys {
-            let result = keyboard.translate(TranslateParams {
-                virtual_key_code,
-                modifier_flags,
-                dead_state: 0,
-                ignore_dead_keys: false,
-                display: false,
-            })?;
-
-            self.dead_pending.replace(DeadKeyState {
-                dead_state: result.dead_state,
-            });
-
-            // Get the non-dead-key rendition to show as the composing state
-            let composing = keyboard.translate(TranslateParams {
-                virtual_key_code,
-                modifier_flags,
-                dead_state: 0,
-                ignore_dead_keys: true,
-                display: true,
-            })?;
-
-            Ok(TranslateStatus::Composing(composing.text))
-        } else {
-            Ok(TranslateStatus::NotDead)
+                use_dead_keys,
+            );
         }
+
+        // A second dead key (the same one twice, or `^` then `´`) types the
+        // first accent and starts a new sequence with its own state.
+        if use_dead_keys {
+            if let Some(composing) =
+                dead_key_composing_text(keyboard, virtual_key_code, modifier_flags)?
+            {
+                dead_pending.replace(DeadKeyState {
+                    dead_state: result.dead_state,
+                });
+                return Ok(TranslateStatus::ComposedThenComposing(
+                    result.text,
+                    composing,
+                ));
+            }
+        }
+        Ok(TranslateStatus::Composed(result.text))
+    } else if use_dead_keys {
+        let result = keyboard.translate(TranslateParams {
+            virtual_key_code,
+            modifier_flags,
+            dead_state: 0,
+            ignore_dead_keys: false,
+            display: false,
+        })?;
+
+        dead_pending.replace(DeadKeyState {
+            dead_state: result.dead_state,
+        });
+
+        // Get the non-dead-key rendition to show as the composing state
+        let composing = keyboard.translate(TranslateParams {
+            virtual_key_code,
+            modifier_flags,
+            dead_state: 0,
+            ignore_dead_keys: true,
+            display: true,
+        })?;
+
+        Ok(TranslateStatus::Composing(composing.text))
+    } else {
+        Ok(TranslateStatus::NotDead)
     }
+}
+
+/// How a pending dead key was resolved before #560: display translation,
+/// with a key-down retry when that gives nothing or dead keys are off.
+fn legacy_dead_key_resolution(
+    keyboard: &Keyboard,
+    virtual_key_code: u16,
+    modifier_flags: NSEventModifierFlags,
+    dead_state: u32,
+    use_dead_keys: bool,
+) -> anyhow::Result<TranslateStatus> {
+    let result = keyboard.translate(TranslateParams {
+        virtual_key_code,
+        modifier_flags,
+        dead_state,
+        ignore_dead_keys: false,
+        display: true,
+    })?;
+    if !use_dead_keys || result.text.is_empty() {
+        let result = keyboard.translate(TranslateParams {
+            virtual_key_code,
+            modifier_flags,
+            dead_state: result.dead_state,
+            ignore_dead_keys: false,
+            display: false,
+        })?;
+        return Ok(TranslateStatus::Composed(result.text));
+    }
+    Ok(TranslateStatus::Composed(result.text))
+}
+
+/// The accent to show as pending when this key is itself a dead key on the
+/// layout (it types nothing and enters a dead state from a clean start).
+fn dead_key_composing_text(
+    keyboard: &Keyboard,
+    virtual_key_code: u16,
+    modifier_flags: NSEventModifierFlags,
+) -> anyhow::Result<Option<String>> {
+    let fresh = keyboard.translate(TranslateParams {
+        virtual_key_code,
+        modifier_flags,
+        dead_state: 0,
+        ignore_dead_keys: false,
+        display: false,
+    })?;
+    if !fresh.text.is_empty() || fresh.dead_state == 0 {
+        return Ok(None);
+    }
+    let composing = keyboard.translate(TranslateParams {
+        virtual_key_code,
+        modifier_flags,
+        dead_state: 0,
+        ignore_dead_keys: true,
+        display: true,
+    })?;
+    Ok(Some(composing.text))
 }
 
 const VIEW_CLS_NAME: &str = "KakuWindowView";
@@ -4673,6 +4807,227 @@ fn should_clear_modifiers_for_empty_unmod(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    /// Left Option as AppKit reports it: the Option mask plus the left device bit.
+    fn left_option() -> NSEventModifierFlags {
+        NSEventModifierFlags::from_bits_truncate(
+            NSEventModifierFlags::NSAlternateKeyMask.bits() | 0x20,
+        )
+    }
+
+    fn shift() -> NSEventModifierFlags {
+        NSEventModifierFlags::NSShiftKeyMask
+    }
+
+    fn no_mods() -> NSEventModifierFlags {
+        NSEventModifierFlags::empty()
+    }
+
+    /// What reached the terminal, and what is still shown as pending.
+    #[derive(Debug, PartialEq)]
+    struct Typed {
+        committed: String,
+        composing: Option<String>,
+    }
+
+    /// Types `keys` on an installed layout without selecting it, the way
+    /// `key_common` routes them with the bundled config (left Option as Meta,
+    /// right Option composes): a press enters the dead-key path when AppKit
+    /// would give it no characters or a dead key is pending.
+    fn type_on_layout(layout: &str, keys: &[(u16, NSEventModifierFlags)]) -> Typed {
+        // Text Input Sources crashes when test threads query it at the same
+        // time; the app only calls it from the main thread.
+        static TIS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _tis = TIS.lock().unwrap_or_else(|e| e.into_inner());
+        let keyboard = Keyboard::from_input_source_id(layout)
+            .unwrap_or_else(|| panic!("keyboard layout {} is not installed", layout));
+        let mut pending = None;
+        let mut typed = Typed {
+            committed: String::new(),
+            composing: None,
+        };
+        for &(virtual_key_code, modifier_flags) in keys {
+            let chars = keyboard
+                .translate(TranslateParams {
+                    virtual_key_code,
+                    modifier_flags,
+                    dead_state: 0,
+                    ignore_dead_keys: false,
+                    display: false,
+                })
+                .unwrap()
+                .text;
+            if !chars.is_empty() && pending.is_none() {
+                typed.committed.push_str(&chars);
+                continue;
+            }
+            let use_dead_keys = dead_keys_enabled(
+                true,
+                chars.is_empty(),
+                key_modifiers(modifier_flags),
+                false,
+                true,
+            );
+            match translate_dead_key_sequence(
+                &keyboard,
+                &mut pending,
+                virtual_key_code,
+                modifier_flags,
+                use_dead_keys,
+            )
+            .unwrap()
+            {
+                TranslateStatus::Composing(text) => typed.composing = Some(text),
+                TranslateStatus::Composed(text) => {
+                    typed.committed.push_str(&text);
+                    typed.composing = None;
+                }
+                TranslateStatus::ComposedThenComposing(text, composing) => {
+                    typed.committed.push_str(&text);
+                    typed.composing = Some(composing);
+                }
+                TranslateStatus::NotDead => {
+                    typed.committed.push_str(&chars);
+                    typed.composing = None;
+                }
+            }
+        }
+        typed
+    }
+
+    fn committed(text: &str) -> Typed {
+        Typed {
+            committed: text.to_string(),
+            composing: None,
+        }
+    }
+
+    const SWISS_FRENCH: &str = "com.apple.keylayout.SwissFrench";
+
+    #[test]
+    fn dead_tilde_keeps_tilde_before_a_key_it_cannot_combine_with() {
+        // French (Switzerland) puts `~` on Option-N, a dead key; `/` is Shift-7 (#560).
+        let tilde = (kVK_ANSI_N, left_option());
+        assert_eq!(
+            type_on_layout(SWISS_FRENCH, &[tilde]),
+            Typed {
+                committed: String::new(),
+                composing: Some("~".to_string()),
+            }
+        );
+        assert_eq!(
+            type_on_layout(SWISS_FRENCH, &[tilde, (kVK_ANSI_7, shift())]),
+            committed("~/")
+        );
+        assert_eq!(
+            type_on_layout(SWISS_FRENCH, &[tilde, (kVK_ANSI_A, no_mods())]),
+            committed("\u{e3}")
+        );
+        assert_eq!(
+            type_on_layout(SWISS_FRENCH, &[tilde, (kVK_Space, no_mods())]),
+            committed("~")
+        );
+    }
+
+    #[test]
+    fn dead_tilde_then_a_control_key_sends_only_the_control_byte() {
+        // Escape, Return and Delete after a pending dead key keep sending just
+        // their control byte, so Escape still cancels the tilde.
+        let tilde = (kVK_ANSI_N, left_option());
+        let wrong: Vec<_> = [
+            (kVK_Escape, "\x1b"),
+            (kVK_Return, "\r"),
+            (kVK_Delete, "\x08"),
+        ]
+        .iter()
+        .map(|&(key, bytes)| {
+            (
+                key,
+                type_on_layout(SWISS_FRENCH, &[tilde, (key, no_mods())]),
+                bytes,
+            )
+        })
+        .filter(|(_, typed, bytes)| *typed != committed(bytes))
+        .collect();
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn dead_key_pressed_twice_types_the_accent_and_starts_again() {
+        // The layout answers a second Option-N with one `~` and a new pending
+        // tilde, so Option-N twice then Space types two tildes.
+        let tilde = (kVK_ANSI_N, left_option());
+        assert_eq!(
+            type_on_layout(SWISS_FRENCH, &[tilde, tilde]),
+            Typed {
+                committed: "~".to_string(),
+                composing: Some("~".to_string()),
+            }
+        );
+        assert_eq!(
+            type_on_layout(SWISS_FRENCH, &[tilde, tilde, (kVK_Space, no_mods())]),
+            committed("~~")
+        );
+    }
+
+    #[test]
+    fn dead_caret_keeps_caret_before_a_digit() {
+        // German `^` is a dead key on the key left of 1 (vk 0x0A).
+        let caret = (0x0A, no_mods());
+        assert_eq!(
+            type_on_layout(
+                "com.apple.keylayout.German",
+                &[caret, (kVK_ANSI_1, no_mods())]
+            ),
+            committed("^1")
+        );
+        assert_eq!(
+            type_on_layout(
+                "com.apple.keylayout.German",
+                &[caret, (kVK_ANSI_E, no_mods())]
+            ),
+            committed("\u{ea}")
+        );
+    }
+
+    #[test]
+    fn turkish_option_tilde_still_types_with_left_option_as_meta() {
+        // #139: Turkish layouts put `~` on an Option dead key; with left Option
+        // as Meta the empty-characters press must still enter the dead-key path.
+        assert!(dead_keys_enabled(
+            true,
+            true,
+            Modifiers::LEFT_ALT | Modifiers::ALT,
+            false,
+            true
+        ));
+        assert!(!dead_keys_enabled(
+            true,
+            false,
+            Modifiers::LEFT_ALT | Modifiers::ALT,
+            false,
+            true
+        ));
+        for (layout, vk) in [
+            ("com.apple.keylayout.Turkish-QWERTY-PC", 0x1E),
+            ("com.apple.keylayout.Turkish", 0x22),
+        ] {
+            let tilde = (vk, left_option());
+            assert_eq!(
+                type_on_layout(layout, &[tilde, (kVK_Space, no_mods())]),
+                committed("~"),
+                "{}",
+                layout
+            );
+        }
+        assert_eq!(
+            type_on_layout(
+                "com.apple.keylayout.Turkish-QWERTY-PC",
+                &[(0x1E, left_option()), (kVK_ANSI_7, shift())]
+            ),
+            committed("~/")
+        );
+    }
 
     fn screen_resize(width: usize, height: usize, dpi: usize, state: WindowState) -> ScreenResize {
         ScreenResize {
@@ -8350,6 +8705,22 @@ impl WindowView {
                             raw: None,
                         };
                         events.dispatch(WindowEvent::KeyEvent(event));
+                        return;
+                    }
+                    Ok(TranslateStatus::ComposedThenComposing(translated, composing)) => {
+                        let events = inner.events.clone();
+                        drop(inner);
+                        events.dispatch(WindowEvent::KeyEvent(KeyEvent {
+                            key: KeyCode::composed(&translated),
+                            modifiers: Modifiers::NONE,
+                            leds: KeyboardLedStatus::empty(),
+                            repeat_count: 1,
+                            key_is_down,
+                            raw: None,
+                        }));
+                        events.dispatch(WindowEvent::AdviseDeadKeyStatus(
+                            DeadKeyStatus::Composing(composing),
+                        ));
                         return;
                     }
                     Ok(TranslateStatus::NotDead) => {
