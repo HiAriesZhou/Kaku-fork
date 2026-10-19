@@ -430,7 +430,93 @@ fn follow_config() {
         return;
     }
     if !RUNNING.swap(true, Ordering::SeqCst) {
-        launch();
+        launch_when_sole();
+    }
+}
+
+/// One Kaku per data directory serves remote access. A second one (a copy
+/// opened from a build folder, or `kaku start` starting another GUI) shares
+/// the identity, so it registered with the relay as the same Mac and took
+/// the browser over to its own terminals; it also overwrote the state file
+/// `kaku remote` reads. It now waits for the first to quit and takes over.
+fn launch_when_sole() {
+    let path = config::DATA_DIR.join("remote.lock");
+    match try_sole_lock(&path) {
+        Ok(Some(lock)) => {
+            std::mem::forget(lock);
+            launch();
+        }
+        Ok(None) => {
+            log::info!(
+                "kaku-remote: another Kaku serves remote access; this one takes over when it quits"
+            );
+            let spawned = std::thread::Builder::new()
+                .name("kaku-remote-wait".to_string())
+                .spawn(move || match wait_sole_lock(&path) {
+                    Ok(lock) => {
+                        std::mem::forget(lock);
+                        if configuration().remote.enabled {
+                            launch();
+                        } else {
+                            RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    Err(e) => log::warn!("kaku-remote: {e:#}"),
+                });
+            if let Err(e) = spawned {
+                log::warn!("kaku-remote: cannot wait for remote access: {e}");
+            }
+        }
+        Err(e) => {
+            // Without a lock file nothing can tell two copies apart; serve
+            // anyway rather than leave remote access off.
+            log::warn!("kaku-remote: {e:#}");
+            launch();
+        }
+    }
+}
+
+fn open_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).context("create data dir")?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))
+}
+
+/// The lock if no other process holds it. It is released when the returned
+/// file closes, which the OS also does for a Kaku that crashed.
+fn try_sole_lock(path: &std::path::Path) -> anyhow::Result<Option<std::fs::File>> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_lock(path)?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(None)
+    } else {
+        Err(err).context("lock remote access")
+    }
+}
+
+fn wait_sole_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_lock(path)?;
+    loop {
+        // SAFETY: flock on a descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err).context("wait for remote access");
+        }
     }
 }
 
@@ -537,6 +623,27 @@ async fn serve_all(
 #[cfg(test)]
 mod relay_status_tests {
     use super::*;
+
+    #[test]
+    fn only_one_kaku_per_data_dir_serves_remote_access() {
+        let dir = std::env::temp_dir().join(format!("kaku-remote-lock-{}", std::process::id()));
+        let path = dir.join("remote.lock");
+        let first = try_sole_lock(&path)
+            .unwrap()
+            .expect("the first copy serves");
+        // flock locks belong to the open file, so a second open in this
+        // process stands in for a second Kaku.
+        assert!(try_sole_lock(&path).unwrap().is_none());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = path.clone();
+        std::thread::spawn(move || tx.send(wait_sole_lock(&waiting).is_ok()).unwrap());
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err());
+        drop(first);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn a_link_failing_over_and_over_reads_as_down_since_it_fell() {
