@@ -1283,8 +1283,10 @@ impl TermWindow {
             // last_session.json resurrects tabs the user already closed.
             crate::session_restore::forget_logically_closed(self.mux_window_id);
             front_end().record_window_focus(self.mux_window_id);
-            #[cfg(feature = "remote")]
-            self.reclaim_active_tab_size();
+            // Focus alone leaves a browser-sized tab alone: switching
+            // between the browser and Kaku resized it each time, and Claude
+            // Code redrew for every size, leaving copies of its output.
+            // Typing or clicking here still takes the tab back.
         }
         if !self.config.tab_bar_at_bottom && self.layout_is_effective_fullscreen() {
             self.arm_layout_sticky_fullscreen();

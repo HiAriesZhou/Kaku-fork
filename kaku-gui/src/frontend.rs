@@ -1763,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_focus_preserves_upstream_remote_size_reclamation() {
+    fn focus_leaves_a_browser_sized_tab_alone() {
         let term = include_str!("termwindow/mod.rs");
         let gain = term
             .split("fn focus_changed(")
@@ -1773,16 +1773,19 @@ mod tests {
             .next()
             .unwrap();
         assert!(gain.contains("if focused {"));
-        assert!(gain
-            .contains("#[cfg(feature = \"remote\")]\n            self.reclaim_active_tab_size()"));
+        assert!(!gain.contains("self.reclaim_active_tab_size()"));
         let forget = gain
             .find("forget_logically_closed(self.mux_window_id)")
             .unwrap();
         let record = gain
             .find("record_window_focus(self.mux_window_id)")
             .unwrap();
-        let reclaim = gain.find("self.reclaim_active_tab_size()").unwrap();
-        assert!(forget < record && record < reclaim);
+        assert!(forget < record);
+        // Local typing and clicking still take the tab back.
+        let keys = include_str!("termwindow/keyevent.rs");
+        let mouse = include_str!("termwindow/mouseevent.rs");
+        assert!(keys.contains("self.reclaim_active_tab_size();"));
+        assert!(mouse.contains("self.reclaim_active_tab_size();"));
     }
 
     #[test]
