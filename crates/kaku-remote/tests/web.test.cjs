@@ -1894,3 +1894,43 @@ test('the desktop view carries the clipboard both ways', async t => {
   assert.equal(await p.evaluate(() => wrote.text.includes('too late') || wrote.item.includes('too late')), false);
   assert.deepEqual(errors, []);
 });
+
+test('the desktop view lets go of held keys, sends modifiers with clicks, and asks before the page closes', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  const tool = p.locator('#bar .tool.desktop');
+  await tool.click();
+  await p.evaluate(() => document.getElementById('desktop').classList.add('live'));
+  const box = await p.locator('#desktop canvas').boundingBox();
+
+  // Shift-click selects a range in Finder; the click carries the key.
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.down('Shift');
+  await p.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await p.keyboard.up('Shift');
+  const down = await p.evaluate(() => messages.find(m => m.type === 'desktop_pointer' && m.kind === 'down'));
+  assert.equal(down.shift, true, JSON.stringify(down));
+  assert.equal('clicks' in down, false, 'the Mac counts clicks itself');
+
+  // Leaving with a key still down releases it on the Mac first.
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.down('Alt');
+  const keys = await p.evaluate(() => messages.filter(m => m.type === 'desktop_key').map(m => [m.code, m.down]));
+  assert.deepEqual(keys, [['AltLeft', true]]);
+
+  // Closing the page while the Mac's screen shows asks first. Headless
+  // Chromium shows no beforeunload dialog even for a bare page, so this
+  // reads the event the browser would ask on.
+  const asks = () => p.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented; });
+  assert.equal(await asks(), true);
+  await p.evaluate(() => { messages.length = 0; });
+  await tool.click();
+  await p.keyboard.up('Alt');
+  const after = await p.evaluate(() => messages.filter(m => ['desktop_key', 'desktop_stop'].includes(m.type)).map(m => m.type === 'desktop_key' ? [m.code, m.down] : m.type));
+  assert.deepEqual(after, [['AltLeft', false], 'desktop_stop']);
+
+  // Back on the terminal, the page closes without asking.
+  assert.equal(await asks(), false);
+  assert.deepEqual(errors, []);
+});

@@ -173,7 +173,7 @@
       active = false;
       if (pasting) { clearTimeout(pasting.timer); pasting = null; }
       if (copyWait) copyWait.reject(new Error("left"));
-      releaseButtons();
+      releaseAll();
       send({ type: "desktop_stop" });
       closeDecoder();
       document.body.classList.remove("desktop");
@@ -183,11 +183,18 @@
     };
 
     button.addEventListener("click", () => (active ? leave() : enter()));
+    // Command-W outside full screen closes the browser tab, not the Mac's
+    // window under the pointer; ask before the page goes.
+    window.addEventListener("beforeunload", (ev) => {
+      if (!active) return;
+      ev.preventDefault();
+      ev.returnValue = "";
+    });
     // Picking a tab means the terminal.
     document.getElementById("tabs")?.addEventListener("click", () => { if (active) leave(); }, true);
     document.addEventListener("visibilitychange", () => {
       if (!active) return;
-      if (document.hidden) { send({ type: "desktop_stop" }); closeDecoder(); }
+      if (document.hidden) { releaseAll(); send({ type: "desktop_stop" }); closeDecoder(); }
       else start();
     });
 
@@ -291,18 +298,30 @@
       moveFrame = 0;
       if (pendingMove) { send(pendingMove); pendingMove = null; }
     };
-    const pointer = (kind, p, button = 0, clicks = 1) => {
+    // Modifier keys as the Mac reads them: off a Mac, Ctrl stands for
+    // Command and the Windows key for Control, so Ctrl-click selects more
+    // in Finder as it does in Explorer.
+    const mods = (ev) => {
+      if (!ev) return {};
+      let meta = ev.metaKey;
+      let ctrl = ev.ctrlKey;
+      if (!isMac) [meta, ctrl] = [ctrl, meta];
+      return { meta, ctrl, alt: ev.altKey, shift: ev.shiftKey };
+    };
+    // The Mac counts double clicks itself: browsers give pointer events no
+    // click count.
+    const pointer = (kind, p, button = 0, ev = null) => {
       if (kind === "move") {
-        pendingMove = { type: "desktop_pointer", kind, x: p.x, y: p.y };
+        pendingMove = { type: "desktop_pointer", kind, x: p.x, y: p.y, ...mods(ev) };
         if (!moveFrame) moveFrame = requestAnimationFrame(flushMove);
         return;
       }
       if (pendingMove) flushMove();
       if (kind === "down") held.add(button); else held.delete(button);
-      send({ type: "desktop_pointer", kind, x: p.x, y: p.y, button, clicks });
+      send({ type: "desktop_pointer", kind, x: p.x, y: p.y, button, ...mods(ev) });
     };
     const releaseButtons = () => {
-      for (const b of held) send({ type: "desktop_pointer", kind: "up", x: lastPoint.x, y: lastPoint.y, button: b, clicks: 1 });
+      for (const b of held) send({ type: "desktop_pointer", kind: "up", x: lastPoint.x, y: lastPoint.y, button: b });
       held.clear();
     };
     let lastPoint = { x: 0.5, y: 0.5 };
@@ -356,7 +375,7 @@
       }
       canvas.setPointerCapture(ev.pointerId);
       const button = ev.button === 2 ? 2 : ev.button === 1 ? 1 : 0;
-      pointer("down", p, button, Math.max(1, ev.detail || 1));
+      pointer("down", p, button, ev);
     });
 
     canvas.addEventListener("pointermove", (ev) => {
@@ -399,7 +418,7 @@
         return;
       }
       lastPoint = p;
-      pointer("move", p);
+      pointer("move", p, 0, ev);
     });
 
     const endPointer = (ev) => {
@@ -429,7 +448,7 @@
       }
       if (!active) return;
       const button = ev.button === 2 ? 2 : ev.button === 1 ? 1 : 0;
-      if (held.has(button)) pointer("up", where(ev), button, Math.max(1, ev.detail || 1));
+      if (held.has(button)) pointer("up", where(ev), button, ev);
     };
     canvas.addEventListener("pointerup", endPointer);
     canvas.addEventListener("pointercancel", (ev) => {
@@ -461,14 +480,8 @@
     // paste, undo work as the hands expect) and the Windows key for Control.
     const SWAP = { ControlLeft: "MetaLeft", ControlRight: "MetaRight", MetaLeft: "ControlLeft", MetaRight: "ControlRight", OSLeft: "ControlLeft", OSRight: "ControlRight" };
     const keyMessage = (ev, down) => {
-      let code = ev.code;
-      let meta = ev.metaKey;
-      let ctrl = ev.ctrlKey;
-      if (!isMac) {
-        code = SWAP[code] || code;
-        [meta, ctrl] = [ctrl, meta];
-      }
-      return { type: "desktop_key", code, down, meta, ctrl, alt: ev.altKey, shift: ev.shiftKey };
+      const code = isMac ? ev.code : SWAP[ev.code] || ev.code;
+      return { type: "desktop_key", code, down, ...mods(ev) };
     };
     const ownsKeys = (ev) => {
       if (!active) return false;
@@ -537,6 +550,13 @@
     };
 
     const pressed = new Set();
+    // Keys and buttons still held when the view goes away would stay down
+    // on the Mac.
+    const releaseAll = () => {
+      for (const code of pressed) send({ type: "desktop_key", code: isMac ? code : SWAP[code] || code, down: false });
+      pressed.clear();
+      releaseButtons();
+    };
     const onKey = (down) => (ev) => {
       if (!ownsKeys(ev)) return;
       const command = (isMac ? ev.metaKey : ev.ctrlKey) && !ev.altKey;
@@ -557,11 +577,7 @@
     window.addEventListener("keydown", onKey(true), true);
     window.addEventListener("keyup", onKey(false), true);
     // Keys still held when the page loses focus would stay down on the Mac.
-    window.addEventListener("blur", () => {
-      for (const code of pressed) send({ type: "desktop_key", code, down: false });
-      pressed.clear();
-      releaseButtons();
-    });
+    window.addEventListener("blur", releaseAll);
 
     return {
       handle(msg) {

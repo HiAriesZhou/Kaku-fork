@@ -10,6 +10,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -109,6 +111,9 @@ struct Helper {
     child: Child,
     stdin: Option<ChildStdin>,
     reader: JoinHandle<()>,
+    /// Set before Kaku ends the helper, so only an exit of its own is
+    /// reported to the page.
+    stopping: Arc<AtomicBool>,
 }
 
 impl Helper {
@@ -132,6 +137,8 @@ impl Helper {
                 }
             });
         }
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stopped = stopping.clone();
         let reader = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -145,8 +152,15 @@ impl Helper {
                     continue;
                 }
                 if outbox.send(line).await.is_err() {
-                    break;
+                    return;
                 }
+            }
+            // The helper ended on its own (a crash, a lost permission): the
+            // page would otherwise keep showing its last picture.
+            if !stopped.load(Ordering::SeqCst) {
+                log::warn!("kaku-remote desktop: the helper exited");
+                let status = serde_json::json!({ "type": "desktop_status", "state": "error", "detail": "Kaku Desktop stopped. Switch the view off and on to start it again." });
+                let _ = outbox.send(status.to_string()).await;
             }
         });
         log::info!("kaku-remote desktop: started {}", path.display());
@@ -154,6 +168,7 @@ impl Helper {
             child,
             stdin,
             reader,
+            stopping,
         })
     }
 
@@ -173,6 +188,7 @@ impl Helper {
 
     /// Ask the helper to let go of the mouse and end, then make sure it did.
     async fn stop(mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
         let _ = self.write("{\"type\":\"desktop_stop\"}").await;
         drop(self.stdin.take());
         if tokio::time::timeout(STOP_GRACE, self.child.wait())
@@ -279,5 +295,51 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(reply.contains("\"state\":\"error\""), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_ends_on_its_own_is_reported_but_a_stopped_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("kaku-desktop-exit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kaku-desktop");
+        // Ends with an error when told to crash, otherwise when stdin closes.
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nwhile read -r line; do\n  case \"$line\" in *crash*) exit 3;; esac\ndone\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (page, inbox) = mpsc::channel(8);
+        let (outbox, mut to_page) = mpsc::channel(8);
+        let _session = tap_with(inbox, outbox, path);
+        page.send(r#"{"type":"desktop_start"}"#.to_string())
+            .await
+            .unwrap();
+        page.send(r#"{"type":"desktop_crash"}"#.to_string())
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), to_page.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.contains("\"state\":\"error\""), "{reply}");
+        assert!(reply.contains("stopped"), "{reply}");
+
+        // Started again and stopped by the page: nothing to report.
+        page.send(r#"{"type":"desktop_start"}"#.to_string())
+            .await
+            .unwrap();
+        page.send(r#"{"type":"desktop_stop"}"#.to_string())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), to_page.recv())
+                .await
+                .is_err(),
+            "a stop the page asked for is not an error"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
