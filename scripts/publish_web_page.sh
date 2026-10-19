@@ -18,7 +18,7 @@ WEB="$ROOT/crates/kaku-remote/assets/web"
 
 OUT="$(mktemp -d "${TMPDIR:-/tmp}/kaku-web.XXXXXX")"
 mkdir -p "$OUT/assets"
-for name in xterm.js xterm-webgl.js xterm-unicode11.js xterm.css icon.png \
+for name in xterm.js xterm-webgl.js xterm-unicode11.js desktop.js xterm.css icon.png \
 	LICENSE-xterm LICENSE-xterm-webgl LICENSE-xterm-unicode11 \
 	font-regular.woff2 font-medium.woff2 font-symbols.woff2; do
 	cp "$WEB/$name" "$OUT/assets/$name"

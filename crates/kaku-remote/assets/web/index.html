@@ -2186,7 +2186,27 @@
   };
 
   let copyOnSelect = true;
+  // Kaku Desktop: the Mac's own screen, offered when Kaku has its helper.
+  // Its code loads only then, from desktop.js.
+  let desktop = null;
+  let desktopLoading = false;
+  const loadDesktop = () => {
+    if (desktopLoading) return;
+    desktopLoading = true;
+    const script = document.createElement("script");
+    script.src = "assets/desktop.js";
+    script.onload = () => {
+      desktop = window.KakuDesktop.init({
+        send, toolsEl, stageEl: document.getElementById("stage"), isMac: IS_MAC, toast, focusTerminal: () => term.focus(),
+      });
+    };
+    script.onerror = () => { desktopLoading = false; };
+    document.head.append(script);
+  };
+
   const onConfig = (cfg) => {
+    if (cfg.desktop) loadDesktop();
+    desktop?.sessionStarted();
     if (typeof cfg.compose_right_option === "boolean") composeOption = { left: !!cfg.compose_left_option, right: cfg.compose_right_option };
     copyOnSelect = cfg.copy_on_select !== false;
     const theme = {};
@@ -2801,6 +2821,7 @@
     else if (msg.type === "found") onFound(msg);
     else if (msg.type === "history") onHistory(msg);
     else if (msg.type.startsWith("file_")) onFile(msg);
+    else if (msg.type.startsWith("desktop_")) desktop?.handle(msg);
     else if (msg.type === "upload_ack") { const a = uploadAcks.get(msg.id); if (a) a(msg.received); }
     else if (msg.type === "uploaded") { const w = uploadWaiters.get(msg.id); if (w) { uploadWaiters.delete(msg.id); w(msg); } }
     else if (msg.type === "closed") {

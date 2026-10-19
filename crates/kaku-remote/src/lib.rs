@@ -13,6 +13,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 mod awake;
+#[cfg(feature = "desktop")]
+mod desktop;
 mod fonts;
 mod pairing;
 mod share;
@@ -59,6 +61,10 @@ struct ConfigInfo {
     font_families: Vec<String>,
     /// Files of those families the user installed, for the page to fetch.
     font_files: Vec<fonts::FontFile>,
+    /// The Mac's screen can be shown in the page (the `desktop` feature,
+    /// with its helper installed). Left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    desktop: bool,
     font_size: f64,
     line_height: f64,
     copy_on_select: bool,
@@ -129,6 +135,7 @@ fn config_info() -> ConfigInfo {
         font_family,
         font_families: page_fonts.families,
         font_files: page_fonts.files,
+        desktop: desktop_available(),
         font_size: cfg.font_size,
         line_height: cfg.line_height,
         copy_on_select: cfg.copy_on_select,
@@ -743,4 +750,14 @@ mod host_guard_tests {
         assert!(!same_secret("abc12", "abc123"));
         assert!(!same_secret("", "abc123"));
     }
+}
+
+#[cfg(feature = "desktop")]
+fn desktop_available() -> bool {
+    desktop::available()
+}
+
+#[cfg(not(feature = "desktop"))]
+fn desktop_available() -> bool {
+    false
 }

@@ -4,6 +4,11 @@ version = "0.8.0"
 edition = "2021"
 publish = false
 
+[features]
+# The page's view of the Mac's screen, through the separately installed
+# kaku-desktop helper. Off by default.
+desktop = ["tokio/process", "tokio/io-util"]
+
 [dependencies]
 anyhow.workspace = true
 base64 = { workspace = true, features = ["alloc"] }

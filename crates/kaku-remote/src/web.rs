@@ -39,6 +39,8 @@ const XTERM_WEBGL_JS: &str = include_str!("../assets/web/xterm-webgl.js");
 /// @xterm/addon-unicode11 0.8.0 (MIT, npm integrity verified): Unicode 11
 /// character widths, so emoji take the two cells Kaku gives them.
 const XTERM_UNICODE11_JS: &str = include_str!("../assets/web/xterm-unicode11.js");
+/// The desktop view, loaded by the page only when Kaku offers it.
+const DESKTOP_JS: &str = include_str!("../assets/web/desktop.js");
 // Kaku's bundled terminal font: Regular for text, Medium for bold, matching
 // the dark-theme weights in the bundled kaku.lua, and the icons of its
 // bundled Symbols Nerd Font. WOFF2 from scripts/build_web_fonts.py.
@@ -312,6 +314,7 @@ pub(crate) fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
             "text/javascript; charset=utf-8",
             XTERM_UNICODE11_JS.as_bytes(),
         ),
+        "assets/desktop.js" => ("text/javascript; charset=utf-8", DESKTOP_JS.as_bytes()),
         "assets/font-regular.woff2" => ("font/woff2", FONT_REGULAR),
         "assets/font-medium.woff2" => ("font/woff2", FONT_MEDIUM),
         "assets/font-symbols.woff2" => ("font/woff2", FONT_SYMBOLS),
@@ -2432,6 +2435,10 @@ pub(crate) async fn run_session(
     dirty: WebDirty,
 ) {
     let _awake = crate::awake::Awake::hold();
+    #[cfg(feature = "desktop")]
+    {
+        inbox = crate::desktop::tap(inbox, outbox.clone());
+    }
     if let Some(json) = encode(&WebServerMsg::Config(&crate::config_info())) {
         if outbox.send(json).await.is_err() {
             return;

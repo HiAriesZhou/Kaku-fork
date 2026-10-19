@@ -85,6 +85,10 @@ fn page_file(name: &str) -> Option<(&'static str, &'static [u8])> {
             "text/javascript; charset=utf-8",
             include_bytes!("../../kaku-remote/assets/web/xterm-unicode11.js"),
         ),
+        "desktop.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../../kaku-remote/assets/web/desktop.js"),
+        ),
         "xterm.css" => (
             "text/css; charset=utf-8",
             include_bytes!("../../kaku-remote/assets/web/xterm.css"),

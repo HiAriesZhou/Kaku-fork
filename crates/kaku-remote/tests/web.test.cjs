@@ -1709,3 +1709,121 @@ test('a tab split on the Mac keeps the Mac\'s sizes, its split shown as large as
   assert.equal(back.font, font);
   assert.deepEqual(errors, []);
 });
+
+test('the desktop view is offered only when Kaku has its helper', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  assert.equal(await p.locator('#bar .tool.desktop').count(), 0);
+  assert.equal(await p.evaluate(() => !!window.KakuDesktop), false, 'its code is not even loaded');
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').waitFor();
+  assert.deepEqual(errors, []);
+});
+
+test('the desktop view takes the keyboard and mouse, and gives them back', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  const tool = p.locator('#bar .tool.desktop');
+  await tool.click();
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), true);
+  const start = await p.evaluate(() => messages.filter(m => m.type === 'desktop_start'));
+  assert.equal(start.length, 1);
+  assert.ok(start[0].max_width >= 640 && start[0].max_height >= 400, JSON.stringify(start[0]));
+  assert.match(await p.locator('#desktop .status .title').innerText(), /Connecting/);
+
+  // Until a picture is drawn, keys are held back from both the terminal
+  // and the Mac.
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.press('a');
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => ['text', 'key', 'desktop_key'].includes(m.type))), []);
+
+  // A helper error reads as one.
+  await p.evaluate(() => probe.handle({ type: 'desktop_status', state: 'error', detail: 'Kaku has no Screen Recording permission on this Mac' }));
+  assert.match(await p.locator('#desktop .status').innerText(), /Screen Recording/);
+
+  // A reconnect asks again.
+  await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'config', desktop: true }); });
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'desktop_start').length), 1);
+
+  // Back to the terminal: the helper stops and typing goes to the pane.
+  await p.evaluate(() => { messages.length = 0; });
+  await tool.click();
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'desktop_stop').length), 1);
+  await p.keyboard.type('b');
+  assert.ok(await p.evaluate(() => messages.some(m => m.type === 'text' && m.data === 'b')));
+  assert.deepEqual(errors, []);
+});
+
+test('picking a tab leaves the desktop view for the terminal', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  const looks = await p.evaluate(() => [...document.querySelectorAll('#tabs .tab')].map(b => getComputedStyle(b).backgroundColor));
+  assert.equal(new Set(looks).size, 1, 'no tab reads as current over the screen: ' + looks);
+  assert.notEqual(await p.locator('#bar .tool.desktop').evaluate(b => getComputedStyle(b).backgroundColor), looks[0]);
+  await p.locator('#tabs .tab').first().click();
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
+  assert.ok(await p.evaluate(() => messages.some(m => m.type === 'desktop_stop')));
+});
+
+test('on a phone the desktop view pinches to zoom and taps where the zoom shows', async t => {
+  const { p, errors } = await page(t, '#t=fixture', { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  const start = await p.evaluate(() => messages.find(m => m.type === 'desktop_start'));
+  assert.ok(start.max_width >= 1920, 'enough detail to zoom into: ' + JSON.stringify(start));
+  assert.equal(await p.locator('#keys').isVisible(), false, 'the terminal keys would type into the terminal');
+
+  // Stand in for a decoded picture: the canvas is live at its own size.
+  const box = await p.evaluate(() => {
+    document.getElementById('desktop').classList.add('live');
+    const r = document.querySelector('#desktop canvas').getBoundingClientRect();
+    return { x: r.left, y: r.top, w: r.width, h: r.height };
+  });
+  const touch = (type, id, x, y) => p.evaluate(([type, id, x, y]) => {
+    document.querySelector('#desktop canvas').dispatchEvent(new PointerEvent(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, bubbles: true, cancelable: true, isPrimary: id === 1 }));
+  }, [type, id, x, y]);
+  const cx = box.x + box.w / 2;
+  const cy = box.y + box.h / 2;
+  await p.evaluate(() => { messages.length = 0; });
+
+  // Fingers spreading apart zoom in, around their midpoint; nothing scrolls.
+  await touch('pointerdown', 1, cx - 20, cy);
+  await touch('pointerdown', 2, cx + 20, cy);
+  for (let d = 30; d <= 60; d += 10) {
+    await touch('pointermove', 1, cx - d, cy);
+    await touch('pointermove', 2, cx + d, cy);
+  }
+  await touch('pointerup', 1, cx - 60, cy);
+  await touch('pointerup', 2, cx + 60, cy);
+  const zoomed = await p.evaluate(() => {
+    const r = document.querySelector('#desktop canvas').getBoundingClientRect();
+    return { w: r.width, left: r.left };
+  });
+  assert.ok(Math.abs(zoomed.w / box.w - 3) < 0.05, 'three times the spread, three times the size: ' + zoomed.w);
+  assert.ok(Math.abs(zoomed.left + zoomed.w / 2 - cx) < 2, 'the midpoint stayed put');
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type.startsWith('desktop_'))), []);
+
+  // Zoomed in, two fingers move the view rather than scroll the Mac.
+  await touch('pointerdown', 1, cx - 10, cy);
+  await touch('pointerdown', 2, cx + 10, cy);
+  await touch('pointermove', 1, cx - 10 + 40, cy);
+  await touch('pointermove', 2, cx + 10 + 40, cy);
+  await touch('pointerup', 1, cx + 30, cy);
+  await touch('pointerup', 2, cx + 50, cy);
+  const moved = await p.evaluate(() => document.querySelector('#desktop canvas').getBoundingClientRect().left);
+  assert.ok(Math.abs(moved - zoomed.left - 40) < 2, 'the view followed the fingers: ' + (moved - zoomed.left));
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'desktop_wheel')), []);
+
+  // A tap lands on the Mac where the zoomed picture shows it.
+  await touch('pointerdown', 1, cx, cy);
+  await touch('pointerup', 1, cx, cy);
+  const click = await p.evaluate(() => messages.find(m => m.type === 'desktop_pointer' && m.kind === 'down'));
+  const expectX = (cx - moved) / zoomed.w;
+  assert.ok(Math.abs(click.x - expectX) < 0.01 && Math.abs(click.y - 0.5) < 0.01, JSON.stringify(click) + ' vs ' + expectX);
+  assert.deepEqual(errors, []);
+});
