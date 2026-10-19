@@ -643,6 +643,14 @@
   };
   document.addEventListener("visibilitychange", freshGlyphs);
   window.addEventListener("focus", freshGlyphs);
+  // A font that arrives after its characters were drawn: the bundled icons
+  // load only once one is on screen, and the user's fonts come from the Mac.
+  // WebGL keeps the box it drew in the meantime until the atlas is rebuilt.
+  document.fonts.addEventListener("loadingdone", () => {
+    if (!webgl || document.hidden) return;
+    freshGlyphs();
+    term.refresh(0, term.rows - 1);
+  });
 
   // Links: URLs in the screen open with Cmd+click (Ctrl+click off the Mac),
   // as in Kaku. Cells and string positions differ once a row holds wide

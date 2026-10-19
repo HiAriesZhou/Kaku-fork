@@ -1620,3 +1620,26 @@ test('a font this browser already has is not fetched', async t => {
   await p.waitForTimeout(300);
   assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'download')), []);
 });
+
+// The icon font loads only once an icon is drawn, after WebGL already
+// rasterized a box for it; the grid must redraw with the icon by itself.
+test('an icon drawn before its font loaded is redrawn once the font is in', async t => {
+  const gpu = await chromium.launch(launchOptions());
+  t.after(() => gpu.close());
+  const { p, errors } = await page(t, '#t=fixture', {}, gpu);
+  if (!await p.evaluate(() => !!document.createElement('canvas').getContext('webgl2'))) return t.skip('this Chromium has no WebGL2');
+  await p.evaluate(() => {
+    probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] });
+    probe.handle({ type: 'frame', seq: 1, pane_id: 1, cols: 80, rows: 24, data: '\x1b[2J\x1b[1;1H dir' });
+  });
+  await p.waitForFunction(() => [...document.fonts].some(f => f.family.includes('Kaku Symbols') && f.status === 'loaded'));
+  await p.waitForTimeout(300);
+  const box = await p.locator('.xterm-screen').boundingBox();
+  const clip = { x: box.x, y: box.y, width: 80, height: 24 };
+  const drawn = await p.screenshot({ clip });
+  // What the cell looks like once the atlas is rebuilt with the font in.
+  await p.evaluate(() => { probe.term.clearTextureAtlas(); probe.term.refresh(0, probe.term.rows - 1); });
+  await p.waitForTimeout(300);
+  assert.ok(drawn.equals(await p.screenshot({ clip })), 'the icon, not the box drawn before its font arrived');
+  assert.deepEqual(errors, []);
+});
