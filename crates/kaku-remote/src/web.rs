@@ -37,9 +37,11 @@ const XTERM_CSS: &str = include_str!("../assets/web/xterm.css");
 /// restart CSS cursor animations.
 const XTERM_WEBGL_JS: &str = include_str!("../assets/web/xterm-webgl.js");
 // Kaku's bundled terminal font: Regular for text, Medium for bold, matching
-// the dark-theme weights in the bundled kaku.lua.
-const FONT_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
-const FONT_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Medium.ttf");
+// the dark-theme weights in the bundled kaku.lua, and the icons of its
+// bundled Symbols Nerd Font. WOFF2 from scripts/build_web_fonts.py.
+const FONT_REGULAR: &[u8] = include_bytes!("../assets/web/font-regular.woff2");
+const FONT_MEDIUM: &[u8] = include_bytes!("../assets/web/font-medium.woff2");
+const FONT_SYMBOLS: &[u8] = include_bytes!("../assets/web/font-symbols.woff2");
 const ICON_PNG: &[u8] = include_bytes!("../assets/web/icon.png");
 
 /// At most one frame per interval. Output after a quiet spell goes out at
@@ -300,8 +302,9 @@ pub(crate) fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
         "assets/xterm.js" => ("text/javascript; charset=utf-8", XTERM_JS.as_bytes()),
         "assets/xterm.css" => ("text/css; charset=utf-8", XTERM_CSS.as_bytes()),
         "assets/xterm-webgl.js" => ("text/javascript; charset=utf-8", XTERM_WEBGL_JS.as_bytes()),
-        "assets/font-regular.ttf" => ("font/ttf", FONT_REGULAR),
-        "assets/font-medium.ttf" => ("font/ttf", FONT_MEDIUM),
+        "assets/font-regular.woff2" => ("font/woff2", FONT_REGULAR),
+        "assets/font-medium.woff2" => ("font/woff2", FONT_MEDIUM),
+        "assets/font-symbols.woff2" => ("font/woff2", FONT_SYMBOLS),
         "assets/icon.png" => ("image/png", ICON_PNG),
         _ => return None,
     })

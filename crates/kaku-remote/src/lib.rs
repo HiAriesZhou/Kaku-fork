@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 mod awake;
+mod fonts;
 mod pairing;
 mod share;
 mod web;
@@ -54,6 +55,10 @@ struct ConfigInfo {
     ansi: Vec<String>,
     brights: Vec<String>,
     font_family: String,
+    /// Every family of Kaku's font config, in order, for the page's stack.
+    font_families: Vec<String>,
+    /// Files of those families the user installed, for the page to fetch.
+    font_files: Vec<fonts::FontFile>,
     font_size: f64,
     line_height: f64,
     copy_on_select: bool,
@@ -110,6 +115,7 @@ fn config_info() -> ConfigInfo {
         .first()
         .map(|f| f.family.clone())
         .unwrap_or_else(|| "JetBrains Mono".to_string());
+    let page_fonts = fonts::page_fonts(&cfg);
 
     ConfigInfo {
         background: opt_hex(palette.background.as_ref()),
@@ -121,6 +127,8 @@ fn config_info() -> ConfigInfo {
         ansi: ansi_colors,
         brights: bright_colors,
         font_family,
+        font_families: page_fonts.families,
+        font_files: page_fonts.files,
         font_size: cfg.font_size,
         line_height: cfg.line_height,
         copy_on_select: cfg.copy_on_select,

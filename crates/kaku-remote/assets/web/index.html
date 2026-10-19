@@ -13,8 +13,12 @@
 <link rel="apple-touch-icon" href="assets/icon.png">
 <link rel="stylesheet" href="assets/xterm.css">
 <style>
-  @font-face { font-family: "Kaku Mono"; src: url("assets/font-regular.ttf") format("truetype"); font-weight: 400; }
-  @font-face { font-family: "Kaku Mono"; src: url("assets/font-medium.ttf") format("truetype"); font-weight: 700; }
+  @font-face { font-family: "Kaku Mono"; src: url("assets/font-regular.woff2") format("woff2"); font-weight: 400; }
+  @font-face { font-family: "Kaku Mono"; src: url("assets/font-medium.woff2") format("woff2"); font-weight: 700; }
+  /* Kaku's bundled Symbols Nerd Font, for the icons prompts and file
+     listers print. Limited to its private-use spans, the browser fetches it
+     only once such an icon is on screen. */
+  @font-face { font-family: "Kaku Symbols"; src: url("assets/font-symbols.woff2") format("woff2"); unicode-range: U+E000-F533, U+F0001-F1AF0; }
   :root { --bg: #16161a; --fg: #d4d4d8; --muted: #8b8b93; --line: rgba(255,255,255,0.08); }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); }
   body { display: flex; flex-direction: column; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -559,7 +563,24 @@
   // status (⏺ ✳) as fixed-color emoji whenever the fonts before it lacked
   // them. The browser's own fallback still gives real emoji (✅) the emoji
   // font and draws text-style symbols in the text color, as Kaku does.
-  const FONT_STACK = '"Kaku Mono", "PingFang SC", "Apple Symbols", "Microsoft YaHei", "Segoe UI Symbol", monospace';
+  // The icons follow Kaku Mono, ahead of Segoe UI Symbol, whose own private
+  // use glyphs would otherwise take them on Windows.
+  const FONT_FALLBACKS = ["Kaku Mono", "Kaku Symbols", "PingFang SC", "Apple Symbols", "Microsoft YaHei", "Segoe UI Symbol"];
+  // The families of Kaku's font config in its order, JetBrains Mono being
+  // the bundled copy, then the page's fallbacks it did not name.
+  const fontStack = (families) => {
+    const names = [];
+    const add = (name) => {
+      name = String(name).replace(/["\\]/g, "");
+      if (name && !/emoji/i.test(name) && !names.some((n) => n.toLowerCase() === name.toLowerCase())) names.push(name);
+    };
+    for (const family of families) {
+      if (/^jetbrains mono$/i.test(family)) { add("Kaku Mono"); add("Kaku Symbols"); } else add(family);
+    }
+    FONT_FALLBACKS.forEach(add);
+    return names.map((n) => '"' + n + '"').join(", ") + ", monospace";
+  };
+  const FONT_STACK = fontStack([]);
   const term = new Terminal({
     fontSize,
     fontFamily: FONT_STACK,
@@ -2129,9 +2150,8 @@
     (cfg.ansi || []).slice(0, 8).forEach((c, i) => { theme[themeName(i)] = c; });
     (cfg.brights || []).slice(0, 8).forEach((c, i) => { theme[themeName(i + 8)] = c; });
     term.options.theme = theme;
-    if (cfg.font_family) {
-      term.options.fontFamily = cfg.font_family === "JetBrains Mono" ? FONT_STACK : '"' + cfg.font_family + '", ' + FONT_STACK;
-    }
+    const families = cfg.font_families || (cfg.font_family ? [cfg.font_family] : []);
+    term.options.fontFamily = fontStack(families);
     if (cfg.line_height) term.options.lineHeight = cfg.line_height;
     document.body.classList.toggle("tabs-bottom", !!cfg.tab_bar_at_bottom);
     const root = document.documentElement.style;
@@ -2149,14 +2169,80 @@
     }
     // One pixel under Kaku's size reads closer to the native window.
     if (cfg.font_size) { baseFontSize = Math.max(8, cfg.font_size - 1); setFont(baseFontSize); }
-    // xterm.js measures cells only when a font option changes, so once the
-    // bundled font is in, nudge the size to measure it instead of the
-    // fallback face it saw first; fit() then sets Kaku's size back.
-    document.fonts.load('16px "Kaku Mono"').finally(() => {
+    // The size is claimed once the bundled font and the user's fonts this
+    // browser already keeps are in; a font still on its way from the Mac
+    // measures the terminal again when it lands, once per browser.
+    const kept = loadUserFonts(cfg.font_files || []);
+    Promise.all([document.fonts.load('16px "Kaku Mono"'), Promise.race([kept, sleep(1500)])]).finally(() => {
       fontReady = true;
-      setFont(baseFontSize + 1);
-      fit();
+      remeasure();
     });
+  };
+  // xterm.js measures cells only when a font option changes, so once a font
+  // is in, nudge the size to measure it instead of the face it saw first;
+  // fit() then sets Kaku's size back.
+  const remeasure = () => {
+    if (!fontReady) return;
+    setFont(baseFontSize + 1);
+    fit();
+  };
+
+  // Fonts the user installed on the Mac that this browser lacks. Kaku sends
+  // each file once over the download path; the page keeps it in the
+  // browser's cache under its path, size and date, so later visits draw
+  // with it at once and an updated file is fetched again.
+  const FONT_CACHE = "kaku-fonts";
+  const userFaces = new Map();
+  const fontKey = (f) => "/kaku-fonts/" + encodeURIComponent(f.path) + "?" + f.size + "-" + f.modified;
+  const fontProbe = document.createElement("canvas").getContext("2d");
+  // Installed here (or already added) when it changes the width of a
+  // sample against either generic family.
+  const hasFont = (family) => ["monospace", "serif"].some((generic) => {
+    const sample = "mmmmmmmmmmlli1WQ@\u4e2d\uf015";
+    fontProbe.font = "32px " + generic;
+    const base = fontProbe.measureText(sample).width;
+    fontProbe.font = '32px "' + family.replace(/["\\]/g, "") + '", ' + generic;
+    return fontProbe.measureText(sample).width !== base;
+  });
+  const fontCache = async () => { try { return await caches.open(FONT_CACHE); } catch (_) { return null; } };
+  const keptFont = async (f) => {
+    try { const r = await (await fontCache())?.match(fontKey(f)); return r ? await r.arrayBuffer() : null; } catch (_) { return null; }
+  };
+  const keepFont = async (f, buf) => {
+    try {
+      const cache = await fontCache();
+      if (!cache) return;
+      const same = "/kaku-fonts/" + encodeURIComponent(f.path) + "?";
+      for (const req of await cache.keys()) {
+        const url = new URL(req.url);
+        if (url.pathname + "?" === same && url.pathname + url.search !== fontKey(f)) await cache.delete(req);
+      }
+      await cache.put(fontKey(f), new Response(buf, { headers: { "Content-Type": "font/sfnt" } }));
+    } catch (_) {}
+  };
+  const addFace = async (f, buf) => {
+    const face = new FontFace(f.family, buf);
+    await face.load();
+    document.fonts.add(face);
+  };
+  const loadUserFonts = (files) => {
+    const waits = [];
+    for (const f of files) {
+      if (!f || !f.family || !f.path) continue;
+      const key = fontKey(f);
+      if (userFaces.has(key)) continue;
+      if (hasFont(f.family)) { userFaces.set(key, "local"); continue; }
+      userFaces.set(key, "loading");
+      const failed = () => userFaces.set(key, "failed");
+      waits.push(keptFont(f).then((buf) => {
+        if (buf) return addFace(f, buf).then(() => userFaces.set(key, "loaded"), failed);
+        fetchFromMac(f.path).then(
+          (buf) => addFace(f, buf).then(() => { userFaces.set(key, "loaded"); keepFont(f, buf); remeasure(); }, failed),
+          // The link dropped mid-file: the next session's config asks again.
+          () => userFaces.delete(key));
+      }));
+    }
+    return Promise.all(waits);
   };
 
   // Inline images (imgcat, kitty, sixel) Kaku shows in the pane: their files
@@ -2493,9 +2579,30 @@
     toast(`Getting ${path.split("/").pop()}`, true);
     send({ type: "download", id, path, pane_id: paneId });
   };
+  // A font file for the page itself: no toasts, no save.
+  const fetchFromMac = (path) => new Promise((resolve, reject) => {
+    const id = ++downloadSeq;
+    incoming.set(id, { path, name: "", size: 0, received: 0, parts: [], font: { resolve, reject } });
+    send({ type: "download", id, path });
+  });
   const onFile = (msg) => {
     const file = incoming.get(msg.id);
     if (!file) return;
+    if (file.font) {
+      if (msg.type === "file_chunk") {
+        const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
+        file.parts.push(bytes);
+        file.received += bytes.length;
+        send({ type: "download_ack", id: msg.id, received: file.received });
+      } else if (msg.type === "file_end") {
+        incoming.delete(msg.id);
+        new Blob(file.parts).arrayBuffer().then(file.font.resolve, file.font.reject);
+      } else if (msg.type === "file_error") {
+        incoming.delete(msg.id);
+        file.font.reject(new Error(msg.detail));
+      }
+      return;
+    }
     if (msg.type === "file_start") {
       file.name = msg.name;
       file.size = msg.size;
@@ -2787,9 +2894,12 @@
         return;
       }
       // Kaku drops a download with its session; ask for the file again.
+      // A font is asked for again by the next session's config.
       if (incoming.size) {
+        const files = [...incoming.values()];
         incoming.clear();
-        toast("Download stopped because the connection dropped. Cmd+click the path again.");
+        files.forEach((file) => file.font?.reject(new Error("connection dropped")));
+        if (files.some((file) => !file.font)) toast("Download stopped because the connection dropped. Cmd+click the path again.");
       }
       // A quick blip reconnects before anyone notices; say something only if
       // it lasts, and after a few failures say why when the page can tell.

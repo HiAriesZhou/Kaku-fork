@@ -89,13 +89,17 @@ fn page_file(name: &str) -> Option<(&'static str, &'static [u8])> {
             "image/png",
             include_bytes!("../../kaku-remote/assets/web/icon.png"),
         ),
-        "font-regular.ttf" => (
-            "font/ttf",
-            include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf"),
+        "font-regular.woff2" => (
+            "font/woff2",
+            include_bytes!("../../kaku-remote/assets/web/font-regular.woff2"),
         ),
-        "font-medium.ttf" => (
-            "font/ttf",
-            include_bytes!("../../../assets/fonts/JetBrainsMono-Medium.ttf"),
+        "font-medium.woff2" => (
+            "font/woff2",
+            include_bytes!("../../kaku-remote/assets/web/font-medium.woff2"),
+        ),
+        "font-symbols.woff2" => (
+            "font/woff2",
+            include_bytes!("../../kaku-remote/assets/web/font-symbols.woff2"),
         ),
         _ => return None,
     })
@@ -1137,8 +1141,8 @@ mod tests {
         };
         assert_eq!(asset("xterm.js").status(), StatusCode::OK);
         assert_eq!(
-            asset("font-regular.ttf").headers()[header::CONTENT_TYPE],
-            "font/ttf"
+            asset("font-regular.woff2").headers()[header::CONTENT_TYPE],
+            "font/woff2"
         );
         assert_eq!(asset("../Cargo.toml").status(), StatusCode::NOT_FOUND);
         assert_eq!(asset("index.html").status(), StatusCode::NOT_FOUND);

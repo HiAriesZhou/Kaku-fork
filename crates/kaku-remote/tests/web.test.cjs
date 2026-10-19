@@ -43,9 +43,7 @@ async function page(t, hash = '#t=fixture', options = {}, context = browser) {
   await p.route('http://localhost:9988/**', route => {
     const name = new URL(route.request().url()).pathname.split('/').pop();
     if (!name) return route.fulfill({ contentType: 'text/html', body: html });
-    const file = name === 'font-regular.ttf' || name === 'font-medium.ttf'
-      ? path.join(root, 'assets/fonts', name === 'font-regular.ttf' ? 'JetBrainsMono-Regular.ttf' : 'JetBrainsMono-Medium.ttf')
-      : path.join(root, 'crates/kaku-remote/assets/web', name);
+    const file = path.join(root, 'crates/kaku-remote/assets/web', name);
     return fs.existsSync(file) ? route.fulfill({ path: file }) : route.fulfill({ status: 404, body: '' });
   });
   await p.goto('http://localhost:9988/' + hash);
@@ -1554,4 +1552,71 @@ test('the drift check names the last frame drawn, so it runs while output stream
   assert.equal(last.seq, 4);
   assert.deepEqual([last.view.cols, last.view.rows], [90, 24]);
   assert.equal(last.rows[0].trimEnd(), 'resized');
+});
+
+test('the page draws with Kaku\'s font families in their order', async t => {
+  const { p } = await page(t);
+  assert.equal(await p.evaluate(() => probe.term.options.fontFamily),
+    '"Kaku Mono", "Kaku Symbols", "PingFang SC", "Apple Symbols", "Microsoft YaHei", "Segoe UI Symbol", monospace');
+  await p.evaluate(() => probe.handle({ type: 'config', font_families: ['Maple Mono NF', 'JetBrains Mono', 'PingFang SC', 'Apple Color Emoji'] }));
+  assert.equal(await p.evaluate(() => probe.term.options.fontFamily),
+    '"Maple Mono NF", "Kaku Mono", "Kaku Symbols", "PingFang SC", "Apple Symbols", "Microsoft YaHei", "Segoe UI Symbol", monospace');
+  // A Mac on an older Kaku names only its first family.
+  await p.evaluate(() => probe.handle({ type: 'config', font_family: 'Iosevka' }));
+  assert.ok((await p.evaluate(() => probe.term.options.fontFamily)).startsWith('"Iosevka", "Kaku Mono", '));
+});
+
+test('Kaku\'s bundled icons draw on the page', async t => {
+  const { p } = await page(t);
+  const drawn = await p.evaluate(async () => {
+    const faces = await document.fonts.load('16px "Kaku Symbols"', '');
+    const ctx = document.createElement('canvas').getContext('2d');
+    const width = (font) => { ctx.font = font; return ctx.measureText('').width; };
+    return { faces: faces.length, stack: width('16px ' + probe.term.options.fontFamily), icons: width('16px "Kaku Symbols"') };
+  });
+  assert.equal(drawn.faces, 1);
+  assert.equal(drawn.stack, drawn.icons, 'the stack draws icons from the bundled symbol font');
+});
+
+test('a font only the Mac has is fetched once, then kept by this browser', async t => {
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  const font = fs.readFileSync(path.join(root, 'crates/kaku-remote/assets/web/font-regular.woff2'));
+  const file = { family: 'Kaku Test Mono', path: '/Users/me/Library/Fonts/Test Mono.woff2', size: font.length, modified: 7 };
+  const serve = async (p) => {
+    const asked = await p.evaluate(() => messages.filter(m => m.type === 'download'));
+    for (const { id } of asked) {
+      await p.evaluate(({ id, size, data }) => {
+        probe.handle({ type: 'file_start', id, name: 'Test Mono.woff2', size });
+        for (let i = 0; i < data.length; i += 65536) probe.handle({ type: 'file_chunk', id, data: data.slice(i, i + 65536) });
+        probe.handle({ type: 'file_end', id });
+      }, { id, size: font.length, data: font.toString('base64') });
+    }
+    return asked;
+  };
+  const loaded = (p) => p.evaluate(() => [...document.fonts].some(f => f.family.replace(/"/g, '') === 'Kaku Test Mono' && f.status === 'loaded'));
+  const first = await page(t, '#t=fixture', {}, context);
+  await screen(first.p);
+  await first.p.evaluate(file => probe.handle({ type: 'config', font_families: [file.family], font_files: [file] }), file);
+  await first.p.waitForTimeout(200);
+  const asked = await serve(first.p);
+  assert.deepEqual(asked.map(m => m.path), [file.path]);
+  await first.p.waitForTimeout(300);
+  assert.ok(await loaded(first.p), 'the fetched file draws the terminal');
+  assert.equal(await first.p.evaluate(() => document.querySelector('#toast').classList.contains('show')), false, 'no download toast for a font');
+  assert.deepEqual(first.errors, []);
+
+  const again = await page(t, '#t=fixture', {}, context);
+  await screen(again.p);
+  await again.p.evaluate(file => probe.handle({ type: 'config', font_families: [file.family], font_files: [file] }), file);
+  await again.p.waitForTimeout(400);
+  assert.deepEqual(await again.p.evaluate(() => messages.filter(m => m.type === 'download')), [], 'kept from the first visit');
+  assert.ok(await loaded(again.p));
+});
+
+test('a font this browser already has is not fetched', async t => {
+  const { p } = await page(t);
+  await p.evaluate(() => probe.handle({ type: 'config', font_families: ['Menlo'], font_files: [{ family: 'Menlo', path: '/Library/Fonts/Menlo.ttf', size: 100, modified: 1 }] }));
+  await p.waitForTimeout(300);
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'download')), []);
 });

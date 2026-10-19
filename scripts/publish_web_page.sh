@@ -18,11 +18,10 @@ WEB="$ROOT/crates/kaku-remote/assets/web"
 
 OUT="$(mktemp -d "${TMPDIR:-/tmp}/kaku-web.XXXXXX")"
 mkdir -p "$OUT/assets"
-for name in xterm.js xterm-webgl.js xterm.css icon.png LICENSE-xterm LICENSE-xterm-webgl; do
+for name in xterm.js xterm-webgl.js xterm.css icon.png LICENSE-xterm LICENSE-xterm-webgl \
+	font-regular.woff2 font-medium.woff2 font-symbols.woff2; do
 	cp "$WEB/$name" "$OUT/assets/$name"
 done
-cp "$ROOT/assets/fonts/JetBrainsMono-Regular.ttf" "$OUT/assets/font-regular.ttf"
-cp "$ROOT/assets/fonts/JetBrainsMono-Medium.ttf" "$OUT/assets/font-medium.ttf"
 
 python3 -I - "$WEB/index.html" "$OUT" "$RELAY" <<'PY'
 import base64, hashlib, json, re, sys

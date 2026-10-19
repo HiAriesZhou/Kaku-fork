@@ -24,6 +24,7 @@ serde_json.workspace = true
 termwiz.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
 tokio-tungstenite.workspace = true
+wezterm-font.workspace = true
 wezterm-term.workspace = true
 wezterm-toast-notification.workspace = true
 rustls.workspace = true

@@ -33,7 +33,7 @@ function serveLikeVercel(dir, listenPort) {
   const pattern = source => new RegExp('^' + source
     .replace(/:(\w+)\(([^)]+)\)/g, '(?<$1>$2)')
     .replace(/:(\w+)/g, '(?<$1>[^/]+)') + '$');
-  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.ttf': 'font/ttf' };
+  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.woff2': 'font/woff2' };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x');
     for (const [key, value] of config.headers[0].headers.map(h => [h.key, h.value])) res.setHeader(key, value);
