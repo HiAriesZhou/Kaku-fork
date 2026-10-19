@@ -28,7 +28,8 @@ fn perform(action: TabAction) {
         | TabAction::Activate { pane_id }
         | TabAction::Rename { pane_id, .. }
         | TabAction::Move { pane_id, .. }
-        | TabAction::Zoom { pane_id, .. } => PaneId::from(*pane_id),
+        | TabAction::Zoom { pane_id, .. }
+        | TabAction::Reclaim { pane_id } => PaneId::from(*pane_id),
     };
     let mux = Mux::get();
     let Some((_, window_id, tab_id)) = mux.resolve_pane_id(pane_id) else {
@@ -124,6 +125,14 @@ fn perform(action: TabAction) {
                 assignment: KeyAssignment::ActivateTab(idx as isize),
                 tx: None,
             });
+        }
+        TabAction::Reclaim { .. } => {
+            if let Some(tab) = mux.get_tab(tab_id) {
+                gui.window
+                    .notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                        tw.reclaim_tab_size(&tab)
+                    })));
+            }
         }
         TabAction::Zoom { claimed, .. } => {
             // The browser shows one pane at a time; zooming the one it is on

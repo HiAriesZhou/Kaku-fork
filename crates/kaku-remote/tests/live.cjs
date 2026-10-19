@@ -87,9 +87,18 @@ async function until(fn, ms = 15000) {
     const tabs = await until(() => received.find(m => m.type === 'tabs'));
     const pane = tabs.tabs[0].pane_id;
     send({ type: 'attach', pane_id: pane });
+    // A browser sizes a lone pane's tab; once the tab is split, it goes back
+    // to the Mac window and a claim while split leaves it there.
+    send({ type: 'resize', cols: 200, rows: 50 });
+    await until(() => received.some(m => m.type === 'frame' && m.pane_id === pane && m.cols === 200));
     send({ type: 'split_pane', pane_id: pane, direction: 'Right' });
     const two = await until(() => received.filter(m => m.type === 'tabs').at(-1)?.tabs.find(t => t.panes?.length === 2));
     const right = two.panes.find(p => p.pane_id !== pane).pane_id;
+    send({ type: 'resize', cols: 200, rows: 50 });
+    const extent = t => Math.max(...t.panes.map(p => p.left + p.width));
+    await until(() => { const t = received.filter(m => m.type === 'tabs').at(-1)?.tabs.find(t => t.panes?.length === 2); return t && extent(t) < 190; });
+    await sleep(300);
+    assert.ok(extent(received.filter(m => m.type === 'tabs').at(-1).tabs.find(t => t.panes?.length === 2)) < 190, 'a split tab keeps the Mac window size');
     send({ type: 'split_pane', pane_id: pane, direction: 'Down' });
     send({ type: 'attach', pane_id: right, focus: true });
     const three = await until(() => received.filter(m => m.type === 'tabs').at(-1)?.tabs.find(t => t.panes?.length === 3));

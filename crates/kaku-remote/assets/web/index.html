@@ -766,6 +766,12 @@
     return Math.max(8, Math.min(baseFontSize * 1.6, px));
   };
   let fontReady = false;
+  // A tab split on the Mac keeps the Mac's layout, however many splits it
+  // has: the page shows the one in view at its own size and claims none.
+  const splitView = () => {
+    const tab = tabs.find((t) => t.tab_id === tabId);
+    return !!tab && (tab.panes || []).length > 1 && !tab.zoomed;
+  };
   const fit = () => {
     if (stage.clientWidth <= MARGIN * 2 || stage.clientHeight <= MARGIN * 2) return;
     const want = claimFont();
@@ -783,7 +789,8 @@
     // No claim until Kaku's font size and the bundled face are in: a size
     // measured on the fallback face is claimed and then corrected, and each
     // claim makes a full-screen app such as Claude Code redraw.
-    if (fontReady && ws && ws.readyState === WebSocket.OPEN && paneId !== null) {
+    const split = splitView();
+    if (!split && fontReady && ws && ws.readyState === WebSocket.OPEN && paneId !== null) {
       const cols = Math.floor(availW / base.width);
       const rows = Math.floor(availH / base.height);
       const key = cols + "x" + rows;
@@ -793,9 +800,14 @@
       }
     }
     // Until Kaku applies that size, the current grid may be larger than the
-    // window; shrink the font just enough for it to fit.
+    // window; shrink the font just enough for it to fit. A split, smaller
+    // than the page, grows to fill it, up to twice Kaku's size.
     if (!size.cols) return;
     let px = want;
+    if (split) {
+      const grow = Math.min(availW / (size.cols * base.width), availH / (size.rows * base.height), 2);
+      if (grow > 1) { px = Math.floor(want * grow * 4) / 4; setFont(px); }
+    }
     for (let i = 0; i < 40; i++) {
       const cell = cellSize();
       if (!cell || (size.cols * cell.width <= availW && size.rows * cell.height <= availH) || px <= 6) break;
@@ -1514,6 +1526,7 @@
   stage.addEventListener("mousedown", (ev) => { if (!pastEl.contains(ev.target)) term.focus(); });
   // ── Tabs ───────────────────────────────────────────────────────────────
   let tabs = [];
+  let wasSplit = false;
   // After asking for a new tab, follow it once it shows up, the way Cmd+T
   // switches to the new tab on the Mac.
   let followNewTab = null;
@@ -1618,6 +1631,7 @@
     liveWrapped = [];
     tabId = tab.tab_id;
     claimed = "";
+    wasSplit = splitView();
     imagePlacements = [];
     imagesEl.textContent = "";
     size = { cols: 0, rows: 0 };
@@ -2128,6 +2142,10 @@
       if (Date.now() > followUntil) followNewTab = null;
     }
     const current = tabs.find((t) => t.tab_id === tabId);
+    // Split or joined on the Mac: a tab back to one pane is the page's to
+    // size again, and a split one is shown at the Mac's size.
+    const split = splitView();
+    if (split !== wasSplit) { wasSplit = split; claimed = ""; fit(); }
     if (!current) {
       let saved = null;
       try { saved = Number(localStorage.getItem("kaku.tab")); } catch (_) {}

@@ -1457,6 +1457,12 @@ impl TermWindow {
         let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
             return;
         };
+        self.reclaim_tab_size(&tab);
+    }
+
+    /// Size a tab a browser had sized back to this window.
+    #[cfg(feature = "remote")]
+    pub(crate) fn reclaim_tab_size(&mut self, tab: &Arc<Tab>) {
         let size = tab.get_size();
         if size.rows != self.terminal_size.rows || size.cols != self.terminal_size.cols {
             tab.resize(self.terminal_size);

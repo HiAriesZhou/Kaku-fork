@@ -163,6 +163,9 @@ pub enum TabAction {
         pane_id: usize,
         claimed: Option<(usize, usize)>,
     },
+    /// The tab holding this pane is split now, and a browser had sized it:
+    /// give it back the Mac window's size, which its splits share.
+    Reclaim { pane_id: usize },
 }
 
 pub type TabActionHandler = Arc<dyn Fn(TabAction) + Send + Sync + 'static>;
@@ -1313,6 +1316,26 @@ fn mark_seen(pane_id: usize, view: &mut View) {
     dispatch_tab_action(TabAction::Seen { pane_id });
 }
 
+/// What a browser's size claim does to a tab with `visible` panes on screen
+/// (a zoomed pane is the only one).
+#[derive(Debug, PartialEq)]
+enum SplitClaim {
+    /// One pane: the tab takes the browser's grid.
+    Size,
+    /// Split, at the Mac's size already: nothing to do.
+    Ignore,
+    /// Split while a browser's size still holds it: back to the window.
+    GiveBack,
+}
+
+fn split_claim(visible: usize, web_sized: bool) -> SplitClaim {
+    match (visible > 1, web_sized) {
+        (false, _) => SplitClaim::Size,
+        (true, false) => SplitClaim::Ignore,
+        (true, true) => SplitClaim::GiveBack,
+    }
+}
+
 /// Size the tab holding `pane_id` to the browser's grid. Runs on the GUI
 /// thread, where the window's own resizes happen.
 fn claim_tab_size(pane_id: usize, cols: usize, rows: usize) {
@@ -1336,20 +1359,19 @@ pub fn claim_tab_size_on_gui_thread(pane_id: usize, cols: usize, rows: usize) {
         return;
     };
     let current = tab.get_size();
-    // In a split, the pane is a share of the tab: grow the tab so that
-    // share comes out at the browser's grid. Splits keep their
-    // proportions on resize, so scaling by the share lands within a cell.
-    let (cols, rows) = match tab
-        .iter_panes()
-        .into_iter()
-        .find(|p| p.pane.pane_id() == PaneId::from(pane_id))
-    {
-        Some(p) if p.width < current.cols || p.height < current.rows => (
-            split_share(cols, current.cols, p.width),
-            split_share(rows, current.rows, p.height),
-        ),
-        _ => (cols, rows),
-    };
+    // A split tab keeps the Mac's layout: the browser shows one split at its
+    // own size, scaled to fit, and sizes nothing. Growing the tab so that one
+    // split filled the page pushed the others out of the Mac window, and
+    // every split on either side moved the claim again.
+    match split_claim(tab.iter_panes().len(), tab_is_web_sized(tab_id.into())) {
+        SplitClaim::Size => {}
+        SplitClaim::Ignore => return,
+        SplitClaim::GiveBack => {
+            release_web_size(tab_id.into());
+            dispatch_tab_action(TabAction::Reclaim { pane_id });
+            return;
+        }
+    }
     let (cols, rows) = (cols.min(MAX_COLS), rows.min(MAX_ROWS));
     WEB_SIZED_TABS.lock().insert(tab_id.into());
     if current.cols == cols && current.rows == rows {
@@ -1364,15 +1386,6 @@ pub fn claim_tab_size_on_gui_thread(pane_id: usize, cols: usize, rows: usize) {
         pixel_height: cell_height * rows,
         dpi: current.dpi,
     });
-}
-
-/// The tab extent that gives a pane holding `part` of `whole` cells a
-/// size of `want`.
-fn split_share(want: usize, whole: usize, part: usize) -> usize {
-    if part == 0 || part >= whole {
-        return want;
-    }
-    (want * whole + part / 2) / part
 }
 
 struct Frame {
@@ -2831,13 +2844,29 @@ mod tests {
     }
 
     #[test]
-    fn a_split_pane_gets_the_browser_grid() {
-        // Half of a 161-column tab is 80: a 100-column browser grows the tab
-        // so that half comes out at 100.
-        assert_eq!(split_share(100, 161, 80), 201);
-        // A lone pane is the whole tab.
-        assert_eq!(split_share(100, 80, 80), 100);
-        assert_eq!(split_share(100, 80, 0), 100);
+    fn a_split_tab_keeps_the_macs_size() {
+        assert_eq!(split_claim(1, false), SplitClaim::Size);
+        assert_eq!(split_claim(1, true), SplitClaim::Size, "a zoomed pane");
+        assert_eq!(split_claim(2, false), SplitClaim::Ignore);
+        assert_eq!(
+            split_claim(4, true),
+            SplitClaim::GiveBack,
+            "split after a browser had sized it"
+        );
+        let source = include_str!("web.rs");
+        let claim = source
+            .split("pub fn claim_tab_size_on_gui_thread(")
+            .nth(1)
+            .unwrap()
+            .split("struct Frame {")
+            .next()
+            .unwrap();
+        assert!(claim.contains("split_claim(tab.iter_panes().len()"));
+        assert!(
+            claim.find("SplitClaim::Ignore => return").unwrap()
+                < claim.find("WEB_SIZED_TABS.lock().insert").unwrap(),
+            "a split tab is never marked as sized by the browser"
+        );
     }
 
     #[test]
@@ -3466,7 +3495,7 @@ mod tests {
             .split("pub fn claim_tab_size_on_gui_thread(")
             .nth(1)
             .unwrap()
-            .split("fn split_share(")
+            .split("struct Frame {")
             .next()
             .unwrap();
         assert!(

@@ -1315,7 +1315,18 @@ for (const entry of ['keyboard', 'menu']) test('browser zoom reclaims its grid a
     }
     assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'zoom_pane').length), 1);
     await p.evaluate(() => { messages.length = 0; });
-    assert.deepEqual(await frame(zoomed ? Math.floor(initial.grid.cols / 2) : initial.grid.cols * 2), [initial.grid]);
+    // Kaku reports the zoom, then the pane's frame. Zoomed, the pane is the
+    // whole tab and the page claims it; unzoomed, the tab is split again and
+    // keeps the Mac's layout. Half as wide and as tall as before, the pane
+    // already fills the page's height, so the text keeps its size.
+    await p.evaluate(zoomed => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, title: 'split', zoomed: !zoomed,
+      panes: [{ pane_id: 1 }, { pane_id: 3 }] }] }), zoomed);
+    if (zoomed) {
+      assert.deepEqual(await frame(Math.floor(initial.grid.cols / 2)), []);
+      assert.equal(await p.evaluate(() => probe.term.options.fontSize), initial.font);
+    } else {
+      assert.deepEqual(await frame(initial.grid.cols * 2), [initial.grid]);
+    }
     await frame(initial.grid.cols);
     assert.equal(await p.evaluate(() => probe.term.options.fontSize), initial.font);
   }
@@ -1641,5 +1652,38 @@ test('an icon drawn before its font loaded is redrawn once the font is in', asyn
   await p.evaluate(() => { probe.term.clearTextureAtlas(); probe.term.refresh(0, probe.term.rows - 1); });
   await p.waitForTimeout(300);
   assert.ok(drawn.equals(await p.screenshot({ clip })), 'the icon, not the box drawn before its font arrived');
+  assert.deepEqual(errors, []);
+});
+
+test('a tab split on the Mac keeps the Mac\'s sizes, its split shown as large as fits', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.waitForTimeout(200);
+  const grid = await p.evaluate(() => messages.filter(m => m.type === 'resize').at(-1));
+  const font = await p.evaluate(() => probe.term.options.fontSize);
+  const tabs = (panes) => p.evaluate(panes => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, title: 'one', active: true,
+    panes: panes > 1 ? Array.from({ length: panes }, (_, i) => ({ pane_id: i + 1 })) : undefined }] }), panes);
+  const frame = (cols, rows) => p.evaluate(async ({ cols, rows }) => {
+    probe.handle({ type: 'frame', pane_id: 1, cols, rows, data: '\x1b[2J\x1b[1;1Hpane' });
+    await new Promise(resolve => probe.term.write('', resolve));
+    const stage = document.querySelector('#stage') || document.querySelector('.xterm').parentElement;
+    const screen = document.querySelector('.xterm-screen').getBoundingClientRect();
+    const room = stage.getBoundingClientRect();
+    return { font: probe.term.options.fontSize, fits: screen.width <= room.width + 1 && screen.height <= room.height + 1,
+      claims: messages.filter(m => m.type === 'resize') };
+  }, { cols, rows });
+  await p.evaluate(() => { messages.length = 0; });
+  await tabs(2);
+  const half = await frame(Math.floor(grid.cols / 2), Math.floor(grid.rows / 2));
+  assert.deepEqual(half.claims, [], 'the Mac keeps its layout');
+  assert.ok(half.font > font * 1.5 && half.fits, 'a half-size split fills the page');
+  await tabs(4);
+  const quarter = await frame(Math.floor(grid.cols / 4), Math.floor(grid.rows / 4));
+  assert.deepEqual(quarter.claims, []);
+  assert.ok(quarter.font <= font * 2 && quarter.fits, 'at most twice Kaku\'s size');
+  await tabs(1);
+  const back = await frame(grid.cols, grid.rows);
+  assert.deepEqual(back.claims.map(({ cols, rows }) => ({ cols, rows })), [{ cols: grid.cols, rows: grid.rows }], 'one pane again: the page sizes the tab');
+  assert.equal(back.font, font);
   assert.deepEqual(errors, []);
 });
