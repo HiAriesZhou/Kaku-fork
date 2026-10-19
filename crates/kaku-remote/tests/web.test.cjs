@@ -676,7 +676,9 @@ test('history copy keeps native selection and does not send terminal input', asy
       const before = String(getSelection());
       const ev = new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', metaKey: mac, ctrlKey: !mac, bubbles: true, cancelable: true });
       document.body.dispatchEvent(ev);
-      return { before, after: String(getSelection()), prevented: ev.defaultPrevented, messages };
+      // A late font load can re-measure and send a resize; only input counts.
+      const input = messages.filter(m => ['key', 'text'].includes(m.type));
+      return { before, after: String(getSelection()), prevented: ev.defaultPrevented, messages: input };
     }, platform === 'MacIntel');
     assert.ok(result.before);
     assert.equal(result.after, result.before);
