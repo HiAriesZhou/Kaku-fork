@@ -11,6 +11,7 @@ struct Theme {
     error: Color,
     text: Color,
     muted: Color,
+    rule: Color,
     bg: Color,
     panel: Color,
 }
@@ -37,6 +38,9 @@ fn theme_from_palette(palette: &crate::kaku_theme::ThemePalette) -> Theme {
     // Preserve the existing background formula regardless of external tool integrations.
     let panel_blend = if palette.is_light { 0.05 } else { 0.08 };
     let panel = blend(palette.bg, palette.text, panel_blend);
+    // Tree connectors and other rules sit a quarter of the way to the text,
+    // matching the GUI overlay frames, so they stay quieter than muted labels.
+    let rule = blend(palette.bg, palette.text, 0.25);
 
     Theme {
         primary: to_color(palette.primary),
@@ -45,6 +49,7 @@ fn theme_from_palette(palette: &crate::kaku_theme::ThemePalette) -> Theme {
         error: to_color(palette.error),
         text: to_color(palette.text),
         muted: to_color(palette.muted),
+        rule: to_color(rule),
         bg: to_color(palette.bg),
         panel: to_color(panel),
     }
@@ -89,6 +94,10 @@ pub fn text_fg() -> Color {
 
 pub fn muted() -> Color {
     current_theme().muted
+}
+
+pub fn divider() -> Color {
+    current_theme().rule
 }
 
 pub fn bg() -> Color {

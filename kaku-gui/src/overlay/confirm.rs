@@ -3,11 +3,12 @@ use config::keyassignment::{Confirmation, KeyAssignment};
 use mux::termwiztermtab::TermWizTerminal;
 use mux_lua::MuxPane;
 use std::rc::Rc;
-use termwiz::cell::{unicode_column_width, AttributeChange, Intensity};
+use termwiz::cell::{unicode_column_width, AttributeChange, CellAttributes, Intensity};
 use termwiz::color::ColorAttribute;
 use termwiz::input::{InputEvent, KeyCode, KeyEvent, MouseButtons, MouseEvent};
 use termwiz::surface::{Change, CursorVisibility, Position};
 use termwiz::terminal::Terminal;
+use wezterm_term::TerminalConfiguration;
 
 pub fn run_confirmation(message: &str, term: &mut TermWizTerminal) -> anyhow::Result<bool> {
     run_confirmation_impl(message, term)
@@ -23,6 +24,17 @@ enum ActiveButton {
 struct ButtonLayout {
     x: usize,
     width: usize,
+}
+
+/// The dialog frame takes the shared overlay divider color instead of the
+/// default foreground, which made it the brightest line on screen.
+fn frame_attributes() -> CellAttributes {
+    let palette = config::TermConfig::with_config(config::configuration()).color_palette();
+    let mut attrs = CellAttributes::default();
+    attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
+        super::divider_color(palette.background, palette.foreground),
+    ));
+    attrs
 }
 
 fn run_confirmation_impl(message: &str, term: &mut TermWizTerminal) -> anyhow::Result<bool> {
@@ -86,12 +98,15 @@ fn run_confirmation_impl(message: &str, term: &mut TermWizTerminal) -> anyhow::R
         width: yes_w,
     };
 
+    let frame_attrs = frame_attributes();
+
     let render = |term: &mut TermWizTerminal, active: ActiveButton| -> termwiz::Result<()> {
         let mut changes = vec![
             Change::ClearScreen(ColorAttribute::Default),
             Change::CursorVisibility(CursorVisibility::Hidden),
         ];
 
+        changes.push(Change::AllAttributes(frame_attrs.clone()));
         changes.push(Change::CursorPosition {
             x: Position::Absolute(x_pos),
             y: Position::Absolute(top_row),
@@ -120,6 +135,7 @@ fn run_confirmation_impl(message: &str, term: &mut TermWizTerminal) -> anyhow::R
             "╰{}╯",
             "─".repeat(dialog_width.saturating_sub(2))
         )));
+        changes.push(Change::AllAttributes(CellAttributes::default()));
 
         for (y, row) in wrapped.iter().enumerate() {
             let row_width = unicode_column_width(row, None);

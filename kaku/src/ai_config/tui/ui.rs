@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use super::{App, Tool};
-use crate::tui_core::theme::{accent, bg, muted, panel, primary, red, success, text_fg};
+use crate::tui_core::theme::{accent, bg, divider, muted, panel, primary, red, success, text_fg};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MainLayoutMode {
@@ -201,7 +201,7 @@ fn render_tools(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 
             let indent_str = if extra_indent { "    │  " } else { "    " };
             let key_width = if extra_indent { 21 } else { 24 };
-            let tree_color = if is_selected { primary() } else { muted() };
+            let tree_color = if is_selected { primary() } else { divider() };
             let row_color = if is_selected { primary() } else { text_fg() };
             let key_marker = if is_selected { "› " } else { "  " };
 

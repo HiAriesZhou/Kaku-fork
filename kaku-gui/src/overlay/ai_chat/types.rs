@@ -112,6 +112,15 @@ impl ChatPalette {
     pub fn border_dim_cell(&self) -> CellAttributes {
         self.make_attrs(self.border_attr(), self.bg_attr())
     }
+    /// Frame edges, rules and quote bars. Labels set into a frame edge keep
+    /// `border_dim_cell` so they stay readable.
+    pub fn rule_cell(&self) -> CellAttributes {
+        let rule = crate::overlay::divider_color(self.bg, self.fg);
+        self.make_attrs(
+            ColorAttribute::TrueColorWithDefaultFallback(rule),
+            self.bg_attr(),
+        )
+    }
     pub fn plain_cell(&self) -> CellAttributes {
         self.make_attrs(self.fg_attr(), self.bg_attr())
     }

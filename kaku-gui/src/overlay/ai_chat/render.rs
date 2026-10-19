@@ -125,7 +125,7 @@ fn inline_cell(style: InlineStyle, block: BlockStyle, pal: &ChatPalette) -> Cell
     let base = match block {
         BlockStyle::Heading(_) => pal.heading_text_cell(),
         BlockStyle::Quote => pal.input_cell(), // dim fg for block-quoted text
-        BlockStyle::Hr => pal.border_dim_cell(),
+        BlockStyle::Hr => pal.rule_cell(),
         BlockStyle::Code => pal.input_cell(),
         _ => pal.ai_text_cell(),
     };
@@ -232,7 +232,7 @@ fn build_line_runs(
                 BlockStyle::Quote => {
                     // "  │ " = 2 cols leading + quote bar + space
                     runs.push((pal.plain_cell(), "  ".to_string()));
-                    runs.push((pal.border_dim_cell(), "│ ".to_string()));
+                    runs.push((pal.rule_cell(), "│ ".to_string()));
                     String::new()
                 }
                 BlockStyle::ListContinuation => "    ".to_string(),
@@ -387,6 +387,29 @@ pub(super) fn render(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<(
 
 /// Emit a bordered separator row containing the given styled runs.
 /// Used for the inline slash-command and attachment pickers.
+/// Draws a frame edge with a label set into it: the corners and rules take the
+/// rule color, the label keeps the dimmer text color. Clipped to `cols`.
+fn push_labelled_edge(
+    changes: &mut Vec<Change>,
+    pal: &ChatPalette,
+    lead: &str,
+    label: &str,
+    tail: &str,
+    cols: usize,
+) {
+    let mut left = cols;
+    for (attrs, text) in [
+        (pal.rule_cell(), lead),
+        (pal.border_dim_cell(), label),
+        (pal.rule_cell(), tail),
+    ] {
+        let text = truncate(text, left);
+        left = left.saturating_sub(unicode_column_width(&text, None));
+        changes.push(Change::AllAttributes(attrs));
+        changes.push(Change::Text(text));
+    }
+}
+
 fn push_picker_row(
     changes: &mut Vec<Change>,
     row: usize,
@@ -398,10 +421,10 @@ fn push_picker_row(
         x: Position::Absolute(0),
         y: Position::Absolute(row),
     });
-    changes.push(Change::AllAttributes(pal.border_dim_cell()));
+    changes.push(Change::AllAttributes(pal.rule_cell()));
     changes.push(Change::Text("│".to_string()));
     emit_styled_line(changes, &runs, inner_w, None, pal);
-    changes.push(Change::AllAttributes(pal.border_dim_cell()));
+    changes.push(Change::AllAttributes(pal.rule_cell()));
     changes.push(Change::Text("│".to_string()));
 }
 
@@ -472,13 +495,18 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
     let title = format!(" Kaku AI · {} ", model_display);
     let title_width = unicode_column_width(&title, None);
     let border_fill = inner_w.saturating_sub(title_width);
-    let top_line = format!("╭─{}{}─╮", title, "─".repeat(border_fill.saturating_sub(2)));
     changes.push(Change::CursorPosition {
         x: Position::Absolute(0),
         y: Position::Absolute(0),
     });
-    changes.push(Change::AllAttributes(pal.border_dim_cell()));
-    changes.push(Change::Text(truncate(&top_line, cols)));
+    push_labelled_edge(
+        &mut changes,
+        pal,
+        "╭─",
+        &title,
+        &format!("{}─╮", "─".repeat(border_fill.saturating_sub(2))),
+        cols,
+    );
 
     // 3. Message area.
     let input_visible_h = app.input_visible_rows();
@@ -499,7 +527,7 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
             x: Position::Absolute(0),
             y: Position::Absolute(row),
         });
-        changes.push(Change::AllAttributes(pal.border_dim_cell()));
+        changes.push(Change::AllAttributes(pal.rule_cell()));
         changes.push(Change::Text("│".to_string()));
 
         let line_idx = visible_start + i;
@@ -537,7 +565,7 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
 
         emit_styled_line(&mut changes, &runs, inner_w, sel_range, pal);
 
-        changes.push(Change::AllAttributes(pal.border_dim_cell()));
+        changes.push(Change::AllAttributes(pal.rule_cell()));
         changes.push(Change::Text("│".to_string()));
     }
 
@@ -548,11 +576,11 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
             x: Position::Absolute(0),
             y: Position::Absolute(row),
         });
-        changes.push(Change::AllAttributes(pal.border_dim_cell()));
+        changes.push(Change::AllAttributes(pal.rule_cell()));
         changes.push(Change::Text("│".to_string()));
         changes.push(Change::AllAttributes(pal.plain_cell()));
         changes.push(Change::Text(pad_to_visual_width("", inner_w)));
-        changes.push(Change::AllAttributes(pal.border_dim_cell()));
+        changes.push(Change::AllAttributes(pal.rule_cell()));
         changes.push(Change::Text("│".to_string()));
     }
 
@@ -630,7 +658,7 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
                 x: Position::Absolute(0),
                 y: Position::Absolute(abs_row),
             });
-            changes.push(Change::AllAttributes(pal.border_dim_cell()));
+            changes.push(Change::AllAttributes(pal.rule_cell()));
             changes.push(Change::Text("│".to_string()));
             if (input_top..input_top + input_visible_h).contains(&abs_row) {
                 changes.push(Change::AllAttributes(pal.composer_cell()));
@@ -647,7 +675,7 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
                 let edge = if abs_row < input_top { "▄" } else { "▀" };
                 changes.push(Change::Text(edge.repeat(inner_w)));
             }
-            changes.push(Change::AllAttributes(pal.border_dim_cell()));
+            changes.push(Change::AllAttributes(pal.rule_cell()));
             changes.push(Change::Text("│".to_string()));
         }
 
@@ -674,18 +702,23 @@ fn render_chat(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()> {
         x: Position::Absolute(0),
         y: Position::Absolute(bot_row),
     });
-    changes.push(Change::AllAttributes(pal.border_dim_cell()));
     let hint = if app.is_streaming {
         " Enter interrupt & send · Esc stop "
     } else {
         " Enter send · Shift+Enter newline · Esc close "
     };
     let hint = truncate(hint, inner_w);
-    changes.push(Change::Text(format!(
-        "╰{}{}╯",
-        hint,
-        "─".repeat(inner_w.saturating_sub(unicode_column_width(&hint, None)))
-    )));
+    push_labelled_edge(
+        &mut changes,
+        pal,
+        "╰",
+        &hint,
+        &format!(
+            "{}╯",
+            "─".repeat(inner_w.saturating_sub(unicode_column_width(&hint, None)))
+        ),
+        cols,
+    );
 
     // Restore cursor to input position AFTER drawing all decorations, so the
     // terminal's physical cursor lands on the input row, not the bottom border.
@@ -733,13 +766,18 @@ fn render_picker(
     let title = format!(" Resume Conversation · {} saved · ESC cancel ", items.len());
     let title_width = unicode_column_width(&title, None);
     let border_fill = inner_w.saturating_sub(title_width);
-    let top_line = format!("╭─{}{}─╮", title, "─".repeat(border_fill.saturating_sub(2)));
     changes.push(Change::CursorPosition {
         x: Position::Absolute(0),
         y: Position::Absolute(0),
     });
-    changes.push(Change::AllAttributes(pal.border_dim_cell()));
-    changes.push(Change::Text(truncate(&top_line, cols)));
+    push_labelled_edge(
+        &mut changes,
+        pal,
+        "╭─",
+        &title,
+        &format!("{}─╮", "─".repeat(border_fill.saturating_sub(2))),
+        cols,
+    );
 
     // List area does not reserve the hidden chat composer.
     let msg_area_h = app.resume_picker_height();
@@ -750,7 +788,7 @@ fn render_picker(
             x: Position::Absolute(0),
             y: Position::Absolute(row),
         });
-        changes.push(Change::AllAttributes(pal.border_dim_cell()));
+        changes.push(Change::AllAttributes(pal.rule_cell()));
         changes.push(Change::Text("│".to_string()));
 
         if let Some(meta) = items.get(start + i) {
@@ -796,7 +834,7 @@ fn render_picker(
             changes.push(Change::Text(pad_to_visual_width("", inner_w)));
         }
 
-        changes.push(Change::AllAttributes(pal.border_dim_cell()));
+        changes.push(Change::AllAttributes(pal.rule_cell()));
         changes.push(Change::Text("│".to_string()));
     }
 
@@ -806,7 +844,7 @@ fn render_picker(
         x: Position::Absolute(0),
         y: Position::Absolute(sep_row),
     });
-    changes.push(Change::AllAttributes(pal.border_dim_cell()));
+    changes.push(Change::AllAttributes(pal.rule_cell()));
     changes.push(Change::Text(format!("├{}┤", "─".repeat(inner_w))));
 
     // Hint row
@@ -815,12 +853,12 @@ fn render_picker(
         x: Position::Absolute(0),
         y: Position::Absolute(input_row),
     });
-    changes.push(Change::AllAttributes(pal.border_dim_cell()));
+    changes.push(Change::AllAttributes(pal.rule_cell()));
     changes.push(Change::Text("│".to_string()));
     let hint = format!("  ↑↓ select · Enter load · Esc cancel");
     changes.push(Change::AllAttributes(pal.input_cell()));
     changes.push(Change::Text(pad_to_visual_width(&hint, inner_w)));
-    changes.push(Change::AllAttributes(pal.border_dim_cell()));
+    changes.push(Change::AllAttributes(pal.rule_cell()));
     changes.push(Change::Text("│".to_string()));
     // cursor is already hidden at frame start
 
@@ -830,7 +868,7 @@ fn render_picker(
         x: Position::Absolute(0),
         y: Position::Absolute(bot_row),
     });
-    changes.push(Change::AllAttributes(pal.border_dim_cell()));
+    changes.push(Change::AllAttributes(pal.rule_cell()));
     changes.push(Change::Text(format!("╰{}╯", "─".repeat(inner_w))));
 
     // End atomic frame.
@@ -859,12 +897,17 @@ fn render_approval(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()>
             x: Position::Absolute(0),
             y: Position::Absolute(0),
         });
-        changes.push(Change::AllAttributes(pal.border_dim_cell()));
-        changes.push(Change::Text(format!(
-            "╭{}{}╮",
-            title,
-            "─".repeat(inner_w.saturating_sub(unicode_column_width(&title, None)))
-        )));
+        push_labelled_edge(
+            &mut changes,
+            pal,
+            "╭",
+            &title,
+            &format!(
+                "{}╮",
+                "─".repeat(inner_w.saturating_sub(unicode_column_width(&title, None)))
+            ),
+            app.cols,
+        );
         let lines = app.approval_lines();
         let height = app.rows - 4;
         let start = app.approval_scroll.min(lines.len().saturating_sub(height));
@@ -899,12 +942,17 @@ fn render_approval(term: &mut TermWizTerminal, app: &App) -> termwiz::Result<()>
             x: Position::Absolute(0),
             y: Position::Absolute(app.rows - 1),
         });
-        changes.push(Change::AllAttributes(pal.border_dim_cell()));
-        changes.push(Change::Text(format!(
-            "╰{}{}╯",
-            hint,
-            "─".repeat(inner_w.saturating_sub(unicode_column_width(&hint, None)))
-        )));
+        push_labelled_edge(
+            &mut changes,
+            pal,
+            "╰",
+            &hint,
+            &format!(
+                "{}╯",
+                "─".repeat(inner_w.saturating_sub(unicode_column_width(&hint, None)))
+            ),
+            app.cols,
+        );
     }
     changes.push(Change::Text("\x1b[?2026l".into()));
     term.render(&changes)
@@ -933,4 +981,44 @@ fn control_runs(
         runs.push((attrs, label.into()));
     }
     runs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kaku_dark() -> ChatPalette {
+        let rgb = |r: u8, g: u8, b: u8| SrgbaTuple::from((r, g, b));
+        ChatPalette {
+            bg: rgb(0x15, 0x14, 0x1b),
+            fg: rgb(0xd5, 0xd4, 0xd6),
+            accent: rgb(0x58, 0xd8, 0xad),
+            border: rgb(0x6d, 0x6d, 0x6d),
+            user_header: rgb(0xda, 0xae, 0x76),
+            user_text: rgb(0xd5, 0xd4, 0xd6),
+            ai_text: rgb(0xd5, 0xd4, 0xd6),
+            selection_fg: rgb(0xd5, 0xd4, 0xd6),
+            selection_bg: rgb(0x8e, 0x6a, 0xd9),
+        }
+    }
+
+    #[test]
+    fn labelled_edge_draws_rules_quieter_than_the_label() {
+        let pal = kaku_dark();
+        let mut changes = Vec::new();
+        push_labelled_edge(&mut changes, &pal, "╭─", " Kaku AI ", "────╮", 12);
+
+        let runs: Vec<(CellAttributes, String)> = changes
+            .chunks(2)
+            .map(|pair| match pair {
+                [Change::AllAttributes(attrs), Change::Text(text)] => (attrs.clone(), text.clone()),
+                _ => panic!("expected attribute and text pairs"),
+            })
+            .collect();
+        assert_eq!(runs[0], (pal.rule_cell(), "╭─".to_string()));
+        assert_eq!(runs[1], (pal.border_dim_cell(), " Kaku AI ".to_string()));
+        // Clipped to the 12 columns left after the label.
+        assert_eq!(runs[2], (pal.rule_cell(), "─".to_string()));
+        assert_ne!(pal.rule_cell(), pal.border_dim_cell());
+    }
 }

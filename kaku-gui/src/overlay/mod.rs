@@ -4,6 +4,7 @@ use mux::tab::{Tab, TabId};
 use mux::termwiztermtab::{allocate, TermWizTerminal};
 use std::pin::Pin;
 use std::sync::Arc;
+use termwiz::color::SrgbaTuple;
 use wezterm_term::{TerminalConfiguration, TerminalSize};
 
 pub mod ai_chat;
@@ -21,6 +22,22 @@ pub use confirm_close_pane::{
 pub use copy::{CopyModeParams, CopyOverlay};
 pub use launcher::{launcher, LauncherArgs, LauncherFlags};
 pub use quickselect::QuickSelectOverlay;
+
+/// How far overlay frames and rules sit from the background toward the
+/// foreground. Bright black or the foreground itself made box lines read
+/// louder than the text they frame on dark themes.
+const DIVIDER_BLEND: f32 = 0.25;
+
+/// Color for overlay frames and rules, derived from the active palette so it
+/// stays quiet on both light and dark themes.
+pub(crate) fn divider_color(bg: SrgbaTuple, fg: SrgbaTuple) -> SrgbaTuple {
+    SrgbaTuple(
+        bg.0 + (fg.0 - bg.0) * DIVIDER_BLEND,
+        bg.1 + (fg.1 - bg.1) * DIVIDER_BLEND,
+        bg.2 + (fg.2 - bg.2) * DIVIDER_BLEND,
+        1.0,
+    )
+}
 
 pub fn start_overlay<T, F>(
     term_window: &TermWindow,
@@ -87,4 +104,23 @@ where
     });
 
     (tw_tab, Box::pin(future))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::divider_color;
+    use termwiz::color::SrgbaTuple;
+
+    #[test]
+    fn divider_sits_between_background_and_bright_black() {
+        // Kaku Dark: frames used bright black #6d6d6d or the foreground.
+        let bg = SrgbaTuple::from((0x15u8, 0x14u8, 0x1bu8));
+        let fg = SrgbaTuple::from((0xd5u8, 0xd4u8, 0xd6u8));
+        assert_eq!(divider_color(bg, fg).to_srgb_u8(), (0x45, 0x44, 0x49, 0xff));
+
+        // Kaku Light keeps a visible but quiet line on its paper background.
+        let bg = SrgbaTuple::from((0xffu8, 0xfcu8, 0xf0u8));
+        let fg = SrgbaTuple::from((0x10u8, 0x0fu8, 0x0fu8));
+        assert_eq!(divider_color(bg, fg).to_srgb_u8(), (0xc3, 0xc0, 0xb7, 0xff));
+    }
 }
