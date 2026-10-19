@@ -262,6 +262,16 @@ mod tests {
             let value: String = normalize.call(format!("{expected}然后查看文件。")).unwrap();
             assert_eq!(value, expected);
         }
+        for (input, expected) in [
+            (
+                "Undo changes to src/search.ts.",
+                "Undo changes to src/search.ts.",
+            ),
+            ("Pin v1.2 first. Then update.", "Pin v1.2 first."),
+        ] {
+            let value: String = normalize.call(input).unwrap();
+            assert_eq!(value, expected);
+        }
         for text in ["中".repeat(30), format!("x{}", "🙂".repeat(20))] {
             let value: String = normalize.call(text.as_str()).unwrap();
             assert!(text.starts_with(value.trim_end_matches('.')));

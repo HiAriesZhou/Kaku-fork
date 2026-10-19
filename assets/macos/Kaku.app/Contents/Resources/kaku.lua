@@ -504,7 +504,22 @@ local function normalize_ai_summary(value, fallback)
   text = text:gsub("%s+", " ")
   text = trim_surrounding_whitespace(text)
 
-  local sentence_start, sentence_end = text:find("[%.!?]")
+  -- An ASCII stop ends the sentence only before whitespace, the end or
+  -- non-ASCII text, so file names and versions such as src/search.ts stay whole.
+  local sentence_start, sentence_end
+  local search_from = 1
+  while true do
+    local first, last = text:find("[%.!?]", search_from)
+    if not first then
+      break
+    end
+    local next_byte = text:byte(last + 1)
+    if not next_byte or next_byte >= 0x80 or string.char(next_byte):match("%s") then
+      sentence_start, sentence_end = first, last
+      break
+    end
+    search_from = last + 1
+  end
   for _, punctuation in ipairs({ "。", "！", "？" }) do
     local first, last = text:find(punctuation, 1, true)
     if first and (not sentence_start or first < sentence_start) then
