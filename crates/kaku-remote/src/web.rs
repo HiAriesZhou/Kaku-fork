@@ -589,6 +589,11 @@ enum WebClientMsg {
     Verify {
         frames: u64,
         rows: Vec<String>,
+        /// The last frame the page drew, so the check holds while later
+        /// frames are still on the way. Older pages omit it and are checked
+        /// only when nothing is in flight.
+        #[serde(default)]
+        seq: Option<u64>,
         /// The page's own grid, for the drift report. Older pages omit it.
         #[serde(default)]
         view: Option<PageView>,
@@ -1632,9 +1637,34 @@ struct Shown {
     /// For drift reports: the last row move sent, and frames since a full one.
     last_move: isize,
     since_full: usize,
+    /// The rows each recent frame left on the page, by frame number. While
+    /// Claude Code works, frames are always in flight over the relay, and a
+    /// check that waited for none to be pending never ran, so drift stayed
+    /// on screen until a reload.
+    sent: VecDeque<(u64, Vec<String>)>,
 }
 
+/// Frames that can be in flight, with room for the page's check to travel.
+const SENT_KEPT: usize = FRAME_WINDOW * 2;
+
 impl Shown {
+    /// Remember what frame `seq` left on the page, for checking it later.
+    fn sent_as(&mut self, seq: u64) {
+        if self.sent.len() == SENT_KEPT {
+            self.sent.pop_front();
+        }
+        self.sent.push_back((seq, self.lines.clone()));
+    }
+
+    /// The rows frame `seq` left on the page, if it is recent.
+    fn rows_after(&self, seq: u64) -> Option<&[String]> {
+        self.sent
+            .iter()
+            .rev()
+            .find(|(s, _)| *s == seq)
+            .map(|(_, lines)| lines.as_slice())
+    }
+
     /// The bytes that bring the browser from what it shows to `frame`, or
     /// None when nothing changed. The frame's images are left in it only when
     /// they changed.
@@ -2426,9 +2456,13 @@ pub(crate) async fn run_session(
                     }
                     continue;
                 }
-                if let WebClientMsg::Verify { frames, rows, view } = &msg {
-                    if *frames == frame_window.sent && attached.is_some() {
-                        let drift = drifted_rows(&shown.lines, rows);
+                if let WebClientMsg::Verify { frames, rows, seq, view } = &msg {
+                    let expected = match seq {
+                        Some(seq) => shown.rows_after(*seq),
+                        None => (*frames == frame_window.sent).then_some(shown.lines.as_slice()),
+                    };
+                    if let (Some(expected), true) = (expected, attached.is_some()) {
+                        let drift = drifted_rows(expected, rows);
                         if !drift.is_empty() {
                             let pane = attached.and_then(lookup_pane);
                             let view = view.as_ref();
@@ -2442,7 +2476,7 @@ pub(crate) async fn run_session(
                                 pane.as_ref().is_some_and(|p| p.is_alt_screen_active()),
                                 pane.as_ref().is_some_and(|p| p.is_mouse_grabbed()),
                                 &drift[..drift.len().min(8)],
-                                page_offset(&shown.lines, rows, &drift),
+                                page_offset(expected, rows, &drift),
                                 view.map_or(0, |v| v.cols),
                                 view.map_or(0, |v| v.rows),
                                 view.map_or(0, |v| v.base),
@@ -2611,6 +2645,7 @@ pub(crate) async fn run_session(
                     break;
                 }
                 frame_window.record(frame_bytes);
+                shown.sent_as(frame_window.sent);
                 last_frame_at = std::time::Instant::now();
                 // Only a frame sent starts the interval: input marks the view
                 // dirty before its echo arrives, and that render, which finds
@@ -3078,6 +3113,23 @@ mod tests {
             })
             .unwrap();
         assert!(!data.contains('S') && !data.contains('T'), "{data:?}");
+    }
+
+    #[test]
+    fn a_check_compares_with_the_frame_the_page_drew() {
+        let mut shown = Shown::default();
+        shown.update(frame(10, &["A", "B"], "@1")).unwrap();
+        shown.sent_as(1);
+        shown.update(frame(10, &["A", "C"], "@1")).unwrap();
+        shown.sent_as(2);
+        assert_eq!(shown.rows_after(1).map(<[String]>::len), Some(2));
+        assert_ne!(shown.rows_after(1), shown.rows_after(2));
+        assert!(shown.rows_after(2).unwrap()[1].ends_with('C'));
+        for seq in 3..=(2 + SENT_KEPT as u64) {
+            shown.sent_as(seq);
+        }
+        assert_eq!(shown.rows_after(1), None);
+        assert!(Shown::default().rows_after(2).is_none());
     }
 
     #[test]

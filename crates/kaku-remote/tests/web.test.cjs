@@ -1539,3 +1539,19 @@ test('no size is claimed before Kaku\'s config and font are in, then one', async
   await p.waitForTimeout(250);
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'resize').length), 1);
 });
+
+test('the drift check names the last frame drawn, so it runs while output streams', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.evaluate(() => {
+    for (let seq = 2; seq <= 3; seq++) probe.handle({ type: 'frame', seq, pane_id: 1, cols: 80, rows: 24, data: '\x1b[2;1Hline ' + seq });
+    probe.handle({ type: 'frame', seq: 4, pane_id: 1, cols: 90, rows: 24, data: '\x1b[2J\x1b[1;1Hresized' });
+  });
+  await p.waitForTimeout(1400);
+  const checks = await p.evaluate(() => messages.filter(m => m.type === 'verify'));
+  assert.ok(checks.length >= 1, 'a resize is checked within a second or so');
+  const last = checks.at(-1);
+  assert.equal(last.seq, 4);
+  assert.deepEqual([last.view.cols, last.view.rows], [90, 24]);
+  assert.equal(last.rows[0].trimEnd(), 'resized');
+});

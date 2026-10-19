@@ -1054,11 +1054,14 @@
   };
   // Tell Kaku what this page shows, once the frames it has sent are drawn;
   // Kaku logs and redraws if that differs from what it sent. Run after a
-  // scroll settles, where stale rows have shown up, and every 10 seconds.
+  // scroll settles, where stale rows have shown up, after a resize or a
+  // return to the page, and every 3 seconds. It names the last frame drawn,
+  // so it holds while later frames are still on the way.
   let framesSeen = 0;
+  let appliedSeq = 0;
   let verifyTimer = 0;
   // The periodic check only runs after something changed; idle, it would
-  // upload the whole screen every 10 s on a phone's data plan.
+  // upload the whole screen every few seconds on a phone's data plan.
   let verified = { socket: null, frames: -1 };
   const verify = (force = false) => {
     if (!ws || ws.readyState !== WebSocket.OPEN || paneId === null || !size.cols) return;
@@ -1072,14 +1075,14 @@
         rows.push(line ? line.translateToString(true) : "");
       }
       const view = { cols: term.cols, rows: term.rows, base: buf.baseY, top: buf.viewportY, alt: buf.type === "alternate" };
-      send({ type: "verify", frames: framesSeen, rows, view });
+      send({ type: "verify", frames: framesSeen, seq: appliedSeq || undefined, rows, view });
     });
   };
   const verifySoon = () => {
     clearTimeout(verifyTimer);
     verifyTimer = setTimeout(() => verify(true), 1000);
   };
-  setInterval(() => verify(), 10000);
+  setInterval(() => verify(), 3000);
   // Positive lines move toward history.
   const queueScroll = (lines) => {
     wheelRemainder += lines;
@@ -2203,6 +2206,7 @@
       resizeTerm(msg.cols, msg.rows);
       fit();
       clearPending = true;
+      verifySoon();
     }
     localScroll = !!msg.local_scroll;
     if (!localScroll) closePast();
@@ -2216,6 +2220,7 @@
     term.write(clear + NO_WRAP + steadyCursor(msg.data), () => {
       if (ws !== socket) return;
       if (msg.pane_id === paneId) {
+        if (msg.seq) appliedSeq = msg.seq;
         liveWrapped = msg.wrapped || [];
         markFound();
       }
@@ -2725,6 +2730,7 @@
     lastHeard = Date.now();
     pingSentAt = 0;
     framesSeen = 0;
+    appliedSeq = 0;
     link = newLink();
     sendChain = relay ? link.promise : Promise.resolve();
     recvChain = Promise.resolve();
@@ -2816,6 +2822,7 @@
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible" || linkRejected) return;
     reclaim();
+    verifySoon();
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       retry = 0;
       connect();
