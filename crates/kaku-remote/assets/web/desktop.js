@@ -34,7 +34,6 @@
   const WHEEL_LINE = 16;
   const LONG_PRESS_MS = 450;
   const TAP_SLOP = 10;
-  const TOUCH = matchMedia("(pointer: coarse)").matches;
   // A pinch that changes the fingers' spread by more than this zooms
   // instead of scrolling.
   const PINCH_START = 0.12;
@@ -48,6 +47,8 @@
 
   const init = (api) => {
     const { send, toolsEl, stageEl, isMac, toast, focusTerminal } = api;
+    // The page's own reading of the screen, so both agree on touch.
+    const TOUCH = api.touch ?? matchMedia("(pointer: coarse)").matches;
     const style = document.createElement("style");
     style.textContent = CSS;
     document.head.append(style);

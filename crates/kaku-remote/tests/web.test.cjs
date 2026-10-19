@@ -1771,6 +1771,18 @@ test('picking a tab leaves the desktop view for the terminal', async t => {
 
 test('on a phone the desktop view pinches to zoom and taps where the zoom shows', async t => {
   const { p, errors } = await page(t, '#t=fixture', { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  // CI's Chromium has not always reported a coarse pointer for an emulated
+  // phone; the page's touch layout is what this test is about.
+  if (!(await p.evaluate(() => document.body.classList.contains('touch')))) {
+    await p.addInitScript(() => {
+      const real = window.matchMedia.bind(window);
+      window.matchMedia = q => q === '(pointer: coarse)' ? { matches: true, media: q, addEventListener() {}, removeEventListener() {} } : real(q);
+    });
+    await p.reload();
+    await p.waitForTimeout(100);
+    await p.evaluate(() => { probe.handle({ type: 'config' }); return document.fonts.load('16px "Kaku Mono"'); });
+  }
+  assert.equal(await p.evaluate(() => document.body.classList.contains('touch')), true);
   await screen(p);
   await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
   await p.locator('#bar .tool.desktop').click();
