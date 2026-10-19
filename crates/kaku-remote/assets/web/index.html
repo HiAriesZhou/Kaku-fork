@@ -1071,7 +1071,8 @@
         const line = buf.getLine(buf.viewportY + y);
         rows.push(line ? line.translateToString(true) : "");
       }
-      send({ type: "verify", frames: framesSeen, rows });
+      const view = { cols: term.cols, rows: term.rows, base: buf.baseY, top: buf.viewportY, alt: buf.type === "alternate" };
+      send({ type: "verify", frames: framesSeen, rows, view });
     });
   };
   const verifySoon = () => {
@@ -2149,8 +2150,8 @@
     // bundled font is in, nudge the size to measure it instead of the
     // fallback face it saw first; fit() then sets Kaku's size back.
     document.fonts.load('16px "Kaku Mono"').finally(() => {
-      setFont(baseFontSize + 1);
       fontReady = true;
+      setFont(baseFontSize + 1);
       fit();
     });
   };

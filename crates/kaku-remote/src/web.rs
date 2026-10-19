@@ -589,7 +589,26 @@ enum WebClientMsg {
     Verify {
         frames: u64,
         rows: Vec<String>,
+        /// The page's own grid, for the drift report. Older pages omit it.
+        #[serde(default)]
+        view: Option<PageView>,
     },
+}
+
+/// Where the page's terminal stands when it verifies; no screen content.
+#[derive(Debug, Deserialize, Default)]
+struct PageView {
+    #[serde(default)]
+    cols: usize,
+    #[serde(default)]
+    rows: usize,
+    /// xterm.js's first screen row in its buffer, and the row in view.
+    #[serde(default)]
+    base: usize,
+    #[serde(default)]
+    top: usize,
+    #[serde(default)]
+    alt: bool,
 }
 
 #[derive(Serialize)]
@@ -1772,6 +1791,27 @@ fn drifted_rows(shown: &[String], page: &[String]) -> Vec<usize> {
         .collect()
 }
 
+/// When the drifted rows all show Kaku's rows from `k` rows away, the page
+/// is shifted by `k` (positive: it shows rows from further down); the drift
+/// report names that so its cause can be told from a garbled screen.
+fn page_offset(shown: &[String], page: &[String], drift: &[usize]) -> Option<isize> {
+    let text = |l: &str| -> String { l.chars().filter(|c| !c.is_whitespace()).collect() };
+    let candidates = drift
+        .iter()
+        .filter(|&&i| page.get(i).is_some_and(|l| !text(l).is_empty()));
+    let candidates: Vec<usize> = candidates.copied().collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    (-4isize..=4).filter(|&k| k != 0).find(|&k| {
+        candidates.iter().all(|&i| {
+            i.checked_add_signed(k)
+                .and_then(|j| shown.get(j))
+                .is_some_and(|kaku| row_text(kaku) == text(&page[i]))
+        })
+    })
+}
+
 fn cursor_shape_param(shape: CursorShape) -> u8 {
     match shape {
         // The app did not pick a shape, so Kaku draws its configured default.
@@ -2386,13 +2426,14 @@ pub(crate) async fn run_session(
                     }
                     continue;
                 }
-                if let WebClientMsg::Verify { frames, rows } = &msg {
+                if let WebClientMsg::Verify { frames, rows, view } = &msg {
                     if *frames == frame_window.sent && attached.is_some() {
                         let drift = drifted_rows(&shown.lines, rows);
                         if !drift.is_empty() {
                             let pane = attached.and_then(lookup_pane);
+                            let view = view.as_ref();
                             log::warn!(
-                                "kaku-remote web: screen drift in {} of {} rows (last move {}, {} frames since full, scrolled {}, alt screen {}, mouse grabbed {}); redrawing",
+                                "kaku-remote web: screen drift in {} of {} rows (last move {}, {} frames since full, scrolled {}, alt screen {}, mouse grabbed {}); rows {:?}, page offset {:?}, page grid {}x{} base {} top {} alt {}; redrawing",
                                 drift.len(),
                                 shown.lines.len(),
                                 shown.last_move,
@@ -2400,6 +2441,13 @@ pub(crate) async fn run_session(
                                 shown.scrolled,
                                 pane.as_ref().is_some_and(|p| p.is_alt_screen_active()),
                                 pane.as_ref().is_some_and(|p| p.is_mouse_grabbed()),
+                                &drift[..drift.len().min(8)],
+                                page_offset(&shown.lines, rows, &drift),
+                                view.map_or(0, |v| v.cols),
+                                view.map_or(0, |v| v.rows),
+                                view.map_or(0, |v| v.base),
+                                view.map_or(0, |v| v.top),
+                                view.is_some_and(|v| v.alt),
                             );
                             shown = Shown::default();
                             dirty_frame = true;
@@ -3030,6 +3078,29 @@ mod tests {
             })
             .unwrap();
         assert!(!data.contains('S') && !data.contains('T'), "{data:?}");
+    }
+
+    #[test]
+    fn drift_report_names_a_page_shifted_by_whole_rows() {
+        let shown = rows(&["a", "b", "c", "d", "prompt"]);
+        // The page shows Kaku's rows one further down, as a stale extra row
+        // scrolled up by a move would leave it.
+        let page: Vec<String> = ["b", "c", "d", "prompt", "prompt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let drift = drifted_rows(&shown, &page);
+        assert_eq!(drift, vec![0, 1, 2, 3]);
+        assert_eq!(page_offset(&shown, &page, &drift), Some(1));
+        let garbled: Vec<String> = ["a", "x", "c", "y", "prompt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let drift = drifted_rows(&shown, &garbled);
+        assert_eq!(page_offset(&shown, &garbled, &drift), None);
+        let blank = vec![String::new(); 5];
+        let drift = drifted_rows(&shown, &blank);
+        assert_eq!(page_offset(&shown, &blank, &drift), None);
     }
 
     #[test]
