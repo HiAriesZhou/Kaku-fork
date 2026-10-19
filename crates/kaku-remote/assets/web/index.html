@@ -348,7 +348,7 @@
     paired = true;
     saveDevice({ macPub: device.macPub, keys: device.keys, publicKey: device.publicKey })
       .then(() => toast("Paired. Bookmark this page to come back."))
-      .catch(() => toast("Paired for this tab only: this browser does not keep site data."));
+      .catch(() => toast("Paired for this tab only, since this browser does not keep site data."));
   };
 
   // ── Transport ──────────────────────────────────────────────────────────
@@ -2046,8 +2046,8 @@
     const items = [];
     if (selected) items.push(["Copy", () => {
       pendingCopy = null;
-      if (!navigator.clipboard) { toast("Use the keyboard shortcut to copy"); return; }
-      navigator.clipboard.writeText(selected).catch(() => toast("Use the keyboard shortcut to copy"));
+      if (!navigator.clipboard) { toast(`The browser blocked copying. Press ${IS_MAC ? "Cmd" : "Ctrl"}+C instead.`); return; }
+      navigator.clipboard.writeText(selected).catch(() => toast(`The browser blocked copying. Press ${IS_MAC ? "Cmd" : "Ctrl"}+C instead.`));
     }]);
     items.push(["Paste", async () => {
       try {
@@ -2055,7 +2055,7 @@
         if (paneId !== target) { toast("Pane changed. Paste again in the target pane."); return; }
         pasteText(text);
         term.focus();
-      } catch (_) { toast("Use the keyboard shortcut to paste"); }
+      } catch (_) { toast(`The browser blocked pasting. Press ${IS_MAC ? "Cmd" : "Ctrl"}+V instead.`); }
     }], ["Search", openFind], null);
     for (const direction of ["Left", "Right", "Up", "Down"]) {
       items.push(["Split " + direction, () => send({ type: "split_pane", pane_id: target, direction })]);
@@ -2584,7 +2584,7 @@
         result = await sendOnce(file, name, socket, transfer, target);
       } catch (_) {
         // The file could not be read (moved, or on a share that dropped).
-        toast(`Not sent: ${name} could not be read`);
+        toast(`${name} was not sent because it could not be read.`);
         return;
       }
       if (result) {
@@ -2592,7 +2592,7 @@
         return;
       }
     }
-    toast(`Not sent: ${name}, the connection dropped. Try again.`);
+    toast(`${name} was not sent because the connection dropped. Try again.`);
   };
   const pastedName = (file) => {
     const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
@@ -2664,7 +2664,7 @@
   // connected, and fails outright without a network.
   const explainOffline = () => {
     if (!relay) {
-      setNotice("Kaku is not running", "This page reconnects when it is back.", { stale: true, brand: true });
+      setNotice("Kaku is not running", "Open Kaku on the Mac. This page reconnects by itself.", { stale: true, brand: true });
       return;
     }
     const asked = RELAY
@@ -2672,10 +2672,10 @@
       : fetch(location.pathname, { method: "HEAD", cache: "no-store" });
     asked.then((res) => {
       if (ws && ws.readyState === WebSocket.OPEN) return;
-      if (res.status === 404) setNotice("Kaku on the Mac is offline", "This page reconnects when it is back.", { stale: true, brand: true });
+      if (res.status === 404) setNotice("Kaku on the Mac is offline", "Make sure Kaku is open on the Mac and online. If it is, run kaku doctor there to see why. This page reconnects by itself.", { stale: true, brand: true });
     }).catch(() => {
       if (ws && ws.readyState === WebSocket.OPEN) return;
-      setNotice("No connection", "Check this device's network. Retrying.", { stale: true });
+      setNotice("No connection", "Check this device's network. This page reconnects by itself.", { stale: true });
     });
   };
   // A page left open across a Kaku update or a new page release keeps
@@ -2754,34 +2754,34 @@
       if (ev.code === 4403 || ev.code === 1008) {
         linkRejected = true;
         if (!relay) {
-          setNotice("This link no longer works", "Run kaku remote on the Mac for the current link.", { stale: true });
+          setNotice("This link no longer works", "Kaku was restarted, which changes the link. Run kaku remote on the Mac for the current one.", { stale: true });
           return;
         }
         if (paired) forgetDevice();
-        setNotice("This browser is not paired", "Run kaku remote on the Mac and open the link it shows.", { stale: true });
+        setNotice("This browser is not paired", "It may have been removed on the Mac. Run kaku remote there and open the new link in this browser.", { stale: true });
         return;
       }
       if (ev.code === 4401) {
         linkRejected = true;
-        setNotice("This pairing link has expired", "Run kaku remote on the Mac for a new one. Each link works once.", { stale: true });
+        setNotice("This pairing link has expired", "Each link works once, within 10 minutes. Run kaku remote on the Mac for a new one.", { stale: true });
         return;
       }
       if (ev.code === 4426) {
         linkRejected = true;
-        setNotice("Kaku on the Mac was updated", "Reload this page.", { stale: true });
+        setNotice("Kaku on the Mac was updated", "Reload this page to use the new version.", { stale: true });
         return;
       }
       // Kaku drops a download with its session; ask for the file again.
       if (incoming.size) {
         incoming.clear();
-        toast("Download stopped: the connection dropped. Cmd+click the path again.");
+        toast("Download stopped because the connection dropped. Cmd+click the path again.");
       }
       // A quick blip reconnects before anyone notices; say something only if
       // it lasts, and after a few failures say why when the page can tell.
       claimed = "";
       // Offline, retrying cannot work; the online event reconnects at once.
       if (navigator.onLine === false) {
-        setNotice("No connection", "Check this device's network. Reconnects when it is back.", { stale: true });
+        setNotice("No connection", "Check this device's network. This page reconnects by itself.", { stale: true });
         return;
       }
       setNotice("Reconnecting", "", { stale: true, delay: retry ? 0 : 800 });
@@ -2825,12 +2825,12 @@
   notThisMac = (socket) => {
     linkRejected = true;
     if (ws === socket) socket.close();
-    setNotice("Could not verify the Mac", "If you reset Kaku's remote access, run kaku remote to pair again.", { stale: true });
+    setNotice("Could not verify the Mac", "If remote access was reset on the Mac, run kaku remote there and pair again. Otherwise close this page.", { stale: true });
   };
   linkExpired = (socket) => {
     linkRejected = true;
     if (ws === socket) socket.close();
-    setNotice("This pairing link has expired", "Run kaku remote on the Mac for a new one. Each link works once.", { stale: true });
+    setNotice("This pairing link has expired", "Each link works once, within 10 minutes. Run kaku remote on the Mac for a new one.", { stale: true });
   };
 })();
 </script>

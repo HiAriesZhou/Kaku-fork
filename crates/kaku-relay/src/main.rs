@@ -695,6 +695,7 @@ body{display:flex;flex-direction:column;align-items:center;justify-content:cente
 .title{font-size:15px}.detail{font-size:13px;color:#8b8b93}
 </style>
 <div class="title">Kaku on the Mac is offline</div>
+<div class="detail">Make sure Kaku is open on the Mac and online. If it is, run kaku doctor there to see why.</div>
 <div class="detail">This page opens the terminal by itself when it is back.</div>
 <script>
 setInterval(function () {
