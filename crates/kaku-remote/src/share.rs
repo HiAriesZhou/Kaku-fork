@@ -37,6 +37,8 @@ const KEEPALIVE: Duration = Duration::from_secs(20);
 const SILENCE_LIMIT: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const INBOX_TIMEOUT: Duration = Duration::from_secs(2);
+/// Input a busy session holds before `INBOX_TIMEOUT` starts counting.
+const SESSION_INBOX: usize = 64;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Longest a connect, TLS and WebSocket handshake may take. A proxy can
@@ -427,14 +429,21 @@ struct AssetRequests {
 
 impl AssetRequests {
     fn new(output: mpsc::Sender<Outbound>) -> Self {
+        Self::waiting(output, WRITE_TIMEOUT)
+    }
+
+    fn waiting(output: mpsc::Sender<Outbound>, patience: Duration) -> Self {
         let (requests, mut pending) = mpsc::channel::<(u32, String)>(16);
         let worker = tokio::spawn(async move {
             while let Some((request, path)) = pending.recv().await {
                 // Keep only names while the socket is busy. Construct the
                 // asset only after reserving its one slot in the bulk queue.
-                let Ok(Ok(slot)) = tokio::time::timeout(WRITE_TIMEOUT, output.reserve()).await
-                else {
-                    break;
+                // A busy socket drops this request; only a closed one ends
+                // the worker, or every later file would go unanswered.
+                let slot = match tokio::time::timeout(patience, output.reserve()).await {
+                    Ok(Ok(slot)) => slot,
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
                 };
                 slot.send(Outbound::Protocol(Message::Binary(
                     asset_frame(request, &path).into(),
@@ -846,9 +855,11 @@ fn start_session(
     to_relay: crate::queue::Sender<Outbound>,
     ended: mpsc::UnboundedSender<u32>,
 ) -> SessionInput {
-    // The per-browser forwarder supplies the bounded burst queue; the
-    // session itself needs only the next message, not a second backlog.
-    let (inbox, session_in) = mpsc::channel::<String>(1);
+    // The forwarder's timeout starts only once this queue is full. With one
+    // slot, a session busy for two seconds (a config reload resolving fonts)
+    // closed the browser with two keys pending; 64 is what V0.25.0 allowed.
+    // Removing the browser aborts the session, so these are dropped with it.
+    let (inbox, session_in) = mpsc::channel::<String>(SESSION_INBOX);
     let mut input = input_forwarder(c, inbox, ended.clone(), INBOX_TIMEOUT);
     let (session_out, replies) = crate::queue::channel::<String>(64);
     let (frames_out, mut frames) = mpsc::channel::<Vec<u8>>(4);
@@ -985,6 +996,33 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn legacy_asset_requests_outlive_one_busy_socket() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Outbound::Protocol(Message::Ping(Vec::new().into())))
+            .await
+            .unwrap();
+        let assets = AssetRequests::waiting(tx.clone(), Duration::from_millis(50));
+        assert!(assets.try_send(1, "assets/icon.png".into()));
+        // Get 1 gives up on the full queue; the worker must stay for Get 2.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(Outbound::Protocol(Message::Ping(_)))
+        ));
+        assert!(assets.try_send(2, "assets/icon.png".into()));
+        let rng = SystemRandom::new();
+        let Some(Message::Binary(bytes)) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .message(&rng)
+        else {
+            panic!("asset frame");
+        };
+        assert_eq!(bytes.as_ref(), asset_frame(2, "assets/icon.png"));
+    }
+
     fn identity() -> ShareIdentity {
         ShareIdentity::generate().unwrap()
     }
@@ -1038,6 +1076,22 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         tx.send("first".into()).await.unwrap();
         assert!(!deliver_input(&tx, "second".into(), Duration::from_millis(20)).await);
+    }
+
+    #[tokio::test]
+    async fn a_session_busy_past_the_timeout_keeps_its_browser() {
+        let (session, mut rx) = mpsc::channel(SESSION_INBOX);
+        let (ended, mut ended_rx) = mpsc::unbounded_channel();
+        let input = input_forwarder(3, session, ended, Duration::from_millis(50));
+        for n in 0..8 {
+            input.inbox.try_send(n.to_string()).unwrap();
+        }
+        // The session reads nothing for three timeouts, then catches up.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        for n in 0..8 {
+            assert_eq!(rx.recv().await, Some(n.to_string()));
+        }
+        assert!(ended_rx.try_recv().is_err());
     }
 
     #[tokio::test]
