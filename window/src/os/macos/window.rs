@@ -4159,6 +4159,17 @@ enum TranslateStatus {
     NotDead,
 }
 
+/// A second dead key that typed nothing on key-down only starts the new
+/// sequence: an empty composed key would still clear the selection and the
+/// unread bell as if a key had been typed.
+fn chained_dead_key_status(text: String, composing: String) -> TranslateStatus {
+    if text.is_empty() {
+        TranslateStatus::Composing(composing)
+    } else {
+        TranslateStatus::ComposedThenComposing(text, composing)
+    }
+}
+
 /// Represents the current keyboard layout.
 /// Holds state needed to perform keymap translation.
 struct Keyboard {
@@ -4395,10 +4406,7 @@ fn translate_dead_key_sequence(
                 dead_pending.replace(DeadKeyState {
                     dead_state: result.dead_state,
                 });
-                return Ok(TranslateStatus::ComposedThenComposing(
-                    result.text,
-                    composing,
-                ));
+                return Ok(chained_dead_key_status(result.text, composing));
             }
         }
         Ok(TranslateStatus::Composed(result.text))
@@ -4903,6 +4911,18 @@ mod tests {
     }
 
     const SWISS_FRENCH: &str = "com.apple.keylayout.SwissFrench";
+
+    #[test]
+    fn a_chained_dead_key_that_types_nothing_only_starts_composing() {
+        assert!(matches!(
+            chained_dead_key_status(String::new(), "^".into()),
+            TranslateStatus::Composing(c) if c == "^"
+        ));
+        assert!(matches!(
+            chained_dead_key_status("~".into(), "~".into()),
+            TranslateStatus::ComposedThenComposing(t, c) if t == "~" && c == "~"
+        ));
+    }
 
     #[test]
     fn dead_tilde_keeps_tilde_before_a_key_it_cannot_combine_with() {
