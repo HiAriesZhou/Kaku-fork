@@ -53,7 +53,40 @@
   const MAX_PASTE_BYTES = 256 * 1024;
 
   const init = (api) => {
-    const { send, toolsEl, stageEl, isMac, toast, focusTerminal } = api;
+    const { send: rawSend, toolsEl, stageEl, isMac, toast, focusTerminal } = api;
+    // Timings for the Mac's log, every ten seconds while the screen shows:
+    // how long a picture takes to decode, and a click or key press to show.
+    const REPORT_MS = 10000;
+    const report = { drawn: 0, decode: [], input: [] };
+    const decodeAt = new Map();
+    let inputAt = null;
+    const send = (msg) => {
+      if (msg.down === true || (msg.type === "desktop_pointer" && msg.kind === "down")) inputAt ??= performance.now();
+      rawSend(msg);
+    };
+    const quantile = (list, q) => {
+      if (!list.length) return 0;
+      const sorted = [...list].sort((a, b) => a - b);
+      return sorted[Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1)];
+    };
+    const round = (n) => Math.round(n * 10) / 10;
+    const sendReport = () => {
+      if (!report.drawn) return;
+      rawSend({
+        type: "desktop_report",
+        drawn: report.drawn,
+        decode_p50: round(quantile(report.decode, 0.5)),
+        decode_max: round(Math.max(0, ...report.decode)),
+        clicks: report.input.length,
+        click_p50: round(quantile(report.input, 0.5)),
+        click_max: round(Math.max(0, ...report.input)),
+        view: `${view.clientWidth}x${view.clientHeight}@${round(window.devicePixelRatio || 1)}`,
+      });
+      report.drawn = 0;
+      report.decode = [];
+      report.input = [];
+    };
+    let reportTimer = 0;
     // The page's own reading of the screen, so both agree on touch.
     const TOUCH = api.touch ?? matchMedia("(pointer: coarse)").matches;
     const style = document.createElement("style");
@@ -152,6 +185,9 @@
     // The picture is sized to the view in device pixels, up to the Mac's
     // own (the helper never scales up), so a Retina or 4K screen gets every
     // pixel and a small window no more than it can show.
+    // With a mouse the Mac's screen takes the view's own shape and size on a
+    // virtual display, so it fills the view without bars. A touch screen
+    // zooms in on the Mac's screen as it is.
     let requested = null;
     const request = () => {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -161,7 +197,7 @@
         type: "desktop_start",
         max_width: Math.min(3840, Math.max(floor, Math.round(view.clientWidth * dpr))),
         max_height: Math.min(2400, Math.max(floor * 0.625, Math.round(view.clientHeight * dpr))),
-        fps: 30,
+        fps: 60,
         // With a mouse the page's own pointer is the one to follow, in the
         // Mac's shape; a touch screen has none, so the Mac's stays in the
         // picture.
@@ -169,10 +205,12 @@
         binary: true,
       };
       if (chosenDisplay) requested.display = chosenDisplay;
+      if (!TOUCH) Object.assign(requested, { view_width: view.clientWidth, view_height: view.clientHeight, dpr: round(dpr) });
       return requested;
     };
-    // A view that grows (full screen) or shrinks by more than a tenth asks
-    // for a picture of its new size; the old one stays up meanwhile.
+    // A view that grows (full screen) or shrinks asks for a picture of its
+    // new size; the old one stays up meanwhile. A filled view asks at any
+    // real change, a zoomed one only past a tenth.
     let resizeTimer = 0;
     const resized = () => {
       if (!active || !requested || document.hidden) return;
@@ -182,7 +220,10 @@
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
         const w = Math.min(3840, view.clientWidth * dpr);
         const h = Math.min(2400, view.clientHeight * dpr);
-        if (Math.abs(w / requested.max_width - 1) > 0.1 || Math.abs(h / requested.max_height - 1) > 0.1) send(request());
+        const moved = requested.view_width
+          ? Math.abs(view.clientWidth - requested.view_width) > 16 || Math.abs(view.clientHeight - requested.view_height) > 16
+          : Math.abs(w / requested.max_width - 1) > 0.1 || Math.abs(h / requested.max_height - 1) > 0.1;
+        if (moved) send(request());
       }, 400);
     };
 
@@ -220,14 +261,19 @@
     // same place, and a full screen the terminal was already in is kept.
     let ownFullscreen = false;
     const lockKeys = () => navigator.keyboard?.lock?.().catch(() => {});
+    // When it asks for full screen, a promise that settles once the view has
+    // its full-screen size, so the first picture is asked for at that size
+    // rather than once more right after.
     const goFullscreen = () => {
-      if (TOUCH || !document.fullscreenEnabled) return;
-      if (document.fullscreenElement) { lockKeys(); return; }
-      document.documentElement.requestFullscreen().then(() => {
+      if (TOUCH || !document.fullscreenEnabled) return null;
+      if (document.fullscreenElement) { lockKeys(); return null; }
+      const entered = document.documentElement.requestFullscreen().then(() => {
         ownFullscreen = true;
         lockKeys();
         focusView();
+        return new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
       }).catch(() => {});
+      return Promise.race([entered, new Promise((done) => setTimeout(done, 1000))]);
     };
     const syncFullscreen = () => {
       if (!document.fullscreenElement) ownFullscreen = false;
@@ -240,10 +286,15 @@
       document.body.classList.add("desktop");
       syncButton();
       if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
-      goFullscreen();
+      // The last picture shows meanwhile, but input waits for the new stream.
+      fresh = false;
+      clearInterval(reportTimer);
+      reportTimer = setInterval(sendReport, REPORT_MS);
       syncFullscreen();
-      start();
       focusView();
+      const entering = goFullscreen();
+      if (entering) entering.then(() => { if (active) start(); });
+      else start();
     };
 
     const leave = () => {
@@ -252,6 +303,8 @@
       if (pasting) { clearTimeout(pasting.timer); pasting = null; }
       if (copyWait) copyWait.reject(new Error("left"));
       clearTimeout(resizeTimer);
+      clearInterval(reportTimer);
+      sendReport();
       releaseAll();
       send({ type: "desktop_stop" });
       closeDecoder();
@@ -316,6 +369,12 @@
           }
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
           frame.close();
+          const now = performance.now();
+          const at = decodeAt.get(seq);
+          if (at !== undefined) { report.decode.push(now - at); decodeAt.delete(seq); }
+          // A click that changed nothing shows no picture of its own.
+          if (inputAt !== null) { if (now - inputAt < 1000) report.input.push(now - inputAt); inputAt = null; }
+          report.drawn++;
           lastDrawn = seq;
           hasPicture = true;
           fresh = true;
@@ -357,6 +416,8 @@
         ack(msg.seq);
         return;
       }
+      if (decodeAt.size > 64) decodeAt.clear();
+      decodeAt.set(msg.seq, performance.now());
       try {
         decoder.decode(new EncodedVideoChunk({ type: msg.key ? "key" : "delta", timestamp: msg.seq, data: msg.bytes || b64(msg.data) }));
       } catch (e) {

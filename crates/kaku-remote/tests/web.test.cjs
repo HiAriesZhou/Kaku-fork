@@ -1746,9 +1746,15 @@ test('the desktop view takes the keyboard and mouse, and gives them back', async
   assert.equal(await p.evaluate(() => !!document.fullscreenElement), true, 'the screen opens in full screen');
   const cover = await p.evaluate(() => { const r = document.getElementById('desktop').getBoundingClientRect(); const b = document.getElementById('bar').getBoundingClientRect(); return r.bottom <= b.top || r.top >= b.bottom; });
   assert.equal(cover, true, 'beside the bar, which keeps the way back');
+  // The picture is asked for once full screen settles, at the view's size,
+  // which the Mac's screen takes on.
+  await p.waitForFunction(() => messages.some(m => m.type === 'desktop_start'), null, { timeout: 3000 });
   const start = await p.evaluate(() => messages.filter(m => m.type === 'desktop_start'));
   assert.equal(start.length, 1);
   assert.ok(start[0].max_width >= 640 && start[0].max_height >= 400, JSON.stringify(start[0]));
+  const shape = await p.evaluate(() => ({ w: document.getElementById('desktop').clientWidth, h: document.getElementById('desktop').clientHeight }));
+  assert.deepEqual([start[0].view_width, start[0].view_height, start[0].fps], [shape.w, shape.h, 60], JSON.stringify(start[0]));
+  assert.equal(typeof start[0].dpr, 'number');
   assert.match(await p.locator('#desktop .status .title').innerText(), /Connecting/);
 
   // Until a picture is drawn, keys are held back from both the terminal
@@ -1791,6 +1797,10 @@ const spyDesktop = p => p.evaluate(() => {
 // A picture from the Mac, decoded by a stand-in for WebCodecs that draws a
 // plain 320x200 frame for each chunk.
 const showPicture = (p, seq = 1) => p.evaluate(async (seq) => {
+  // Entering asks for full screen first and the picture after it settles.
+  const t0 = performance.now();
+  while (!document.fullscreenElement && performance.now() - t0 < 1200) await new Promise(r => setTimeout(r, 10));
+  for (let i = 0; i < 3; i++) await new Promise(r => requestAnimationFrame(r));
   if (!window.fakeDecoder) {
     window.fakeDecoder = true;
     window.VideoDecoder = class {
@@ -1824,6 +1834,7 @@ test('desktop pictures arrive as binary messages, locally and through the relay'
   await spyDesktop(p);
   await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
   await p.locator('#bar .tool.desktop').click();
+  await p.waitForFunction(() => messages.some(m => m.type === 'desktop_start'), null, { timeout: 3000 });
   const start = await p.evaluate(() => messages.find(m => m.type === 'desktop_start'));
   assert.equal(start.binary, true, 'the page asks for them');
   const frame = binaryFrame({ type: 'desktop_frame', seq: 5, key: true }, [0, 0, 0, 1, 9]);
@@ -1989,6 +2000,40 @@ test('coming back to the Mac\'s screen keeps its last picture until the new one,
   await p.locator('#bar .tool.screens').click();
   assert.equal(await p.evaluate(() => document.getElementById('desktop').classList.contains('live')), false);
   assert.match(await p.locator('#desktop .status .title').innerText(), /Connecting/);
+  assert.deepEqual(errors, []);
+});
+
+test('the desktop view reports its timings, and a filled view asks again only when its size really changes', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  const tool = p.locator('#bar .tool.desktop');
+  await tool.click();
+  await showPicture(p);
+  const box = await p.locator('#desktop canvas').boundingBox();
+  await p.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await showPicture(p, 2);
+
+  // A few pixels are not worth a new screen on the Mac; a real change is.
+  const starts = () => p.evaluate(() => messages.filter(m => m.type === 'desktop_start'));
+  const before = (await starts()).length;
+  const size = p.viewportSize();
+  await p.setViewportSize({ width: size.width - 8, height: size.height });
+  await p.waitForTimeout(600);
+  assert.equal((await starts()).length, before, 'eight pixels narrower');
+  await p.setViewportSize({ width: size.width - 200, height: size.height });
+  await p.waitForFunction((n) => messages.filter(m => m.type === 'desktop_start').length > n, before, { timeout: 3000 });
+  const again = (await starts()).at(-1);
+  assert.equal(again.view_width, await p.evaluate(() => document.getElementById('desktop').clientWidth));
+
+  // Leaving sends what the period measured.
+  await tool.click();
+  const report = await p.evaluate(() => messages.find(m => m.type === 'desktop_report'));
+  assert.ok(report, 'a report on the way out');
+  assert.equal(report.drawn, 2, JSON.stringify(report));
+  assert.equal(report.clicks, 1, JSON.stringify(report));
+  assert.ok(report.decode_max >= report.decode_p50 && report.click_max >= report.click_p50, JSON.stringify(report));
+  assert.match(report.view, /^\d+x\d+@\d/);
   assert.deepEqual(errors, []);
 });
 

@@ -9,7 +9,10 @@
 //! H.264 bytes. Sent as JSON, base64 made every picture a third larger.
 //!
 //! The helper runs as Kaku's child, so macOS counts its screen capture and
-//! input against Kaku's own permissions. Built only with the `desktop`
+//! input against Kaku's own permissions. It lives as long as the page's
+//! session: `desktop_stop` only pauses it, since it may hold a virtual
+//! display the size of the page's view, and making one again on every visit
+//! costs seconds and moves the Mac's windows about. Built only with the `desktop`
 //! feature, and offered to the page only when the helper is installed.
 
 use std::path::{Path, PathBuf};
@@ -138,12 +141,6 @@ fn tap_with(
                         None
                     }
                 };
-            }
-            if kind == "desktop_stop" {
-                if let Some(h) = running.take() {
-                    h.stop().await;
-                }
-                continue;
             }
             if let Some(h) = running.as_mut() {
                 if h.write(&text).await.is_err() {
@@ -335,11 +332,18 @@ mod tests {
         assert_eq!(reply["type"], "desktop_status");
         assert_eq!(reply["line"]["type"], "desktop_start");
 
-        // Stopping ends the helper; nothing it wrote besides desktop lines
-        // got through, and the session keeps working.
+        // Stopping reaches the helper, which stays for the next visit;
+        // nothing it wrote besides desktop lines got through, and the
+        // session keeps working.
         page.send(r#"{"type":"desktop_stop"}"#.to_string())
             .await
             .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), to_page.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["line"]["type"], "desktop_stop");
         page.send(r#"{"type":"text","data":"x"}"#.to_string())
             .await
             .unwrap();
@@ -420,6 +424,61 @@ mod tests {
                 .is_err(),
             "a stop the page asked for is not an error"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_helper_outlives_a_stop_but_not_the_session() {
+        let dir = std::env::temp_dir().join(format!("kaku-desktop-life-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kaku-desktop");
+        let ended = dir.join("ended");
+        // Answers each line, and leaves a mark when stdin closes.
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nwhile read -r line; do\n  echo '{{\"type\":\"desktop_status\",\"pid\":'$$'}}'\ndone\ntouch '{}'\n",
+                ended.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (page, inbox) = mpsc::channel(8);
+        let (outbox, mut to_page) = mpsc::channel(8);
+        let (frames, _) = mpsc::channel(8);
+        let session = tap_with(inbox, outbox, frames, path);
+        let pid =
+            |line: String| serde_json::from_str::<serde_json::Value>(&line).unwrap()["pid"].clone();
+        page.send(r#"{"type":"desktop_start"}"#.to_string())
+            .await
+            .unwrap();
+        let first = pid(next(&mut to_page).await);
+        page.send(r#"{"type":"desktop_stop"}"#.to_string())
+            .await
+            .unwrap();
+        assert_eq!(pid(next(&mut to_page).await), first);
+        page.send(r#"{"type":"desktop_start"}"#.to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            pid(next(&mut to_page).await),
+            first,
+            "the same helper takes the next visit"
+        );
+        assert!(!ended.exists());
+
+        // The page's session ends: so does the helper.
+        drop(page);
+        drop(session);
+        for _ in 0..50 {
+            if ended.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ended.exists(), "the helper ends with the session");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
