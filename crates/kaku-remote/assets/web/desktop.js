@@ -9,6 +9,9 @@
   const CSS = `
   #desktop { position: absolute; inset: 0; z-index: 4; display: none; align-items: center; justify-content: center; background: var(--bg); overflow: hidden; }
   body.desktop #desktop { display: flex; }
+  /* Full screen: the Mac's screen covers the whole display, bar included,
+     without resizing the stage, so the terminal keeps its grid on the Mac. */
+  body.desktop.desktop-full #desktop { position: fixed; inset: 0; z-index: 50; background: #000; }
   body.desktop #term, body.desktop #past, body.desktop #history, body.desktop #find { visibility: hidden !important; }
   body.desktop #keys { display: none !important; }
   /* The screen, not a tab, is what is showing: the button alone reads as current. */
@@ -71,7 +74,9 @@
     button.type = "button";
     button.className = "tool desktop";
     button.innerHTML = ICON;
-    const anchor = toolsEl.querySelector(".clock");
+    // Beside the full screen button, the two icons together, with the
+    // clock's text to their left rather than between them.
+    const anchor = toolsEl.querySelector(".fs");
     if (anchor) toolsEl.insertBefore(button, anchor); else toolsEl.append(button);
 
     let active = false;
@@ -121,21 +126,40 @@
       zoom.y = Math.min(0, Math.max(h - h * z, y));
       canvas.style.transform = z === 1 ? "" : `translate(${zoom.x}px, ${zoom.y}px) scale(${z})`;
     };
-    new ResizeObserver(() => { layout(); }).observe(view);
+    new ResizeObserver(() => { layout(); resized(); }).observe(view);
 
+    // The picture is sized to the view in device pixels, up to the Mac's
+    // own (the helper never scales up), so a Retina or 4K screen gets every
+    // pixel and a small window no more than it can show.
+    let requested = null;
     const request = () => {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       // A touch screen zooms in, so it gets the detail a zoom shows.
       const floor = TOUCH ? 1920 : 640;
-      return {
+      requested = {
         type: "desktop_start",
-        max_width: Math.min(2560, Math.max(floor, Math.round(view.clientWidth * dpr))),
-        max_height: Math.min(1600, Math.max(floor * 0.625, Math.round(view.clientHeight * dpr))),
+        max_width: Math.min(3840, Math.max(floor, Math.round(view.clientWidth * dpr))),
+        max_height: Math.min(2400, Math.max(floor * 0.625, Math.round(view.clientHeight * dpr))),
         fps: 30,
         // With a mouse the page's own pointer is the one to follow; a touch
         // screen has none, so the Mac's stays in the picture.
         cursor: TOUCH,
       };
+      return requested;
+    };
+    // A view that grows (full screen) or shrinks by more than a tenth asks
+    // for a picture of its new size; the old one stays up meanwhile.
+    let resizeTimer = 0;
+    const resized = () => {
+      if (!active || !requested || document.hidden) return;
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (!active || document.hidden || !view.clientWidth) return;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.min(3840, view.clientWidth * dpr);
+        const h = Math.min(2400, view.clientHeight * dpr);
+        if (Math.abs(w / requested.max_width - 1) > 0.1 || Math.abs(h / requested.max_height - 1) > 0.1) send(request());
+      }, 400);
     };
 
     const closeDecoder = () => {
@@ -159,12 +183,35 @@
       send(request());
     };
 
+    // With a keyboard the screen opens in full screen, every key locked to
+    // the page where the browser allows it (Chrome, Edge), so Command-W and
+    // the like reach the Mac; holding Esc leaves full screen, and the bar
+    // with this view's button comes back.
+    let ownFullscreen = false;
+    const lockKeys = () => navigator.keyboard?.lock?.().catch(() => {});
+    const goFullscreen = () => {
+      if (TOUCH || !document.fullscreenEnabled) return;
+      if (document.fullscreenElement) { lockKeys(); return; }
+      document.documentElement.requestFullscreen().then(() => {
+        ownFullscreen = true;
+        lockKeys();
+        focusView();
+      }).catch(() => {});
+    };
+    const syncFullscreen = () => {
+      document.body.classList.toggle("desktop-full", active && !!document.fullscreenElement);
+      if (!document.fullscreenElement) ownFullscreen = false;
+    };
+    document.addEventListener("fullscreenchange", syncFullscreen);
+
     const enter = () => {
       if (active) return;
       active = true;
       document.body.classList.add("desktop");
       syncButton();
       if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+      goFullscreen();
+      syncFullscreen();
       start();
       focusView();
     };
@@ -174,11 +221,14 @@
       active = false;
       if (pasting) { clearTimeout(pasting.timer); pasting = null; }
       if (copyWait) copyWait.reject(new Error("left"));
+      clearTimeout(resizeTimer);
       releaseAll();
       send({ type: "desktop_stop" });
       closeDecoder();
       document.body.classList.remove("desktop");
       view.classList.remove("live");
+      if (ownFullscreen && document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      syncFullscreen();
       syncButton();
       focusTerminal();
     };
@@ -205,9 +255,20 @@
       send({ type: "desktop_keyframe" });
     };
 
-    const ensureDecoder = (codec, description) => {
-      const key = codec + ":" + description.length;
+    // Key frames come from two encoders, the moving stream and the sharp
+    // picture sent once the screen settles, each with its own parameter
+    // sets: a change of description reconfigures the decoder in order.
+    const ensureDecoder = (codec, desc) => {
+      const key = codec + ":" + desc;
       if (decoder && decoder.state === "configured" && configured === key) return true;
+      const config = { codec, description: b64(desc), optimizeForLatency: true, hardwareAcceleration: "no-preference" };
+      if (decoder && decoder.state === "configured") {
+        try {
+          decoder.configure(config);
+          configured = key;
+          return true;
+        } catch (_) {}
+      }
       closeDecoder();
       decoder = new VideoDecoder({
         output: (frame) => {
@@ -232,7 +293,7 @@
         },
       });
       try {
-        decoder.configure({ codec, description, optimizeForLatency: true, hardwareAcceleration: "no-preference" });
+        decoder.configure(config);
       } catch (e) {
         showStatus("This browser cannot decode the Mac's screen", String(e.message || e), true);
         closeDecoder();
@@ -253,7 +314,7 @@
       if (!active || document.hidden) { ack(msg.seq); return; }
       if (msg.key) {
         if (!msg.codec || !msg.desc) { ack(msg.seq); return; }
-        if (!ensureDecoder(msg.codec, b64(msg.desc))) { ack(msg.seq); return; }
+        if (!ensureDecoder(msg.codec, msg.desc)) { ack(msg.seq); return; }
         haveKey = true;
       } else if (!haveKey || !decoder) {
         // A picture that depends on one this decoder never saw.

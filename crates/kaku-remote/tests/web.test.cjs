@@ -1720,13 +1720,22 @@ test('the desktop view is offered only when Kaku has its helper', async t => {
   assert.deepEqual(errors, []);
 });
 
+// The desktop view opens in full screen over the bar; leave full screen,
+// as holding Esc does, before using the bar.
+const windowed = p => p.evaluate(() => document.fullscreenElement && document.exitFullscreen());
+
 test('the desktop view takes the keyboard and mouse, and gives them back', async t => {
   const { p, errors } = await page(t);
   await screen(p);
   await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
   const tool = p.locator('#bar .tool.desktop');
+  assert.equal(await tool.evaluate(b => b.nextElementSibling?.classList.contains('fs')), true, 'beside the full screen button');
   await tool.click();
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), true);
+  await p.waitForFunction(() => document.body.classList.contains('desktop-full'), null, { timeout: 3000 });
+  assert.equal(await p.evaluate(() => !!document.fullscreenElement), true, 'the screen opens in full screen');
+  const cover = await p.evaluate(() => { const r = document.getElementById('desktop').getBoundingClientRect(); return [r.top, r.height === innerHeight]; });
+  assert.deepEqual(cover, [0, true], 'over the bar');
   const start = await p.evaluate(() => messages.filter(m => m.type === 'desktop_start'));
   assert.equal(start.length, 1);
   assert.ok(start[0].max_width >= 640 && start[0].max_height >= 400, JSON.stringify(start[0]));
@@ -1748,6 +1757,7 @@ test('the desktop view takes the keyboard and mouse, and gives them back', async
 
   // Back to the terminal: the helper stops and typing goes to the pane.
   await p.evaluate(() => { messages.length = 0; });
+  await windowed(p);
   await tool.click();
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'desktop_stop').length), 1);
@@ -1764,6 +1774,7 @@ test('picking a tab leaves the desktop view for the terminal', async t => {
   const looks = await p.evaluate(() => [...document.querySelectorAll('#tabs .tab')].map(b => getComputedStyle(b).backgroundColor));
   assert.equal(new Set(looks).size, 1, 'no tab reads as current over the screen: ' + looks);
   assert.notEqual(await p.locator('#bar .tool.desktop').evaluate(b => getComputedStyle(b).backgroundColor), looks[0]);
+  await windowed(p);
   await p.locator('#tabs .tab').first().click();
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
   assert.ok(await p.evaluate(() => messages.some(m => m.type === 'desktop_stop')));
@@ -1900,6 +1911,7 @@ test('the desktop view carries the clipboard both ways', async t => {
   await p.waitForFunction(() => wrote.text.includes('from a menu'));
 
   // Back on the terminal, the Mac's clipboard no longer comes through.
+  await windowed(p);
   await p.locator('#bar .tool.desktop').click();
   await p.evaluate(() => probe.handle({ type: 'desktop_clipboard', text: 'too late' }));
   await p.waitForTimeout(50);
@@ -1937,6 +1949,7 @@ test('the desktop view lets go of held keys, sends modifiers with clicks, and as
   const asks = () => p.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented; });
   assert.equal(await asks(), true);
   await p.evaluate(() => { messages.length = 0; });
+  await windowed(p);
   await tool.click();
   await p.keyboard.up('Alt');
   const after = await p.evaluate(() => messages.filter(m => ['desktop_key', 'desktop_stop'].includes(m.type)).map(m => m.type === 'desktop_key' ? [m.code, m.down] : m.type));
