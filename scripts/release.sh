@@ -350,7 +350,8 @@ build_release() {
 
     # Releases ship the default features only; a CARGO_FEATURES left in the
     # shell must not change them, since build.sh passes it straight to cargo.
-    unset CARGO_FEATURES
+    # A KAKU_DESKTOP_HELPER left from a private build would stop build.sh.
+    unset CARGO_FEATURES KAKU_DESKTOP_HELPER
     export KAKU_SIGNING_IDENTITY
     export KAKU_REQUIRE_SIGNED_RELEASE=1
     export PROFILE

@@ -31,6 +31,13 @@ const PREFIX: &str = "desktop_";
 const MAX_LINE: usize = 3 << 20;
 /// How long a stopped helper gets to let go of held buttons and exit.
 const STOP_GRACE: Duration = Duration::from_secs(1);
+/// How long one write to the helper may wait. A helper that stops reading
+/// would otherwise hold the session's messages, and outlive the session.
+const WRITE_LIMIT: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(2)
+};
 /// First byte of a binary message; a JSON one starts with `{`.
 const BINARY_FRAME: u8 = 0;
 
@@ -275,9 +282,14 @@ impl Helper {
             .stdin
             .as_mut()
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
-        stdin.write_all(text.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await
+        let write = async {
+            stdin.write_all(text.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await
+        };
+        tokio::time::timeout(WRITE_LIMIT, write)
+            .await
+            .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
     }
 
     /// Ask the helper to let go of the mouse and end, then make sure it did.
@@ -407,6 +419,34 @@ mod tests {
         {
             assert!(line.contains("desktop_"), "{line}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_stops_reading_does_not_outlive_the_session() {
+        let dir = std::env::temp_dir().join(format!("kaku-desktop-deaf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kaku-desktop");
+        // Never reads stdin, so writes stall once the pipe buffer is full.
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (page, inbox) = mpsc::channel(8);
+        let (outbox, _to_page) = crate::queue::channel(8);
+        let (frames, _) = mpsc::channel(8);
+        let mut session = tap_with(inbox, outbox, frames, path);
+        page.send(r#"{"type":"desktop_start"}"#.to_string())
+            .await
+            .unwrap();
+        let big = format!(r#"{{"type":"desktop_input","pad":"{}"}}"#, "x".repeat(256 << 10));
+        page.send(big).await.unwrap();
+        drop(page);
+        // The session ends: the tap gave up on the helper and saw the close.
+        assert!(tokio::time::timeout(Duration::from_secs(5), session.recv())
+            .await
+            .unwrap()
+            .is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

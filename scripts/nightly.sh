@@ -106,7 +106,7 @@ if [[ "$UPLOAD_ONLY" -eq 0 ]]; then
     # PIPESTATUS: `| grep ... || true` would mask any build failure.
     set +e
     PROFILE="$PROFILE" BUILD_ARCH=universal OUT_DIR="$OUT_DIR" \
-        KAKU_REQUIRE_SIGNED_RELEASE=1 CARGO_FEATURES="$FEATURES" \
+        KAKU_REQUIRE_SIGNED_RELEASE=1 CARGO_FEATURES="$FEATURES" KAKU_DESKTOP_HELPER= \
         ./scripts/build.sh 2>&1 | grep -v 'ranlib: warning:.*has no symbols'
     BUILD_STATUS=${PIPESTATUS[0]}
     set -e
