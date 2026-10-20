@@ -1788,6 +1788,26 @@ const spyDesktop = p => p.evaluate(() => {
     } } });
   } });
 });
+// A picture from the Mac, decoded by a stand-in for WebCodecs that draws a
+// plain 320x200 frame for each chunk.
+const showPicture = (p, seq = 1) => p.evaluate(async (seq) => {
+  if (!window.fakeDecoder) {
+    window.fakeDecoder = true;
+    window.VideoDecoder = class {
+      constructor(init) { this.init = init; this.state = 'unconfigured'; }
+      configure() { this.state = 'configured'; }
+      decode(chunk) {
+        const frame = document.createElement('canvas');
+        Object.assign(frame, { width: 320, height: 200, displayWidth: 320, displayHeight: 200, timestamp: chunk.timestamp, close() {} });
+        setTimeout(() => this.init.output(frame), 0);
+      }
+      close() { this.state = 'closed'; }
+    };
+  }
+  probe.handle({ type: 'desktop_frame', seq, key: true, codec: 'avc1.640028', desc: 'AAAA', data: 'AAAA' });
+  await new Promise(r => setTimeout(r, 30));
+}, seq);
+
 // A picture as Kaku sends it to a page that asked for binary messages.
 const binaryFrame = (header, bytes) => {
   const head = new TextEncoder().encode(JSON.stringify(header));
@@ -1840,7 +1860,7 @@ test('the desktop view takes the Mac\'s pointer shape, its displays and dropped 
   await screen(p);
   await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
   await p.locator('#bar .tool.desktop').click();
-  await p.evaluate(() => document.getElementById('desktop').classList.add('live'));
+  await showPicture(p);
 
   // The pointer over the screen takes the Mac's shape, at twice its size.
   const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -1866,7 +1886,7 @@ test('the desktop view takes the Mac\'s pointer shape, its displays and dropped 
 
   // A file dropped on the screen pastes no path into the pane; once it is
   // on the Mac, Finder shows it.
-  await p.evaluate(() => document.getElementById('desktop').classList.add('live'));
+  await showPicture(p);
   const sent = await p.evaluate(async () => {
     const socket = connections.at(-1);
     const original = socket.send.bind(socket);
@@ -1943,6 +1963,47 @@ test('in full screen a dock at the top switches back to the terminal, keeping th
   assert.deepEqual(errors, []);
 });
 
+test('coming back to the Mac\'s screen keeps its last picture until the new one, and input waits for it', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  const tool = p.locator('#bar .tool.desktop');
+  await tool.click();
+  await windowed(p);
+  await showPicture(p);
+  const canvas = p.locator('#desktop canvas');
+  const moves = () => p.evaluate(() => messages.filter(m => m.type === 'desktop_pointer').length);
+  const box = await canvas.boundingBox();
+  await p.mouse.move(box.x + 50, box.y + 50);
+  await p.mouse.move(box.x + 60, box.y + 60);
+  await p.waitForTimeout(50);
+  assert.ok(await moves() > 0, 'a live picture takes the mouse');
+
+  // Away and back: the old picture shows at once, no black and no spinner.
+  await tool.click();
+  await tool.click();
+  await windowed(p);
+  assert.equal(await p.evaluate(() => document.getElementById('desktop').classList.contains('live')), true);
+  assert.equal(await p.evaluate(() => getComputedStyle(document.querySelector('#desktop canvas')).opacity), '1');
+  // Until the new stream draws, the mouse stays on the page.
+  await p.evaluate(() => { messages.length = 0; });
+  await p.mouse.move(box.x + 70, box.y + 70);
+  await p.mouse.move(box.x + 80, box.y + 80);
+  await p.waitForTimeout(50);
+  assert.equal(await moves(), 0);
+  await showPicture(p);
+  await p.mouse.move(box.x + 90, box.y + 90);
+  await p.waitForTimeout(50);
+  assert.ok(await moves() > 0);
+
+  // Another display: its picture is not this one, so it waits visibly.
+  await p.evaluate(() => probe.handle({ type: 'desktop_status', state: 'streaming', display: 1, displays: [{ id: 1, name: 'Built-in', main: true }, { id: 7, name: 'Studio Display', main: false }] }));
+  await p.locator('#bar .tool.screens').click();
+  assert.equal(await p.evaluate(() => document.getElementById('desktop').classList.contains('live')), false);
+  assert.match(await p.locator('#desktop .status .title').innerText(), /Connecting/);
+  assert.deepEqual(errors, []);
+});
+
 test('picking a tab leaves the desktop view for the terminal', async t => {
   const { p } = await page(t);
   await screen(p);
@@ -1978,9 +2039,8 @@ test('on a phone the desktop view pinches to zoom and taps where the zoom shows'
   assert.ok(start.max_width >= 1920, 'enough detail to zoom into: ' + JSON.stringify(start));
   assert.equal(await p.locator('#keys').isVisible(), false, 'the terminal keys would type into the terminal');
 
-  // Stand in for a decoded picture: the canvas is live at its own size.
+  await showPicture(p);
   const box = await p.evaluate(() => {
-    document.getElementById('desktop').classList.add('live');
     const r = document.querySelector('#desktop canvas').getBoundingClientRect();
     return { x: r.left, y: r.top, w: r.width, h: r.height };
   });
@@ -2040,7 +2100,7 @@ test('the desktop view carries the clipboard both ways', async t => {
     probe.handle({ type: 'config', desktop: true });
   });
   await p.locator('#bar .tool.desktop').click();
-  await p.evaluate(() => document.getElementById('desktop').classList.add('live'));
+  await showPicture(p);
   assert.equal(await p.evaluate(() => document.activeElement.className), 'sink', 'focus can take a paste');
   const key = (type, code, extra = {}) => p.evaluate(([type, code, extra]) => {
     const command = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? { metaKey: true } : { ctrlKey: true };
@@ -2102,7 +2162,7 @@ test('the desktop view lets go of held keys, sends modifiers with clicks, and as
   await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
   const tool = p.locator('#bar .tool.desktop');
   await tool.click();
-  await p.evaluate(() => document.getElementById('desktop').classList.add('live'));
+  await showPicture(p);
   const box = await p.locator('#desktop canvas').boundingBox();
 
   // Shift-click selects a range in Finder; the click carries the key.

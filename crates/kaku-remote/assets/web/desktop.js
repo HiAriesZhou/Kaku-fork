@@ -123,6 +123,10 @@
     let canControl = true;
     let warnedControl = false;
     let lastDrawn = 0;
+    // The canvas still holds a picture of the Mac, and whether one came
+    // from the current stream: until it does, input waits.
+    let hasPicture = false;
+    let fresh = false;
     let displays = [];
     let shownDisplay = 0;
     const DISPLAY_SLOT = "kaku.desktop.display";
@@ -130,6 +134,7 @@
     try { chosenDisplay = Number(localStorage.getItem(DISPLAY_SLOT)) || 0; } catch (_) {}
 
     const showStatus = (title, detail = "", failed = false) => {
+      hasPicture = false;
       statusTitle.textContent = title;
       statusDetail.textContent = detail;
       view.classList.toggle("failed", failed);
@@ -214,14 +219,20 @@
 
     const supported = () => typeof window.VideoDecoder === "function" && typeof window.EncodedVideoChunk === "function";
 
-    const start = () => {
+    // Coming back to the same display keeps the last picture up until the
+    // new stream's first one replaces it, instead of a black screen.
+    const start = (keep = true) => {
       closeDecoder();
-      videoW = 0;
       setZoom(1, 0, 0);
-      showStatus("Connecting to the Mac's screen");
+      fresh = false;
       if (!supported()) {
         showStatus("This browser cannot show the Mac's screen", "It needs WebCodecs: a current Chrome, Edge or Safari.", true);
         return;
+      }
+      if (keep && hasPicture) view.classList.add("live");
+      else {
+        videoW = 0;
+        showStatus("Connecting to the Mac's screen");
       }
       send(request());
     };
@@ -280,8 +291,8 @@
       releaseAll();
       send({ type: "desktop_stop" });
       closeDecoder();
+      // The last picture stays on the hidden canvas for the way back.
       document.body.classList.remove("desktop");
-      view.classList.remove("live");
       canvas.style.cursor = "";
       syncScreens();
       // Full screen the view opened goes with it; one the terminal was
@@ -342,6 +353,8 @@
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
           frame.close();
           lastDrawn = seq;
+          hasPicture = true;
+          fresh = true;
           if (!view.classList.contains("live")) view.classList.add("live");
           ack(seq);
         },
@@ -403,7 +416,8 @@
       chosenDisplay = displays[(at + 1) % displays.length].id;
       try { localStorage.setItem(DISPLAY_SLOT, String(chosenDisplay)); } catch (_) {}
       releaseAll();
-      start();
+      // The old picture is of another display: clicks on it would land wrong.
+      start(false);
       focusView();
     };
     screens.addEventListener("click", nextDisplay);
@@ -448,7 +462,7 @@
         y: Math.min(1, Math.max(0, (ev.clientY - r.top) / Math.max(1, r.height))),
       };
     };
-    const live = () => active && canControl && view.classList.contains("live");
+    const live = () => active && canControl && fresh && view.classList.contains("live");
 
     let pendingMove = null;
     let moveFrame = 0;
