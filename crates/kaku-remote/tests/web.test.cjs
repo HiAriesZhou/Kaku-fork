@@ -159,6 +159,15 @@ async function handshake(p, signer, { admit = true, secret = null, tag = secret 
       paired = await sub.verify('HMAC', key, unb64(proof.proof || ''), transcript);
     }
     if (admit) await deliver({ type: 'pong' }, 1);
+    // Later messages from this Mac, raw bytes or JSON, in order.
+    let next = admit ? 2 : 1;
+    window.fromMac = async (msg) => {
+      const plain = msg instanceof Uint8Array ? msg : enc.encode(JSON.stringify(msg));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const data = new Uint8Array(await sub.encrypt({ name: 'AES-GCM', iv, additionalData: aad('kaku-web h2c', next++) }, fromHost, plain));
+      const frame = new Uint8Array(12 + data.length); frame.set(iv); frame.set(data, 12);
+      socket.onmessage({ data: frame.buffer });
+    };
     await sleep(50);
     return { proof, signed, paired };
   }, { pkcs8: signer.pkcs8, pub: signer.pub.toString('base64url'), secret: secret && secret.toString('base64url'), tag: tag && tag.toString('base64url'), admit });
@@ -1729,7 +1738,8 @@ test('the desktop view takes the keyboard and mouse, and gives them back', async
   await screen(p);
   await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
   const tool = p.locator('#bar .tool.desktop');
-  assert.equal(await tool.evaluate(b => b.nextElementSibling?.classList.contains('fs')), true, 'beside the full screen button');
+  // The display button between them shows only with two displays.
+  assert.equal(await tool.evaluate(b => b.nextElementSibling?.classList.contains('screens') && b.nextElementSibling.nextElementSibling?.classList.contains('fs')), true, 'beside the full screen button');
   await tool.click();
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), true);
   await p.waitForFunction(() => document.body.classList.contains('desktop-full'), null, { timeout: 3000 });
@@ -1763,6 +1773,121 @@ test('the desktop view takes the keyboard and mouse, and gives them back', async
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'desktop_stop').length), 1);
   await p.keyboard.type('b');
   assert.ok(await p.evaluate(() => messages.some(m => m.type === 'text' && m.data === 'b')));
+  assert.deepEqual(errors, []);
+});
+
+// Watch what reaches the desktop view, whichever way it came.
+const spyDesktop = p => p.evaluate(() => {
+  window.desktopSeen = [];
+  Object.defineProperty(window, 'KakuDesktop', { configurable: true, set(real) {
+    Object.defineProperty(window, 'KakuDesktop', { configurable: true, writable: true, value: { init(api) {
+      const view = real.init(api);
+      const handle = view.handle;
+      view.handle = (msg) => { desktopSeen.push(msg); handle(msg); };
+      return view;
+    } } });
+  } });
+});
+// A picture as Kaku sends it to a page that asked for binary messages.
+const binaryFrame = (header, bytes) => {
+  const head = new TextEncoder().encode(JSON.stringify(header));
+  const out = new Uint8Array(5 + head.length + bytes.length);
+  new DataView(out.buffer).setUint32(1, head.length);
+  out.set(head, 5);
+  out.set(bytes, 5 + head.length);
+  return out;
+};
+
+test('desktop pictures arrive as binary messages, locally and through the relay', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await spyDesktop(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  const start = await p.evaluate(() => messages.find(m => m.type === 'desktop_start'));
+  assert.equal(start.binary, true, 'the page asks for them');
+  const frame = binaryFrame({ type: 'desktop_frame', seq: 5, key: true }, [0, 0, 0, 1, 9]);
+  await p.evaluate((bytes) => connections.at(-1).onmessage({ data: new Uint8Array(bytes).buffer }), [...frame]);
+  const seen = await p.evaluate(() => desktopSeen.map(m => ({ type: m.type, seq: m.seq, bytes: m.bytes && [...m.bytes] })));
+  assert.deepEqual(seen, [{ type: 'desktop_frame', seq: 5, bytes: [0, 0, 0, 1, 9] }]);
+  // A key frame without its parameter sets cannot be shown; it is still
+  // acknowledged, so the Mac keeps sending.
+  assert.ok(await p.evaluate(() => messages.some(m => m.type === 'desktop_ack' && m.seq === 5)));
+  assert.deepEqual(errors, []);
+
+  const mac = await newMac();
+  const secret = Buffer.alloc(16, 9);
+  const relayed = await page(t, pairingLink(mac, secret));
+  await spyDesktop(relayed.p);
+  await handshake(relayed.p, mac, { secret });
+  await relayed.p.evaluate(async (bytes) => {
+    await fromMac({ type: 'config', desktop: true });
+    await new Promise(r => setTimeout(r, 300));
+    document.querySelector('#bar .tool.desktop').click();
+    await fromMac(new Uint8Array(bytes));
+    // The binary message used its place in the sequence: what follows opens.
+    await fromMac({ type: 'desktop_status', state: 'streaming' });
+    await new Promise(r => setTimeout(r, 100));
+  }, [...frame]);
+  const relaySeen = await relayed.p.evaluate(() => desktopSeen.map(m => m.type));
+  assert.deepEqual(relaySeen, ['desktop_frame', 'desktop_status']);
+  assert.notEqual(await relayed.p.evaluate(() => connections.at(-1).readyState), 3);
+  assert.deepEqual(relayed.errors, []);
+});
+
+test('the desktop view takes the Mac\'s pointer shape, its displays and dropped files', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await p.evaluate(() => document.getElementById('desktop').classList.add('live'));
+
+  // The pointer over the screen takes the Mac's shape, at twice its size.
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  await p.evaluate((png) => probe.handle({ type: 'desktop_cursor', png, scale: 2, hot_x: 4, hot_y: 9 }), png);
+  const cursor = await p.locator('#desktop canvas').evaluate(c => c.style.cursor);
+  assert.match(cursor, /image-set\(url\("data:image\/png;base64,iVBOR.*2x\) 4 9, default/);
+
+  // One display: nothing to switch. Two: a button beside the screen's.
+  const screens = p.locator('#bar .tool.screens');
+  await p.evaluate(() => probe.handle({ type: 'desktop_status', state: 'streaming', display: 1, displays: [{ id: 1, name: 'Built-in', main: true }] }));
+  await windowed(p);
+  assert.equal(await screens.isVisible(), false);
+  await p.evaluate(() => probe.handle({ type: 'desktop_status', state: 'streaming', display: 1, displays: [{ id: 1, name: 'Built-in', main: true }, { id: 7, name: 'Studio Display', main: false }] }));
+  assert.equal(await screens.isVisible(), true);
+  assert.equal(await screens.evaluate(b => b.previousElementSibling.classList.contains('desktop') && b.nextElementSibling.classList.contains('fs')), true);
+  assert.match(await screens.getAttribute('title'), /Showing Built-in\. Switch to Studio Display/);
+  await p.evaluate(() => { messages.length = 0; });
+  await screens.click();
+  const asked = await p.evaluate(() => messages.filter(m => m.type === 'desktop_start'));
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0].display, 7);
+  assert.equal(await p.evaluate(() => localStorage.getItem('kaku.desktop.display')), '7', 'remembered for next time');
+
+  // A file dropped on the screen pastes no path into the pane; once it is
+  // on the Mac, Finder shows it.
+  await p.evaluate(() => document.getElementById('desktop').classList.add('live'));
+  const sent = await p.evaluate(async () => {
+    const socket = connections.at(-1);
+    const original = socket.send.bind(socket);
+    socket.send = data => {
+      original(data);
+      const m = JSON.parse(data);
+      if (m.type === 'upload_chunk') setTimeout(() => probe.handle({ type: 'upload_ack', id: m.id, received: atob(m.data).length }), 5);
+      if (m.type === 'upload_end') setTimeout(() => probe.handle({ type: 'uploaded', id: m.id, ok: true, detail: '/Users/me/Downloads/Kaku/a.txt' }), 5);
+    };
+    messages.length = 0;
+    await probe.sendFiles([new File(['hello'], 'a.txt')], false, true);
+    return messages.filter(m => m.type === 'upload_start' || m.type === 'desktop_reveal');
+  });
+  assert.equal(sent[0].type, 'upload_start');
+  assert.equal(sent[0].paste, false);
+  assert.deepEqual(sent[1], { type: 'desktop_reveal', paths: ['/Users/me/Downloads/Kaku/a.txt'] });
+
+  // Back to the terminal: the browser's own pointer, and no display button.
+  await p.locator('#bar .tool.desktop').click();
+  assert.equal(await p.locator('#desktop canvas').evaluate(c => c.style.cursor), '');
+  assert.equal(await screens.isVisible(), false);
   assert.deepEqual(errors, []);
 });
 

@@ -532,6 +532,9 @@ enum WebClientMsg {
         transfer: String,
         #[serde(default)]
         pane_id: Option<usize>,
+        /// Paste the saved path into the pane; the desktop view keeps it out.
+        #[serde(default = "yes")]
+        paste: bool,
     },
     UploadCancel {
         id: u32,
@@ -1056,6 +1059,16 @@ impl UploadReply {
     }
 }
 
+fn yes() -> bool {
+    true
+}
+
+/// The pane an upload's path is pasted into: the one the page named, else
+/// the attached one, and none for a file dropped on the desktop view.
+fn upload_target(pane_id: Option<usize>, paste: bool, attached: Option<usize>) -> Option<usize> {
+    paste.then(|| pane_id.or(attached)).flatten()
+}
+
 /// Apply one upload message; a reply only when the upload finished or failed.
 fn handle_upload(
     msg: &WebClientMsg,
@@ -1084,8 +1097,9 @@ fn handle_upload(
             size,
             transfer,
             pane_id,
+            paste,
         } => {
-            let target = (*pane_id).or(attached);
+            let target = upload_target(*pane_id, *paste, attached);
             if !transfer.is_empty()
                 && (transfer.len() != 32 || !transfer.bytes().all(|b| b.is_ascii_hexdigit()))
             {
@@ -2428,17 +2442,21 @@ async fn send_tabs(
 
 /// One browser, whatever carries its messages: the local WebSocket or the
 /// relay tunnel. `inbox` yields the page's JSON messages and `outbox` takes
-/// ours; the session ends when either side goes away.
+/// ours; `frames` takes the desktop view's pictures as binary messages. The
+/// session ends when either side goes away.
 pub(crate) async fn run_session(
     mut inbox: mpsc::Receiver<String>,
     outbox: mpsc::Sender<String>,
+    frames: mpsc::Sender<Vec<u8>>,
     dirty: WebDirty,
 ) {
     let _awake = crate::awake::Awake::hold();
     #[cfg(feature = "desktop")]
     {
-        inbox = crate::desktop::tap(inbox, outbox.clone());
+        inbox = crate::desktop::tap(inbox, outbox.clone(), frames);
     }
+    #[cfg(not(feature = "desktop"))]
+    drop(frames);
     if let Some(json) = encode(&WebServerMsg::Config(&crate::config_info())) {
         if outbox.send(json).await.is_err() {
             return;
@@ -2808,10 +2826,18 @@ async fn handle_local_ws(socket: ws::WebSocket, dirty: WebDirty) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (in_tx, in_rx) = mpsc::channel::<String>(64);
     let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
-    let session = tokio::spawn(run_session(in_rx, out_tx, dirty));
+    let (frames_tx, mut frames_rx) = mpsc::channel::<Vec<u8>>(4);
+    let session = tokio::spawn(run_session(in_rx, out_tx, frames_tx, dirty));
     let writer = tokio::spawn(async move {
-        while let Some(text) = out_rx.recv().await {
-            if ws_tx.send(ws::Message::Text(text.into())).await.is_err() {
+        loop {
+            let msg = tokio::select! {
+                text = out_rx.recv() => match text {
+                    Some(text) => ws::Message::Text(text.into()),
+                    None => break,
+                },
+                Some(frame) = frames_rx.recv() => ws::Message::Binary(frame.into()),
+            };
+            if ws_tx.send(msg).await.is_err() {
                 break;
             }
         }
@@ -3566,6 +3592,17 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_upload_pastes_nowhere() {
+        let msg: WebClientMsg =
+            serde_json::from_str(r#"{"type":"upload_start","id":1,"name":"a","size":1}"#).unwrap();
+        assert!(matches!(msg, WebClientMsg::UploadStart { paste: true, .. }));
+        assert_eq!(upload_target(None, true, Some(9)), Some(9));
+        assert_eq!(upload_target(Some(4), true, Some(9)), Some(4));
+        assert_eq!(upload_target(Some(4), false, Some(9)), None);
+        assert_eq!(upload_target(None, false, Some(9)), None);
+    }
+
+    #[test]
     fn completed_upload_receipt_survives_reconnect_without_pasting_again() {
         let path = std::env::temp_dir().join(format!("kaku-receipt-{}", std::process::id()));
         let transfer = "ab".repeat(16);
@@ -3599,6 +3636,7 @@ mod tests {
                 size: 0,
                 transfer: transfer.clone(),
                 pane_id: Some(42),
+                paste: true,
             },
             &mut reconnected,
             Some(99),
@@ -3617,6 +3655,7 @@ mod tests {
                 size: 0,
                 transfer: transfer.clone(),
                 pane_id: Some(42),
+                paste: true,
             },
             &mut reconnected,
             Some(99),

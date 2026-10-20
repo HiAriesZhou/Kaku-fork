@@ -490,8 +490,16 @@
   };
   let notThisMac = null;
   let linkExpired = null;
+  // A desktop picture comes as one binary message: a zero byte, the length
+  // of its JSON header, the header, then the video bytes.
+  const unpackFrame = (bytes) => {
+    const len = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(1);
+    const msg = JSON.parse(dec.decode(bytes.subarray(5, 5 + len)));
+    msg.bytes = bytes.subarray(5 + len);
+    return msg;
+  };
   const receive = (socket, data, handle) => {
-    if (!relay) { handle(JSON.parse(data)); return; }
+    if (!relay) { handle(typeof data === "string" ? JSON.parse(data) : unpackFrame(new Uint8Array(data))); return; }
     const conn = link;
     recvChain = recvChain.then(async () => {
       const bytes = new Uint8Array(data);
@@ -502,6 +510,11 @@
       } catch (_) {
         // Altered or replayed on the way: start over on a fresh connection.
         throw new Error("sealed message did not open");
+      }
+      const view = new Uint8Array(plain);
+      if (view[0] === 0) {
+        if (conn.verified) handle(unpackFrame(view));
+        return;
       }
       const msg = JSON.parse(dec.decode(plain));
       if (!conn.verified) {
@@ -2721,7 +2734,7 @@
     }
     return null;
   };
-  const sendOnce = async (file, name, socket, transfer, target) => {
+  const sendOnce = async (file, name, socket, transfer, target, paste) => {
     const id = ++uploadSeq;
     let finishLost;
     const lost = new Promise(resolve => { finishLost = () => resolve(null); });
@@ -2736,7 +2749,7 @@
       } finally { clearTimeout(timer); }
     };
     try {
-      send({ type: "upload_start", id, name, size: file.size, transfer, pane_id: target });
+      send({ type: "upload_start", id, name, size: file.size, transfer, pane_id: target, paste });
       // Eight small chunks in flight keep the original 512 KB window while
       // giving interactive keys a chance between chunks on the shared link.
       for (let off = 0; off < file.size; off += CHUNK * 8) {
@@ -2764,7 +2777,8 @@
       if (!result && ws === socket && socket.readyState === WebSocket.OPEN) send({ type: "upload_cancel", id });
     }
   };
-  const sendFile = async (file, name, target = paneId) => {
+  // Resolves to where the file landed on the Mac, once it did.
+  const sendFile = async (file, name, target = paneId, paste = true) => {
     if (file.size > 50 * 1024 * 1024) { toast(`${name} is larger than 50 MB`); return; }
     const transfer = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -2773,7 +2787,7 @@
       if (!socket) break;
       let result;
       try {
-        result = await sendOnce(file, name, socket, transfer, target);
+        result = await sendOnce(file, name, socket, transfer, target, paste);
       } catch (_) {
         // The file could not be read (moved, or on a share that dropped).
         toast(`${name} was not sent because it could not be read.`);
@@ -2781,7 +2795,7 @@
       }
       if (result) {
         toast(result.ok ? `Sent to ${result.detail.replace(/^\/Users\/[^/]+/, "~")}` : `Not sent: ${result.detail}`);
-        return;
+        return result.ok ? result.detail : undefined;
       }
     }
     toast(`${name} was not sent because the connection dropped. Try again.`);
@@ -2791,10 +2805,17 @@
     const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
     return `pasted-${stamp}.${ext}`;
   };
-  const sendFiles = async (files, pasted) => {
+  // Dropped on the Mac's screen, files paste no path into a pane; Finder
+  // shows them once they all arrived.
+  const sendFiles = async (files, pasted, onDesktop = false) => {
     const target = paneId;
-    for (const f of files) await sendFile(f, pasted ? pastedName(f) : f.name, target);
-    term.focus();
+    const landed = [];
+    for (const f of files) {
+      const path = await sendFile(f, pasted ? pastedName(f) : f.name, target, !onDesktop);
+      if (path) landed.push(path);
+    }
+    if (!onDesktop) term.focus();
+    else if (landed.length && desktop?.active) send({ type: "desktop_reveal", paths: landed });
   };
   stage.addEventListener("dragover", (ev) => {
     if (![...(ev.dataTransfer?.types || [])].includes("Files")) return;
@@ -2807,7 +2828,7 @@
     const files = [...(ev.dataTransfer?.files || [])];
     if (!files.length) return;
     ev.preventDefault();
-    sendFiles(files, false);
+    sendFiles(files, false, !!desktop?.active);
   });
 
   const handle = (msg) => {

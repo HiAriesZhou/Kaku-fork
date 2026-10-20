@@ -29,8 +29,15 @@
   #desktop .status .spin { width: 18px; height: 18px; margin-bottom: 8px; border: 2px solid rgba(127,127,127,0.25); border-top-color: var(--fg); border-radius: 50%; opacity: 0.7; animation: desktop-spin 0.9s linear infinite; }
   #desktop.failed .status .spin { display: none; }
   @keyframes desktop-spin { to { transform: rotate(360deg); } }
-  #bar .tool.desktop svg { width: 15px; height: 15px; }
+  #bar .tool.desktop svg, #bar .tool.screens svg { width: 15px; height: 15px; }
+  #bar .tool.screens { display: none; }
+  body.desktop.screens #bar .tool.screens { display: flex; }
+  /* Files dragged over the screen: the same outline as over the terminal,
+     drawn above the picture. */
+  #desktop::after { content: ""; position: absolute; inset: 0; pointer-events: none; box-shadow: inset 0 0 0 2px var(--muted); opacity: 0; }
+  body.dropping #desktop::after { opacity: 1; }
   `;
+  const SCREENS_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.25" y="4.5" width="9" height="6.5" rx="1.25"/><path d="M4.5 4.5V3.25c0-.7.55-1.25 1.25-1.25h7.75c.7 0 1.25.55 1.25 1.25v5c0 .7-.55 1.25-1.25 1.25H10.25M4.5 13.5h3.5"/></svg>';
   const ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.75" y="2.5" width="12.5" height="8.5" rx="1.5"/><path d="M6 13.5h4M8 11v2.5"/></svg>';
 
   // Pictures the page may hold undrawn; the helper paces itself on our acks.
@@ -76,8 +83,15 @@
     button.innerHTML = ICON;
     // Beside the full screen button, the two icons together, with the
     // clock's text to their left rather than between them.
+    // With more than one display on the Mac, the next one is a click away.
+    const screens = document.createElement("button");
+    screens.type = "button";
+    screens.className = "tool screens";
+    screens.innerHTML = SCREENS_ICON;
     const anchor = toolsEl.querySelector(".fs");
-    if (anchor) toolsEl.insertBefore(button, anchor); else toolsEl.append(button);
+    for (const b of [button, screens]) {
+      if (anchor) toolsEl.insertBefore(b, anchor); else toolsEl.append(b);
+    }
 
     let active = false;
     let decoder = null;
@@ -88,6 +102,11 @@
     let canControl = true;
     let warnedControl = false;
     let lastDrawn = 0;
+    let displays = [];
+    let shownDisplay = 0;
+    const DISPLAY_SLOT = "kaku.desktop.display";
+    let chosenDisplay = 0;
+    try { chosenDisplay = Number(localStorage.getItem(DISPLAY_SLOT)) || 0; } catch (_) {}
 
     const showStatus = (title, detail = "", failed = false) => {
       statusTitle.textContent = title;
@@ -141,10 +160,13 @@
         max_width: Math.min(3840, Math.max(floor, Math.round(view.clientWidth * dpr))),
         max_height: Math.min(2400, Math.max(floor * 0.625, Math.round(view.clientHeight * dpr))),
         fps: 30,
-        // With a mouse the page's own pointer is the one to follow; a touch
-        // screen has none, so the Mac's stays in the picture.
+        // With a mouse the page's own pointer is the one to follow, in the
+        // Mac's shape; a touch screen has none, so the Mac's stays in the
+        // picture.
         cursor: TOUCH,
+        binary: true,
       };
+      if (chosenDisplay) requested.display = chosenDisplay;
       return requested;
     };
     // A view that grows (full screen) or shrinks by more than a tenth asks
@@ -227,6 +249,8 @@
       closeDecoder();
       document.body.classList.remove("desktop");
       view.classList.remove("live");
+      canvas.style.cursor = "";
+      syncScreens();
       if (ownFullscreen && document.fullscreenElement) document.exitFullscreen().catch(() => {});
       syncFullscreen();
       syncButton();
@@ -255,8 +279,7 @@
       send({ type: "desktop_keyframe" });
     };
 
-    // Key frames come from two encoders, the moving stream and the sharp
-    // picture sent once the screen settles, each with its own parameter
+    // A new stream (another size, another display) brings new parameter
     // sets: a change of description reconfigures the decoder in order.
     const ensureDecoder = (codec, desc) => {
       const key = codec + ":" + desc;
@@ -322,17 +345,52 @@
         return;
       }
       try {
-        decoder.decode(new EncodedVideoChunk({ type: msg.key ? "key" : "delta", timestamp: msg.seq, data: b64(msg.data) }));
+        decoder.decode(new EncodedVideoChunk({ type: msg.key ? "key" : "delta", timestamp: msg.seq, data: msg.bytes || b64(msg.data) }));
       } catch (e) {
         ack(msg.seq);
         wantKey();
       }
     };
 
+    const syncScreens = () => {
+      const many = active && displays.length > 1;
+      document.body.classList.toggle("screens", many);
+      if (!many) return;
+      const at = Math.max(0, displays.findIndex((d) => d.id === shownDisplay));
+      const next = displays[(at + 1) % displays.length];
+      screens.title = `Showing ${displays[at].name}. Switch to ${next.name}`;
+    };
+    screens.addEventListener("click", () => {
+      if (!active || displays.length < 2) return;
+      const at = Math.max(0, displays.findIndex((d) => d.id === shownDisplay));
+      chosenDisplay = displays[(at + 1) % displays.length].id;
+      try { localStorage.setItem(DISPLAY_SLOT, String(chosenDisplay)); } catch (_) {}
+      releaseAll();
+      start();
+      focusView();
+    });
+
+    // The Mac's pointer shape (an I-beam over text, a resize arrow at a
+    // window's edge) on the page's own pointer, drawn at twice its size.
+    const onCursor = (msg) => {
+      if (!active || TOUCH || typeof msg.png !== "string") return;
+      const url = `url("data:image/png;base64,${msg.png}")`;
+      const hot = `${msg.hot_x | 0} ${msg.hot_y | 0}`;
+      const scale = msg.scale || 1;
+      for (const value of [`image-set(${url} ${scale}x) ${hot}, default`, `-webkit-image-set(${url} ${scale}x) ${hot}, default`]) {
+        canvas.style.cursor = value;
+        if (canvas.style.cursor) return;
+      }
+      canvas.style.cursor = "";
+    };
+
     const onStatus = (msg) => {
       if (!active) return;
       if (msg.state === "streaming") {
         canControl = msg.control !== false;
+        displays = Array.isArray(msg.displays) ? msg.displays : [];
+        shownDisplay = msg.display || 0;
+        syncScreens();
         if (!canControl && !warnedControl) {
           warnedControl = true;
           toast("View only: Kaku has no Accessibility permission on the Mac");
@@ -646,6 +704,7 @@
         if (msg.type === "desktop_frame") onFrame(msg);
         else if (msg.type === "desktop_status") onStatus(msg);
         else if (msg.type === "desktop_clipboard") onClipboard(msg);
+        else if (msg.type === "desktop_cursor") onCursor(msg);
       },
       // A new session (a reconnect) has no helper running yet.
       sessionStarted() {

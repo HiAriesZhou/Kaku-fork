@@ -730,13 +730,20 @@ fn start_session(
 ) -> mpsc::Sender<String> {
     let (inbox, session_in) = mpsc::channel::<String>(64);
     let (session_out, mut replies) = mpsc::channel::<String>(64);
-    tokio::spawn(web::run_session(session_in, session_out, dirty));
+    let (frames_out, mut frames) = mpsc::channel::<Vec<u8>>(4);
+    tokio::spawn(web::run_session(session_in, session_out, frames_out, dirty));
     tokio::spawn(async move {
         let rng = SystemRandom::new();
         let mut seq = first_seq;
-        while let Some(text) = replies.recv().await {
-            let Some(sealed) = seal(&keys.from_host, &rng, &aad(FROM_HOST, seq), text.as_bytes())
-            else {
+        loop {
+            let plain = tokio::select! {
+                text = replies.recv() => match text {
+                    Some(text) => text.into_bytes(),
+                    None => break,
+                },
+                Some(frame) = frames.recv() => frame,
+            };
+            let Some(sealed) = seal(&keys.from_host, &rng, &aad(FROM_HOST, seq), &plain) else {
                 break;
             };
             seq += 1;
