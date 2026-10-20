@@ -5,8 +5,8 @@ edition = "2021"
 publish = false
 
 [features]
-# The page's view of the Mac's screen, through the separately installed
-# kaku-desktop helper. Off by default.
+# The page's view of the Mac's screen, through a bundled or separately
+# installed kaku-desktop helper. Off by default.
 desktop = ["tokio/process", "tokio/io-util"]
 
 [dependencies]

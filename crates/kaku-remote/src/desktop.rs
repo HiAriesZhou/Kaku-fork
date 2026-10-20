@@ -35,7 +35,27 @@ const STOP_GRACE: Duration = Duration::from_secs(1);
 const BINARY_FRAME: u8 = 0;
 
 pub(crate) fn helper_path() -> PathBuf {
-    config::DATA_DIR.join("kaku-desktop")
+    helper_path_for_executable(
+        std::env::current_exe().ok().as_deref(),
+        config::DATA_DIR.join("kaku-desktop"),
+    )
+}
+
+fn helper_path_for_executable(exe: Option<&Path>, legacy: PathBuf) -> PathBuf {
+    let bundled = exe.and_then(|exe| {
+        let macos = exe.parent()?;
+        let contents = macos.parent()?;
+        let app = contents.parent()?;
+        if macos.file_name()? != "MacOS"
+            || contents.file_name()? != "Contents"
+            || app.extension()? != "app"
+        {
+            return None;
+        }
+        let helper = macos.join("kaku-desktop");
+        is_executable(&helper).then_some(helper)
+    });
+    bundled.unwrap_or(legacy)
 }
 
 /// Whether to offer the desktop view to the page.
@@ -279,6 +299,32 @@ impl Helper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_helper_takes_precedence_without_using_unbundled_siblings() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kaku-helper-path-{}", fastrand::u64(..)));
+        let macos = dir.join("Private.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let exe = macos.join("kaku-gui");
+        let bundled = macos.join("kaku-desktop");
+        let legacy = dir.join("legacy/kaku-desktop");
+        assert_eq!(
+            helper_path_for_executable(Some(&exe), legacy.clone()),
+            legacy
+        );
+        std::fs::write(&bundled, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let selected = helper_path_for_executable(Some(&exe), legacy.clone());
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::copy(&bundled, bin.join("kaku-desktop")).unwrap();
+        let unbundled = helper_path_for_executable(Some(&bin.join("kaku-gui")), legacy.clone());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(selected, bundled);
+        assert_eq!(unbundled, legacy);
+        assert_eq!(helper_path_for_executable(None, legacy.clone()), legacy);
+    }
 
     #[test]
     fn only_desktop_messages_are_the_helpers() {

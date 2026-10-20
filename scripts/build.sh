@@ -192,7 +192,7 @@ elif [[ "$PROFILE" == "release-opt" ]]; then
 	PROFILE_DIR="release-opt"
 fi
 
-# Optional cargo features, comma-separated. Set via `CARGO_FEATURES=remote` env.
+# Optional cargo features, comma-separated, e.g. `CARGO_FEATURES=kaku-gui/desktop`.
 CARGO_FEATURE_ARGS=()
 if [[ -n "${CARGO_FEATURES:-}" ]]; then
 	CARGO_FEATURE_ARGS=(--features "$CARGO_FEATURES")
@@ -208,6 +208,30 @@ IFS=' ' read -r -a BUILD_TARGETS <<<"$BUILD_TARGETS_STR"
 if [[ ${#BUILD_TARGETS[@]} -eq 0 ]]; then
 	echo "No build targets resolved for BUILD_ARCH=$BUILD_ARCH" >&2
 	exit 1
+fi
+
+# A private desktop build can carry its helper instead of depending on a
+# separately installed copy. Public builds never copy it implicitly.
+if [[ -n "${KAKU_DESKTOP_HELPER:-}" ]]; then
+	helper_features="${CARGO_FEATURES:-}"
+	case ",${helper_features// /,}," in
+	*,desktop,* | *,kaku-gui/desktop,*) ;;
+	*) echo "KAKU_DESKTOP_HELPER requires CARGO_FEATURES=kaku-gui/desktop" >&2; exit 1 ;;
+	esac
+	if [[ ! -f "$KAKU_DESKTOP_HELPER" || ! -x "$KAKU_DESKTOP_HELPER" ]]; then
+		echo "KAKU_DESKTOP_HELPER must name an executable helper" >&2
+		exit 1
+	fi
+	for target in "${BUILD_TARGETS[@]}"; do
+		case "$target" in
+		aarch64-apple-darwin) helper_arch=arm64 ;;
+		x86_64-apple-darwin) helper_arch=x86_64 ;;
+		esac
+		if ! lipo -verify_arch "$helper_arch" "$KAKU_DESKTOP_HELPER"; then
+			echo "Desktop helper does not contain requested architecture: $helper_arch" >&2
+			exit 1
+		fi
+	done
 fi
 
 ensure_rust_targets "${BUILD_TARGETS[@]}"
@@ -301,6 +325,11 @@ for bin in kaku kaku-gui k; do
 	chmod +x "$APP_BUNDLE_OUT/Contents/MacOS/$bin"
 done
 
+if [[ -n "${KAKU_DESKTOP_HELPER:-}" ]]; then
+	cp "$KAKU_DESKTOP_HELPER" "$APP_BUNDLE_OUT/Contents/MacOS/kaku-desktop"
+	chmod +x "$APP_BUNDLE_OUT/Contents/MacOS/kaku-desktop"
+fi
+
 # Clean up xattrs to prevent icon caching issues or quarantine
 xattr -cr "$APP_BUNDLE_OUT"
 
@@ -366,8 +395,13 @@ done < <(find "$APP_BUNDLE_OUT/Contents/Frameworks" -type f -name '*.dylib' -pri
 # validates the other executables in Contents/MacOS as nested code and refuses
 # while any of them is still unsigned ("code object is not signed at all,
 # In subcomponent: .../k"), so the helpers must be signed before it.
-for bin in "$APP_BUNDLE_OUT/Contents/MacOS/kaku" "$APP_BUNDLE_OUT/Contents/MacOS/k" "$APP_BUNDLE_OUT/Contents/MacOS/kaku-gui"; do
-	codesign_with_retry "${RUNTIME_SIGN_ARGS[@]}" "$bin"
+SIGN_BINARIES=(kaku k)
+if [[ -n "${KAKU_DESKTOP_HELPER:-}" ]]; then
+	SIGN_BINARIES+=(kaku-desktop)
+fi
+SIGN_BINARIES+=(kaku-gui)
+for bin in "${SIGN_BINARIES[@]}"; do
+	codesign_with_retry "${RUNTIME_SIGN_ARGS[@]}" "$APP_BUNDLE_OUT/Contents/MacOS/$bin"
 done
 
 APP_SIGN_ARGS=("${RUNTIME_SIGN_ARGS[@]}")
