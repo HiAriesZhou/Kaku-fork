@@ -361,7 +361,12 @@ fn compute_tab_title_from_precomputed(
     precomputed: Option<TitleText>,
 ) -> TitleText {
     if let Some(ssh_host) = ssh_destination_for_default_title(tab, config) {
-        return build_default_title(tab, config, &ssh_title(&ssh_host), false, true);
+        // This path skips the bundled formatter, so add its `N:` index here.
+        let mut title = ssh_title(&ssh_host);
+        if config.show_tab_index_in_tab_bar {
+            title = format!("{}:{title}", tab_display_index(tab, config));
+        }
+        return build_default_title(tab, config, &title, false, true);
     }
     match precomputed {
         Some(title) => title,
@@ -452,6 +457,10 @@ pub(crate) fn compute_pane_plain_title(
         .unwrap_or_else(|| pane.title.clone())
 }
 
+fn tab_display_index(tab: &TabInformation, config: &ConfigHandle) -> usize {
+    tab.tab_index + usize::from(!config.tab_and_split_indices_are_zero_based)
+}
+
 fn build_default_title(
     tab: &TabInformation,
     config: &ConfigHandle,
@@ -465,15 +474,7 @@ fn build_default_title(
 
     let classic_spacing = if config.use_fancy_tab_bar { "" } else { " " };
     if with_tab_index && config.show_tab_index_in_tab_bar {
-        let index = format!(
-            "{classic_spacing}{}: ",
-            tab.tab_index
-                + if config.tab_and_split_indices_are_zero_based {
-                    0
-                } else {
-                    1
-                }
-        );
+        let index = format!("{classic_spacing}{}: ", tab_display_index(tab, config));
         len += unicode_column_width(&index, None);
         items.push(FormatItem::Text(index));
         title = format!("{}{classic_spacing}", title);
@@ -1546,6 +1547,7 @@ mod test {
 local wezterm = require 'wezterm'
 wezterm.on('format-tab-title', function() return ' Lua title ' end)
 return {{ use_fancy_tab_bar = false, show_new_tab_button_in_tab_bar = false,
+          show_tab_index_in_tab_bar = true,
           automatically_reload_config = false, tab_title_use_pane_title = {} }}
 "#,
                     enabled
@@ -1593,6 +1595,8 @@ return {{ use_fancy_tab_bar = false, show_new_tab_button_in_tab_bar = false,
                     assert_eq!(normal_tab.title.as_str(), " Lua title ");
                 } else {
                     assert!(normal_tab.title.as_str().contains("test-host"));
+                    // The SSH path skips Lua, so it must keep the tab index itself.
+                    assert!(normal_tab.title.as_str().starts_with(" 1:"));
                 }
                 assert_eq!(normal_tab.title.as_str(), hovered_tab.title.as_str());
                 assert_eq!(normal_tab.width, hovered_tab.width);
