@@ -4,14 +4,20 @@ use mux::termwiztermtab::TermWizTerminal;
 use mux_lua::MuxPane;
 use std::rc::Rc;
 use termwiz::cell::{unicode_column_width, AttributeChange, CellAttributes, Intensity};
-use termwiz::color::ColorAttribute;
+use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::input::{InputEvent, KeyCode, KeyEvent, MouseButtons, MouseEvent};
 use termwiz::surface::{Change, CursorVisibility, Position};
 use termwiz::terminal::Terminal;
-use wezterm_term::TerminalConfiguration;
 
-pub fn run_confirmation(message: &str, term: &mut TermWizTerminal) -> anyhow::Result<bool> {
-    run_confirmation_impl(message, term)
+/// `frame` is the window's divider color (`TermWindow::confirm_frame_color`):
+/// the overlay runs off the GUI thread and cannot read the window's palette,
+/// which a per-window color scheme makes differ from the global one.
+pub fn run_confirmation(
+    message: &str,
+    frame: SrgbaTuple,
+    term: &mut TermWizTerminal,
+) -> anyhow::Result<bool> {
+    run_confirmation_impl(message, frame, term)
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -28,16 +34,17 @@ struct ButtonLayout {
 
 /// The dialog frame takes the shared overlay divider color instead of the
 /// default foreground, which made it the brightest line on screen.
-fn frame_attributes() -> CellAttributes {
-    let palette = config::TermConfig::with_config(config::configuration()).color_palette();
+fn frame_attributes(frame: SrgbaTuple) -> CellAttributes {
     let mut attrs = CellAttributes::default();
-    attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
-        super::divider_color(palette.background, palette.foreground),
-    ));
+    attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(frame));
     attrs
 }
 
-fn run_confirmation_impl(message: &str, term: &mut TermWizTerminal) -> anyhow::Result<bool> {
+fn run_confirmation_impl(
+    message: &str,
+    frame: SrgbaTuple,
+    term: &mut TermWizTerminal,
+) -> anyhow::Result<bool> {
     term.set_raw_mode()?;
 
     let size = term.get_screen_size()?;
@@ -98,7 +105,7 @@ fn run_confirmation_impl(message: &str, term: &mut TermWizTerminal) -> anyhow::R
         width: yes_w,
     };
 
-    let frame_attrs = frame_attributes();
+    let frame_attrs = frame_attributes(frame);
 
     let render = |term: &mut TermWizTerminal, active: ActiveButton| -> termwiz::Result<()> {
         let mut changes = vec![
@@ -240,6 +247,7 @@ fn run_confirmation_impl(message: &str, term: &mut TermWizTerminal) -> anyhow::R
 }
 
 pub fn show_confirmation_overlay(
+    frame: SrgbaTuple,
     mut term: TermWizTerminal,
     args: Confirmation,
     window: GuiWin,
@@ -250,7 +258,7 @@ pub fn show_confirmation_overlay(
         _ => anyhow::bail!("Confirmation requires action to be defined by action_callback"),
     };
 
-    if let Ok(confirm) = run_confirmation_impl(&args.message, &mut term) {
+    if let Ok(confirm) = run_confirmation_impl(&args.message, frame, &mut term) {
         if confirm {
             promise::spawn::spawn_into_main_thread(async move {
                 trampoline(name, window, pane);

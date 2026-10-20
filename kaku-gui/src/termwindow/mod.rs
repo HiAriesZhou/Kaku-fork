@@ -3287,6 +3287,12 @@ impl TermWindow {
         self.palette.as_ref().unwrap()
     }
 
+    /// The frame color of confirmation dialogs, from this window's palette.
+    fn confirm_frame_color(&mut self) -> termwiz::color::SrgbaTuple {
+        let palette = self.palette();
+        crate::overlay::divider_color(palette.background, palette.foreground)
+    }
+
     pub fn config_was_reloaded(&mut self) {
         // Skip config reload during live resizing to avoid performance issues
         // when dragging the window. The reload will be processed after resize completes.
@@ -4343,8 +4349,9 @@ impl TermWindow {
         let gui_win = GuiWin::new(self);
         let pane = MuxPane(pane.pane_id());
 
+        let frame = self.confirm_frame_color();
         let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
-            crate::overlay::confirm::show_confirmation_overlay(term, args, gui_win, pane)
+            crate::overlay::confirm::show_confirmation_overlay(frame, term, args, gui_win, pane)
         });
         self.assign_overlay(tab.tab_id(), overlay);
         promise::spawn::spawn(future).detach();
@@ -4362,8 +4369,9 @@ impl TermWindow {
         };
 
         if let Some(window) = self.window.clone() {
+            let frame = self.confirm_frame_color();
             let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                crate::overlay::confirm_apply_update(term, window, tab_id)
+                crate::overlay::confirm_apply_update(frame, term, window, tab_id)
             });
             self.assign_overlay(tab.tab_id(), overlay);
             promise::spawn::spawn(future).detach();
@@ -5017,8 +5025,9 @@ impl TermWindow {
                     };
 
                     if let Some(window) = self.window.clone() {
+                        let frame = self.confirm_frame_color();
                         let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                            confirm_quit_program(term, window, tab_id)
+                            confirm_quit_program(frame, term, window, tab_id)
                         });
                         self.assign_overlay(tab.tab_id(), overlay);
                         promise::spawn::spawn(future).detach();
@@ -5910,8 +5919,9 @@ impl TermWindow {
             });
         if should_confirm {
             if let Some(window) = self.window.clone() {
+                let frame = self.confirm_frame_color();
                 let (overlay, future) = start_overlay_pane(self, &pane, move |pane_id, term| {
-                    confirm_close_pane(pane_id, term, mux_window_id, window)
+                    confirm_close_pane(pane_id, frame, term, mux_window_id, window)
                 });
                 self.assign_overlay_for_pane(pane_id, overlay);
                 promise::spawn::spawn(future).detach();
@@ -5955,9 +5965,11 @@ impl TermWindow {
             let host_tab_id = host_tab.tab_id();
             if let Some(window) = self.window.clone() {
                 let notify_window = window.clone();
+                let frame = self.confirm_frame_color();
                 let (overlay, future) = start_overlay(self, &host_tab, move |_tab_id, mut term| {
                     crate::overlay::confirm::run_confirmation(
                         "Close this tab?\nAll panes in this tab will be terminated.",
+                        frame,
                         &mut term,
                     )
                 });
@@ -6047,8 +6059,9 @@ impl TermWindow {
             }
 
             if let Some(window) = self.window.clone() {
+                let frame = self.confirm_frame_color();
                 let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                    confirm_close_tab(tab_id, term, mux_window_id, window)
+                    confirm_close_tab(tab_id, frame, term, mux_window_id, window)
                 });
                 self.assign_overlay(tab_id, overlay);
                 promise::spawn::spawn(future).detach();
@@ -6082,8 +6095,9 @@ impl TermWindow {
             // recorded from the confirmed branch of confirm_close_tab, which is
             // the only place that knows the user did not cancel.
             if let Some(window) = self.window.clone() {
+                let frame = self.confirm_frame_color();
                 let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                    confirm_close_tab(tab_id, term, mux_window_id, window)
+                    confirm_close_tab(tab_id, frame, term, mux_window_id, window)
                 });
                 self.assign_overlay(tab_id, overlay);
                 promise::spawn::spawn(future).detach();
@@ -6733,6 +6747,19 @@ mod tests {
             .next()
             .unwrap();
         assert!(reload.contains("window_configuration(self.window_state"));
+    }
+
+    #[test]
+    fn confirmations_take_the_frame_color_from_the_window() {
+        let confirm = include_str!("../overlay/confirm.rs");
+        assert!(!confirm.contains("config::configuration()"));
+        let source = include_str!("mod.rs").split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            source
+                .matches("let frame = self.confirm_frame_color();")
+                .count(),
+            7
+        );
     }
 
     #[test]

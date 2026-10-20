@@ -6,16 +6,19 @@ use mux::tab::TabId;
 use mux::termwiztermtab::TermWizTerminal;
 use mux::window::WindowId;
 use mux::Mux;
+use termwiz::color::SrgbaTuple;
 use window::WindowOps;
 
 pub fn confirm_close_pane(
     pane_id: PaneId,
+    frame: SrgbaTuple,
     mut term: TermWizTerminal,
     _mux_window_id: WindowId,
     window: ::window::Window,
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation(
         "Close this pane?\nThe running process in this pane will be terminated.",
+        frame,
         &mut term,
     )? {
         promise::spawn::spawn_into_main_thread(async move {
@@ -41,12 +44,14 @@ pub fn confirm_close_pane(
 
 pub fn confirm_close_tab(
     tab_id: TabId,
+    frame: SrgbaTuple,
     mut term: TermWizTerminal,
     _mux_window_id: WindowId,
     window: ::window::Window,
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation(
         "Close this tab?\nAll panes in this tab will be terminated.",
+        frame,
         &mut term,
     )? {
         // Record the cwd from here rather than at the call site: the user may
@@ -67,12 +72,14 @@ pub fn confirm_close_tab(
 }
 
 pub fn confirm_apply_update(
+    frame: SrgbaTuple,
     mut term: TermWizTerminal,
     window: ::window::Window,
     tab_id: TabId,
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation(
         "Update Kaku now?\nAll windows will close and running tasks will stop.",
+        frame,
         &mut term,
     )? {
         promise::spawn::spawn_into_main_thread(async move {
@@ -86,12 +93,14 @@ pub fn confirm_apply_update(
 }
 
 pub fn confirm_quit_program(
+    frame: SrgbaTuple,
     mut term: TermWizTerminal,
     window: ::window::Window,
     tab_id: TabId,
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation(
         "Quit Kaku?\nAll open tabs and panes will be closed.",
+        frame,
         &mut term,
     )? {
         promise::spawn::spawn_into_main_thread(async move {
