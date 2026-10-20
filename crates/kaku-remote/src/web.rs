@@ -1753,11 +1753,15 @@ const SENT_KEPT: usize = FRAME_WINDOW * 2;
 
 impl Shown {
     /// Remember what frame `seq` left on the page, for checking it later.
+    /// A check compares visible text only, so keep that rather than every
+    /// row's styling, which on a tall, colorful screen ran to megabytes
+    /// across the frames kept.
     fn sent_as(&mut self, seq: u64) {
         if self.sent.len() == SENT_KEPT {
             self.sent.pop_front();
         }
-        self.sent.push_back((seq, self.lines.clone()));
+        self.sent
+            .push_back((seq, self.lines.iter().map(|l| row_text(l)).collect()));
     }
 
     /// The rows frame `seq` left on the page, if it is recent.
@@ -3339,13 +3343,22 @@ mod tests {
     #[test]
     fn a_check_compares_with_the_frame_the_page_drew() {
         let mut shown = Shown::default();
-        shown.update(frame(10, &["A", "B"], "@1")).unwrap();
+        shown
+            .update(frame(10, &["\x1b[1;1H\x1b[31mA", "\x1b[2;1HB"], "@1"))
+            .unwrap();
         shown.sent_as(1);
-        shown.update(frame(10, &["A", "C"], "@1")).unwrap();
+        shown
+            .update(frame(10, &["\x1b[1;1H\x1b[31mA", "\x1b[2;1HC"], "@1"))
+            .unwrap();
         shown.sent_as(2);
         assert_eq!(shown.rows_after(1).map(<[String]>::len), Some(2));
         assert_ne!(shown.rows_after(1), shown.rows_after(2));
         assert!(shown.rows_after(2).unwrap()[1].ends_with('C'));
+        // Only the text is kept, and a check on it still finds drift.
+        assert!(!shown.rows_after(2).unwrap().concat().contains('\x1b'));
+        let page = vec!["A".to_string(), "B".to_string()];
+        assert!(drifted_rows(shown.rows_after(1).unwrap(), &page).is_empty());
+        assert_eq!(drifted_rows(shown.rows_after(2).unwrap(), &page), vec![1]);
         for seq in 3..=(2 + SENT_KEPT as u64) {
             shown.sent_as(seq);
         }
