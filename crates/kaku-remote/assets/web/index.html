@@ -2210,7 +2210,7 @@
     script.src = "assets/desktop.js";
     script.onload = () => {
       desktop = window.KakuDesktop.init({
-        send, toolsEl, stageEl: document.getElementById("stage"), isMac: IS_MAC, touch: TOUCH, toast, focusTerminal: () => term.focus(),
+        send, toolsEl, stageEl: document.getElementById("stage"), isMac: IS_MAC, touch: TOUCH, toast, focusTerminal: () => term.focus(), terminalKeys: LOCKED_KEYS,
       });
     };
     script.onerror = () => { desktopLoading = false; };
