@@ -1154,6 +1154,10 @@
         font: term.options.fontSize, cell_w: cell.width, cell_h: cell.height, icon: iconWidth(),
         dpr: window.devicePixelRatio, gl: !!webgl, atlas: atlasResets, past: pastOpen,
       };
+      const region = term._core?.buffer;
+      const modes = term.modes || {};
+      view.trace = `cursor ${buf.cursorX},${buf.cursorY} region ${region?.scrollTop ?? "?"}-${region?.scrollBottom ?? "?"}`
+        + ` wrap ${modes.wraparoundMode} origin ${modes.originMode} insert ${modes.insertMode}; writes ${writeTrace.join(" | ")}`;
       send({ type: "verify", frames: framesSeen, seq: appliedSeq || undefined, rows, view });
     });
   };
@@ -1588,6 +1592,49 @@
     if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows);
   };
   const CLEAR = "\x1b[0m\x1b[2J\x1b[3J";
+  // For the Mac's drift report: the last writes into xterm with the text
+  // masked (a run of letters reads `a12`, of spaces `s3`, of other
+  // characters `u2`) and escape sequences and controls kept, so the log
+  // shows what moved rows without what they said.
+  const TRACE_KEPT = 8;
+  const TRACE_CHARS = 600;
+  const writeTrace = [];
+  const maskWrite = (data) => {
+    let out = "";
+    let run = "";
+    let n = 0;
+    const flush = () => { if (n) out += run + n; run = ""; n = 0; };
+    for (let i = 0; i < data.length && out.length < TRACE_CHARS; i++) {
+      const c = data[i];
+      const code = data.charCodeAt(i);
+      if (c === "\x1b") {
+        flush();
+        let j = i + 1;
+        if (data[j] === "[") {
+          j++;
+          while (j < data.length && !(data.charCodeAt(j) >= 0x40 && data.charCodeAt(j) <= 0x7e)) j++;
+        }
+        out += "\\e" + data.slice(i + 1, j + 1);
+        i = j;
+        continue;
+      }
+      if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
+        flush();
+        out += "\\x" + code.toString(16).padStart(2, "0");
+        continue;
+      }
+      const kind = code >= 0x80 ? "u" : c === " " ? "s" : "a";
+      if (kind !== run) { flush(); run = kind; }
+      n++;
+    }
+    flush();
+    return out.length >= TRACE_CHARS ? out + "~" : out;
+  };
+  const writeTerm = (data, done) => {
+    if (writeTrace.length === TRACE_KEPT) writeTrace.shift();
+    writeTrace.push(`${framesSeen}:${maskWrite(data)}`);
+    term.write(data, done);
+  };
   let clearPending = false;
   const snapshots = new Map();
   let liveWrapped = [];
@@ -1614,7 +1661,7 @@
     if (!cursorBlink) return data;
     if (!shaped) data = cursorBlink.replace(/\d/, (n) => +n ? +n + 1 : 2) + data;
     const blink = cursorBlink;
-    cursorBlinkTimer = setTimeout(() => term.write(blink), CURSOR_IDLE_MS);
+    cursorBlinkTimer = setTimeout(() => writeTerm(blink), CURSOR_IDLE_MS);
     return data;
   };
   const sgrColor = (cell, fg) => {
@@ -1684,7 +1731,7 @@
       // waits on a timer, which Chrome runs only after the frame that
       // follows a click, and the tab showed one frame late.
       term._core?._writeBuffer?.handleUserInput?.();
-      term.write(NO_WRAP + "\x1b[?25l" + CLEAR + steadyCursor(saved.data), () => {
+      writeTerm(NO_WRAP + "\x1b[?25l" + CLEAR + steadyCursor(saved.data), () => {
         if (paneId === tab.pane_id) liveWrapped = saved.wrapped || [];
       });
     }
@@ -2387,7 +2434,7 @@
     // over a shifted copy: stale rows stayed until a reload.
     const clear = clearPending ? CLEAR : "";
     clearPending = false;
-    term.write(clear + NO_WRAP + steadyCursor(msg.data), () => {
+    writeTerm(clear + NO_WRAP + steadyCursor(msg.data), () => {
       if (ws !== socket) return;
       if (msg.pane_id === paneId) {
         if (msg.seq) appliedSeq = msg.seq;

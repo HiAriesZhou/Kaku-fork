@@ -653,9 +653,28 @@ struct PageView {
     atlas: u32,
     #[serde(default)]
     past: bool,
+    /// The page's last writes into xterm, text masked, with its cursor,
+    /// scroll region and modes, logged only with a drift report.
+    #[serde(default)]
+    trace: String,
 }
 
+/// Longest page trace a drift report carries.
+const TRACE_LOGGED: usize = 6000;
+
 impl PageView {
+    /// The page's trace for the log, cut at `TRACE_LOGGED` bytes.
+    fn trace(&self) -> &str {
+        if self.trace.len() <= TRACE_LOGGED {
+            return &self.trace;
+        }
+        let mut end = TRACE_LOGGED;
+        while !self.trace.is_char_boundary(end) {
+            end -= 1;
+        }
+        &self.trace[..end]
+    }
+
     /// One line naming how the page draws, empty for pages that do not say.
     fn drawing(&self) -> String {
         if self.font == 0.0 {
@@ -2615,7 +2634,7 @@ pub(crate) async fn run_session(
                             let pane = attached.and_then(lookup_pane);
                             let view = view.as_ref();
                             log::warn!(
-                                "kaku-remote web: screen drift in {} of {} rows (last move {}, {} frames since full, scrolled {}, alt screen {}, mouse grabbed {}); rows {:?}, page offset {:?}, page shows {}, page repeats {} rows, recent frames [{}], page grid {}x{} base {} top {} alt {}, {}; redrawing",
+                                "kaku-remote web: screen drift in {} of {} rows (last move {}, {} frames since full, scrolled {}, alt screen {}, mouse grabbed {}); rows {:?}, page offset {:?}, page shows {}, page repeats {} rows, recent frames [{}], page grid {}x{} base {} top {} alt {}, {}; page trace [{}]; redrawing",
                                 drift.len(),
                                 shown.lines.len(),
                                 shown.last_move,
@@ -2634,6 +2653,7 @@ pub(crate) async fn run_session(
                                 view.map_or(0, |v| v.top),
                                 view.is_some_and(|v| v.alt),
                                 view.map(PageView::drawing).unwrap_or_default(),
+                                view.map_or("", PageView::trace),
                             );
                             shown = Shown::default();
                             dirty_frame = true;
@@ -3343,6 +3363,19 @@ mod tests {
         assert_eq!(page_sources(&shown, &page, &drift), "0>3 1>3 2>3 3>_ 4>?");
         assert_eq!(repeated_rows(&page), 2);
         assert_eq!(repeated_rows(&rows(&["a", "b"])), 0);
+
+        // The page's trace rides along, cut on a character boundary.
+        let traced: PageView = serde_json::from_str(
+            r#"{"cols":10,"trace":"cursor 0,4 region 0-4; writes 3:\\e[5;1Ha2"}"#,
+        )
+        .unwrap();
+        assert_eq!(traced.trace(), "cursor 0,4 region 0-4; writes 3:\\e[5;1Ha2");
+        let long = PageView {
+            trace: "é".repeat(TRACE_LOGGED),
+            ..Default::default()
+        };
+        assert!(long.trace().len() <= TRACE_LOGGED && long.trace().ends_with('é'));
+        assert_eq!(PageView::default().trace(), "");
 
         let mut shown = Shown::default();
         let texts = ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"];
