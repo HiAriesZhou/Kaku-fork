@@ -1891,6 +1891,51 @@ test('the desktop view takes the Mac\'s pointer shape, its displays and dropped 
   assert.deepEqual(errors, []);
 });
 
+test('in full screen a dock at the top leads back to the terminal or out of full screen', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  const tool = p.locator('#bar .tool.desktop');
+  await tool.click();
+  await p.waitForFunction(() => document.body.classList.contains('desktop-full'), null, { timeout: 3000 });
+  const dock = p.locator('#desktop .dock');
+  // Open at first, so it is seen, over the picture and not over the bar.
+  assert.equal(await dock.evaluate(d => d.classList.contains('open')), true);
+  const back = p.locator('#desktop .dock .back');
+  assert.equal(await back.isVisible(), true);
+  const box = await back.boundingBox();
+  assert.ok(box.y < 40 && Math.abs(box.x + box.width / 2 - 500) < 120, 'top centre: ' + JSON.stringify(box));
+  assert.equal(await p.locator('#desktop .dock .screens').isVisible(), false, 'one display: no switch');
+
+  // Out of full screen: the Mac's screen stays, with the bar back.
+  await p.locator('#desktop .dock .exit').click();
+  await p.waitForFunction(() => !document.body.classList.contains('desktop-full'), null, { timeout: 3000 });
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), true);
+  assert.equal(await tool.isVisible(), true);
+  assert.equal(await dock.isVisible(), false);
+
+  // In again; after a while only the handle shows (unless the pointer is on
+  // it), and pointing at it opens it.
+  await p.mouse.move(500, 400);
+  await p.evaluate(() => document.documentElement.requestFullscreen());
+  await p.waitForFunction(() => document.body.classList.contains('desktop-full'), null, { timeout: 3000 });
+  await p.waitForFunction(() => !document.querySelector('#desktop .dock').classList.contains('open'), null, { timeout: 5000 });
+  assert.equal(await back.isVisible(), false);
+  const handle = await p.locator('#desktop .dock .handle').boundingBox();
+  await p.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+  assert.equal(await back.isVisible(), true);
+
+  // Back to the terminal: the bar shows again. (Full screen the user chose
+  // stays; one the view opened goes with it.)
+  await p.evaluate(() => { messages.length = 0; });
+  await back.click();
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop-full')), false);
+  assert.equal(await tool.isVisible(), true);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'desktop_stop').length), 1);
+  assert.deepEqual(errors, []);
+});
+
 test('picking a tab leaves the desktop view for the terminal', async t => {
   const { p } = await page(t);
   await screen(p);

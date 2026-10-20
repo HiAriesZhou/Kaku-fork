@@ -36,8 +36,25 @@
      drawn above the picture. */
   #desktop::after { content: ""; position: absolute; inset: 0; pointer-events: none; box-shadow: inset 0 0 0 2px var(--muted); opacity: 0; }
   body.dropping #desktop::after { opacity: 1; }
+  /* In full screen the bar is covered: a dock at the top centre, over the
+     notch where the Mac's menu bar has nothing, leads back. Open for a moment
+     on entering, then a short handle that opens under the pointer. */
+  #desktop .dock { position: absolute; top: 0; left: 50%; transform: translateX(-50%); z-index: 3; display: none; flex-direction: column; align-items: center; padding: 0 24px 12px; font: 13px var(--mono); }
+  body.desktop-full #desktop .dock { display: flex; }
+  #desktop .dock .handle { width: 44px; height: 5px; margin-top: 5px; border-radius: 3px; background: rgba(255,255,255,0.5); box-shadow: 0 0 0 1px rgba(0,0,0,0.3); }
+  #desktop .dock .panel { display: none; align-items: center; gap: 2px; margin-top: 6px; padding: 4px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); box-shadow: 0 6px 24px rgba(0,0,0,0.35); }
+  #desktop .dock.open .handle { display: none; }
+  #desktop .dock.open .panel { display: flex; }
+  #desktop .dock button { display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 9px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font: inherit; cursor: pointer; white-space: nowrap; }
+  #desktop .dock button:hover, #desktop .dock button:focus-visible { background: var(--tab-hover-bg); color: var(--fg); outline: none; }
+  #desktop .dock button svg { width: 14px; height: 14px; flex: none; }
+  #desktop .dock .screens { display: none; }
+  body.screens #desktop .dock .screens { display: flex; }
   `;
   const SCREENS_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.25" y="4.5" width="9" height="6.5" rx="1.25"/><path d="M4.5 4.5V3.25c0-.7.55-1.25 1.25-1.25h7.75c.7 0 1.25.55 1.25 1.25v5c0 .7-.55 1.25-1.25 1.25H10.25M4.5 13.5h3.5"/></svg>';
+  const TERMINAL_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4.5 6.5 6.5 8.25 4.5 10M8.5 10h3"/></svg>';
+  const EXIT_FULL_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M6 1v5H1M10 1v5h5M6 15v-5H1M10 15v-5h5"/></svg>';
+  const DOCK_OPEN_MS = 3000;
   const ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.75" y="2.5" width="12.5" height="8.5" rx="1.5"/><path d="M6 13.5h4M8 11v2.5"/></svg>';
 
   // Pictures the page may hold undrawn; the helper paces itself on our acks.
@@ -66,6 +83,10 @@
     const view = document.createElement("div");
     view.id = "desktop";
     view.innerHTML = '<canvas tabindex="0" aria-label="Mac screen"></canvas><textarea class="sink" tabindex="-1" aria-hidden="true" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea><div class="status"><div class="spin"></div><div class="title"></div><div class="detail"></div></div>';
+    const dock = document.createElement("div");
+    dock.className = "dock";
+    dock.innerHTML = `<div class="handle"></div><div class="panel"><button type="button" class="back">${TERMINAL_ICON}<span>Terminal</span></button><button type="button" class="screens">${SCREENS_ICON}</button><button type="button" class="exit" title="Exit Full Screen (or hold Esc)">${EXIT_FULL_ICON}</button></div>`;
+    view.append(dock);
     stageEl.append(view);
     const canvas = view.querySelector("canvas");
     // With a keyboard, focus sits in a hidden text field: only an editable
@@ -220,8 +241,24 @@
         focusView();
       }).catch(() => {});
     };
+    let dockTimer = 0;
+    const openDock = (ms) => {
+      clearTimeout(dockTimer);
+      dock.classList.add("open");
+      if (ms) dockTimer = setTimeout(() => dock.classList.remove("open"), ms);
+    };
+    dock.addEventListener("pointerenter", () => openDock(0));
+    dock.addEventListener("pointerleave", () => openDock(600));
+    dock.querySelector(".back").addEventListener("click", () => leave());
+    dock.querySelector(".screens").addEventListener("click", () => nextDisplay());
+    dock.querySelector(".exit").addEventListener("click", () => {
+      document.exitFullscreen().catch(() => {});
+      focusView();
+    });
     const syncFullscreen = () => {
-      document.body.classList.toggle("desktop-full", active && !!document.fullscreenElement);
+      const full = active && !!document.fullscreenElement;
+      if (full && !document.body.classList.contains("desktop-full")) openDock(DOCK_OPEN_MS);
+      document.body.classList.toggle("desktop-full", full);
       if (!document.fullscreenElement) ownFullscreen = false;
     };
     document.addEventListener("fullscreenchange", syncFullscreen);
@@ -359,8 +396,9 @@
       const at = Math.max(0, displays.findIndex((d) => d.id === shownDisplay));
       const next = displays[(at + 1) % displays.length];
       screens.title = `Showing ${displays[at].name}. Switch to ${next.name}`;
+      dock.querySelector(".screens").title = screens.title;
     };
-    screens.addEventListener("click", () => {
+    const nextDisplay = () => {
       if (!active || displays.length < 2) return;
       const at = Math.max(0, displays.findIndex((d) => d.id === shownDisplay));
       chosenDisplay = displays[(at + 1) % displays.length].id;
@@ -368,7 +406,8 @@
       releaseAll();
       start();
       focusView();
-    });
+    };
+    screens.addEventListener("click", nextDisplay);
 
     // The Mac's pointer shape (an I-beam over text, a resize arrow at a
     // window's edge) on the page's own pointer, drawn at twice its size.
