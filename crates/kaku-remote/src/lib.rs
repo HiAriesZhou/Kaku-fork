@@ -373,6 +373,10 @@ const DEFAULT_PAGE: &str = "https://t.kaku.fun";
 /// Whether the bridge is serving; it follows `remote.enabled` on reload.
 static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static WEB_DIRTY: std::sync::OnceLock<web::WebDirty> = std::sync::OnceLock::new();
+/// This Kaku's hold on `remote.lock`, kept until it quits. flock locks
+/// belong to the open file, so opening it again in this process to turn
+/// remote access back on would conflict with this hold and wait on itself.
+static SOLE_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
 
 /// Called once at GUI startup. Remote access stays off until the user turns
 /// it on (`kaku remote` writes `remote.enabled`); the bridge then starts on
@@ -457,12 +461,9 @@ fn follow_config() {
 /// `kaku remote` reads. It now waits for the first to quit and takes over.
 fn launch_when_sole() {
     let path = config::DATA_DIR.join("remote.lock");
-    match try_sole_lock(&path) {
-        Ok(Some(lock)) => {
-            std::mem::forget(lock);
-            launch();
-        }
-        Ok(None) => {
+    match hold_sole_lock(&SOLE_LOCK, &path) {
+        Ok(true) => launch(),
+        Ok(false) => {
             log::info!(
                 "kaku-remote: another Kaku serves remote access; this one takes over when it quits"
             );
@@ -470,7 +471,7 @@ fn launch_when_sole() {
                 .name("kaku-remote-wait".to_string())
                 .spawn(move || match wait_sole_lock(&path) {
                     Ok(lock) => {
-                        std::mem::forget(lock);
+                        let _ = SOLE_LOCK.set(lock);
                         if configuration().remote.enabled {
                             launch();
                         } else {
@@ -502,6 +503,24 @@ fn open_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
         .write(true)
         .open(path)
         .with_context(|| format!("open {}", path.display()))
+}
+
+/// Whether this process holds the lock, taking it when no other process
+/// does. Once taken it stays in `held`, so a later call reuses it.
+fn hold_sole_lock(
+    held: &std::sync::OnceLock<std::fs::File>,
+    path: &std::path::Path,
+) -> anyhow::Result<bool> {
+    if held.get().is_some() {
+        return Ok(true);
+    }
+    match try_sole_lock(path)? {
+        Some(file) => {
+            let _ = held.set(file);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// The lock if no other process holds it. It is released when the returned
@@ -658,6 +677,20 @@ mod relay_status_tests {
             .is_err());
         drop(first);
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn turning_remote_access_back_on_reuses_this_kakus_lock() {
+        let dir = std::env::temp_dir().join(format!("kaku-remote-relock-{}", std::process::id()));
+        let path = dir.join("remote.lock");
+        let held = std::sync::OnceLock::new();
+        assert!(hold_sole_lock(&held, &path).unwrap());
+        // Off and on again in the same Kaku: it must not wait on itself.
+        assert!(hold_sole_lock(&held, &path).unwrap());
+        // Another Kaku still waits.
+        let other = std::sync::OnceLock::new();
+        assert!(!hold_sole_lock(&other, &path).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 
