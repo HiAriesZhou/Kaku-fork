@@ -421,6 +421,102 @@ test('local token stays tab-only', async t => {
   assert.ok(await p.evaluate(() => sessionStorage.getItem('kaku.link:/')));
 });
 
+test('image paths preview after 300ms and cancel on leave without downloading', async t => {
+  const { p, errors } = await page(t);
+  await screen(p, '~/Desktop/shot.png');
+  await p.evaluate(() => new Promise(resolve => testLinkProvider.provideLinks(1, links => {
+    window.previewLink = links[0];
+    previewLink.hover({ clientX: 980, clientY: 580, buttons: 0 });
+    resolve();
+  })));
+  await p.waitForTimeout(180);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
+  await p.waitForFunction(() => messages.some(m => m.type === 'download'));
+  const request = await p.evaluate(() => messages.find(m => m.type === 'download'));
+  assert.equal(request.path, '~/Desktop/shot.png');
+  assert.equal(request.pane_id, 1);
+  let saves = 0;
+  p.on('download', () => saves++);
+  await p.evaluate(id => {
+    probe.handle({ type: 'file_start', id, name: 'shot.png', size: 68 });
+    probe.handle({ type: 'file_chunk', id, data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aCFsAAAAASUVORK5CYII=' });
+    probe.handle({ type: 'file_end', id });
+  }, request.id);
+  await p.waitForFunction(() => !document.querySelector('#image-preview').hidden);
+  const box = await p.locator('#image-preview').boundingBox();
+  assert.ok(box.x >= 12 && box.y >= 12 && box.x + box.width <= 988 && box.y + box.height <= 588);
+  assert.equal(saves, 0);
+  await p.evaluate(() => previewLink.leave());
+  assert.equal(await p.locator('#image-preview').isVisible(), false);
+  assert.equal(await p.locator('#image-preview').getAttribute('src'), null);
+  await p.evaluate(() => {
+    messages.length = 0;
+    previewLink.hover({ clientX: 100, clientY: 100, buttons: 0 });
+    previewLink.leave();
+  });
+  await p.waitForTimeout(350);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
+  await p.evaluate(() => previewLink.hover({ clientX: 100, clientY: 100, buttons: 1 }));
+  await p.waitForTimeout(350);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
+  assert.deepEqual(errors, []);
+});
+
+test('revoking a connection clears an already displayed image preview', async t => {
+  const { p, errors } = await page(t);
+  await screen(p, '/tmp/preview.png');
+  await p.evaluate(() => new Promise(resolve => testLinkProvider.provideLinks(1, links => {
+    links[0].hover({ clientX: 100, clientY: 100, buttons: 0 });
+    resolve();
+  })));
+  await p.waitForFunction(() => messages.some(m => m.type === 'download'));
+  await p.evaluate(() => {
+    const id = messages.find(m => m.type === 'download').id;
+    probe.handle({ type: 'file_chunk', id, data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aCFsAAAAASUVORK5CYII=' });
+    probe.handle({ type: 'file_end', id });
+  });
+  await p.waitForFunction(() => !document.querySelector('#image-preview').hidden);
+  await p.evaluate(() => connections.at(-1).close(1008));
+  assert.equal(await p.locator('#image-preview').isVisible(), false);
+  assert.equal(await p.locator('#image-preview').getAttribute('src'), null);
+  assert.deepEqual(errors, []);
+});
+
+test('real mouse hover previews an image and leaving cancels the transfer', async t => {
+  const { p, errors } = await page(t);
+  await screen(p, '/tmp/preview.png');
+  const box = await p.locator('.xterm-screen').boundingBox();
+  const cell = await p.evaluate(() => probe.term._core._renderService.dimensions.css.cell);
+  await p.mouse.move(box.x + cell.width * 5, box.y + cell.height / 2);
+  await p.waitForFunction(() => messages.some(m => m.type === 'download'));
+  const id = await p.evaluate(() => messages.find(m => m.type === 'download').id);
+  await p.mouse.move(box.x + cell.width * 30, box.y + cell.height * 3);
+  await p.waitForFunction(id => messages.some(m => m.type === 'download_cancel' && m.id === id), id);
+  assert.equal(await p.locator('#image-preview').isVisible(), false);
+  assert.deepEqual(errors, []);
+});
+
+test('image preview rejects large files and ignores late replies after cancellation', async t => {
+  const { p, errors } = await page(t);
+  await screen(p, '/tmp/photo.webp');
+  await p.evaluate(() => new Promise(resolve => testLinkProvider.provideLinks(1, links => {
+    window.previewLink = links[0];
+    previewLink.hover({ clientX: 40, clientY: 40, buttons: 0 });
+    resolve();
+  })));
+  await p.waitForFunction(() => messages.some(m => m.type === 'download'));
+  const id = await p.evaluate(() => messages.find(m => m.type === 'download').id);
+  await p.evaluate(id => {
+    probe.handle({ type: 'file_start', id, name: 'photo.webp', size: 9 * 1024 * 1024 });
+    probe.handle({ type: 'file_chunk', id, data: 'YWJj' });
+    probe.handle({ type: 'file_end', id });
+  }, id);
+  assert.ok(await p.evaluate(id => messages.some(m => m.type === 'download_cancel' && m.id === id), id));
+  assert.equal(await p.locator('#image-preview').isVisible(), false);
+  assert.equal(await p.evaluate(() => messages.some(m => m.type === 'download_ack')), false);
+  assert.deepEqual(errors, []);
+});
+
 test('authentication rejection stops reconnecting', async t => {
   const { p } = await page(t);
   await screen(p);

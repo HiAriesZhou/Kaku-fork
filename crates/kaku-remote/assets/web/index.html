@@ -25,6 +25,7 @@
   /* The tab bar follows Kaku's own: monospace titles, the active tab as a
      filled block in Kaku's tab colors, no rule between it and the terminal. */
   :root { --mono: "Kaku Mono", monospace; --bar-bg: var(--bg); --tab-fg: var(--muted); --tab-active-bg: rgba(255,255,255,0.08); --tab-active-fg: var(--fg); --tab-hover-bg: rgba(255,255,255,0.05); --tab-hover-fg: var(--fg); }
+  #image-preview { box-sizing: border-box; position: fixed; z-index: 30; pointer-events: none; max-width: min(420px, calc(100vw - 24px)); max-height: min(320px, calc(100vh - 24px)); object-fit: contain; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 8px 24px #0004; }
   body.tabs-bottom #bar { order: 2; }
   #bar { display: flex; align-items: stretch; height: var(--bar-h, 32px); padding: 0; background: var(--bar-bg); flex: none; font: var(--bar-font, 15px) var(--mono); }
   /* Tabs scroll sideways when they do not fit; a fade at either end says
@@ -738,6 +739,8 @@
         links.push({
           range: range(m.index, path.length),
           text: path,
+          hover: (ev) => previewImage(ev, path),
+          leave: () => hideImagePreview(),
           activate: (ev, path) => {
             if (ev.metaKey || ev.ctrlKey) download(path);
           },
@@ -2704,6 +2707,48 @@
   // the page saves the whole file through the browser's downloads.
   let downloadSeq = 0;
   const incoming = new Map();
+  // Image paths preview after 300ms; use the authenticated file channel,
+  // and cancel the transfer as soon as the pointer leaves the path.
+  const previewEl = document.createElement("img");
+  previewEl.id = "image-preview";
+  previewEl.alt = "";
+  previewEl.hidden = true;
+  document.body.append(previewEl);
+  let previewTimer = 0, previewId = null, previewUrl = null;
+  const PREVIEW_LIMIT = 8 * 1024 * 1024;
+  const hideImagePreview = () => {
+    clearTimeout(previewTimer);
+    if (previewId !== null) {
+      incoming.delete(previewId);
+      send({ type: "download_cancel", id: previewId });
+      previewId = null;
+    }
+    previewEl.onload = previewEl.onerror = null;
+    previewEl.hidden = true;
+    previewEl.removeAttribute("src");
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = null;
+  };
+  const previewImage = (ev, path) => {
+    hideImagePreview();
+    if (ev.buttons || !/\.(png|jpe?g|gif|webp|avif|bmp|ico)$/i.test(path) || term.hasSelection()) return;
+    const x = ev.clientX, y = ev.clientY, target = paneId;
+    previewTimer = setTimeout(() => {
+      if (target !== paneId || term.hasSelection() || !ws || ws.readyState !== WebSocket.OPEN) return;
+      const id = ++downloadSeq;
+      previewId = id;
+      incoming.set(id, { preview: { x, y, target }, parts: [], received: 0 });
+      send({ type: "download", id, path, pane_id: target });
+    }, 300);
+  };
+  document.addEventListener("pointerdown", hideImagePreview, true);
+  document.addEventListener("keydown", hideImagePreview, true);
+  document.addEventListener("wheel", hideImagePreview, { capture: true, passive: true });
+  document.addEventListener("scroll", hideImagePreview, true);
+  window.addEventListener("blur", hideImagePreview);
+  window.addEventListener("resize", hideImagePreview);
+  document.addEventListener("visibilitychange", hideImagePreview);
+  term.onSelectionChange(hideImagePreview);
   const download = (path) => {
     const id = ++downloadSeq;
     incoming.set(id, { path, name: path.split("/").pop(), size: 0, received: 0, parts: [] });
@@ -2719,6 +2764,31 @@
   const onFile = (msg) => {
     const file = incoming.get(msg.id);
     if (!file) return;
+    if (file.preview) {
+      if (file.preview.target !== paneId || (msg.type === "file_start" && msg.size > PREVIEW_LIMIT)) {
+        hideImagePreview();
+      } else if (msg.type === "file_chunk") {
+        const bytes = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
+        file.received += bytes.length;
+        if (file.received > PREVIEW_LIMIT) { hideImagePreview(); return; }
+        file.parts.push(bytes);
+        send({ type: "download_ack", id: msg.id, received: file.received });
+      } else if (msg.type === "file_end") {
+        incoming.delete(msg.id);
+        previewUrl = URL.createObjectURL(new Blob(file.parts));
+        previewEl.onload = () => {
+          if (previewId !== msg.id || file.preview.target !== paneId) { hideImagePreview(); return; }
+          previewEl.hidden = false;
+          const box = previewEl.getBoundingClientRect();
+          previewEl.style.left = Math.max(12, Math.min(file.preview.x + 12, innerWidth - box.width - 12)) + "px";
+          previewEl.style.top = Math.max(12, file.preview.y + 16 + box.height <= innerHeight - 12
+            ? file.preview.y + 16 : file.preview.y - box.height - 16) + "px";
+        };
+        previewEl.onerror = hideImagePreview;
+        previewEl.src = previewUrl;
+      } else if (msg.type === "file_error") hideImagePreview();
+      return;
+    }
     if (file.font) {
       if (msg.type === "file_chunk") {
         const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
@@ -3010,6 +3080,7 @@
     };
     socket.onclose = (ev) => {
       if (ws !== socket) return;
+      hideImagePreview();
       clearTimeout(handshakeTimer);
       stopScrolling();
       closePast();
