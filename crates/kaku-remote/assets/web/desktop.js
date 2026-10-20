@@ -55,14 +55,47 @@
   const init = (api) => {
     const { send: rawSend, toolsEl, stageEl, isMac, toast, focusTerminal } = api;
     // Timings for the Mac's log, every ten seconds while the screen shows:
-    // how long a picture takes to decode, and a click or key press to show.
+    // decoding, input posting and the first picture captured after posting.
+    // A later capture does not prove the application handled the input.
     const REPORT_MS = 10000;
-    const report = { drawn: 0, decode: [], input: [] };
+    const report = { drawn: 0, decode: [], input: [], post: [], queue: [], unposted: 0, unframed: 0, cancelled: 0 };
     const decodeAt = new Map();
-    let inputAt = null;
+    const pendingInputs = new Map();
+    let inputSeq = 0;
+    let supportsInputTiming = false;
+    const INPUT_DEADLINE_MS = 30000;
+    const retireInput = (seq, input, cancelled = false) => {
+      if (supportsInputTiming || input.posted) report[cancelled ? "cancelled" : input.posted ? "unframed" : "unposted"]++;
+      pendingInputs.delete(seq);
+    };
+    const cancelInputs = () => {
+      for (const [seq, input] of pendingInputs) retireInput(seq, input, true);
+    };
     const send = (msg) => {
-      if (msg.down === true || (msg.type === "desktop_pointer" && msg.kind === "down")) inputAt ??= performance.now();
+      if (msg.down === true || (msg.type === "desktop_pointer" && msg.kind === "down")) {
+        msg = { ...msg, input_seq: ++inputSeq };
+        pendingInputs.set(inputSeq, { at: performance.now(), posted: false });
+        // Older helpers never acknowledge input; bound their pending history.
+        if (pendingInputs.size > 1024) {
+          const [seq, input] = pendingInputs.entries().next().value;
+          retireInput(seq, input);
+        }
+      }
       rawSend(msg);
+    };
+    const settleInput = (seq, input) => {
+      if (!input.posted || input.frameAt === undefined) return;
+      report.input.push(input.frameAt - input.at);
+      pendingInputs.delete(seq);
+    };
+    const onInputAck = (msg) => {
+      const input = pendingInputs.get(msg.input_seq);
+      if (!input || input.posted) return;
+      supportsInputTiming = true;
+      input.posted = true;
+      report.post.push(performance.now() - input.at);
+      if (Number.isFinite(msg.queue_ms) && msg.queue_ms >= 0) report.queue.push(msg.queue_ms);
+      settleInput(msg.input_seq, input);
     };
     const quantile = (list, q) => {
       if (!list.length) return 0;
@@ -71,20 +104,32 @@
     };
     const round = (n) => Math.round(n * 10) / 10;
     const sendReport = () => {
-      if (!report.drawn) return;
+      const now = performance.now();
+      for (const [seq, input] of pendingInputs) {
+        if (now - input.at >= INPUT_DEADLINE_MS) retireInput(seq, input);
+      }
+      if (!report.drawn && !report.post.length && !report.input.length && !report.unposted && !report.unframed && !report.cancelled) return;
       rawSend({
         type: "desktop_report",
         drawn: report.drawn,
         decode_p50: round(quantile(report.decode, 0.5)),
         decode_max: round(Math.max(0, ...report.decode)),
-        clicks: report.input.length,
-        click_p50: round(quantile(report.input, 0.5)),
-        click_max: round(Math.max(0, ...report.input)),
+        ...(report.post.length ? { posted: report.post.length,
+          post_p50: round(quantile(report.post, 0.5)), post_max: round(Math.max(...report.post)) } : {}),
+        ...(report.queue.length ? { queue_p50: round(quantile(report.queue, 0.5)), queue_max: round(Math.max(...report.queue)) } : {}),
+        ...(report.input.length ? { inputs: report.input.length,
+          input_frame_p50: round(quantile(report.input, 0.5)), input_frame_max: round(Math.max(...report.input)) } : {}),
+        ...(report.unposted ? { input_unposted: report.unposted } : {}),
+        ...(report.unframed ? { input_unframed: report.unframed } : {}),
+        ...(report.cancelled ? { input_cancelled: report.cancelled } : {}),
         view: `${view.clientWidth}x${view.clientHeight}@${round(window.devicePixelRatio || 1)}`,
       });
       report.drawn = 0;
       report.decode = [];
       report.input = [];
+      report.post = [];
+      report.queue = [];
+      report.unposted = report.unframed = report.cancelled = 0;
     };
     let reportTimer = 0;
     // The page's own reading of the screen, so both agree on touch.
@@ -125,6 +170,10 @@
 
     let active = false;
     let decoder = null;
+    let decoderGeneration = 0;
+    let streamId = null;
+    let awaitingStream = false;
+    let earlyStream = null;
     let configured = "";
     let haveKey = false;
     let videoW = 0;
@@ -228,6 +277,8 @@
     };
 
     const closeDecoder = () => {
+      decoderGeneration++;
+      decodeAt.clear();
       if (decoder && decoder.state !== "closed") { try { decoder.close(); } catch (_) {} }
       decoder = null;
       configured = "";
@@ -239,7 +290,11 @@
     // Coming back to the same display keeps the last picture up until the
     // new stream's first one replaces it, instead of a black screen.
     const start = (keep = true) => {
+      cancelInputs();
+      supportsInputTiming = false;
       closeDecoder();
+      awaitingStream = true;
+      earlyStream = null;
       setZoom(1, 0, 0);
       fresh = false;
       if (!supported()) {
@@ -282,6 +337,7 @@
 
     const enter = () => {
       if (active) return;
+      api.beforeEnter?.();
       active = true;
       document.body.classList.add("desktop");
       syncButton();
@@ -304,6 +360,7 @@
       if (copyWait) copyWait.reject(new Error("left"));
       clearTimeout(resizeTimer);
       clearInterval(reportTimer);
+      cancelInputs();
       sendReport();
       releaseAll();
       send({ type: "desktop_stop" });
@@ -333,11 +390,11 @@
     document.getElementById("tabs")?.addEventListener("click", () => { if (active) leave(); }, true);
     document.addEventListener("visibilitychange", () => {
       if (!active) return;
-      if (document.hidden) { releaseAll(); send({ type: "desktop_stop" }); closeDecoder(); }
+      if (document.hidden) { releaseAll(); cancelInputs(); sendReport(); send({ type: "desktop_stop" }); closeDecoder(); }
       else start();
     });
 
-    const ack = (seq) => send({ type: "desktop_ack", seq });
+    const ack = (seq, id) => send({ type: "desktop_ack", seq, ...(id ? { stream_id: id } : {}) });
     const wantKey = () => {
       haveKey = false;
       send({ type: "desktop_keyframe" });
@@ -357,8 +414,11 @@
         } catch (_) {}
       }
       closeDecoder();
+      const generation = decoderGeneration;
+      const decodingStream = streamId;
       decoder = new VideoDecoder({
         output: (frame) => {
+          if (generation !== decoderGeneration || !active || document.hidden) { frame.close(); return; }
           const seq = frame.timestamp;
           if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
             canvas.width = frame.displayWidth;
@@ -370,18 +430,31 @@
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
           frame.close();
           const now = performance.now();
-          const at = decodeAt.get(seq);
-          if (at !== undefined) { report.decode.push(now - at); decodeAt.delete(seq); }
-          // A click that changed nothing shows no picture of its own.
-          if (inputAt !== null) { if (now - inputAt < 1000) report.input.push(now - inputAt); inputAt = null; }
+          const timing = decodeAt.get(seq);
+          if (timing) {
+            report.decode.push(now - timing.at);
+            decodeAt.delete(seq);
+            // A cumulative watermark only advances for captures after posting.
+            // An old helper's unrelated next frame carries no such evidence.
+            if (Number.isSafeInteger(timing.inputSeq) && timing.inputSeq > 0) {
+              for (const [id, input] of pendingInputs) {
+                if (id > timing.inputSeq) break;
+                // Text acknowledgments and frames cross separate host queues.
+                // Keep the first frame time even when its post ack comes later.
+                if (input.frameAt === undefined) input.frameAt = now;
+                settleInput(id, input);
+              }
+            }
+          }
           report.drawn++;
           lastDrawn = seq;
           hasPicture = true;
           fresh = true;
           if (!view.classList.contains("live")) view.classList.add("live");
-          ack(seq);
+          ack(seq, decodingStream);
         },
         error: (e) => {
+          if (generation !== decoderGeneration) return;
           console.warn("kaku desktop decoder", e);
           closeDecoder();
           if (active && !document.hidden) wantKey();
@@ -406,22 +479,28 @@
     };
 
     const onFrame = (msg) => {
-      if (!active || document.hidden) { ack(msg.seq); return; }
+      if (!active || document.hidden) { ack(msg.seq, msg.stream_id); return; }
+      const incomingStream = typeof msg.stream_id === "string" ? msg.stream_id : null;
+      if (incomingStream !== streamId || (awaitingStream && streamId !== null)) {
+        earlyStream = incomingStream;
+        ack(msg.seq, msg.stream_id);
+        return;
+      }
       if (msg.key) {
-        if (!msg.codec || !msg.desc) { ack(msg.seq); return; }
-        if (!ensureDecoder(msg.codec, msg.desc)) { ack(msg.seq); return; }
+        if (!msg.codec || !msg.desc) { ack(msg.seq, msg.stream_id); return; }
+        if (!ensureDecoder(msg.codec, msg.desc)) { ack(msg.seq, msg.stream_id); return; }
         haveKey = true;
       } else if (!haveKey || !decoder) {
         // A picture that depends on one this decoder never saw.
-        ack(msg.seq);
+        ack(msg.seq, msg.stream_id);
         return;
       }
       if (decodeAt.size > 64) decodeAt.clear();
-      decodeAt.set(msg.seq, performance.now());
+      decodeAt.set(msg.seq, { at: performance.now(), inputSeq: msg.input_seq });
       try {
         decoder.decode(new EncodedVideoChunk({ type: msg.key ? "key" : "delta", timestamp: msg.seq, data: msg.bytes || b64(msg.data) }));
       } catch (e) {
-        ack(msg.seq);
+        ack(msg.seq, msg.stream_id);
         wantKey();
       }
     };
@@ -463,6 +542,20 @@
     const onStatus = (msg) => {
       if (!active) return;
       if (msg.state === "streaming") {
+        const nextStream = typeof msg.stream_id === "string" ? msg.stream_id : null;
+        if (awaitingStream && nextStream !== null && nextStream === streamId) return;
+        if (nextStream !== streamId) {
+          closeDecoder();
+          cancelInputs();
+          supportsInputTiming = nextStream !== null;
+          fresh = false;
+          streamId = nextStream;
+          // A frame can overtake status in the host's separate queues. It was
+          // acknowledged without decoding; request a usable keyframe now.
+          if (earlyStream === nextStream) wantKey();
+        }
+        awaitingStream = false;
+        earlyStream = null;
         canControl = msg.control !== false;
         displays = Array.isArray(msg.displays) ? msg.displays : [];
         shownDisplay = msg.display || 0;
@@ -517,6 +610,9 @@
       send({ type: "desktop_pointer", kind, x: p.x, y: p.y, button, ...mods(ev) });
     };
     const releaseButtons = () => {
+      cancelAnimationFrame(moveFrame);
+      moveFrame = 0;
+      pendingMove = null;
       for (const b of held) send({ type: "desktop_pointer", kind: "up", x: lastPoint.x, y: lastPoint.y, button: b });
       held.clear();
     };
@@ -648,8 +744,12 @@
     };
     canvas.addEventListener("pointerup", endPointer);
     canvas.addEventListener("pointercancel", (ev) => {
-      if (ev.pointerType === "touch") { touches.delete(ev.pointerId); if (touchPlan?.timer) clearTimeout(touchPlan.timer); touchPlan = null; }
-      else releaseButtons();
+      if (ev.pointerType === "touch") {
+        touches.clear();
+        if (touchPlan?.timer) clearTimeout(touchPlan.timer);
+        touchPlan = null;
+      }
+      releaseButtons();
     });
     canvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
 
@@ -749,6 +849,12 @@
     // Keys and buttons still held when the view goes away would stay down
     // on the Mac.
     const releaseAll = () => {
+      touches.clear();
+      if (touchPlan?.timer) clearTimeout(touchPlan.timer);
+      touchPlan = null;
+      if (wheelFrame) cancelAnimationFrame(wheelFrame);
+      wheelFrame = 0;
+      wheel = null;
       for (const code of pressed) send({ type: "desktop_key", code: isMac ? code : SWAP[code] || code, down: false });
       pressed.clear();
       releaseButtons();
@@ -779,6 +885,7 @@
       handle(msg) {
         if (msg.type === "desktop_frame") onFrame(msg);
         else if (msg.type === "desktop_status") onStatus(msg);
+        else if (msg.type === "desktop_input_ack") onInputAck(msg);
         else if (msg.type === "desktop_clipboard") onClipboard(msg);
         else if (msg.type === "desktop_cursor") onCursor(msg);
       },

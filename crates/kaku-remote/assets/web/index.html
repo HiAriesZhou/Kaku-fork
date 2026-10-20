@@ -488,6 +488,7 @@
       const out = await seal(conn, json);
       if (socket.readyState === WebSocket.OPEN) socket.send(out);
     }).catch(() => {});
+    return sendChain;
   };
   let notThisMac = null;
   let linkExpired = null;
@@ -869,7 +870,7 @@
   setInterval(densityChanged, 2000);
   // Coming back to the page means using it here: claim the tab's size again,
   // in case the Mac took it back meanwhile.
-  const reclaim = () => { claimed = ""; fit(); };
+  const reclaim = () => { if (desktop?.active) return; claimed = ""; fit(); };
   window.addEventListener("focus", reclaim);
   // A press anywhere on the page means this side is in use, as a click in
   // the Mac window is for the Mac.
@@ -1426,6 +1427,7 @@
   const showHistoryButton = () => { historyBtn.style.display = serverScrolled || pastOpen ? "block" : "none"; };
 
   stage.addEventListener("wheel", (ev) => {
+    if (desktop?.active) return;
     ev.preventDefault();
     ev.stopPropagation();
     const lineHeight = rowHeight();
@@ -1488,6 +1490,7 @@
   let pinchRatio = 1;
   const fingerGap = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
   stage.addEventListener("touchstart", (ev) => {
+    if (desktop?.active) return;
     cancelAnimationFrame(flingFrame);
     if (ev.touches.length === 2 && TOUCH) {
       touchY = null;
@@ -1502,6 +1505,7 @@
     touchAt = performance.now();
   }, { passive: true, capture: true });
   stage.addEventListener("touchmove", (ev) => {
+    if (desktop?.active) return;
     if (pinchFrom && ev.touches.length === 2) {
       ev.preventDefault();
       pinchRatio = Math.max(0.5, Math.min(2, fingerGap(ev.touches) / pinchFrom));
@@ -1523,6 +1527,7 @@
     scrollInput(dy);
   }, { passive: false, capture: true });
   stage.addEventListener("touchend", (ev) => {
+    if (desktop?.active) return;
     if (pinchFrom) {
       if (ev.touches.length) return;
       pinchFrom = 0;
@@ -1554,6 +1559,7 @@
   // pinch preview and the drag, or the next one-finger touchend would apply
   // the stale pinch scale.
   stage.addEventListener("touchcancel", () => {
+    if (desktop?.active) return;
     pinchFrom = 0;
     pinchRatio = 1;
     termEl.style.transform = "";
@@ -2261,6 +2267,13 @@
     script.onload = () => {
       desktop = window.KakuDesktop.init({
         send, toolsEl, stageEl: document.getElementById("stage"), isMac: IS_MAC, touch: TOUCH, toast, focusTerminal: () => term.focus(), terminalKeys: LOCKED_KEYS,
+        beforeEnter: () => {
+          stopScrolling();
+          closePast();
+          pinchFrom = 0;
+          pinchRatio = 1;
+          termEl.style.transform = "";
+        },
       });
     };
     script.onerror = () => { desktopLoading = false; };
@@ -2831,7 +2844,19 @@
   };
   let uploadSeq = 0;
   const uploadWaiters = new Map();
-  const CHUNK = 64 * 1024;
+  const CHUNK = 16 * 1024;
+  const UPLOAD_WINDOW = 512 * 1024;
+  // Keep the acknowledged window large for high RTT, but do not fill a slow
+  // browser socket with bulk data ahead of keys. This cannot measure bytes
+  // already accepted by a proxy or the OS, only the browser's writable queue.
+  const uploadWritable = async (socket, cancelled) => {
+    const deadline = performance.now() + 30000;
+    while (socket.bufferedAmount > CHUNK) {
+      if (cancelled() || ws !== socket || socket.readyState !== WebSocket.OPEN || performance.now() >= deadline) return false;
+      await sleep(8);
+    }
+    return !cancelled() && ws === socket && socket.readyState === WebSocket.OPEN;
+  };
   const toBase64 = (buf) => {
     let s = "";
     const bytes = new Uint8Array(buf);
@@ -2867,18 +2892,21 @@
     };
     try {
       send({ type: "upload_start", id, name, size: file.size, transfer, pane_id: target, paste });
-      // Eight small chunks in flight keep the original 512 KB window while
-      // giving interactive keys a chance between chunks on the shared link.
-      for (let off = 0; off < file.size; off += CHUNK * 8) {
-        const end = Math.min(file.size, off + CHUNK * 8);
+      // Small writes yield between chunks without shrinking the 512 KB
+      // acknowledged window. Await encryption so it cannot bypass the socket
+      // queue limit; unrelated input keeps its place in the same ordered chain.
+      for (let off = 0; off < file.size; off += UPLOAD_WINDOW) {
+        const end = Math.min(file.size, off + UPLOAD_WINDOW);
         const acked = new Promise(resolve => uploadAcks.set(id, received => {
           toast(`Sending ${name} ${Math.round((received / file.size) * 100)}%`, true);
           if (received >= end) resolve(received);
         }));
         for (let pos = off; pos < end; pos += CHUNK) {
+          if (!await uploadWritable(socket, () => result)) return result;
           const data = toBase64(await file.slice(pos, Math.min(pos + CHUNK, end)).arrayBuffer());
           if (result || ws !== socket || socket.readyState !== WebSocket.OPEN) return result;
-          send({ type: "upload_chunk", id, data });
+          const sent = await wait([Promise.resolve(send({ type: "upload_chunk", id, data })), done], 30000);
+          if (sent === null || result || ws !== socket) return result;
         }
         const received = await wait([acked, done], 30000);
         if (result) return result;

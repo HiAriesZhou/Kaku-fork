@@ -39,7 +39,7 @@ async function page(t, hash = '#t=fixture', options = {}, context = browser) {
   });
   const html = fs.readFileSync(process.env.KAKU_WEB_SOURCE || path.join(root, 'crates/kaku-remote/assets/web/index.html'), 'utf8')
     .replace('term.registerLinkProvider({', 'term.registerLinkProvider(window.testLinkProvider = {')
-    .replace(/\}\)\(\);\s*<\/script>/, 'window.probe = {term, handle, attach, openPast, onHistory, pastScroll, sendFile, sendFiles, snapshots, download};\n})();\n</script>');
+    .replace(/\}\)\(\);\s*<\/script>/, 'window.probe = {term, handle, attach, openPast, onHistory, pastScroll, sendFile, sendFiles, sendOnce, snapshots, download, get desktop() { return desktop; }};\n})();\n</script>');
   await p.route('http://localhost:9988/**', route => {
     const name = new URL(route.request().url()).pathname.split('/').pop();
     if (!name) return route.fulfill({ contentType: 'text/html', body: html });
@@ -168,6 +168,8 @@ async function handshake(p, signer, { admit = true, secret = null, tag = secret 
       const frame = new Uint8Array(12 + data.length); frame.set(iv); frame.set(data, 12);
       socket.onmessage({ data: frame.buffer });
     };
+    window.readPage = async (frame, seq) => JSON.parse(dec.decode(await sub.decrypt(
+      { name: 'AES-GCM', iv: frame.slice(0, 12), additionalData: aad('kaku-web c2h', seq) }, toHost, frame.slice(12))));
     await sleep(50);
     return { proof, signed, paired };
   }, { pkcs8: signer.pkcs8, pub: signer.pub.toString('base64url'), secret: secret && secret.toString('base64url'), tag: tag && tag.toString('base64url'), admit });
@@ -850,6 +852,68 @@ test('history selection survives scrolling and older-page insertion', async t =>
   assert.equal(result.afterPrepend, result.before);
 });
 
+test('an upload waiting for relay authentication settles when its socket closes', async t => {
+  const mac = await newMac(), secret = Buffer.alloc(16, 31);
+  const { p } = await page(t, pairingLink(mac, secret));
+  await p.evaluate(() => {
+    const socket = connections.at(-1);
+    window.uploadSettled = false;
+    probe.sendOnce(new File(['waiting'], 'waiting.txt'), 'waiting.txt', socket, 'fixture', 1, false)
+      .then(value => { uploadSettled = value === null; });
+    setTimeout(() => socket.close(), 40);
+  });
+  await p.waitForFunction(() => uploadSettled, null, { timeout: 1500 });
+});
+
+for (const eager of [false, true]) test((eager ? 'an eager socket exposes downstream buffering' : 'a slow encrypted upload leaves room for keyboard input') + ' without breaking message order', async t => {
+  const mac = await newMac(), secret = Buffer.alloc(16, 23);
+  const { p, errors } = await page(t, pairingLink(mac, secret));
+  await handshake(p, mac, { secret });
+  await screen(p);
+  await p.waitForTimeout(50);
+  await p.evaluate(eager => {
+    const socket = connections.at(-1), original = socket.send.bind(socket);
+    const bytesPerMs = 250; // A deterministic 2 Mbps writable socket, not a network benchmark.
+    let writtenUntil = performance.now(), chain = Promise.resolve(), received = 0, typedAt = null;
+    window.uploadProbe = { messages: [], delays: [], failures: [] };
+    Object.defineProperty(socket, 'bufferedAmount', { get: () => eager ? 0 : Math.max(0, writtenUntil - performance.now()) * bytesPerMs });
+    socket.send = data => {
+      const seq = socket.binary.length - 1;
+      original(data);
+      writtenUntil = Math.max(writtenUntil, performance.now()) + data.byteLength / bytesPerMs;
+      const wireAt = writtenUntil;
+      chain = chain.then(async () => {
+        const m = await readPage(new Uint8Array(data), seq);
+        uploadProbe.messages.push(m);
+        if (m.type === 'upload_chunk') {
+          received += atob(m.data).length;
+          const total = received;
+          setTimeout(() => probe.handle({ type: 'upload_ack', id: m.id, received: total }), Math.max(0, wireAt - performance.now()));
+          if (typedAt === null && (!eager || received === 256 * 1024)) {
+            typedAt = performance.now();
+            probe.term.textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', ctrlKey: true, bubbles: true, cancelable: true }));
+          }
+        }
+        if (m.type === 'key' && m.key === 'c') uploadProbe.delays.push(wireAt - typedAt);
+        if (m.type === 'upload_end') setTimeout(() => probe.handle({ type: 'uploaded', id: m.id, ok: true, detail: 'fixture' }), Math.max(0, wireAt - performance.now()));
+      }).catch(e => uploadProbe.failures.push(String(e)));
+    };
+    window.uploadDone = probe.sendFiles([new File([new Uint8Array(256 * 1024)], 'slow.bin')], false);
+  }, eager);
+  await p.waitForFunction(() => uploadProbe.delays.length || uploadProbe.failures.length);
+  await p.evaluate(() => uploadDone);
+  const result = await p.evaluate(() => uploadProbe);
+  assert.deepEqual(result.failures, [], 'every ciphertext verifies under its ordered sequence');
+  t.diagnostic('modeled key wait: ' + result.delays[0].toFixed(1) + ' ms');
+  if (eager) assert.ok(result.delays[0] > 1000, 'bufferedAmount cannot see data already accepted downstream');
+  else assert.ok(result.delays[0] < 200, 'key waits behind ' + result.delays[0].toFixed(1) + ' ms of modeled wire bytes');
+  const uploads = result.messages.filter(m => m.type.startsWith('upload_'));
+  assert.equal(uploads[0].type, 'upload_start');
+  assert.equal(uploads.at(-1).type, 'upload_end');
+  assert.equal(uploads.filter(m => m.type === 'upload_chunk').reduce((n, m) => n + Buffer.from(m.data, 'base64').length, 0), 256 * 1024);
+  assert.deepEqual(errors, []);
+});
+
 test('a multi-file drop stays on its original pane and retains the upload window', async t => {
   const { p } = await page(t);
   await screen(p);
@@ -870,7 +934,7 @@ test('a multi-file drop stays on its original pane and retains the upload window
         totals.set(m.id, totals.get(m.id) + bytes);
         outstanding += bytes; peak = Math.max(peak, outstanding);
         const received = totals.get(m.id);
-        setTimeout(() => { outstanding -= bytes; probe.handle({ type: 'upload_ack', id: m.id, received }); }, 50);
+        if (received % (512 * 1024) === 0 || bytes === 3) setTimeout(() => { outstanding = 0; probe.handle({ type: 'upload_ack', id: m.id, received }); }, 50);
       }
       if (m.type === 'upload_end') setTimeout(() => probe.handle({ type: 'uploaded', id: m.id, ok: true, detail: 'fixture' }), 10);
     };
@@ -881,9 +945,8 @@ test('a multi-file drop stays on its original pane and retains the upload window
   assert.equal(result.starts.length, 2);
   assert.deepEqual(result.starts.map(m => m.pane_id), [1, 1]);
   assert.equal(new Set(result.starts.map(m => m.transfer)).size, 2);
-  assert.ok(result.peak > 65536, 'multiple chunks in flight avoid one RTT per small chunk');
-  assert.ok(result.peak <= 512 * 1024);
-  assert.ok(result.chunks.every(n => n <= 65536));
+  assert.equal(result.peak, 512 * 1024, 'the complete byte window is sent before its first acknowledgment');
+  assert.ok(result.chunks.every(n => n <= 16 * 1024));
 });
 
 test('frame acknowledgments include discarded panes and follow xterm parsing', async t => {
@@ -1892,7 +1955,7 @@ const spyDesktop = p => p.evaluate(() => {
 });
 // A picture from the Mac, decoded by a stand-in for WebCodecs that draws a
 // plain 320x200 frame for each chunk.
-const showPicture = (p, seq = 1) => p.evaluate(async (seq) => {
+const showPicture = (p, seq = 1, inputSeq, streamId) => p.evaluate(async ({ seq, inputSeq, streamId }) => {
   // Entering asks for full screen first and the picture after it settles.
   const t0 = performance.now();
   while (!document.fullscreenElement && performance.now() - t0 < 1200) await new Promise(r => setTimeout(r, 10));
@@ -1910,9 +1973,78 @@ const showPicture = (p, seq = 1) => p.evaluate(async (seq) => {
       close() { this.state = 'closed'; }
     };
   }
-  probe.handle({ type: 'desktop_frame', seq, key: true, codec: 'avc1.640028', desc: 'AAAA', data: 'AAAA' });
+  probe.handle({ type: 'desktop_frame', seq, input_seq: inputSeq, stream_id: streamId, key: true, codec: 'avc1.640028', desc: 'AAAA', data: 'AAAA' });
   await new Promise(r => setTimeout(r, 30));
-}, seq);
+}, { seq, inputSeq, streamId });
+
+test('desktop stream IDs reject old frames and recover a frame that overtakes status', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p, 10, undefined, 'first');
+  assert.equal(await p.evaluate(() => probe.desktop.lastDrawn), 0, 'a new stream waits for its status');
+  assert.deepEqual(await p.evaluate(() => messages.find(m => m.type === 'desktop_ack' && m.seq === 10)),
+    { type: 'desktop_ack', seq: 10, stream_id: 'first' });
+  await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'desktop_status', state: 'streaming', stream_id: 'first' }); });
+  assert.ok(await p.evaluate(() => messages.some(m => m.type === 'desktop_keyframe')), 'recover a discarded first keyframe');
+  await showPicture(p, 11, undefined, 'first');
+  assert.equal(await p.evaluate(() => probe.desktop.lastDrawn), 11);
+  await windowed(p);
+  await p.locator('#bar .tool.desktop').click();
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p, 12, undefined, 'first');
+  await p.evaluate(() => probe.handle({ type: 'desktop_status', state: 'streaming', stream_id: 'first' }));
+  await showPicture(p, 13, undefined, 'first');
+  assert.equal(await p.evaluate(() => probe.desktop.lastDrawn), 11, 'a resumed view cannot reactivate the old stream');
+  await p.evaluate(() => probe.handle({ type: 'desktop_status', state: 'streaming', stream_id: 'second' }));
+  await showPicture(p, 1, undefined, 'second');
+  assert.equal(await p.evaluate(() => probe.desktop.lastDrawn), 1, 'a restarted helper may begin at sequence one with a new ID');
+  await showPicture(p, 999, undefined, 'first');
+  assert.equal(await p.evaluate(() => probe.desktop.lastDrawn), 1);
+  assert.deepEqual(await p.evaluate(() => messages.find(m => m.type === 'desktop_ack' && m.seq === 999)),
+    { type: 'desktop_ack', seq: 999, stream_id: 'first' }, 'an old frame never receives the new stream identity');
+  assert.deepEqual(errors, []);
+});
+
+test('an old desktop decoder cannot paint or reset a new stream', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+  await p.evaluate(() => {
+    window.outputs = [];
+    window.decoderCallbacks = [];
+    window.closedFrames = 0;
+    window.VideoDecoder = class {
+      constructor(init) { this.init = init; this.state = 'unconfigured'; decoderCallbacks.push(init); }
+      configure() { this.state = 'configured'; }
+      close() { this.state = 'closed'; }
+      decode(chunk) {
+        const frame = document.createElement('canvas');
+        Object.assign(frame, { width: 320, height: 200, displayWidth: 320, displayHeight: 200, timestamp: chunk.timestamp, close() { closedFrames++; } });
+        frame.getContext('2d').fillStyle = decoderCallbacks.length === 1 ? 'red' : 'blue';
+        frame.getContext('2d').fillRect(0, 0, 320, 200);
+        outputs.push(() => this.init.output(frame));
+      }
+    };
+    for (const [id, seq] of [['first', 100], ['second', 1]]) {
+      probe.handle({ type: 'desktop_status', state: 'streaming', stream_id: id });
+      probe.handle({ type: 'desktop_frame', seq, stream_id: id, key: true, codec: 'avc1.640028', desc: 'AAAA', data: 'AAAA' });
+    }
+    outputs[1]();
+    outputs[0]();
+    decoderCallbacks[0].error(new Error('late old decoder error'));
+  });
+  assert.deepEqual(await p.evaluate(() => Array.from(document.querySelector('#desktop canvas').getContext('2d').getImageData(0, 0, 1, 1).data)), [0, 0, 255, 255]);
+  assert.equal(await p.evaluate(() => probe.desktop.lastDrawn), 1);
+  assert.equal(await p.evaluate(() => closedFrames), 2, 'both current and discarded frames are released');
+  await showPicture(p, 2, undefined, 'second');
+  await p.evaluate(() => outputs.at(-1)());
+  assert.equal(await p.evaluate(() => probe.desktop.lastDrawn), 2, 'a stale error leaves the new decoder usable');
+  assert.deepEqual(errors, []);
+});
 
 // A picture as Kaku sends it to a page that asked for binary messages.
 const binaryFrame = (header, bytes) => {
@@ -2127,10 +2259,181 @@ test('the desktop view reports its timings, and a filled view asks again only wh
   const report = await p.evaluate(() => messages.find(m => m.type === 'desktop_report'));
   assert.ok(report, 'a report on the way out');
   assert.equal(report.drawn, 2, JSON.stringify(report));
-  assert.equal(report.clicks, 1, JSON.stringify(report));
-  assert.ok(report.decode_max >= report.decode_p50 && report.click_max >= report.click_p50, JSON.stringify(report));
+  assert.equal(report.inputs, undefined, 'an old helper cannot confirm which input preceded capture');
+  assert.equal(report.clicks, undefined, 'do not report next-frame timing as click response');
+  assert.ok(report.decode_max >= report.decode_p50, JSON.stringify(report));
   assert.match(report.view, /^\d+x\d+@\d/);
   assert.deepEqual(errors, []);
+});
+
+test('desktop post timings are reported even when input changes no pixels', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.evaluate(() => {
+    const interval = window.setInterval;
+    window.setInterval = (fn, ms, ...args) => {
+      if (ms === 10000) window.flushDesktopReport = fn;
+      return interval(fn, ms, ...args);
+    };
+    probe.handle({ type: 'config', desktop: true });
+  });
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+  await p.evaluate(() => { flushDesktopReport(); messages.length = 0; });
+  await p.keyboard.press('a');
+  const report = await p.evaluate(() => {
+    const input = messages.find(m => m.type === 'desktop_key' && m.down);
+    probe.handle({ type: 'desktop_input_ack', input_seq: input.input_seq, queue_ms: 0 });
+    flushDesktopReport();
+    return messages.find(m => m.type === 'desktop_report');
+  });
+  assert.ok(report);
+  assert.equal(report.drawn, 0);
+  assert.equal(report.posted, 1);
+  assert.equal(report.inputs, undefined, 'posting does not imply a new picture');
+});
+
+test('desktop reports incomplete supported inputs without inventing legacy timeouts', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => {
+    const interval = window.setInterval;
+    window.setInterval = (fn, ms, ...args) => {
+      if (ms === 10000) window.flushDesktopReport = fn;
+      return interval(fn, ms, ...args);
+    };
+    const now = performance.now.bind(performance);
+    window.metricClock = 0;
+    performance.now = () => now() + metricClock;
+    probe.handle({ type: 'config', desktop: true });
+  });
+  const tool = p.locator('#bar .tool.desktop');
+  await tool.click();
+  await p.waitForFunction(() => messages.some(m => m.type === 'desktop_start'));
+  await p.evaluate(() => probe.handle({ type: 'desktop_status', state: 'streaming', stream_id: 'modern' }));
+  await showPicture(p, 1, undefined, 'modern');
+  await p.evaluate(() => { flushDesktopReport(); messages.length = 0; });
+  await p.keyboard.press('a');
+  await p.keyboard.press('b');
+  const timedOut = await p.evaluate(() => {
+    const inputs = messages.filter(m => m.type === 'desktop_key' && m.down);
+    probe.handle({ type: 'desktop_input_ack', input_seq: inputs[1].input_seq, queue_ms: 0 });
+    metricClock += 30001;
+    flushDesktopReport();
+    return messages.find(m => m.type === 'desktop_report');
+  });
+  assert.equal(timedOut.input_unposted, 1);
+  assert.equal(timedOut.input_unframed, 1);
+  assert.equal(timedOut.input_cancelled, undefined);
+  assert.equal(timedOut.inputs, undefined);
+  await p.evaluate(() => { messages.length = 0; flushDesktopReport(); });
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'desktop_report')), [], 'incomplete counts drain once');
+  await p.keyboard.press('c');
+  await windowed(p);
+  await tool.click();
+  assert.equal(await p.evaluate(() => messages.find(m => m.type === 'desktop_report').input_cancelled), 1);
+
+  await tool.click();
+  await p.evaluate(() => probe.handle({ type: 'desktop_status', state: 'streaming' }));
+  await showPicture(p);
+  await p.keyboard.press('d');
+  await p.evaluate(() => { messages.length = 0; metricClock += 30001; flushDesktopReport(); });
+  const legacy = await p.evaluate(() => messages.find(m => m.type === 'desktop_report'));
+  assert.equal(legacy.input_unposted, undefined, 'a legacy helper never promised an input ack');
+  assert.equal(legacy.input_unframed, undefined);
+  assert.equal(legacy.input_cancelled, undefined);
+  assert.deepEqual(errors, []);
+});
+
+test('desktop input history accounts for capacity eviction and lifecycle cancellation', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.evaluate(() => {
+    const interval = window.setInterval;
+    window.setInterval = (fn, ms, ...args) => {
+      if (ms === 10000) window.flushDesktopReport = fn;
+      return interval(fn, ms, ...args);
+    };
+    probe.handle({ type: 'config', desktop: true });
+  });
+  await p.locator('#bar .tool.desktop').click();
+  await p.waitForFunction(() => messages.some(m => m.type === 'desktop_start'));
+  await p.evaluate(() => probe.handle({ type: 'desktop_status', state: 'streaming', stream_id: 'modern' }));
+  await showPicture(p, 1, undefined, 'modern');
+  const overflow = await p.evaluate(() => {
+    flushDesktopReport(); messages.length = 0;
+    for (let i = 0; i < 1030; i++) document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', repeat: i > 0, bubbles: true, cancelable: true }));
+    flushDesktopReport();
+    return messages.find(m => m.type === 'desktop_report');
+  });
+  assert.equal(overflow.input_unposted, 6);
+  assert.equal(overflow.input_unframed, undefined);
+  await windowed(p);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.locator('#bar .tool.desktop').click();
+  assert.equal(await p.evaluate(() => messages.find(m => m.type === 'desktop_report').input_cancelled), 1024);
+});
+
+test('desktop timings retain the first post-capture frame when its input ack arrives later', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  const tool = p.locator('#bar .tool.desktop');
+  await tool.click();
+  await showPicture(p);
+  const before = await p.evaluate(() => performance.now());
+  await p.keyboard.press('a');
+  const seq = await p.evaluate(() => messages.find(m => m.type === 'desktop_key' && m.down).input_seq);
+  await showPicture(p, 2, seq);
+  const firstFrameBy = await p.evaluate(() => performance.now());
+  await p.waitForTimeout(180);
+  await showPicture(p, 3, seq);
+  await p.evaluate(seq => probe.handle({ type: 'desktop_input_ack', input_seq: seq, queue_ms: 4 }), seq);
+  await tool.click();
+  const report = await p.evaluate(() => messages.find(m => m.type === 'desktop_report'));
+  assert.equal(report.posted, 1, JSON.stringify(report));
+  assert.equal(report.inputs, 1);
+  assert.ok(report.input_frame_max <= firstFrameBy - before + 1, JSON.stringify(report));
+  assert.ok(report.post_max > report.input_frame_max + 150, JSON.stringify(report));
+});
+
+test('desktop input timings wait for post acknowledgments and post-capture watermarks, including slow input', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  const tool = p.locator('#bar .tool.desktop');
+  await tool.click();
+  await showPicture(p);
+  await p.keyboard.press('a');
+  await p.evaluate(() => document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Unidentified', code: 'Unidentified', bubbles: true, cancelable: true })));
+  await p.keyboard.press('b');
+  const inputs = await p.evaluate(() => messages.filter(m => m.type === 'desktop_key' && m.down));
+  assert.equal(inputs.length, 3);
+  assert.ok(Number.isSafeInteger(inputs[0].input_seq) && inputs[0].input_seq > 0);
+  assert.ok(inputs[1].input_seq > inputs[0].input_seq);
+  await showPicture(p, 2); // A frame already in flight proves nothing about these keys.
+  await p.evaluate(seq => {
+    probe.handle({ type: 'desktop_input_ack', input_seq: seq, queue_ms: 12 });
+    probe.handle({ type: 'desktop_input_ack', input_seq: seq, queue_ms: 12 });
+  }, inputs[0].input_seq);
+  await p.evaluate(seq => probe.handle({ type: 'desktop_input_ack', input_seq: seq, queue_ms: 12 }), inputs[2].input_seq);
+  // The helper rejected the middle input, so a later watermark must not count it.
+  await p.waitForTimeout(1100);
+  await showPicture(p, 3, inputs[2].input_seq);
+  await showPicture(p, 4, inputs[2].input_seq); // The same watermark must not count twice.
+  await tool.click();
+  const report = await p.evaluate(() => messages.find(m => m.type === 'desktop_report'));
+  assert.equal(report.posted, 2, JSON.stringify(report));
+  assert.equal(report.queue_p50, 12);
+  assert.equal(report.inputs, 2, JSON.stringify(report));
+  assert.ok(report.input_frame_p50 >= 1100, JSON.stringify(report));
+  assert.equal(report.clicks, undefined);
+  // A new stream must not attribute the previous session's delayed input.
+  await tool.click();
+  await showPicture(p, 5, inputs[2].input_seq);
+  await tool.click();
+  const next = await p.evaluate(() => messages.filter(m => m.type === 'desktop_report').at(-1));
+  assert.equal(next.inputs, undefined);
 });
 
 test('picking a tab leaves the desktop view for the terminal', async t => {
@@ -2145,6 +2448,72 @@ test('picking a tab leaves the desktop view for the terminal', async t => {
   await p.locator('#tabs .tab').first().click();
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
   assert.ok(await p.evaluate(() => messages.some(m => m.type === 'desktop_stop')));
+});
+
+test('real desktop wheel events never scroll the hidden terminal', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+  const box = await p.locator('#desktop canvas').boundingBox();
+  await p.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.mouse.wheel(0, 120);
+  await p.waitForTimeout(80);
+  const sent = await p.evaluate(() => messages);
+  assert.ok(sent.some(m => m.type === 'desktop_wheel' && m.dy === 120), JSON.stringify(sent));
+  assert.equal(sent.some(m => m.type === 'scroll'), false);
+  assert.deepEqual(errors, []);
+});
+
+for (const cancel of [false, true]) test('real desktop touch ' + (cancel ? 'cancel releases a drag' : 'pinch leaves terminal scale alone'), async t => {
+  const { p, errors } = await page(t, '#t=fixture', { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+  const box = await p.locator('#desktop canvas').boundingBox(), x = box.x + box.width / 2, y = box.y + box.height / 2;
+  const cdp = await p.context().newCDPSession(p);
+  const touch = (type, points) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: points.map(([id, x, y]) => ({ id, x, y })) });
+  const scale = await p.evaluate(() => localStorage.getItem('kaku.scale'));
+  await p.evaluate(() => { messages.length = 0; });
+  if (cancel) {
+    await touch('touchStart', [[1, x, y]]);
+    await touch('touchMove', [[1, x + 30, y + 30]]);
+    await touch('touchCancel', []);
+    await p.waitForTimeout(50);
+    const sent = await p.evaluate(() => messages.filter(m => m.type === 'desktop_pointer'));
+    assert.equal(sent.filter(m => m.kind === 'down').length, 1, JSON.stringify(sent));
+    assert.equal(sent.filter(m => m.kind === 'up').length, 1, JSON.stringify(sent));
+    assert.equal(sent.at(-1).kind, 'up', 'no pending move after cancellation');
+  } else {
+    await touch('touchStart', [[1, x - 20, y], [2, x + 20, y]]);
+    await touch('touchMove', [[1, x - 50, y], [2, x + 50, y]]);
+    await touch('touchEnd', []);
+    await p.waitForTimeout(80);
+    assert.equal(await p.evaluate(() => localStorage.getItem('kaku.scale')), scale);
+    assert.deepEqual(await p.evaluate(() => messages.filter(m => ['scroll', 'resize'].includes(m.type))), []);
+    assert.ok((await p.locator('#desktop canvas').boundingBox()).width > box.width * 2);
+  }
+  assert.deepEqual(errors, []);
+});
+
+test('losing focus cancels a desktop long press before it clicks', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+  const box = await p.locator('#desktop canvas').boundingBox();
+  const cdp = await p.context().newCDPSession(p);
+  await p.evaluate(() => { messages.length = 0; });
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ id: 1, x: box.x + box.width / 2, y: box.y + box.height / 2 }] });
+  await p.evaluate(() => window.dispatchEvent(new Event('blur')));
+  await p.waitForTimeout(500);
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'desktop_pointer')), []);
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'desktop_pointer')), []);
 });
 
 test('on a phone the desktop view pinches to zoom and taps where the zoom shows', async t => {

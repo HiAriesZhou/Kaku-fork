@@ -96,7 +96,7 @@ fn wants_binary(text: &str) -> bool {
 /// Pictures go to `frames` when the page takes binary messages.
 pub(crate) fn tap(
     inbox: mpsc::Receiver<String>,
-    outbox: mpsc::Sender<String>,
+    outbox: crate::queue::Sender<String>,
     frames: mpsc::Sender<Vec<u8>>,
 ) -> mpsc::Receiver<String> {
     tap_with(inbox, outbox, frames, helper_path())
@@ -104,7 +104,7 @@ pub(crate) fn tap(
 
 fn tap_with(
     mut inbox: mpsc::Receiver<String>,
-    outbox: mpsc::Sender<String>,
+    outbox: crate::queue::Sender<String>,
     frames: mpsc::Sender<Vec<u8>>,
     helper: PathBuf,
 ) -> mpsc::Receiver<String> {
@@ -158,7 +158,7 @@ fn tap_with(
 /// Where the helper's lines go: pictures as binary messages when the page
 /// asked for them, everything else as the JSON the helper wrote.
 struct Out {
-    text: mpsc::Sender<String>,
+    text: crate::queue::Sender<String>,
     frames: mpsc::Sender<Vec<u8>>,
     binary: Arc<AtomicBool>,
 }
@@ -220,7 +220,12 @@ impl Helper {
                         continue;
                     }
                 }
-                if outbox.send(line).await.is_err() {
+                let result = if desktop_type(&line).as_deref() == Some("desktop_frame") {
+                    outbox.send_bulk(line).await
+                } else {
+                    outbox.send(line).await
+                };
+                if result.is_err() {
                     return;
                 }
             }
@@ -309,7 +314,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let helper = fake_helper(&dir);
         let (page, inbox) = mpsc::channel(8);
-        let (outbox, mut to_page) = mpsc::channel(8);
+        let (outbox, mut to_page) = crate::queue::channel(8);
         let (frames, _) = mpsc::channel(8);
         let mut session = tap_with(inbox, outbox, frames, helper);
 
@@ -362,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_helper_is_reported_to_the_page() {
         let (page, inbox) = mpsc::channel(8);
-        let (outbox, mut to_page) = mpsc::channel(8);
+        let (outbox, mut to_page) = crate::queue::channel(8);
         let (frames, _) = mpsc::channel(8);
         let _session = tap_with(
             inbox,
@@ -395,7 +400,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let (page, inbox) = mpsc::channel(8);
-        let (outbox, mut to_page) = mpsc::channel(8);
+        let (outbox, mut to_page) = crate::queue::channel(8);
         let (frames, _) = mpsc::channel(8);
         let _session = tap_with(inbox, outbox, frames, path);
         page.send(r#"{"type":"desktop_start"}"#.to_string())
@@ -446,7 +451,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let (page, inbox) = mpsc::channel(8);
-        let (outbox, mut to_page) = mpsc::channel(8);
+        let (outbox, mut to_page) = crate::queue::channel(8);
         let (frames, _) = mpsc::channel(8);
         let session = tap_with(inbox, outbox, frames, path);
         let pid =
@@ -499,7 +504,7 @@ mod tests {
         assert!(binary_frame(r#"{"type":"text","x":"\"desktop_frame\""}"#).is_none());
     }
 
-    async fn next(rx: &mut mpsc::Receiver<String>) -> String {
+    async fn next(rx: &mut crate::queue::Receiver<String>) -> String {
         tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap()
@@ -521,7 +526,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let (page, inbox) = mpsc::channel(8);
-        let (outbox, mut to_page) = mpsc::channel(8);
+        let (outbox, mut to_page) = crate::queue::channel(8);
         let (frames, mut frames_to_page) = mpsc::channel(8);
         let _session = tap_with(inbox, outbox, frames, path);
 

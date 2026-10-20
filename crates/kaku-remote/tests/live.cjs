@@ -10,6 +10,12 @@ const assert = require('node:assert/strict');
 const { chromium } = require('playwright');
 const WebSocket = require(path.join(path.dirname(require.resolve('playwright-core')), 'lib/utilsBundle.js')).ws;
 const root = path.resolve(__dirname, '../../..');
+// A shell inside Kaku carries its real configuration and mux address. Keep
+// child apps and CLI probes inside this harness's scratch HOME and TMPDIR.
+const inheritedEnv = { ...process.env };
+for (const key of ['KAKU_CONFIG_FILE', 'KAKU_CONFIG_DIR', 'KAKU_SESSION',
+  'KAKU_UNIX_SOCKET', 'KAKU_ZSH_DIR', 'XDG_CONFIG_HOME']) delete inheritedEnv[key];
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function port() {
   const server = net.createServer();
@@ -28,7 +34,7 @@ async function until(fn, ms = 15000) {
   const children = [], sockets = [];
   let browser;
   const start = (file, args, env) => {
-    const p = spawn(file, args, { env: { ...process.env, ...env }, stdio: 'ignore' });
+    const p = spawn(file, args, { env: { ...inheritedEnv, ...env }, stdio: 'ignore' });
     children.push(p); return p;
   };
   try {
@@ -245,7 +251,7 @@ async function until(fn, ms = 15000) {
     await until(async () => (await fetch(relayBase)).ok);
     const cli = (...args) => new Promise((resolve, reject) => {
       const child = spawn(path.join(app, 'Contents/MacOS/kaku'), args, {
-        env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), TMPDIR: path.join(home, 'tmp/') },
+        env: { ...inheritedEnv, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), TMPDIR: path.join(home, 'tmp/') },
       });
       let out = '';
       child.stdout.on('data', d => { out += d; });

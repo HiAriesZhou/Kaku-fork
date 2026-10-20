@@ -2440,23 +2440,13 @@ fn encode(msg: &WebServerMsg) -> Option<String> {
     serde_json::to_string(msg).ok()
 }
 
-/// Send the tab list if it changed since `last`. Tab state lives on the GUI
-/// thread; the close-confirmation check reads the Lua config, which only
-/// that thread may touch.
-async fn send_tabs(
-    last: &mut Option<Vec<TabInfo>>,
-    outbox: &mpsc::Sender<String>,
-) -> Result<(), ()> {
-    let tabs = promise::spawn::spawn_into_main_thread(async { collect_tabs() }).await;
-    if last.as_ref() == Some(&tabs) {
-        return Ok(());
-    }
-    let Some(json) = encode(&WebServerMsg::Tabs { tabs: &tabs }) else {
-        return Ok(());
-    };
-    outbox.send(json).await.map_err(|_| ())?;
-    *last = Some(tabs);
-    Ok(())
+/// Collect on the GUI thread, but return through a mailbox so input keeps
+/// flowing while AppKit is busy. Each session has at most one request in flight.
+fn request_tabs(reply: mpsc::Sender<Vec<TabInfo>>) {
+    promise::spawn::spawn_into_main_thread(async move {
+        let _ = reply.try_send(collect_tabs());
+    })
+    .detach();
 }
 
 /// One browser, whatever carries its messages: the local WebSocket or the
@@ -2465,7 +2455,7 @@ async fn send_tabs(
 /// session ends when either side goes away.
 pub(crate) async fn run_session(
     mut inbox: mpsc::Receiver<String>,
-    outbox: mpsc::Sender<String>,
+    outbox: crate::queue::Sender<String>,
     frames: mpsc::Sender<Vec<u8>>,
     dirty: WebDirty,
 ) {
@@ -2489,6 +2479,8 @@ pub(crate) async fn run_session(
     // How the page last said it draws, logged when that changes.
     let mut page_drawing = String::new();
     let mut last_tabs: Option<Vec<TabInfo>> = None;
+    let (tabs_ready, mut tabs_results) = mpsc::channel(1);
+    let mut tabs_pending = false;
     let mut dirty_frame = false;
     // Frames sent this session; a page's verify only counts once it has
     // applied the same number, so frames in flight never read as drift.
@@ -2555,7 +2547,7 @@ pub(crate) async fn run_session(
                 };
                 if let Some(replies) = handle_download(&msg, &mut downloads.0, cwd) {
                     for json in replies {
-                        if outbox.send(json).await.is_err() {
+                        if outbox.send_bulk(json).await.is_err() {
                             break;
                         }
                     }
@@ -2662,6 +2654,8 @@ pub(crate) async fn run_session(
                     continue;
                 }
                 if let WebClientMsg::Attach { pane_id, focus } = msg {
+                    // A later explicit choice wins over an outstanding NewTab snapshot.
+                    follow_new = None;
                     // A pane that is already gone gets the same answer as one
                     // that closes while viewed, and no entry in `dirty`.
                     if lookup_pane(pane_id).is_none() {
@@ -2722,9 +2716,7 @@ pub(crate) async fn run_session(
                     break;
                 }
                 dirty_frame = attached.is_some();
-                if send_tabs(&mut last_tabs, &outbox).await.is_err() {
-                    break;
-                }
+                tabs_due = Some(tokio::time::Instant::now());
             }
             changed = tab_changes.recv() => {
                 let wait = match changed {
@@ -2735,16 +2727,24 @@ pub(crate) async fn run_session(
                 let due = tokio::time::Instant::now() + wait;
                 tabs_due = Some(tabs_due.map_or(due, |d| d.min(due)));
             }
-            _ = tokio::time::sleep_until(tabs_due.unwrap_or_else(tokio::time::Instant::now)), if tabs_due.is_some() => {
+            _ = tokio::time::sleep_until(tabs_due.unwrap_or_else(tokio::time::Instant::now)), if tabs_due.is_some() && !tabs_pending => {
                 tabs_due = None;
-                if send_tabs(&mut last_tabs, &outbox).await.is_err() {
-                    break;
+                tabs_pending = true;
+                request_tabs(tabs_ready.clone());
+            }
+            Some(tabs) = tabs_results.recv() => {
+                tabs_pending = false;
+                if last_tabs.as_ref() != Some(&tabs) {
+                    if let Some(json) = encode(&WebServerMsg::Tabs { tabs: &tabs }) {
+                        if outbox.send(json).await.is_err() { break; }
+                        last_tabs = Some(tabs);
+                    }
                 }
                 // The tab this browser opened: view it now and send its first
                 // frame right behind the list, rather than a round trip later
                 // when the page asks for it.
                 if let Some((seen, until)) = &follow_new {
-                    let fresh = last_tabs.iter().flatten().find(|t| !seen.contains(&t.tab_id)).map(|t| t.pane_id);
+                    let fresh = last_tabs.iter().flatten().find(|t| !seen.contains(&t.tab_id) && lookup_pane(t.pane_id).is_some()).map(|t| t.pane_id);
                     if let Some(pane_id) = fresh {
                         follow_new = None;
                         attached = Some(pane_id);
@@ -2845,18 +2845,40 @@ pub(crate) async fn route_ws(
 async fn handle_local_ws(socket: ws::WebSocket, dirty: WebDirty) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (in_tx, in_rx) = mpsc::channel::<String>(64);
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
+    let (out_tx, replies) = crate::queue::channel::<String>(64);
     let (frames_tx, mut frames_rx) = mpsc::channel::<Vec<u8>>(4);
     let session = tokio::spawn(run_session(in_rx, out_tx, frames_tx, dirty));
+    let (output, mut outgoing) = crate::queue::channel_with_capacity(64, 1);
+    let mut forwarders = Vec::new();
+    for (mut source, destination) in [
+        (replies.interactive, output.interactive.clone()),
+        (replies.bulk, output.bulk.clone()),
+    ] {
+        forwarders.push(tokio::spawn(async move {
+            while let Some(text) = source.recv().await {
+                if destination
+                    .send(ws::Message::Text(text.into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+    forwarders.push(tokio::spawn(async move {
+        while let Some(frame) = frames_rx.recv().await {
+            if output
+                .send_bulk(ws::Message::Binary(frame.into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }));
     let writer = tokio::spawn(async move {
-        loop {
-            let msg = tokio::select! {
-                text = out_rx.recv() => match text {
-                    Some(text) => ws::Message::Text(text.into()),
-                    None => break,
-                },
-                Some(frame) = frames_rx.recv() => ws::Message::Binary(frame.into()),
-            };
+        while let Some(msg) = outgoing.recv().await {
             if ws_tx.send(msg).await.is_err() {
                 break;
             }
@@ -2864,6 +2886,9 @@ async fn handle_local_ws(socket: ws::WebSocket, dirty: WebDirty) {
     });
     forward_until_session_ends(&mut ws_rx, in_tx, session).await;
     writer.abort();
+    for forwarder in forwarders {
+        forwarder.abort();
+    }
 }
 
 /// Passes the browser's text messages to its session until either side is

@@ -12,6 +12,12 @@ const assert = require('node:assert/strict');
 const { chromium } = require('playwright');
 const WebSocket = require(path.join(path.dirname(require.resolve('playwright-core')), 'lib/utilsBundle.js')).ws;
 const root = path.resolve(__dirname, '../../..');
+// A shell inside Kaku carries its real configuration and mux address. Keep
+// child apps and CLI probes inside this harness's scratch HOME and TMPDIR.
+const inheritedEnv = { ...process.env };
+for (const key of ['KAKU_CONFIG_FILE', 'KAKU_CONFIG_DIR', 'KAKU_SESSION',
+  'KAKU_UNIX_SOCKET', 'KAKU_ZSH_DIR', 'XDG_CONFIG_HOME']) delete inheritedEnv[key];
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function port() {
   const server = net.createServer();
@@ -58,14 +64,14 @@ function serveLikeVercel(dir, listenPort) {
   const children = [], sockets = [];
   let browser, server;
   const start = (file, args, env) => {
-    const p = spawn(file, args, { env: { ...process.env, ...env }, stdio: 'ignore' });
+    const p = spawn(file, args, { env: { ...inheritedEnv, ...env }, stdio: 'ignore' });
     children.push(p); return p;
   };
   try {
     const relay = await port(), local = await port(), pagePort = await port();
     const origin = `http://127.0.0.1:${pagePort}`;
     const dir = path.resolve(execFileSync(path.join(root, 'scripts/publish_web_page.sh'), ['--dry-run'], {
-      env: { ...process.env, KAKU_WEB_RELAY: `ws://127.0.0.1:${relay}` },
+      env: { ...inheritedEnv, KAKU_WEB_RELAY: `ws://127.0.0.1:${relay}` },
     }).toString().trim());
     server = await serveLikeVercel(dir, pagePort);
     start(path.join(root, 'crates/kaku-relay/target/debug/kaku-relay'), [], { PORT: String(relay), KAKU_RELAY_PAGE_ORIGIN: origin });
@@ -78,7 +84,7 @@ function serveLikeVercel(dir, listenPort) {
     const app = process.env.KAKU_TEST_APP || path.join(root, 'dist/Kaku.app');
     const env = { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), TMPDIR: path.join(home, 'tmp/') };
     start(path.join(app, 'Contents/MacOS/kaku-gui'), ['--config-file', config, 'start', '--always-new-process'], env);
-    const cli = (...args) => execFileSync(path.join(app, 'Contents/MacOS/kaku'), args, { env: { ...process.env, ...env } }).toString();
+    const cli = (...args) => execFileSync(path.join(app, 'Contents/MacOS/kaku'), args, { env: { ...inheritedEnv, ...env } }).toString();
 
     // Wait for the Mac on the relay, through the route the page asks.
     await until(() => fs.existsSync(path.join(home, 'Library/Application Support/kaku/remote-share.json')));

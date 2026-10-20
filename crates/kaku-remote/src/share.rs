@@ -17,6 +17,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -261,7 +262,7 @@ enum Stage {
     Session {
         keys: Arc<SessionKeys>,
         device: String,
-        inbox: Option<mpsc::Sender<String>>,
+        inbox: Option<SessionInput>,
     },
     Gone,
 }
@@ -419,6 +420,41 @@ fn asset_frame(request: u32, path: &str) -> Vec<u8> {
     frame(KIND_ASSET, request, &payload)
 }
 
+struct AssetRequests {
+    requests: mpsc::Sender<(u32, String)>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl AssetRequests {
+    fn new(output: mpsc::Sender<Outbound>) -> Self {
+        let (requests, mut pending) = mpsc::channel::<(u32, String)>(16);
+        let worker = tokio::spawn(async move {
+            while let Some((request, path)) = pending.recv().await {
+                // Keep only names while the socket is busy. Construct the
+                // asset only after reserving its one slot in the bulk queue.
+                let Ok(Ok(slot)) = tokio::time::timeout(WRITE_TIMEOUT, output.reserve()).await
+                else {
+                    break;
+                };
+                slot.send(Outbound::Protocol(Message::Binary(
+                    asset_frame(request, &path).into(),
+                )));
+            }
+        });
+        Self { requests, worker }
+    }
+
+    fn try_send(&self, request: u32, path: String) -> bool {
+        self.requests.try_send((request, path)).is_ok()
+    }
+}
+
+impl Drop for AssetRequests {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
+
 // ── Tunnel ────────────────────────────────────────────────────────────────────
 
 /// Keep this Kaku registered with the relay for as long as the bridge runs.
@@ -501,6 +537,79 @@ async fn deliver_input(inbox: &mpsc::Sender<String>, text: String, limit: Durati
     )
 }
 
+/// A browser owns its pending work. Removing it cancels queued input and
+/// output immediately, including when its session is waiting for the GUI.
+struct SessionInput {
+    inbox: mpsc::Sender<String>,
+    active: Arc<AtomicBool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SessionInput {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::SeqCst);
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn input_forwarder(
+    c: u32,
+    session: mpsc::Sender<String>,
+    ended: mpsc::UnboundedSender<u32>,
+    limit: Duration,
+) -> SessionInput {
+    let (inbox, mut pending) = mpsc::channel(64);
+    let task = tokio::spawn(async move {
+        while let Some(text) = pending.recv().await {
+            if !deliver_input(&session, text, limit).await {
+                let _ = ended.send(c);
+                break;
+            }
+        }
+    });
+    SessionInput {
+        inbox,
+        active: Arc::new(AtomicBool::new(true)),
+        tasks: vec![task],
+    }
+}
+
+enum Outbound {
+    Protocol(Message),
+    Session {
+        c: u32,
+        keys: Arc<SessionKeys>,
+        seq: Arc<AtomicU64>,
+        active: Arc<AtomicBool>,
+        plain: Vec<u8>,
+    },
+}
+
+impl Outbound {
+    /// Sequence numbers belong to the socket order, after priority selection.
+    fn message(self, rng: &SystemRandom) -> Option<Message> {
+        match self {
+            Self::Protocol(msg) => Some(msg),
+            Self::Session {
+                c,
+                keys,
+                seq,
+                active,
+                plain,
+            } => {
+                if !active.load(Ordering::SeqCst) {
+                    return None;
+                }
+                let seq = seq.fetch_add(1, Ordering::Relaxed);
+                let sealed = seal(&keys.from_host, rng, &aad(FROM_HOST, seq), &plain)?;
+                Some(Message::Binary(frame(KIND_DATA, c, &sealed).into()))
+            }
+        }
+    }
+}
+
 type RelaySocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -564,9 +673,16 @@ async fn serve(
     let (mut relay_tx, mut relay_rx) = socket.split();
 
     // Everything bound for the relay goes through one writer.
-    let (to_relay, mut outgoing) = mpsc::channel::<Message>(256);
+    // One bulk item ahead of the socket. A second ciphertext FIFO here
+    // would undo priority selection on a slow connection.
+    let (to_relay, mut outgoing) = crate::queue::channel_with_capacity::<Outbound>(256, 1);
+    let assets = AssetRequests::new(to_relay.bulk.clone());
     let mut writer = tokio::spawn(async move {
+        let rng = SystemRandom::new();
         while let Some(msg) = outgoing.recv().await {
+            let Some(msg) = msg.message(&rng) else {
+                continue;
+            };
             if !matches!(
                 tokio::time::timeout(WRITE_TIMEOUT, relay_tx.send(msg)).await,
                 Ok(Ok(()))
@@ -578,6 +694,7 @@ async fn serve(
 
     let rng = SystemRandom::new();
     let mut browsers: HashMap<u32, Browser> = HashMap::new();
+    let (ended_tx, mut ended_rx) = mpsc::unbounded_channel();
     let mut identity_check = tokio::time::interval(IDENTITY_CHECK);
     identity_check.tick().await;
     let mut keepalive = tokio::time::interval(KEEPALIVE);
@@ -587,6 +704,12 @@ async fn serve(
     let result = 'connection: loop {
         tokio::select! {
             _ = &mut writer => break Err(anyhow::anyhow!("relay writer stopped or timed out")),
+            Some(c) = ended_rx.recv() => {
+                browsers.remove(&c);
+                if to_relay.interactive.try_send(Outbound::Protocol(close_browser(c, 4413))).is_err() {
+                    break Err(anyhow::anyhow!("relay output queue is full"));
+                }
+            }
             msg = relay_rx.next() => {
                 let msg = match msg {
                     Some(Ok(msg)) => msg,
@@ -599,7 +722,7 @@ async fn serve(
                         Ok(RelayMsg::Open { c }) => {
                             let Some(exchange) = Exchange::new(&rng) else { continue };
                             let hello = exchange.hello();
-                            if to_relay.try_send(Message::Binary(frame(KIND_DATA, c, &hello).into())).is_err() {
+                            if to_relay.interactive.try_send(Outbound::Protocol(Message::Binary(frame(KIND_DATA, c, &hello).into()))).is_err() {
                                 break Err(anyhow::anyhow!("relay output queue is full"));
                             }
                             browsers.insert(c, Browser {
@@ -613,15 +736,10 @@ async fn serve(
                         }
                         Ok(RelayMsg::Get { r, p }) => {
                             // Anyone who knows this Mac's id can ask for the
-                            // page's files, without the key. Answer only while
-                            // half the queue is free, so those requests can
-                            // never crowd out a session's frames or drop the
-                            // link; an unanswered one times out at the relay.
-                            if to_relay.capacity() * 2 < to_relay.max_capacity() {
-                                log::debug!("kaku-share: busy, not serving {p}");
-                                continue;
-                            }
-                            let _ = to_relay.try_send(Message::Binary(asset_frame(r, &p).into()));
+                            // old relay's page files. Queue only a bounded
+                            // number of names; excess requests time out there
+                            // without crowding out interactive replies here.
+                            let _ = assets.try_send(r, p);
                         }
                         Err(e) => log::debug!("kaku-share: unknown relay message: {e}"),
                     },
@@ -635,14 +753,14 @@ async fn serve(
                         let text = match step {
                             Step::Nothing => continue,
                             Step::Send(bytes) => {
-                                if to_relay.try_send(Message::Binary(frame(KIND_DATA, c, &bytes).into())).is_err() {
+                                if to_relay.interactive.try_send(Outbound::Protocol(Message::Binary(frame(KIND_DATA, c, &bytes).into()))).is_err() {
                                     break Err(anyhow::anyhow!("relay output queue is full"));
                                 }
                                 continue;
                             }
                             Step::Close(code) => {
                                 browsers.remove(&c);
-                                if to_relay.try_send(close_browser(c, code)).is_err() {
+                                if to_relay.interactive.try_send(Outbound::Protocol(close_browser(c, code))).is_err() {
                                     break Err(anyhow::anyhow!("relay output queue is full"));
                                 }
                                 continue;
@@ -656,24 +774,23 @@ async fn serve(
                                 }
                                 if let Stage::Session { keys, inbox, .. } = &mut browser.stage {
                                     // Kaku's own signature was message 0.
-                                    *inbox = Some(start_session(c, keys.clone(), 1, dirty.clone(), to_relay.clone()));
+                                    *inbox = Some(start_session(c, keys.clone(), 1, dirty.clone(), to_relay.clone(), ended_tx.clone()));
                                 }
                                 // Tell the relay this socket is a paired browser, so
                                 // sockets that only know the id cannot push it out.
                                 let ok = serde_json::json!({ "t": "ok", "c": c }).to_string();
-                                let _ = to_relay.try_send(Message::Text(ok.into()));
+                                let _ = to_relay.interactive.try_send(Outbound::Protocol(Message::Text(ok.into())));
                                 continue;
                             }
                             Step::Input(text) => text,
                         };
                         let Stage::Session { inbox: Some(inbox), .. } = &browser.stage else { continue };
-                        let inbox = inbox.clone();
-                        // A burst of typing may briefly fill the mailbox while
-                        // the session awaits the GUI. Preserve it, but never
-                        // wait indefinitely and starve heartbeat/reset work.
-                        if !deliver_input(&inbox, text, INBOX_TIMEOUT).await {
+                        // A slow browser waits in its own ordered worker,
+                        // never in the shared relay receive loop. Overload is
+                        // an explicit disconnect, never a silently lost key.
+                        if inbox.inbox.try_send(text).is_err() {
                             browsers.remove(&c);
-                            if to_relay.try_send(close_browser(c, 4413)).is_err() {
+                            if to_relay.interactive.try_send(Outbound::Protocol(close_browser(c, 4413))).is_err() {
                                 break Err(anyhow::anyhow!("relay output queue is full"));
                             }
                         }
@@ -686,7 +803,7 @@ async fn serve(
                 if last_heard.elapsed() > SILENCE_LIMIT {
                     break Err(anyhow::anyhow!("relay went silent"));
                 }
-                if to_relay.try_send(Message::Ping(Vec::new().into())).is_err() {
+                if to_relay.interactive.try_send(Outbound::Protocol(Message::Ping(Vec::new().into()))).is_err() {
                     break Ok(());
                 }
             }
@@ -701,7 +818,7 @@ async fn serve(
                 }).collect();
                 for (c, code) in ended {
                     browsers.remove(&c);
-                    if to_relay.try_send(close_browser(c, code)).is_err() {
+                    if to_relay.interactive.try_send(Outbound::Protocol(close_browser(c, code))).is_err() {
                         break 'connection Err(anyhow::anyhow!("relay output queue is full"));
                     }
                 }
@@ -726,42 +843,147 @@ fn start_session(
     keys: Arc<SessionKeys>,
     first_seq: u64,
     dirty: WebDirty,
-    to_relay: mpsc::Sender<Message>,
-) -> mpsc::Sender<String> {
-    let (inbox, session_in) = mpsc::channel::<String>(64);
-    let (session_out, mut replies) = mpsc::channel::<String>(64);
+    to_relay: crate::queue::Sender<Outbound>,
+    ended: mpsc::UnboundedSender<u32>,
+) -> SessionInput {
+    // The per-browser forwarder supplies the bounded burst queue; the
+    // session itself needs only the next message, not a second backlog.
+    let (inbox, session_in) = mpsc::channel::<String>(1);
+    let mut input = input_forwarder(c, inbox, ended.clone(), INBOX_TIMEOUT);
+    let (session_out, replies) = crate::queue::channel::<String>(64);
     let (frames_out, mut frames) = mpsc::channel::<Vec<u8>>(4);
-    tokio::spawn(web::run_session(session_in, session_out, frames_out, dirty));
-    tokio::spawn(async move {
-        let rng = SystemRandom::new();
-        let mut seq = first_seq;
-        loop {
-            let plain = tokio::select! {
-                text = replies.recv() => match text {
-                    Some(text) => text.into_bytes(),
-                    None => break,
-                },
-                Some(frame) = frames.recv() => frame,
+    input.tasks.push(tokio::spawn(web::run_session(
+        session_in,
+        session_out,
+        frames_out,
+        dirty,
+    )));
+    let seq = Arc::new(AtomicU64::new(first_seq));
+    // Independent producers: waiting for space for a file or picture must
+    // not prevent this browser's terminal replies reaching the writer.
+    for (mut rx, destination) in [
+        (replies.interactive, to_relay.interactive.clone()),
+        (replies.bulk, to_relay.bulk.clone()),
+    ] {
+        let keys = keys.clone();
+        let seq = seq.clone();
+        let active = input.active.clone();
+        let ended = ended.clone();
+        input.tasks.push(tokio::spawn(async move {
+            while let Some(text) = rx.recv().await {
+                let msg = Outbound::Session {
+                    c,
+                    keys: keys.clone(),
+                    seq: seq.clone(),
+                    active: active.clone(),
+                    plain: text.into_bytes(),
+                };
+                if !matches!(
+                    tokio::time::timeout(WRITE_TIMEOUT, destination.send(msg)).await,
+                    Ok(Ok(()))
+                ) {
+                    let _ = ended.send(c);
+                    break;
+                }
+            }
+        }));
+    }
+    let active = input.active.clone();
+    input.tasks.push(tokio::spawn(async move {
+        while let Some(plain) = frames.recv().await {
+            let msg = Outbound::Session {
+                c,
+                keys: keys.clone(),
+                seq: seq.clone(),
+                active: active.clone(),
+                plain,
             };
-            let Some(sealed) = seal(&keys.from_host, &rng, &aad(FROM_HOST, seq), &plain) else {
-                break;
-            };
-            seq += 1;
-            let msg = Message::Binary(frame(KIND_DATA, c, &sealed).into());
             if !matches!(
-                tokio::time::timeout(WRITE_TIMEOUT, to_relay.send(msg)).await,
+                tokio::time::timeout(WRITE_TIMEOUT, to_relay.send_bulk(msg)).await,
                 Ok(Ok(()))
             ) {
+                let _ = ended.send(c);
                 break;
             }
         }
-    });
-    inbox
+    }));
+    input
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_asset_requests_wait_behind_bulk_and_preserve_response_order() {
+        let (tx, mut rx) = crate::queue::channel_with_capacity(8, 1);
+        tx.send_bulk(Outbound::Protocol(Message::Ping(Vec::new().into())))
+            .await
+            .unwrap();
+        let assets = AssetRequests::new(tx.bulk.clone());
+        for id in 1..=3 {
+            assert!(
+                assets.try_send(id, "assets/icon.png".into()),
+                "accepted Get {id}"
+            );
+        }
+        tx.send(Outbound::Protocol(Message::Text("key echo".into())))
+            .await
+            .unwrap();
+        let rng = SystemRandom::new();
+        assert!(matches!(
+            rx.recv().await.unwrap().message(&rng),
+            Some(Message::Text(_))
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap().message(&rng),
+            Some(Message::Ping(_))
+        ));
+        for id in 1..=3 {
+            let Some(Message::Binary(bytes)) =
+                tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .message(&rng)
+            else {
+                panic!("asset frame");
+            };
+            assert_eq!(bytes.as_ref(), asset_frame(id, "assets/icon.png"));
+        }
+        drop(assets);
+        drop(tx);
+        assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_asset_requests_are_bounded_and_cancelled_with_the_connection() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Outbound::Protocol(Message::Ping(Vec::new().into())))
+            .await
+            .unwrap();
+        let assets = AssetRequests::new(tx.clone());
+        for id in 0..16 {
+            assert!(assets.try_send(id, "assets/xterm.js".into()));
+        }
+        assert!(!assets.try_send(16, "assets/xterm.js".into()));
+        tokio::task::yield_now().await;
+        // The worker is waiting for the occupied bulk slot. Ending serve
+        // cancels its reservation and every pending name, not just new Gets.
+        drop(assets);
+        drop(tx);
+        assert!(matches!(
+            rx.recv().await,
+            Some(Outbound::Protocol(Message::Ping(_)))
+        ));
+        assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     fn identity() -> ShareIdentity {
         ShareIdentity::generate().unwrap()
@@ -816,6 +1038,91 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         tx.send("first".into()).await.unwrap();
         assert!(!deliver_input(&tx, "second".into(), Duration::from_millis(20)).await);
+    }
+
+    #[tokio::test]
+    async fn stalled_browser_does_not_delay_another_and_times_out_alone() {
+        let (blocked, _blocked_rx) = mpsc::channel(1);
+        blocked.send("already full".into()).await.unwrap();
+        let (ready, mut ready_rx) = mpsc::channel(1);
+        let (ended, mut ended_rx) = mpsc::unbounded_channel();
+        let a = input_forwarder(1, blocked, ended.clone(), Duration::from_millis(100));
+        let b = input_forwarder(2, ready, ended, Duration::from_millis(100));
+        a.inbox.try_send("pending".into()).unwrap();
+        b.inbox.try_send("key".into()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(50), ready_rx.recv())
+                .await
+                .unwrap(),
+            Some("key".into()),
+        );
+        assert_eq!(ended_rx.recv().await, Some(1));
+        assert!(ended_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn per_browser_worker_preserves_bursts_and_cancels_pending_input() {
+        let (session, mut rx) = mpsc::channel(1);
+        let (ended, mut ended_rx) = mpsc::unbounded_channel();
+        let input = input_forwarder(7, session, ended, INBOX_TIMEOUT);
+        for n in 0..64 {
+            input.inbox.try_send(n.to_string()).unwrap();
+        }
+        // Full means the caller must close 4413, not discard just this key.
+        assert!(input.inbox.try_send("overflow".into()).is_err());
+        for n in 0..64 {
+            assert_eq!(rx.recv().await, Some(n.to_string()));
+        }
+        drop(input);
+        assert_eq!(rx.recv().await, None);
+        assert!(ended_rx.try_recv().is_err());
+
+        let (session, mut rx) = mpsc::channel(1);
+        session.send("already delivered".into()).await.unwrap();
+        let (ended, _) = mpsc::unbounded_channel();
+        let input = input_forwarder(8, session, ended, INBOX_TIMEOUT);
+        input.inbox.try_send("must be cancelled".into()).unwrap();
+        tokio::task::yield_now().await;
+        drop(input);
+        assert_eq!(rx.recv().await, Some("already delivered".into()));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn priority_is_selected_before_encryption_and_revoke_discards_queued_output() {
+        let (_, keys) = exchanged();
+        let keys = Arc::new(keys);
+        let seq = Arc::new(AtomicU64::new(1));
+        let active = Arc::new(AtomicBool::new(true));
+        let message = |text: &str| Outbound::Session {
+            c: 7,
+            keys: keys.clone(),
+            seq: seq.clone(),
+            active: active.clone(),
+            plain: text.as_bytes().to_vec(),
+        };
+        let (tx, mut rx) = crate::queue::channel(8);
+        tx.send_bulk(message("file start")).await.unwrap();
+        tx.send_bulk(message("file chunk")).await.unwrap();
+        tx.send_bulk(message("file end")).await.unwrap();
+        tx.send(message("key echo")).await.unwrap();
+        let rng = SystemRandom::new();
+        for (n, expected) in ["key echo", "file start", "file chunk", "file end"]
+            .iter()
+            .enumerate()
+        {
+            let Some(Message::Binary(bytes)) = rx.recv().await.unwrap().message(&rng) else {
+                panic!("session message");
+            };
+            assert_eq!(
+                open(&keys.from_host, &aad(FROM_HOST, n as u64 + 1), &bytes[5..]).as_deref(),
+                Some(*expected)
+            );
+        }
+        tx.send_bulk(message("stale picture")).await.unwrap();
+        active.store(false, Ordering::SeqCst);
+        assert!(rx.recv().await.unwrap().message(&rng).is_none());
+        assert_eq!(seq.load(Ordering::Relaxed), 5);
     }
 
     #[tokio::test]

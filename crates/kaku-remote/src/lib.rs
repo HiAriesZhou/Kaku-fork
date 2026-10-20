@@ -17,6 +17,7 @@ mod awake;
 mod desktop;
 mod fonts;
 mod pairing;
+mod queue;
 mod share;
 mod web;
 

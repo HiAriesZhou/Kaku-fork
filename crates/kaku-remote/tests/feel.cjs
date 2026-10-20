@@ -17,6 +17,12 @@ const net = require('node:net');
 const { spawn, execFileSync } = require('node:child_process');
 const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '../../..');
+// A shell inside Kaku carries its real configuration and mux address. Keep
+// child apps and CLI probes inside this harness's scratch HOME and TMPDIR.
+const inheritedEnv = { ...process.env };
+for (const key of ['KAKU_CONFIG_FILE', 'KAKU_CONFIG_DIR', 'KAKU_SESSION',
+  'KAKU_UNIX_SOCKET', 'KAKU_ZSH_DIR', 'XDG_CONFIG_HOME']) delete inheritedEnv[key];
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function port() {
   const server = net.createServer();
@@ -88,7 +94,7 @@ const WATCH = () => {
   const children = [];
   let browser, server, latencyProxy;
   const start = (file, args, env) => {
-    const p = spawn(file, args, { env: { ...process.env, ...env }, stdio: 'ignore' });
+    const p = spawn(file, args, { env: { ...inheritedEnv, ...env }, stdio: 'ignore' });
     children.push(p); return p;
   };
   const report = {};
@@ -100,7 +106,7 @@ const WATCH = () => {
     report.rtt_ms = rtt;
     const origin = `http://127.0.0.1:${pagePort}`;
     const dir = path.resolve(execFileSync(path.join(root, 'scripts/publish_web_page.sh'), ['--dry-run'], {
-      env: { ...process.env, KAKU_WEB_RELAY: `ws://127.0.0.1:${pageRelay}` },
+      env: { ...inheritedEnv, KAKU_WEB_RELAY: `ws://127.0.0.1:${pageRelay}` },
     }).toString().trim());
     server = await serveLikeVercel(dir, pagePort);
     start(path.join(root, 'crates/kaku-relay/target/debug/kaku-relay'), [], { PORT: String(relay), KAKU_RELAY_PAGE_ORIGIN: origin });
@@ -114,7 +120,7 @@ const WATCH = () => {
     const env = { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), TMPDIR: path.join(home, 'tmp/') };
     start(path.join(app, 'Contents/MacOS/kaku-gui'), ['--config-file', config, 'start', '--always-new-process'], env);
     await until(() => fs.existsSync(path.join(home, 'Library/Application Support/kaku/remote-share.json')));
-    const link = execFileSync(path.join(app, 'Contents/MacOS/kaku'), ['remote'], { env: { ...process.env, ...env } })
+    const link = execFileSync(path.join(app, 'Contents/MacOS/kaku'), ['remote'], { env: { ...inheritedEnv, ...env } })
       .toString().split('\n').find(line => /#[A-Za-z0-9_-]{22}$/.test(line));
     const id = /\/([0-9a-f]{32})\//.exec(link)[1];
     await until(async () => (await fetch(`http://127.0.0.1:${relay}/${id}/status`)).ok);
