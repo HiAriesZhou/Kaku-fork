@@ -228,6 +228,9 @@ impl CommandDef {
             PasteFrom(ClipboardPasteSource::Clipboard),
             Search(Pattern::CurrentSelectionOrEmptyString),
             ClearScrollback(ScrollbackEraseMode::ScrollbackOnly),
+            // Palette only, with no default key: an accidental chord into
+            // its key-grabbing modal looked like a frozen pane (#588).
+            CharSelect(CharSelectArguments::default()),
             // View menu
             ResetFontSize,
             IncreaseFontSize,
@@ -2801,15 +2804,15 @@ mod tests {
 
     #[test]
     fn rarely_used_wezterm_actions_are_not_exposed_by_default() {
-        // These either open an input-grabbing modal (QuickSelect, CharSelect,
-        // Copy Mode, the swap pane picker) or have no use in Kaku. User
-        // configs can still bind every one of them.
+        // These either open an input-grabbing modal (QuickSelect, Copy Mode,
+        // the swap pane picker) or have no use in Kaku. User configs can
+        // still bind every one of them. CharSelect is covered by
+        // `char_select_is_in_the_palette_without_a_default_key`.
         let config = ConfigHandle::default_config();
         let is_removed = |action: &KeyAssignment| {
             matches!(
                 action,
                 KeyAssignment::QuickSelect
-                    | KeyAssignment::CharSelect(_)
                     | KeyAssignment::ActivateCopyMode
                     | KeyAssignment::ClearKeyTableStack
                     | KeyAssignment::ResetTerminal
@@ -2843,6 +2846,33 @@ mod tests {
         assert!(CommandDef::actions_for_palette_only(&config)
             .iter()
             .any(|cmd| cmd.action == KeyAssignment::ToggleAlwaysOnTop));
+    }
+
+    #[test]
+    fn char_select_is_in_the_palette_without_a_default_key() {
+        // #588: the emoji and Nerd Font picker is reachable from the palette,
+        // but no default chord opens its key-grabbing modal by accident.
+        let config = ConfigHandle::default_config();
+        let is_char_select =
+            |action: &KeyAssignment| matches!(action, KeyAssignment::CharSelect(_));
+
+        let palette = CommandDef::actions_for_palette_only(&config);
+        let entry = palette
+            .iter()
+            .find(|cmd| is_char_select(&cmd.action))
+            .expect("CharSelect in the command palette");
+        assert!(entry.keys.is_empty(), "{:?}", entry.keys);
+        assert!(entry.menubar.is_empty());
+
+        assert!(!CommandDef::default_key_assignments(&config)
+            .iter()
+            .any(|(_, _, action)| is_char_select(action)));
+        let map = crate::inputmap::InputMap::new(&config);
+        assert!(!map
+            .keys
+            .default
+            .values()
+            .any(|entry| is_char_select(&entry.action)));
     }
 
     #[test]

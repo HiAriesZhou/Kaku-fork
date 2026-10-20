@@ -85,6 +85,8 @@
 | Open link | `Cmd + Click` |
 | Move cursor to clicked column | `Opt + Click` (same row, shell prompt only) |
 
+> The emoji and Nerd Font picker has no default shortcut. Open it from the Command Palette by searching `emoji`, or bind `CharSelect` as in the example below.
+
 ## Custom Keybindings
 
 Add bindings to `~/.config/kaku/kaku.lua` by **appending** to `config.keys`. Do not assign a new table, this would erase Kaku's defaults.
@@ -102,6 +104,13 @@ table.insert(config.keys, {
   key = 'Space',
   mods = 'CMD|SHIFT',
   action = wezterm.action.EmitEvent('kaku-ai-chat'),
+})
+
+-- Example: open the emoji and Nerd Font picker with Cmd+Shift+U:
+table.insert(config.keys, {
+  key = 'u',
+  mods = 'CMD|SHIFT',
+  action = wezterm.action.CharSelect {},
 })
 
 -- Example: copy and paste with Ctrl+Shift+C / Ctrl+Shift+V as on Linux:
