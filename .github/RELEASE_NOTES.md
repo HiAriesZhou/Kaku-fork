@@ -1,31 +1,31 @@
-# V0.25.0 Signal
+# V0.26.0 Bridge
 
 <div align="center">
   <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/logo.png" alt="Kaku Logo" width="120" height="120" />
-  <h1 style="margin: 12px 0 6px;">Kaku V0.25.0</h1>
+  <h1 style="margin: 12px 0 6px;">Kaku V0.26.0</h1>
   <p><em>A fast, out-of-the-box terminal built for AI coding.</em></p>
 </div>
 
 ### Changelog
 
-1. **Agent Title**: While Claude Code, Codex or Kimi works, its mark and current topic show at the top right of the window, and Agent Title in kaku config turns it off.
-2. **Claude Code Alerts**: Claude Code 2.1.295 and later notify you and mark the tab when they wait on you, finish or fail, with no setup needed.
-3. **AI Chat**: History, Context and Model sit above the input, shell code blocks can be inserted into the shell, tool requests show their full details before you allow them, and Stop keeps the partial answer.
-4. **Remote Access**: Typing stays responsive while a lot of output streams in, and remote access stays free.
-5. **Touch**: Press and hold opens menus sooner, and their items are larger and easier to tap.
-6. **Window Padding**: The space around terminal content and the tab bar is now even.
-7. **Links and Shell**: File paths after Chinese punctuation are clickable, shells start faster by loading completions from cache, and Yazi leaves a row under the path.
-8. **Fixes**: kaku ai opens each tool's real login command, and q quits the kaku menu as its hint says.
+1. **Remote Page**: The web page draws with your Mac's fonts, shows the agent title, previews an image path when you hover it, and picks up a new version on its own after reconnecting.
+2. **Remote Typing**: Typing stays ahead of file transfers, emoji take two cells as they do in Kaku, splits keep the Mac's layout, and the page redraws itself if it falls out of step.
+3. **Remote Access**: Only one Kaku serves remote access at a time, so a second copy no longer takes the page over, and notices say what to do when the Mac is offline.
+4. **Lower CPU**: Programs that keep updating the title, such as Claude Code and Codex, no longer redraw the whole window each time.
+5. **Dead Keys**: A dead key such as `~` followed by a key it cannot combine with now types both characters, as Terminal.app does.
+6. **Character Picker**: The emoji and Nerd Font picker is back in the command palette, found by searching emoji.
+7. **Fixes**: Frame lines are quieter on dark themes, SSH tabs show their number when tab numbers are on, and AI summaries keep file names whole.
 
 ### 更新日志
 
-1. **Agent 标题**：Claude Code、Codex 或 Kimi 工作时，窗口右上角会显示它的标志和当前话题，可在 kaku config 里关闭 Agent Title。
-2. **Claude Code 提醒**：Claude Code 2.1.295 及以上版本在等你操作、完成或出错时会发通知并标记标签，无需任何设置。
-3. **AI 对话**：输入框上方新增历史、上下文和模型切换，代码块可插入 shell，工具请求在允许前展示完整参数，停止生成会保留已有回答。
-4. **远程访问**：大量输出时输入依然跟手，远程访问继续免费。
-5. **触屏**：长按更快弹出菜单，菜单项更大也更好点。
-6. **窗口边距**：终端内容和标签栏四周的留白更均匀。
-7. **链接与 Shell**：中文标点后的文件路径可直接点击，补全改从缓存加载让 shell 启动更快，Yazi 在路径下方留出一行。
-8. **修复**：kaku ai 会打开各工具真正的登录命令，kaku 主菜单按 q 可按提示退出。
+1. **远程网页**：网页使用 Mac 上的字体，显示 Agent 标题，悬停图片路径即可预览，重连后自动换上新版本。
+2. **远程输入**：传文件时输入依然优先，emoji 与 Kaku 一样占两格，分屏保持 Mac 上的布局，画面错位时会自动重绘。
+3. **远程访问**：同一时间只有一个 Kaku 提供远程访问，另开的副本不再接管网页，Mac 离线时提示会说明该怎么做。
+4. **更低的 CPU 占用**：Claude Code、Codex 这类持续更新标题的程序不再每次重绘整个窗口。
+5. **死键**：`~` 这类死键后接无法组合的按键时，两个字符都会输入，与 Terminal.app 一致。
+6. **字符选择器**：emoji 和 Nerd Font 选择器回到命令面板，搜索 emoji 即可打开。
+7. **修复**：深色主题下的边框线更柔和，开启标签编号后 SSH 标签也显示编号，AI 摘要里的文件名保持完整。
+
+Special thanks to @SimonRen for their contribution to this release.
 
 > https://github.com/tw93/Kaku

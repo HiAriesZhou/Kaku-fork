@@ -40,5 +40,6 @@ instruction files; read the txt file instead.
 | v38 | V0.23.1 | No schema change. Bumps so existing installs regenerate the shell integrations: the cursor comes back at the prompt after a program hides it and exits, and dotfiles kept as symlinks stay linked when Kaku updates them. |
 | v39 | V0.24.0 | No schema change: the `remote` keys already existed in V0.23.1, and remote access stays off by default. Increments because the release gate requires a bump every release; the highlight introduces `kaku remote`. |
 | v40 | V0.25.0 | Adds `show_agent_title` (default true), which is new in this release, so no migration is needed. Bumps so existing installs regenerate `kaku.zsh`, which loads the completion dump from cache again and refreshes it after a successful full check, and pick up the Yazi `init.lua` that leaves a row under the path when none exists. |
+| v41 | V0.26.0 | No schema change. Increments because the release gate requires a bump every release; the highlights cover the remote page's fonts and agent title, and the character picker's return to the command palette. |
 
 When you bump the version, add a row here in the same change.

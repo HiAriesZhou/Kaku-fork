@@ -106,3 +106,7 @@
 40	Claude Code、Codex 或 Kimi 工作时，窗口右上角会显示它的标志和当前话题
 40	Shells start faster by loading completions from cache
 40	补全改从缓存加载，shell 启动更快
+41	The remote page draws with your Mac's fonts and shows the agent title
+41	远程网页使用 Mac 上的字体，并显示 Agent 标题
+41	The emoji and Nerd Font picker is back in the command palette
+41	emoji 和 Nerd Font 选择器回到命令面板
