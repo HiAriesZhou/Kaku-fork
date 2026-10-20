@@ -1729,8 +1729,8 @@ test('the desktop view is offered only when Kaku has its helper', async t => {
   assert.deepEqual(errors, []);
 });
 
-// The desktop view opens in full screen over the bar; leave full screen,
-// as holding Esc does, before using the bar.
+// The desktop view opens in full screen; leave it, as holding Esc does,
+// where a test wants the plain window.
 const windowed = p => p.evaluate(() => document.fullscreenElement && document.exitFullscreen());
 
 test('the desktop view takes the keyboard and mouse, and gives them back', async t => {
@@ -1742,10 +1742,10 @@ test('the desktop view takes the keyboard and mouse, and gives them back', async
   assert.equal(await tool.evaluate(b => b.nextElementSibling?.classList.contains('screens') && b.nextElementSibling.nextElementSibling?.classList.contains('fs')), true, 'beside the full screen button');
   await tool.click();
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), true);
-  await p.waitForFunction(() => document.body.classList.contains('desktop-full'), null, { timeout: 3000 });
+  await p.waitForFunction(() => !!document.fullscreenElement, null, { timeout: 3000 });
   assert.equal(await p.evaluate(() => !!document.fullscreenElement), true, 'the screen opens in full screen');
-  const cover = await p.evaluate(() => { const r = document.getElementById('desktop').getBoundingClientRect(); return [r.top, r.height === innerHeight]; });
-  assert.deepEqual(cover, [0, true], 'over the bar');
+  const cover = await p.evaluate(() => { const r = document.getElementById('desktop').getBoundingClientRect(); const b = document.getElementById('bar').getBoundingClientRect(); return r.bottom <= b.top || r.top >= b.bottom; });
+  assert.equal(cover, true, 'beside the bar, which keeps the way back');
   const start = await p.evaluate(() => messages.filter(m => m.type === 'desktop_start'));
   assert.equal(start.length, 1);
   assert.ok(start[0].max_width >= 640 && start[0].max_height >= 400, JSON.stringify(start[0]));
@@ -1911,7 +1911,7 @@ test('the desktop view takes the Mac\'s pointer shape, its displays and dropped 
   assert.deepEqual(errors, []);
 });
 
-test('in full screen a dock at the top switches back to the terminal, keeping the full screen it found', async t => {
+test('in full screen the bar stays, and its button switches both ways keeping the full screen it found', async t => {
   const { p, errors } = await page(t);
   await screen(p);
   await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
@@ -1920,45 +1920,33 @@ test('in full screen a dock at the top switches back to the terminal, keeping th
   // From a windowed terminal the view opens its own full screen, and going
   // back closes it again.
   await tool.click();
-  await p.waitForFunction(() => document.body.classList.contains('desktop-full'), null, { timeout: 3000 });
-  const dock = p.locator('#desktop .dock');
-  // Open at first, so it is seen, over the picture and not over the bar.
-  assert.equal(await dock.evaluate(d => d.classList.contains('open')), true);
-  const back = p.locator('#desktop .dock .back');
-  assert.equal(await back.isVisible(), true);
-  const box = await back.boundingBox();
-  assert.ok(box.y < 40 && Math.abs(box.x + box.width / 2 - 500) < 120, 'top centre: ' + JSON.stringify(box));
-  assert.equal(await p.locator('#desktop .dock .screens').isVisible(), false, 'one display: no switch');
-  assert.equal(await p.locator('#desktop .dock button').count(), 2, 'only switches, nothing that leaves full screen');
-  await back.click();
+  await p.waitForFunction(() => !!document.fullscreenElement, null, { timeout: 3000 });
+  const bar = await p.locator('#bar').boundingBox();
+  const view = await p.locator('#desktop').boundingBox();
+  assert.ok(bar.height > 0 && (view.y >= bar.y + bar.height || view.y + view.height <= bar.y), 'the screen sits beside the bar, not over it');
+  assert.equal(await tool.isVisible(), true);
+  assert.equal(await tool.getAttribute('title'), 'Back to the terminal');
+  await tool.click();
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
   await p.waitForFunction(() => !document.fullscreenElement, null, { timeout: 3000 });
 
-  // From a full-screen terminal, back and forth stays in full screen, and
-  // the terminal gets its own locked keys back.
+  // From a full-screen terminal, back and forth from the same button stays
+  // in full screen, and the terminal gets its own locked keys back.
   await p.locator('#bar .tool.fs').click();
   await p.waitForFunction(() => document.body.classList.contains('fullscreen'), null, { timeout: 3000 });
   await p.evaluate(() => { if (navigator.keyboard) navigator.keyboard.lock = (keys) => { window.lockedKeys = keys || 'all'; return Promise.resolve(); }; });
-  await p.mouse.move(500, 400);
   await tool.click();
-  await p.waitForFunction(() => document.body.classList.contains('desktop-full'), null, { timeout: 3000 });
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), true);
   assert.equal(await p.evaluate(() => window.lockedKeys), 'all', 'every key goes to the Mac');
-  // After a while only the handle shows, and pointing at it opens it.
-  await p.waitForFunction(() => !document.querySelector('#desktop .dock').classList.contains('open'), null, { timeout: 5000 });
-  assert.equal(await back.isVisible(), false);
-  const handle = await p.locator('#desktop .dock .handle').boundingBox();
-  await p.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
-  assert.equal(await back.isVisible(), true);
+  assert.equal(await p.locator('#bar .clock').isVisible(), true, 'the clock stays in view');
   await p.evaluate(() => { messages.length = 0; });
-  await back.click();
+  await tool.click();
   await p.waitForTimeout(200);
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
   assert.equal(await p.evaluate(() => !!document.fullscreenElement), true, 'still in full screen');
-  assert.equal(await tool.isVisible(), true, 'the bar is back');
   assert.ok(Array.isArray(await p.evaluate(() => window.lockedKeys)), 'the terminal\'s keys are locked again');
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'desktop_stop').length), 1);
   await tool.click();
-  await p.waitForFunction(() => document.body.classList.contains('desktop-full'), null, { timeout: 3000 });
   assert.equal(await p.evaluate(() => !!document.fullscreenElement), true);
   assert.deepEqual(errors, []);
 });
