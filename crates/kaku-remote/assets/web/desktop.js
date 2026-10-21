@@ -70,6 +70,10 @@
   // Two fingers scroll twice their travel; let go moving, the scroll glides
   // on and slows (velocity per millisecond), as on the Mac's trackpad.
   const TOUCH_SCROLL = 2;
+  // The Mac's standard pointers, by the names the helper gives them.
+  const CURSOR_NAMES = new Set(["default", "text", "vertical-text", "pointer", "crosshair", "grab", "grabbing",
+    "not-allowed", "context-menu", "copy", "alias", "ew-resize", "ns-resize", "w-resize", "e-resize",
+    "n-resize", "s-resize", "col-resize", "row-resize", "nwse-resize", "nesw-resize"]);
   const GLIDE_DECAY = 0.994;
   const GLIDE_START = 50;
   const GLIDE_STOP = 10;
@@ -289,6 +293,7 @@
     // The Mac screen's width in points, and whether this stream's view has
     // been framed for a touch screen yet.
     let screenPoints = 0;
+    let lastCursor = null;
     let framed = false;
     let canControl = true;
     let warnedControl = false;
@@ -325,6 +330,7 @@
       canvas.style.width = Math.floor(videoW * s) + "px";
       canvas.style.height = Math.floor(videoH * s) + "px";
       setZoom(zoom.z, zoom.x, zoom.y);
+      if (lastCursor) onCursor(lastCursor);
     };
 
     // A phone shows a whole Mac screen too small to read, so a pinch zooms
@@ -531,6 +537,7 @@
       // The last picture stays on the hidden canvas for the way back.
       document.body.classList.remove("desktop");
       canvas.style.cursor = "";
+      lastCursor = null;
       syncScreens();
       // Full screen the view opened goes with it; one the terminal was
       // already in stays, with the terminal's own keys locked again.
@@ -695,12 +702,20 @@
     screens.addEventListener("click", nextDisplay);
 
     // The Mac's pointer shape (an I-beam over text, a resize arrow at a
-    // window's edge) on the page's own pointer, drawn at twice its size.
+    // window's edge) on the page's own pointer. A standard one is the
+    // browser's own, at the size this computer is set to: the Mac's picture
+    // read as less than half its size in Helium (maintainer, 2026-10-21).
+    // Any other is the Mac's picture at the size the screen is drawn.
     const onCursor = (msg) => {
-      if (!active || TOUCH || typeof msg.png !== "string") return;
+      lastCursor = msg;
+      if (!active || TOUCH) return;
+      if (CURSOR_NAMES.has(msg.name)) { canvas.style.cursor = msg.name; return; }
+      if (typeof msg.png !== "string") return;
       const url = `url("data:image/png;base64,${msg.png}")`;
-      const hot = `${msg.hot_x | 0} ${msg.hot_y | 0}`;
-      const scale = msg.scale || 1;
+      const shown = screenPoints > 0 ? canvas.getBoundingClientRect().width / screenPoints : 1;
+      const grow = Math.min(Math.max(shown, 1), 3);
+      const hot = `${Math.round((msg.hot_x | 0) * grow)} ${Math.round((msg.hot_y | 0) * grow)}`;
+      const scale = (msg.scale || 1) / grow;
       for (const value of [`image-set(${url} ${scale}x) ${hot}, default`, `-webkit-image-set(${url} ${scale}x) ${hot}, default`]) {
         canvas.style.cursor = value;
         if (canvas.style.cursor) return;

@@ -2106,6 +2106,15 @@ test('the desktop view takes the Mac\'s pointer shape, its displays and dropped 
   await p.evaluate((png) => probe.handle({ type: 'desktop_cursor', png, scale: 2, hot_x: 4, hot_y: 9 }), png);
   const cursor = await p.locator('#desktop canvas').evaluate(c => c.style.cursor);
   assert.match(cursor, /image-set\(url\("data:image\/png;base64,iVBOR.*2x\) 4 9, default/);
+  // A standard pointer is the browser's own, at this computer's size.
+  await p.evaluate((png) => probe.handle({ type: 'desktop_cursor', name: 'text', png, scale: 2, hot_x: 4, hot_y: 9 }), png);
+  assert.equal(await p.locator('#desktop canvas').evaluate(c => c.style.cursor), 'text');
+  // Any other grows with the screen: drawn at twice its points, the
+  // picture shows at twice its size, hot spot moved with it.
+  const drawn = await p.locator('#desktop canvas').evaluate(c => c.getBoundingClientRect().width);
+  await p.evaluate((w) => probe.handle({ type: 'desktop_status', state: 'streaming', screen_width: w }), Math.round(drawn / 2));
+  await p.evaluate((png) => probe.handle({ type: 'desktop_cursor', name: 'url(x)', png, scale: 2, hot_x: 4, hot_y: 9 }), png);
+  assert.match(await p.locator('#desktop canvas').evaluate(c => c.style.cursor), /image-set\(url\("data:image\/png;base64,iVBOR.*1x\) 8 18, default/);
 
   // One display: nothing to switch. Two: a button beside the screen's.
   const screens = p.locator('#bar .tool.screens');
