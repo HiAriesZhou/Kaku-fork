@@ -1175,7 +1175,20 @@
       };
       const region = term._core?.buffer;
       const modes = term.modes || {};
-      view.trace = `cursor ${buf.cursorX},${buf.cursorY} region ${region?.scrollTop ?? "?"}-${region?.scrollBottom ?? "?"}`
+      // Rows that are one line object: writing any of them shows in all,
+      // which a full redraw cannot undo. Named as row>first row it shares.
+      const lines = region?.lines;
+      const shared = [];
+      if (lines) {
+        const first = new Map();
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines.get(i);
+          if (first.has(line)) shared.push(`${i - buf.viewportY}>${first.get(line) - buf.viewportY}`);
+          else first.set(line, i);
+        }
+      }
+      view.trace = `lines ${lines?.length ?? "?"} shared [${shared.slice(0, 12).join(" ")}${shared.length > 12 ? ` +${shared.length - 12}` : ""}]`
+        + ` cursor ${buf.cursorX},${buf.cursorY} region ${region?.scrollTop ?? "?"}-${region?.scrollBottom ?? "?"}`
         + ` wrap ${modes.wraparoundMode} origin ${modes.originMode} insert ${modes.insertMode}; writes ${writeTrace.join(" | ")}`;
       send({ type: "verify", frames: framesSeen, seq: appliedSeq || undefined, rows, view });
     });

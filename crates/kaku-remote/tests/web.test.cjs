@@ -1806,6 +1806,8 @@ test('the drift check names the last frame drawn, so it runs while output stream
   // How the page draws goes along for the Mac's log.
   assert.ok(last.view.font > 0 && last.view.cell_w > 0 && last.view.cell_h > 0 && last.view.icon > 0, JSON.stringify(last.view));
   assert.equal(last.view.past, false);
+  // The buffer's own lines, and rows sharing one line object, which no redraw fixes.
+  assert.match(last.view.trace, /^lines 24 shared \[\] cursor /);
   const resets = last.view.atlas;
   await p.evaluate(() => window.dispatchEvent(new Event('focus')));
   await p.evaluate(() => probe.handle({ type: 'frame', seq: 5, pane_id: 1, cols: 90, rows: 24, data: '\x1b[2;1Hmore' }));
