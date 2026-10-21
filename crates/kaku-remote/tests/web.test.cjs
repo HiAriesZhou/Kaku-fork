@@ -1811,7 +1811,8 @@ test('the drift check names the last frame drawn, so it runs while output stream
   await p.evaluate(() => probe.handle({ type: 'frame', seq: 5, pane_id: 1, cols: 90, rows: 24, data: '\x1b[2;1Hmore' }));
   await p.waitForTimeout(1400);
   const after = (await p.evaluate(() => messages.filter(m => m.type === 'verify'))).at(-1);
-  assert.equal(after.view.atlas, after.view.gl ? resets + 1 : resets);
+  // Focus no longer rebuilds the atlas: a rebuild only made glyph page merges more frequent.
+  assert.equal(after.view.atlas, resets);
 });
 
 test('the page draws with Kaku\'s font families in their order', async t => {
@@ -1892,6 +1893,9 @@ test('an icon drawn before its font loaded is redrawn once the font is in', asyn
     probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] });
     probe.handle({ type: 'frame', seq: 1, pane_id: 1, cols: 80, rows: 24, data: '\x1b[2J\x1b[1;1H dir' });
   });
+  // Drawing into a canvas does not always start the load of a font limited
+  // by unicode-range, so start it here; what is checked is the redraw after.
+  await p.evaluate(() => document.fonts.load('16px "Kaku Symbols"', '\uf115'));
   await p.waitForFunction(() => [...document.fonts].some(f => f.family.includes('Kaku Symbols') && f.status === 'loaded'));
   await p.waitForTimeout(300);
   const box = await p.locator('.xterm-screen').boundingBox();
