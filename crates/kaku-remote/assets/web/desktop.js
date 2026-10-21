@@ -320,9 +320,15 @@
       view.classList.remove("live");
     };
 
+    // Ctrl+Option+Shift+D (Ctrl+Alt+Shift+D elsewhere) switches between
+    // the terminal and this view from either side (maintainer, 2026-10-21):
+    // three modifiers no Mac app or terminal program claims, and no Windows
+    // key, whose combinations Windows takes first.
+    const SWITCH_KEYS = isMac ? "Ctrl+Option+Shift+D" : "Ctrl+Alt+Shift+D";
+    const isSwitch = (ev) => ev.code === "KeyD" && ev.ctrlKey && ev.altKey && ev.shiftKey && !ev.metaKey;
     const syncButton = () => {
       button.setAttribute("aria-current", active ? "true" : "false");
-      button.title = active ? "Back to the terminal" : "Show the Mac's screen";
+      button.title = `${active ? "Back to the terminal" : "Show the Mac's screen"} (${SWITCH_KEYS})`;
     };
     syncButton();
 
@@ -1214,6 +1220,23 @@
       if (down) pressed.add(ev.code); else if (!pressed.delete(ev.code)) return;
       send(keyMessage(ev, down));
     };
+    // Ahead of the keys sent to the Mac: the D goes nowhere, the modifiers
+    // held while switching are let go of on the Mac by the view leaving.
+    let switchHeld = false;
+    window.addEventListener("keydown", (ev) => {
+      if (!isSwitch(ev)) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      if (ev.repeat) return;
+      switchHeld = true;
+      if (active) leave(); else enter();
+    }, true);
+    window.addEventListener("keyup", (ev) => {
+      if (ev.code !== "KeyD" || !switchHeld) return;
+      switchHeld = false;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+    }, true);
     window.addEventListener("keydown", onKey(true), true);
     window.addEventListener("keyup", onKey(false), true);
     // Keys still held when the page loses focus would stay down on the Mac.

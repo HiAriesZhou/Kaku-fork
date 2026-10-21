@@ -1855,6 +1855,7 @@
   // Esc goes to the terminal too; holding it leaves full screen.
   const LOCKED_KEYS = ["Escape", "KeyW", "KeyT", "BracketLeft", "BracketRight",
     "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9"];
+  const FS_KEYS = IS_MAC ? "Ctrl+Cmd+F" : "F11";
   if (document.fullscreenEnabled && !TOUCH) {
     const fs = document.createElement("button");
     fs.type = "button";
@@ -1865,7 +1866,7 @@
     const sync = () => {
       const inFs = !!document.fullscreenElement;
       fs.innerHTML = icon(inFs);
-      fs.title = inFs ? "Exit Full Screen" : "Full Screen, so Cmd+1-9, Cmd+W and Cmd+T work as in Kaku";
+      fs.title = inFs ? `Exit Full Screen (${FS_KEYS})` : `Full Screen, so Cmd+1-9, Cmd+W and Cmd+T work as in Kaku (${FS_KEYS})`;
       if (!inFs && navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
     };
     fs.addEventListener("click", () => {
@@ -1874,6 +1875,17 @@
         if (navigator.keyboard && navigator.keyboard.lock) return navigator.keyboard.lock(LOCKED_KEYS);
       }).catch(() => {}).finally(() => term.focus());
     });
+    // The system's own full-screen keys do the same in the terminal; in the
+    // desktop view they go to the Mac, for its own windows.
+    window.addEventListener("keydown", (ev) => {
+      const keys = IS_MAC
+        ? ev.code === "KeyF" && ev.metaKey && ev.ctrlKey && !ev.altKey && !ev.shiftKey
+        : ev.code === "F11" && !ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey;
+      if (!keys || desktop?.active) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      if (!ev.repeat) fs.click();
+    }, true);
     document.addEventListener("fullscreenchange", sync);
     sync();
     const clock = document.createElement("span");

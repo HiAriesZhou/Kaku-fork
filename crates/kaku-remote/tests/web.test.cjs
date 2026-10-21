@@ -2283,7 +2283,7 @@ test('in full screen the bar stays, and its button switches both ways keeping th
   const view = await p.locator('#desktop').boundingBox();
   assert.ok(bar.height > 0 && (view.y >= bar.y + bar.height || view.y + view.height <= bar.y), 'the screen sits beside the bar, not over it');
   assert.equal(await tool.isVisible(), true);
-  assert.equal(await tool.getAttribute('title'), 'Back to the terminal');
+  assert.equal(await tool.getAttribute('title'), 'Back to the terminal (Ctrl+Option+Shift+D)');
   await tool.click();
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
   await p.waitForFunction(() => !document.fullscreenElement, null, { timeout: 3000 });
@@ -3025,5 +3025,33 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
   // Closed: back to the session.
   await p.evaluate(() => { peer.dc.readyState = 'closed'; peer.dc.onclose(); messages.length = 0; probe.attach({ pane_id: 4, tab_id: 1 }); });
   assert.deepEqual(await p.evaluate(() => messages.map(m => m.type)), ['attach']);
+  assert.deepEqual(errors, []);
+});
+
+test('one key switches between the terminal and the desktop view, and the system keys fill the screen', async t => {
+  const { p, errors } = await page(t, '#t=fixture', { platform: 'MacIntel' });
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').waitFor();
+  const typed = () => p.evaluate(() => messages.filter(m => ['text', 'key', 'desktop_key'].includes(m.type)));
+
+  // Ctrl+Cmd+F fills the screen from the terminal, and leaves it again.
+  await p.keyboard.press('Control+Meta+KeyF');
+  await p.waitForFunction(() => !!document.fullscreenElement, null, { timeout: 3000 });
+  await p.keyboard.press('Control+Meta+KeyF');
+  await p.waitForFunction(() => !document.fullscreenElement, null, { timeout: 3000 });
+
+  // Ctrl+Option+Shift+D goes to the Mac's screen and back, typing nothing.
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.press('Control+Alt+Shift+KeyD');
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), true);
+  await p.waitForFunction(() => !!document.fullscreenElement, null, { timeout: 3000 });
+  // There, Ctrl+Cmd+F is the Mac's, for its own windows.
+  await p.keyboard.press('Control+Meta+KeyF');
+  assert.equal(await p.evaluate(() => !!document.fullscreenElement), true);
+  await p.keyboard.press('Control+Alt+Shift+KeyD');
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'desktop_stop').length), 1);
+  assert.deepEqual((await typed()).filter(m => m.type !== 'desktop_key' || /D$/.test(m.code)), []);
   assert.deepEqual(errors, []);
 });
