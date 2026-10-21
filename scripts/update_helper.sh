@@ -5,6 +5,8 @@ TARGET_APP="$1"
 NEW_APP="$2"
 WORK_DIR="$3"
 LOG_FILE="$WORK_DIR/update.log"
+# Kaku spawns the helper with stderr closed; keep its own errors in the log.
+exec 2>>"$LOG_FILE"
 
 strip_trailing_slashes() {
   local p="$1"

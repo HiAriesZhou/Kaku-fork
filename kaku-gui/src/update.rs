@@ -859,6 +859,7 @@ pub fn spawn_update_helper(
     new_app: &Path,
     work_dir: &Path,
 ) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     // Validate paths end with Kaku.app.
@@ -881,6 +882,10 @@ pub fn spawn_update_helper(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        // Kaku.app runs as a launchd job, and launchd kills what is left of
+        // its process group when kaku-gui exits: the helper stops Kaku first,
+        // so in Kaku's group it died before replacing the app (#591).
+        .process_group(0)
         .spawn()
         .map_err(|e| anyhow!("failed to spawn update helper: {}", e))?;
     Ok(())
@@ -889,6 +894,32 @@ pub fn spawn_update_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A Kaku.app launched from Finder is a launchd job whose process group
+    // launchd kills once kaku-gui exits, so the helper must lead its own group
+    // or it dies right after stopping Kaku (#591).
+    #[test]
+    fn update_helper_leads_its_own_process_group() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let script = tmp.path().join("probe.sh");
+        let out = tmp.path().join("pgid");
+        std::fs::write(
+            &script,
+            "printf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$3/pgid.tmp\"\nmv \"$3/pgid.tmp\" \"$3/pgid\"\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("Kaku.app");
+        spawn_update_helper(&script, &app, &app, tmp.path()).expect("spawn helper");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !out.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let text = std::fs::read_to_string(&out).expect("helper wrote its pid and pgid");
+        let ids: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(ids.len(), 2, "unexpected probe output: {text:?}");
+        assert_eq!(ids[0], ids[1], "helper must lead its own process group");
+    }
 
     #[test]
     fn semver_numeric_comparison() {

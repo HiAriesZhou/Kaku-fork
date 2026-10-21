@@ -23,6 +23,7 @@ mod imp {
     use std::cmp::Ordering;
     use std::fs;
     use std::io::{self, IsTerminal, Read, Write};
+    use std::os::unix::process::CommandExt;
     use std::path::{Component, Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -875,6 +876,9 @@ mod imp {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            // Own process group, so the helper survives Kaku exiting even when
+            // its caller belongs to a launchd job's group (#591).
+            .process_group(0)
             .spawn()
             .context("launch detached updater helper")?;
         Ok(())
@@ -967,9 +971,35 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::{
-            brew_casks_in_priority_order, brew_upgrade_fallback, is_newer_version, strip_html_tags,
-            OFFICIAL_BREW_CASK, TAP_BREW_CASK,
+            brew_casks_in_priority_order, brew_upgrade_fallback, is_newer_version,
+            spawn_update_helper, strip_html_tags, OFFICIAL_BREW_CASK, TAP_BREW_CASK,
         };
+        use std::time::{Duration, Instant};
+
+        // The helper outlives the process that spawns it; when that process is
+        // a launchd job, launchd kills its process group on exit (#591).
+        #[test]
+        fn update_helper_leads_its_own_process_group() {
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            let script = tmp.path().join("probe.sh");
+            let out = tmp.path().join("pgid");
+            std::fs::write(
+                &script,
+                "printf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$3/pgid.tmp\"\nmv \"$3/pgid.tmp\" \"$3/pgid\"\n",
+            )
+            .unwrap();
+            let app = tmp.path().join("Kaku.app");
+            spawn_update_helper(&script, &app, &app, tmp.path()).expect("spawn helper");
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !out.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let text = std::fs::read_to_string(&out).expect("helper wrote its pid and pgid");
+            let ids: Vec<&str> = text.split_whitespace().collect();
+            assert_eq!(ids.len(), 2, "unexpected probe output: {text:?}");
+            assert_eq!(ids[0], ids[1], "helper must lead its own process group");
+        }
 
         #[test]
         fn semver_numeric_comparison() {
