@@ -1,9 +1,10 @@
 //! Single-color marks for the agent CLIs whose title is drawn in the top
 //! strip (`agent_title.rs`), filled even-odd and tinted with the title color.
 //!
-//! Paths come from Lobe Icons (`@lobehub/icons-static-svg` 1.95.1, MIT),
-//! icons `claude`, `codex` and `kimi`, converted on a 24 unit grid by
-//! `scripts/svg_to_poly.py`. The marks identify the program running in the
+//! The `claude`, `codex` and `kimi` paths come from Lobe Icons
+//! (`@lobehub/icons-static-svg` 1.95.1, MIT), converted on a 24 unit grid by
+//! `scripts/svg_to_poly.py`. Lobe Icons has no icon for pi, so `PI_MARK` is
+//! drawn here on the same grid. The marks identify the program running in the
 //! pane; they are trademarks of their owners.
 
 use crate::customglyph::BlockCoord::Frac;
@@ -272,5 +273,25 @@ pub(crate) const KIMI_MARK: &[PolyCommand] = &[
     CubicTo { control1: (Frac(90, 120), Frac(82, 120)), control2: (Frac(87, 120), Frac(80, 120)), to: (Frac(84, 120), Frac(78, 120)) },
     LineTo(Frac(55, 120), Frac(58, 120)),
     CubicTo { control1: (Frac(55, 120), Frac(58, 120)), control2: (Frac(55, 120), Frac(57, 120)), to: (Frac(55, 120), Frac(56, 120)) },
+    Close,
+];
+
+/// pi's mark: a plain π, drawn here rather than converted from Lobe Icons,
+/// which has no icon for pi. It uses the same 24 unit grid as the others, so
+/// it sits on their baseline and fills the same box.
+#[rustfmt::skip]
+pub(crate) const PI_MARK: &[PolyCommand] = &[
+    MoveTo(Frac(18, 120), Frac(20, 120)),
+    LineTo(Frac(102, 120), Frac(20, 120)),
+    LineTo(Frac(102, 120), Frac(34, 120)),
+    LineTo(Frac(84, 120), Frac(34, 120)),
+    LineTo(Frac(84, 120), Frac(100, 120)),
+    LineTo(Frac(68, 120), Frac(100, 120)),
+    LineTo(Frac(68, 120), Frac(34, 120)),
+    LineTo(Frac(52, 120), Frac(34, 120)),
+    LineTo(Frac(52, 120), Frac(100, 120)),
+    LineTo(Frac(36, 120), Frac(100, 120)),
+    LineTo(Frac(36, 120), Frac(34, 120)),
+    LineTo(Frac(18, 120), Frac(34, 120)),
     Close,
 ];

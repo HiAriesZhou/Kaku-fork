@@ -99,7 +99,7 @@ static AI_CHAT_PANES: LazyLock<Mutex<HashSet<usize>>> =
 
 #[derive(Serialize, Clone, PartialEq, Debug)]
 struct AgentInfo {
-    /// "claude", "codex" or "kimi".
+    /// "claude", "codex", "kimi" or "pi".
     program: &'static str,
     topic: String,
 }

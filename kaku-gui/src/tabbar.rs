@@ -802,6 +802,7 @@ pub(crate) fn foreground_agent_cli(pane: &dyn mux::pane::Pane) -> Option<&'stati
         "claude" => Some("claude"),
         "codex" => Some("codex"),
         "kimi" => Some("kimi"),
+        "pi" => Some("pi"),
         _ => None,
     }
 }
