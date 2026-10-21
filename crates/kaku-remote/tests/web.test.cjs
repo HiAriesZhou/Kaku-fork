@@ -2147,7 +2147,10 @@ test('an old desktop decoder cannot paint or reset a new stream', async t => {
     outputs[0]();
     decoderCallbacks[0].error(new Error('late old decoder error'));
   });
-  assert.deepEqual(await p.evaluate(() => Array.from(document.querySelector('#desktop canvas').getContext('2d').getImageData(0, 0, 1, 1).data)), [0, 0, 255, 255]);
+  // The new stream's blue, not the old one's red; a GPU canvas may round
+  // 255 to 254 on the way.
+  const [r, g, b] = await p.evaluate(() => Array.from(document.querySelector('#desktop canvas').getContext('2d').getImageData(0, 0, 1, 1).data));
+  assert.ok(r < 8 && g < 8 && b > 247, `pixel ${r},${g},${b}`);
   assert.equal(await p.evaluate(() => probe.desktop.lastDrawn), 1);
   assert.equal(await p.evaluate(() => closedFrames), 2, 'both current and discarded frames are released');
   await showPicture(p, 2, undefined, 'second');
