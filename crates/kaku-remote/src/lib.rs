@@ -16,6 +16,8 @@ mod awake;
 #[cfg(feature = "desktop")]
 mod desktop;
 mod fonts;
+#[cfg(feature = "desktop")]
+mod p2p;
 mod pairing;
 mod queue;
 mod share;

@@ -2538,9 +2538,11 @@ pub(crate) async fn run_session(
 ) {
     let _awake = crate::awake::Awake::hold();
     #[cfg(feature = "desktop")]
-    {
-        inbox = crate::desktop::tap(inbox, outbox.clone(), frames);
-    }
+    let outbox = {
+        let (direct_inbox, outbox, frames) = crate::p2p::wrap(inbox, outbox, frames);
+        inbox = crate::desktop::tap(direct_inbox, outbox.clone(), frames);
+        outbox
+    };
     #[cfg(not(feature = "desktop"))]
     drop(frames);
     if let Some(json) = encode(&WebServerMsg::Config(&crate::config_info())) {

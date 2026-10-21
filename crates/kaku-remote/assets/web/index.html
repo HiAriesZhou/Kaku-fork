@@ -482,6 +482,11 @@
     // our grid after the Mac has applied the zoom, even if our size is unchanged.
     if (msg.type === "zoom_pane" && msg.pane_id === paneId) claimed = "";
     const json = JSON.stringify(msg);
+    const path = direct;
+    if (path && path.open && path.socket === socket && json.length < DIRECT_PIECE && path.dc.readyState === "open") {
+      path.dc.send(json);
+      return;
+    }
     if (!relay) { socket.send(json); return; }
     const conn = link;
     sendChain = sendChain.then(async () => {
@@ -3157,6 +3162,72 @@
       })
       .catch(() => {});
   };
+  // ── Direct path ──
+  // Beside the relay, a WebRTC data channel straight to the Mac, offered
+  // once Kaku says it can show the desktop. The offer and answer go through
+  // the sealed session, so the DTLS fingerprints in them are the Mac's and
+  // this page's own. Once open, small messages and everything Kaku sends
+  // interactively take it; files stay on the relay. `?p2p` tries it on a
+  // local link too. Kaku's messages come in pieces: a flag byte (1 last,
+  // 2 text), then up to 16 KB.
+  const DIRECT_PIECE = 16 * 1024;
+  const DIRECT_FORCED = new URLSearchParams(location.search).has("p2p");
+  let direct = null;
+  const closeDirect = () => {
+    const path = direct;
+    direct = null;
+    if (!path) return;
+    try { path.dc.close(); path.pc.close(); } catch (_) {}
+  };
+  const gathered = (pc, ms) => new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") { resolve(); return; }
+    const timer = setTimeout(resolve, ms);
+    pc.addEventListener("icegatheringstatechange", () => {
+      if (pc.iceGatheringState === "complete") { clearTimeout(timer); resolve(); }
+    });
+  });
+  const openDirect = async (socket, deliver) => {
+    if (direct || typeof RTCPeerConnection !== "function") return;
+    let pc;
+    try { pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }] }); } catch (_) { return; }
+    const dc = pc.createDataChannel("kaku");
+    dc.binaryType = "arraybuffer";
+    const path = { pc, dc, socket, open: false, parts: [], since: performance.now() };
+    direct = path;
+    dc.onopen = () => {
+      if (direct !== path) return;
+      path.open = true;
+      path.openedIn = Math.round(performance.now() - path.since);
+    };
+    dc.onclose = () => { if (direct === path) direct = null; };
+    dc.onmessage = (ev) => {
+      if (direct !== path || ws !== socket) return;
+      const bytes = new Uint8Array(ev.data);
+      path.parts.push(bytes.subarray(1));
+      if (!(bytes[0] & 1)) return;
+      const size = path.parts.reduce((n, part) => n + part.length, 0);
+      const whole = new Uint8Array(size);
+      let at = 0;
+      for (const part of path.parts) { whole.set(part, at); at += part.length; }
+      path.parts = [];
+      let msg;
+      try { msg = bytes[0] & 2 ? JSON.parse(dec.decode(whole)) : unpackFrame(whole); } catch (_) { return; }
+      // After whatever the relay delivered first.
+      recvChain = recvChain.then(() => deliver(msg));
+    };
+    try {
+      await pc.setLocalDescription(await pc.createOffer());
+      await gathered(pc, 2000);
+    } catch (_) { if (direct === path) closeDirect(); return; }
+    if (direct !== path || ws !== socket) return;
+    send({ type: "rtc_offer", sdp: pc.localDescription.sdp });
+  };
+  const answered = (socket, sdp) => {
+    const path = direct;
+    if (!path || path.socket !== socket || typeof sdp !== "string") return;
+    path.pc.setRemoteDescription({ type: "answer", sdp }).catch(() => { if (direct === path) closeDirect(); });
+  };
+
   let reconnectTimer = 0;
   let linkRejected = false;
   let handshakeTimer = 0;
@@ -3187,25 +3258,29 @@
     };
     socket.onmessage = (ev) => {
       if (ws !== socket) return;
-      receive(socket, ev.data, (msg) => {
-        if (ws !== socket) return;
-        lastHeard = Date.now();
-        if (msg.type === "config" || msg.type === "tabs" || msg.type === "frame" || msg.type === "pong") {
-          clearTimeout(handshakeTimer);
-          retry = 0;
-          if (everConnected && !checkedPage) {
-            checkedPage = true;
-            checkPageFresh();
-          }
-          everConnected = true;
-          clearNotice();
-          finishPairing();
+      receive(socket, ev.data, (msg) => onMessage(socket, msg));
+    };
+    const onMessage = (socket, msg) => {
+      if (ws !== socket) return;
+      if (msg.type === "rtc_answer") { answered(socket, msg.sdp); return; }
+      if (msg.type === "config" && msg.desktop && (relay || DIRECT_FORCED)) openDirect(socket, (m) => onMessage(socket, m));
+      lastHeard = Date.now();
+      if (msg.type === "config" || msg.type === "tabs" || msg.type === "frame" || msg.type === "pong") {
+        clearTimeout(handshakeTimer);
+        retry = 0;
+        if (everConnected && !checkedPage) {
+          checkedPage = true;
+          checkPageFresh();
         }
-        handle(msg);
-      });
+        everConnected = true;
+        clearNotice();
+        finishPairing();
+      }
+      handle(msg);
     };
     socket.onclose = (ev) => {
       if (ws !== socket) return;
+      closeDirect();
       hideImagePreview();
       clearTimeout(handshakeTimer);
       stopScrolling();

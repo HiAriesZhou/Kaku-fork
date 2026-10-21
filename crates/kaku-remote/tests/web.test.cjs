@@ -2967,3 +2967,63 @@ test('the desktop view lets go of held keys, sends modifiers with clicks, and as
   assert.equal(await asks(), false);
   assert.deepEqual(errors, []);
 });
+
+test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens', async t => {
+  const { p, errors } = await page(t, '?p2p#t=fixture', { noConfig: true });
+  // A stand-in peer connection: what the page offers, answers and sends is
+  // the page's own logic; Rust and a real browser meet in p2p_probe.cjs.
+  await p.evaluate(() => {
+    // Messages through the socket run the page's freshness check, which
+    // reloads this test page (its script carries the probe) mid-test.
+    window.fetch = () => Promise.reject(new Error('offline in this test'));
+    window.peer = { sent: [] };
+    window.RTCPeerConnection = class {
+      constructor() { peer.pc = this; this.iceGatheringState = 'complete'; }
+      createDataChannel() { peer.dc = { readyState: 'connecting', send: (d) => peer.sent.push(d), close() {} }; return peer.dc; }
+      async createOffer() { return { type: 'offer', sdp: 'v=0 offer' }; }
+      async setLocalDescription(d) { this.localDescription = d; }
+      async setRemoteDescription(d) { peer.answer = d; }
+      addEventListener() {}
+      close() {}
+    };
+    connections[0].onmessage({ data: JSON.stringify({ type: 'config', desktop: true }) });
+  });
+  await p.waitForFunction(() => messages.some(m => m.type === 'rtc_offer'));
+  assert.equal(await p.evaluate(() => messages.find(m => m.type === 'rtc_offer').sdp), 'v=0 offer');
+  await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'rtc_answer', sdp: 'v=0 answer' }) }));
+  await p.waitForFunction(() => peer.answer);
+  assert.deepEqual(await p.evaluate(() => peer.answer), { type: 'answer', sdp: 'v=0 answer' });
+
+  // Before the channel opens, the page keeps using the session.
+  await p.evaluate(() => { messages.length = 0; probe.attach({ pane_id: 4, tab_id: 1 }); });
+  assert.deepEqual(await p.evaluate(() => [messages.map(m => m.type), peer.sent.length]), [['attach'], 0]);
+
+  // Open: a message larger than one piece arrives whole.
+  const detail = 'direct '.repeat(4000);
+  await p.evaluate((detail) => {
+    peer.dc.readyState = 'open';
+    peer.dc.onopen();
+    const deliver = (flags, bytes) => {
+      const cut = 16 * 1024 - 1;
+      for (let at = 0; at < bytes.length; at += cut) {
+        const part = bytes.subarray(at, at + cut);
+        const piece = new Uint8Array(part.length + 1);
+        piece[0] = flags | (at + cut >= bytes.length ? 1 : 0);
+        piece.set(part, 1);
+        peer.dc.onmessage({ data: piece.buffer });
+      }
+    };
+    deliver(2, new TextEncoder().encode(JSON.stringify({ type: 'error', detail })));
+  }, detail);
+  await p.waitForFunction((n) => document.getElementById('toast').textContent.length === n, detail.length);
+
+  // Small messages now go direct.
+  await p.evaluate(() => { messages.length = 0; probe.attach({ pane_id: 5, tab_id: 1 }); });
+  assert.deepEqual(await p.evaluate(() => peer.sent.map(d => JSON.parse(d).type)), ['attach']);
+  assert.deepEqual(await p.evaluate(() => messages.map(m => m.type)), []);
+
+  // Closed: back to the session.
+  await p.evaluate(() => { peer.dc.readyState = 'closed'; peer.dc.onclose(); messages.length = 0; probe.attach({ pane_id: 4, tab_id: 1 }); });
+  assert.deepEqual(await p.evaluate(() => messages.map(m => m.type)), ['attach']);
+  assert.deepEqual(errors, []);
+});
