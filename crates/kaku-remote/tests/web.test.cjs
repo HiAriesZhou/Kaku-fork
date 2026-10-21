@@ -2717,6 +2717,96 @@ test('the desktop view carries the clipboard both ways', async t => {
   assert.deepEqual(errors, []);
 });
 
+test('the desktop view copies and pastes images in parts', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => {
+    window.wrote = [];
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      writeText: async text => { wrote.push(['text', text]); },
+      write: async items => { for (const item of items) for (const type of item.types) wrote.push([type, [...new Uint8Array(await (await item.getType(type)).arrayBuffer())]]); },
+    } });
+    probe.handle({ type: 'config', desktop: true });
+  });
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+
+  // An image copied on the Mac comes in parts and goes to the browser as PNG.
+  await p.evaluate(() => {
+    const b64 = bytes => btoa(String.fromCharCode(...bytes));
+    probe.handle({ type: 'desktop_clipboard_part', id: 'mac-1', part: 0, parts: 2, data: b64([137, 80, 78, 71]) });
+    probe.handle({ type: 'desktop_clipboard_part', id: 'mac-1', part: 1, parts: 2, data: b64([1, 2, 3]) });
+    probe.handle({ type: 'desktop_clipboard', image: 'mac-1' });
+  });
+  await p.waitForFunction(() => wrote.length === 1);
+  assert.deepEqual(await p.evaluate(() => wrote), [['image/png', [137, 80, 78, 71, 1, 2, 3]]]);
+  // One the Mac kept, too large, says so.
+  await p.evaluate(() => probe.handle({ type: 'desktop_clipboard', too_large: 'image' }));
+  assert.match(await p.locator('#toast').innerText(), /too large/);
+
+  // An image pasted here goes to the Mac in parts before the keys.
+  const size = 200 * 1024;
+  await p.evaluate(() => { messages.length = 0; });
+  await p.evaluate(size => {
+    const command = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? { metaKey: true } : { ctrlKey: true };
+    document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyV', key: 'v', bubbles: true, cancelable: true, ...command }));
+    const bytes = new Uint8Array(size).map((_, i) => i % 251);
+    const data = new DataTransfer();
+    data.items.add(new File([bytes], 'shot.png', { type: 'image/png' }));
+    document.activeElement.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+  }, size);
+  await p.waitForFunction(() => messages.some(m => m.type === 'desktop_key' && m.down === false));
+  const sent = await p.evaluate(() => messages.filter(m => m.type.startsWith('desktop_clipboard') || m.type === 'desktop_key'));
+  assert.deepEqual(sent.map(m => m.type), ['desktop_clipboard_part', 'desktop_clipboard_part', 'desktop_clipboard', 'desktop_key', 'desktop_key']);
+  assert.ok(sent.slice(0, 2).every(m => m.data.length <= 256 * 1024), 'each part fits a relay message');
+  const joined = await p.evaluate(parts => parts.flatMap(m => [...atob(m.data)].map(c => c.charCodeAt(0))), sent.slice(0, 2));
+  assert.equal(joined.length, size);
+  assert.ok(joined.every((b, i) => b === i % 251));
+  assert.equal(sent[2].image, sent[0].id);
+  assert.deepEqual(errors, []);
+});
+
+test('the desktop view dims its last picture while the link is down, and shows timings only with ?debug', async t => {
+  for (const debug of [false, true]) {
+    const { p, errors } = await page(t, (debug ? '?debug' : '') + '#t=fixture');
+    await screen(p);
+    await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+    await p.locator('#bar .tool.desktop').click();
+    await showPicture(p);
+    await p.waitForTimeout(1100);
+    if (!debug) {
+      assert.equal(await p.locator('#desktop .hud').count(), 0, 'no timings for everyone');
+    } else {
+      const hud = await p.locator('#desktop .hud').innerText();
+      assert.match(hud, /320x200/);
+      assert.match(hud, /fps \d+ shown/);
+      assert.match(hud, /queue/);
+    }
+    // The link drops and stays down (this device went offline): the picture
+    // dims under the page's notice, and input waits.
+    await p.evaluate(() => { Object.defineProperty(navigator, 'onLine', { configurable: true, value: false }); connections.at(-1).close(); });
+    await p.waitForFunction(() => document.body.classList.contains('offline'), null, { timeout: 3000 });
+    const look = await p.evaluate(() => {
+      const notice = document.getElementById('notice');
+      const r = notice.getBoundingClientRect();
+      const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return {
+        filter: getComputedStyle(document.querySelector('#desktop canvas')).filter,
+        status: getComputedStyle(document.querySelector('#desktop .status')).opacity,
+        title: notice.querySelector('.title').textContent,
+        above: Number(getComputedStyle(notice).zIndex) > Number(getComputedStyle(document.getElementById('desktop')).zIndex),
+      };
+    });
+    assert.deepEqual(look, { filter: 'brightness(0.45)', status: '0', title: look.title, above: true });
+    assert.ok(look.title.length > 0, 'the notice says what is happening');
+    const box = await p.locator('#desktop > canvas').boundingBox();
+    await p.evaluate(() => { messages.length = 0; });
+    await p.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'desktop_pointer')), []);
+    assert.deepEqual(errors, []);
+  }
+});
+
 test('the desktop view lets go of held keys, sends modifiers with clicks, and asks before the page closes', async t => {
   const { p, errors } = await page(t);
   await screen(p);

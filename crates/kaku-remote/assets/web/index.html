@@ -567,6 +567,8 @@
       noticeEl.classList.toggle("brand", brand || !everConnected);
       noticeEl.classList.toggle("show", !!title);
       document.body.classList.toggle("stale", !!title && stale);
+      // The link itself is down, not only this tab (the Mac's screen dims too).
+      document.body.classList.toggle("offline", !!title && stale && kind === "link");
     };
     if (delay && title) noticeTimer = setTimeout(apply, delay);
     else apply();

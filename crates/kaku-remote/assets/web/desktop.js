@@ -37,6 +37,17 @@
      drawn above the picture. */
   #desktop::after { content: ""; position: absolute; inset: 0; pointer-events: none; box-shadow: inset 0 0 0 2px var(--muted); opacity: 0; }
   body.dropping #desktop::after { opacity: 1; }
+  /* The link is down: the last picture stays, dimmed, under the page's own
+     reconnecting notice, which this view would otherwise cover. */
+  body.desktop.offline #desktop.live canvas { filter: brightness(0.45); }
+  body.desktop.offline #desktop .status { opacity: 0; }
+  body.desktop #notice { z-index: 5; }
+  body.desktop.offline #stage:has(#desktop.live) #notice .title { color: #fff; }
+  body.desktop.offline #stage:has(#desktop.live) #notice .detail { color: rgba(255,255,255,0.75); }
+  /* Timings over the picture, only with ?debug in the page's address. */
+  #desktop .hud { position: absolute; top: 8px; left: 8px; z-index: 1; padding: 6px 8px; border-radius: 6px; background: rgba(0,0,0,0.65); color: #fff; font: 11px/1.45 ui-monospace, Menlo, monospace; white-space: nowrap; pointer-events: none; }
+  #desktop .hud .warn { color: #f5c542; }
+  #desktop .hud canvas { display: block; margin-top: 4px; width: 120px; height: 28px; opacity: 1; }
   `;
   const SCREENS_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.25" y="4.5" width="9" height="6.5" rx="1.25"/><path d="M4.5 4.5V3.25c0-.7.55-1.25 1.25-1.25h7.75c.7 0 1.25.55 1.25 1.25v5c0 .7-.55 1.25-1.25 1.25H10.25M4.5 13.5h3.5"/></svg>';
   const ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.75" y="2.5" width="12.5" height="8.5" rx="1.5"/><path d="M6 13.5h4M8 11v2.5"/></svg>';
@@ -72,6 +83,10 @@
   const COPY_WAIT_MS = 1500;
   // Browser messages through the relay are capped at 512 KB once sealed.
   const MAX_PASTE_BYTES = 256 * 1024;
+  // Images go in parts of this many bytes (256 KB once base64), up to the
+  // helper's limit, either way.
+  const IMAGE_PART_BYTES = 192 * 1024;
+  const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 
   const init = (api) => {
     const { send: rawSend, toolsEl, stageEl, isMac, toast, focusTerminal } = api;
@@ -107,6 +122,7 @@
     const settleInput = (seq, input) => {
       if (!input.posted || input.frameAt === undefined) return;
       report.input.push(input.frameAt - input.at);
+      if (DEBUG) hud.input.push(input.frameAt - input.at);
       pendingInputs.delete(seq);
     };
     const onInputAck = (msg) => {
@@ -173,6 +189,76 @@
     const statusTitle = view.querySelector(".status .title");
     const statusDetail = view.querySelector(".status .detail");
     const press = view.querySelector(".press");
+
+    // ?debug in the page's address shows timings over the picture, each
+    // second: pictures shown and received, the bitrate, decoding, the
+    // downlink's queue (arrival against the Mac's capture clock, less its
+    // lowest lately, so no clock sync), input to its first picture, and the
+    // queue of the last 120 pictures (red past 50 ms).
+    let DEBUG = false;
+    try { DEBUG = new URLSearchParams(location.search).has("debug"); } catch (_) {}
+    const hud = { el: null, text: null, graph: null, timer: 0, recv: 0, decoded: 0, bytes: 0, keys: 0, drawn: 0,
+      decode: [], queue: [], input: [], trail: [], low: Infinity, lows: [], bitrate: 0, codec: "" };
+    const hudFrame = (msg) => {
+      hud.recv++;
+      hud.bytes += msg.bytes ? msg.bytes.byteLength : Math.floor((msg.data || "").length * 0.75);
+      if (msg.key) hud.keys++;
+      if (!Number.isFinite(msg.ts)) return;
+      const lag = performance.now() - msg.ts / 1000;
+      hud.low = Math.min(hud.low, lag);
+      const queue = Math.max(0, lag - Math.min(hud.low, ...hud.lows));
+      hud.queue.push(queue);
+      hud.trail.push(queue);
+      if (hud.trail.length > 120) hud.trail.shift();
+    };
+    const hudShow = () => {
+      if (!hud.el) {
+        hud.el = document.createElement("div");
+        hud.el.className = "hud";
+        hud.text = document.createElement("div");
+        hud.graph = document.createElement("canvas");
+        hud.graph.width = 240;
+        hud.graph.height = 56;
+        hud.el.append(hud.text, hud.graph);
+        view.append(hud.el);
+      }
+      const p50 = (list) => Math.round(quantile(list, 0.5));
+      const max = (list) => Math.round(Math.max(0, ...list));
+      const row = (text, bad = false) => {
+        const line = document.createElement("div");
+        line.textContent = text;
+        if (bad) line.className = "warn";
+        return line;
+      };
+      const decode = p50(hud.decode);
+      const queue = p50(hud.queue);
+      hud.text.replaceChildren(
+        row(`${videoW}x${videoH} ${hud.codec || "-"}  target ${(hud.bitrate / 1e6).toFixed(1)} Mbps`),
+        row(`fps ${hud.drawn} shown / ${hud.recv} received, ${hud.recv - hud.decoded} skipped`, hud.recv - hud.drawn > 1),
+        row(`rate ${((hud.bytes * 8) / 1e6).toFixed(1)} Mbps, ${hud.keys} key`),
+        row(`decode ${decode} ms, max ${max(hud.decode)}`, decode > 16.7),
+        row(`queue ${queue} ms, max ${max(hud.queue)}`, queue > 33),
+        row(`input to picture ${hud.input.length ? p50(hud.input) + " ms" : "-"}, ${pendingInputs.size} waiting`),
+      );
+      const g = hud.graph.getContext("2d");
+      g.clearRect(0, 0, 240, 56);
+      hud.trail.forEach((q, i) => {
+        g.fillStyle = q > 50 ? "#ff5a52" : "rgba(255,255,255,0.7)";
+        const h = Math.max(2, Math.min(56, q * 0.56));
+        g.fillRect(i * 2, 56 - h, 2, h);
+      });
+      if (Number.isFinite(hud.low)) {
+        hud.lows.push(hud.low);
+        if (hud.lows.length > 10) hud.lows.shift();
+      }
+      Object.assign(hud, { recv: 0, decoded: 0, bytes: 0, keys: 0, drawn: 0, decode: [], queue: [], input: [], low: Infinity });
+    };
+    const hudOn = (on) => {
+      clearInterval(hud.timer);
+      hud.timer = 0;
+      if (hud.el) hud.el.hidden = !on;
+      if (on) hud.timer = setInterval(hudShow, 1000);
+    };
 
     const button = document.createElement("button");
     button.type = "button";
@@ -421,6 +507,7 @@
       fresh = false;
       clearInterval(reportTimer);
       reportTimer = setInterval(sendReport, REPORT_MS);
+      if (DEBUG) hudOn(true);
       syncFullscreen();
       focusView();
       const entering = goFullscreen();
@@ -435,6 +522,7 @@
       if (copyWait) copyWait.reject(new Error("left"));
       clearTimeout(resizeTimer);
       clearInterval(reportTimer);
+      if (DEBUG) hudOn(false);
       cancelInputs();
       sendReport();
       releaseAll();
@@ -480,6 +568,7 @@
     const ensureDecoder = (codec, desc) => {
       const key = codec + ":" + desc;
       if (decoder && decoder.state === "configured" && configured === key) return true;
+      hud.codec = codec;
       const config = { codec, description: b64(desc), optimizeForLatency: true, hardwareAcceleration: "no-preference" };
       if (decoder && decoder.state === "configured") {
         try {
@@ -506,8 +595,10 @@
           frame.close();
           const now = performance.now();
           const timing = decodeAt.get(seq);
+          if (DEBUG) hud.drawn++;
           if (timing) {
             report.decode.push(now - timing.at);
+            if (DEBUG) hud.decode.push(now - timing.at);
             decodeAt.delete(seq);
             // A cumulative watermark only advances for captures after posting.
             // An old helper's unrelated next frame carries no such evidence.
@@ -556,6 +647,7 @@
 
     const onFrame = (msg) => {
       if (!active || document.hidden) { ack(msg.seq, msg.stream_id); return; }
+      if (DEBUG) hudFrame(msg);
       const incomingStream = typeof msg.stream_id === "string" ? msg.stream_id : null;
       if (incomingStream !== streamId || (awaitingStream && streamId !== null)) {
         earlyStream = incomingStream;
@@ -573,6 +665,7 @@
       }
       if (decodeAt.size > 64) decodeAt.clear();
       decodeAt.set(msg.seq, { at: performance.now(), inputSeq: msg.input_seq });
+      if (DEBUG) hud.decoded++;
       try {
         decoder.decode(new EncodedVideoChunk({ type: msg.key ? "key" : "delta", timestamp: msg.seq, data: msg.bytes || b64(msg.data) }));
       } catch (e) {
@@ -636,6 +729,7 @@
         displays = Array.isArray(msg.displays) ? msg.displays : [];
         shownDisplay = msg.display || 0;
         screenPoints = msg.screen_width || 0;
+        if (DEBUG) hud.bitrate = msg.bitrate || 0;
         syncScreens();
         if (!canControl && !warnedControl) {
           warnedControl = true;
@@ -656,7 +750,7 @@
         y: Math.min(1, Math.max(0, (ev.clientY - r.top) / Math.max(1, r.height))),
       };
     };
-    const live = () => active && canControl && fresh && view.classList.contains("live");
+    const live = () => active && canControl && fresh && view.classList.contains("live") && !document.body.classList.contains("offline");
 
     let pendingMove = null;
     let moveFrame = 0;
@@ -943,29 +1037,62 @@
       return true;
     };
 
-    // Clipboard. Command-V (Ctrl-V off a Mac) first puts the browser's
-    // clipboard on the Mac, then presses the keys there. Command-C and
-    // Command-X hand the browser a clipboard entry that fills in once the
-    // Mac reports its copy; that write starts inside the key press, which
-    // browsers require. A copy made on the Mac some other way (a menu, a
-    // right click) is written when the browser allows it, or at the next
-    // click or key press here.
+    // Clipboard, text and images. Command-V (Ctrl-V off a Mac) first puts
+    // the browser's clipboard on the Mac, then presses the keys there.
+    // Command-C and Command-X hand the browser a clipboard entry that fills
+    // in once the Mac reports its copy; that write starts inside the key
+    // press, which browsers require. A copy made on the Mac some other way
+    // (a menu, a right click), or an image, is written when the browser
+    // allows it, or at the next click or key press here.
     let pasting = null;
     let copyWait = null;
     let pendingCopy = null;
-    const finishPaste = (text) => {
+    const bytesToBase64 = (bytes) => {
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      return btoa(bin);
+    };
+    // The Mac's pasteboard and browsers both take PNG.
+    const asPng = async (blob) => {
+      if (blob.type === "image/png") return blob;
+      const bitmap = await createImageBitmap(blob);
+      const c = document.createElement("canvas");
+      c.width = bitmap.width;
+      c.height = bitmap.height;
+      c.getContext("2d").drawImage(bitmap, 0, 0);
+      bitmap.close?.();
+      return new Promise((resolve, reject) => c.toBlob((b) => (b ? resolve(b) : reject(new Error("no png"))), "image/png"));
+    };
+    let pastes = 0;
+    const finishPaste = async (text, image) => {
       if (!pasting) return;
       clearTimeout(pasting.timer);
       const { msg } = pasting;
       pasting = null;
-      if (!live()) return;
-      if (text) {
-        if (new TextEncoder().encode(text).length > MAX_PASTE_BYTES) {
-          toast("Too much text to paste on the Mac at once");
-          return;
-        }
-        send({ type: "desktop_clipboard", text });
+      let bytes = null;
+      if (image) {
+        try { bytes = new Uint8Array(await (await asPng(image)).arrayBuffer()); } catch (_) { bytes = null; }
       }
+      if (!live()) return;
+      if (text && new TextEncoder().encode(text).length > MAX_PASTE_BYTES) {
+        toast("Too much text to paste on the Mac at once");
+        return;
+      }
+      if (bytes && bytes.length > MAX_IMAGE_BYTES) {
+        toast("Too large an image to paste on the Mac, over 4 MB");
+        return;
+      }
+      const clip = { type: "desktop_clipboard" };
+      if (text) clip.text = text;
+      if (bytes && bytes.length) {
+        const id = "page-" + ++pastes;
+        const parts = Math.ceil(bytes.length / IMAGE_PART_BYTES);
+        for (let part = 0; part < parts; part++) {
+          send({ type: "desktop_clipboard_part", id, part, parts, data: bytesToBase64(bytes.subarray(part * IMAGE_PART_BYTES, (part + 1) * IMAGE_PART_BYTES)) });
+        }
+        clip.image = id;
+      }
+      if (clip.text !== undefined || clip.image) send(clip);
       send(msg);
       send({ ...msg, down: false });
     };
@@ -973,11 +1100,24 @@
       if (!pasting) return;
       ev.preventDefault();
       ev.stopImmediatePropagation();
-      finishPaste(ev.clipboardData?.getData("text/plain") || "");
+      const data = ev.clipboardData;
+      let image = null;
+      for (const item of data?.items || []) {
+        if (item.kind === "file" && item.type.startsWith("image/")) { image = item.getAsFile(); break; }
+      }
+      finishPaste(data?.getData("text/plain") || "", image);
     }, true);
-    const writeClipboard = (text) => {
+    // What the browser could not take yet: { text } or { png }.
+    const writeClipboard = (copy) => {
+      const done = () => { if (pendingCopy === copy) pendingCopy = null; };
+      const keep = () => { pendingCopy = copy; };
+      if (copy.png) {
+        if (!navigator.clipboard?.write || typeof window.ClipboardItem !== "function") return;
+        navigator.clipboard.write([new ClipboardItem({ "image/png": copy.png })]).then(done, keep);
+        return;
+      }
       if (!navigator.clipboard?.writeText) return;
-      navigator.clipboard.writeText(text).then(() => { if (pendingCopy === text) pendingCopy = null; }, () => { pendingCopy = text; });
+      navigator.clipboard.writeText(copy.text).then(done, keep);
     };
     const flushCopy = () => {
       if (pendingCopy !== null) writeClipboard(pendingCopy);
@@ -995,10 +1135,32 @@
       const blob = text.then((t) => new Blob([t], { type: "text/plain" }));
       navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]).then(() => { pendingCopy = null; }, () => {});
     };
+    // An image from the Mac arrives in parts, then a message naming it.
+    let incomingImage = null;
+    const onClipboardPart = (msg) => {
+      if (!active || typeof msg.id !== "string" || typeof msg.data !== "string") return;
+      if (!incomingImage || incomingImage.id !== msg.id) incomingImage = { id: msg.id, parts: [] };
+      incomingImage.parts[msg.part | 0] = b64(msg.data);
+    };
     const onClipboard = (msg) => {
-      if (!active || typeof msg.text !== "string") return;
+      if (!active) return;
+      if (msg.too_large === "image") {
+        if (copyWait) copyWait.reject(new Error("too large"));
+        toast("The Mac's image is too large to copy here, over 4 MB");
+        return;
+      }
+      if (typeof msg.image === "string") {
+        const image = incomingImage;
+        incomingImage = null;
+        if (!image || image.id !== msg.image || image.parts.some((p) => !p) || !image.parts.length) return;
+        // The copy the key press was waiting for is an image, not text.
+        if (copyWait) copyWait.reject(new Error("an image"));
+        writeClipboard({ png: new Blob(image.parts, { type: "image/png" }) });
+        return;
+      }
+      if (typeof msg.text !== "string") return;
       if (copyWait) copyWait.resolve(msg.text);
-      else writeClipboard(msg.text);
+      else writeClipboard({ text: msg.text });
     };
 
     const pressed = new Set();
@@ -1044,6 +1206,7 @@
         else if (msg.type === "desktop_status") onStatus(msg);
         else if (msg.type === "desktop_input_ack") onInputAck(msg);
         else if (msg.type === "desktop_clipboard") onClipboard(msg);
+        else if (msg.type === "desktop_clipboard_part") onClipboardPart(msg);
         else if (msg.type === "desktop_cursor") onCursor(msg);
       },
       // A new session (a reconnect) has no helper running yet.
