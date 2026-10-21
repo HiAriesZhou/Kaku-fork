@@ -2283,7 +2283,7 @@ test('in full screen the bar stays, and its button switches both ways keeping th
   const view = await p.locator('#desktop').boundingBox();
   assert.ok(bar.height > 0 && (view.y >= bar.y + bar.height || view.y + view.height <= bar.y), 'the screen sits beside the bar, not over it');
   assert.equal(await tool.isVisible(), true);
-  assert.equal(await tool.getAttribute('title'), 'Back to the terminal (Ctrl+Option+Shift+D)');
+  assert.equal(await tool.getAttribute('title'), 'Back to the terminal (Ctrl+Option+Cmd+D)');
   await tool.click();
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
   await p.waitForFunction(() => !document.fullscreenElement, null, { timeout: 3000 });
@@ -3041,15 +3041,18 @@ test('one key switches between the terminal and the desktop view, and the system
   await p.keyboard.press('Control+Meta+KeyF');
   await p.waitForFunction(() => !document.fullscreenElement, null, { timeout: 3000 });
 
-  // Ctrl+Option+Shift+D goes to the Mac's screen and back, typing nothing.
-  await p.evaluate(() => { messages.length = 0; });
+  // Ctrl+Option+Cmd+D goes to the Mac's screen and back, typing nothing;
+  // the other platforms' Ctrl+Alt+Shift+D does nothing on a Mac.
   await p.keyboard.press('Control+Alt+Shift+KeyD');
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.press('Control+Alt+Meta+KeyD');
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), true);
   await p.waitForFunction(() => !!document.fullscreenElement, null, { timeout: 3000 });
   // There, Ctrl+Cmd+F is the Mac's, for its own windows.
   await p.keyboard.press('Control+Meta+KeyF');
   assert.equal(await p.evaluate(() => !!document.fullscreenElement), true);
-  await p.keyboard.press('Control+Alt+Shift+KeyD');
+  await p.keyboard.press('Control+Alt+Meta+KeyD');
   assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'desktop_stop').length), 1);
   assert.deepEqual((await typed()).filter(m => m.type !== 'desktop_key' || /D$/.test(m.code)), []);

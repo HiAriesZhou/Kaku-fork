@@ -320,12 +320,13 @@
       view.classList.remove("live");
     };
 
-    // Ctrl+Option+Shift+D (Ctrl+Alt+Shift+D elsewhere) switches between
-    // the terminal and this view from either side (maintainer, 2026-10-21):
-    // three modifiers no Mac app or terminal program claims, and no Windows
-    // key, whose combinations Windows takes first.
-    const SWITCH_KEYS = isMac ? "Ctrl+Option+Shift+D" : "Ctrl+Alt+Shift+D";
-    const isSwitch = (ev) => ev.code === "KeyD" && ev.ctrlKey && ev.altKey && ev.shiftKey && !ev.metaKey;
+    // Ctrl+Option+Cmd+D (Ctrl+Alt+Shift+D elsewhere) switches between the
+    // terminal and this view from either side (maintainer, 2026-10-21):
+    // three modifiers no Mac app or terminal program claims. Off the Mac
+    // there is no Windows key in it, whose combinations Windows takes first.
+    const SWITCH_KEYS = isMac ? "Ctrl+Option+Cmd+D" : "Ctrl+Alt+Shift+D";
+    const isSwitch = (ev) => ev.code === "KeyD" && ev.ctrlKey && ev.altKey
+      && (isMac ? ev.metaKey && !ev.shiftKey : ev.shiftKey && !ev.metaKey);
     const syncButton = () => {
       button.setAttribute("aria-current", active ? "true" : "false");
       button.title = `${active ? "Back to the terminal" : "Show the Mac's screen"} (${SWITCH_KEYS})`;
