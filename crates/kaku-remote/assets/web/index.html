@@ -483,7 +483,7 @@
     if (msg.type === "zoom_pane" && msg.pane_id === paneId) claimed = "";
     const json = JSON.stringify(msg);
     const path = direct;
-    if (path && path.open && path.socket === socket && json.length < DIRECT_PIECE && path.dc.readyState === "open") {
+    if (path && path.open && !path.paused && path.socket === socket && json.length < DIRECT_PIECE && path.dc.readyState === "open") {
       path.dc.send(json);
       return;
     }
@@ -3182,14 +3182,44 @@
   // interactively take it; files stay on the relay. `?p2p` tries it on a
   // local link too. Kaku's messages come in pieces: a flag byte (1 last,
   // 2 text), then up to 16 KB.
+  //
+  // Order across the move: each side's last word on the relay before it
+  // sends on the path is `rtc_ready`, one per lane from Kaku (text, frames),
+  // and what arrives on the path waits for it, so a key or a picture never
+  // overtakes one still on its way through the relay. Either side ending
+  // the path tells the other by the relay (`rtc_closed`, `rtc_close`); what
+  // was lost on it comes back as a full screen and a key frame.
   const DIRECT_PIECE = 16 * 1024;
   const DIRECT_FORCED = new URLSearchParams(location.search).has("p2p");
+  // After a path that worked ends (a network change), offer again after
+  // these waits; a path held a minute starts the count over. One that never
+  // opened is not retried: the networks between do not let it through.
+  const DIRECT_RETRY_S = [2, 5, 15, 30, 60];
   let direct = null;
+  let directRetries = 0;
+  let directRetryTimer = 0;
   const closeDirect = () => {
     const path = direct;
     direct = null;
     if (!path) return;
     try { path.dc.close(); path.pc.close(); } catch (_) {}
+  };
+  const directLost = (path, tellMac) => {
+    if (direct !== path) return;
+    closeDirect();
+    if (ws !== path.socket) return;
+    if (tellMac && path.id !== null) send({ type: "rtc_close", id: path.id });
+    if (!path.open) return;
+    // Pieces still on the path are gone: start the screen over.
+    send({ type: "hello", frame_ack: true });
+    if (paneId !== null) send({ type: "attach", pane_id: paneId });
+    desktop?.resync?.();
+    if (performance.now() - path.openedAt > 60000) directRetries = 0;
+    if (directRetries >= DIRECT_RETRY_S.length) return;
+    clearTimeout(directRetryTimer);
+    directRetryTimer = setTimeout(() => {
+      if (ws === path.socket) openDirect(path.socket, path.deliver);
+    }, DIRECT_RETRY_S[directRetries++] * 1000);
   };
   const gathered = (pc, ms) => new Promise((resolve) => {
     if (pc.iceGatheringState === "complete") { resolve(); return; }
@@ -3204,14 +3234,30 @@
     try { pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }] }); } catch (_) { return; }
     const dc = pc.createDataChannel("kaku");
     dc.binaryType = "arraybuffer";
-    const path = { pc, dc, socket, open: false, parts: [], since: performance.now() };
+    const path = {
+      pc, dc, socket, deliver, id: null, open: false, paused: false, parts: [], since: performance.now(),
+      // Kaku's lanes that have said `rtc_ready`, and what came before.
+      ready: { text: false, frames: false }, held: [],
+    };
     direct = path;
     dc.onopen = () => {
       if (direct !== path) return;
+      // The last of this page's messages by the relay; a Kaku that numbers
+      // no paths takes the path's messages at once.
+      if (path.id !== null) send({ type: "rtc_ready", id: path.id });
       path.open = true;
-      path.openedIn = Math.round(performance.now() - path.since);
+      path.openedAt = performance.now();
+      path.openedIn = Math.round(path.openedAt - path.since);
     };
-    dc.onclose = () => { if (direct === path) direct = null; };
+    dc.onclose = () => directLost(path, true);
+    // A path that stops answering is left to the relay until it answers
+    // again; one the browser gives up on is closed.
+    pc.oniceconnectionstatechange = () => {
+      const state = pc.iceConnectionState;
+      if (state === "disconnected") path.paused = true;
+      else if (state === "connected" || state === "completed") path.paused = false;
+      else if (state === "failed" || state === "closed") directLost(path, true);
+    };
     dc.onmessage = (ev) => {
       if (direct !== path || ws !== socket) return;
       const bytes = new Uint8Array(ev.data);
@@ -3224,6 +3270,8 @@
       path.parts = [];
       let msg;
       try { msg = bytes[0] & 2 ? JSON.parse(dec.decode(whole)) : unpackFrame(whole); } catch (_) { return; }
+      const lane = bytes[0] & 2 ? "text" : "frames";
+      if (!path.ready[lane]) { path.held.push([lane, msg]); return; }
       // After whatever the relay delivered first.
       recvChain = recvChain.then(() => deliver(msg));
     };
@@ -3234,10 +3282,28 @@
     if (direct !== path || ws !== socket) return;
     send({ type: "rtc_offer", sdp: pc.localDescription.sdp });
   };
-  const answered = (socket, sdp) => {
+  const answered = (socket, msg) => {
     const path = direct;
-    if (!path || path.socket !== socket || typeof sdp !== "string") return;
-    path.pc.setRemoteDescription({ type: "answer", sdp }).catch(() => { if (direct === path) closeDirect(); });
+    if (!path || path.socket !== socket || typeof msg.sdp !== "string") return;
+    if (Number.isSafeInteger(msg.id)) path.id = msg.id;
+    else path.ready = { text: true, frames: true };
+    path.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).catch(() => { if (direct === path) closeDirect(); });
+  };
+  // Kaku's lane moved to the path: what it sent there so far comes next.
+  const laneReady = (socket, msg) => {
+    const path = direct;
+    if (!path || path.socket !== socket || path.id !== msg.id || !(msg.lane in path.ready)) return;
+    path.ready[msg.lane] = true;
+    const held = path.held;
+    path.held = [];
+    for (const [lane, m] of held) {
+      if (lane === msg.lane) path.deliver(m);
+      else path.held.push([lane, m]);
+    }
+  };
+  const directClosed = (socket, msg) => {
+    const path = direct;
+    if (path && path.socket === socket && path.id === msg.id) directLost(path, false);
   };
 
   let reconnectTimer = 0;
@@ -3274,7 +3340,9 @@
     };
     const onMessage = (socket, msg) => {
       if (ws !== socket) return;
-      if (msg.type === "rtc_answer") { answered(socket, msg.sdp); return; }
+      if (msg.type === "rtc_answer") { answered(socket, msg); return; }
+      if (msg.type === "rtc_ready") { laneReady(socket, msg); return; }
+      if (msg.type === "rtc_closed") { directClosed(socket, msg); return; }
       if (msg.type === "config" && msg.desktop && (relay || DIRECT_FORCED)) openDirect(socket, (m) => onMessage(socket, m));
       lastHeard = Date.now();
       if (msg.type === "config" || msg.type === "tabs" || msg.type === "frame" || msg.type === "pong") {
@@ -3293,6 +3361,8 @@
     socket.onclose = (ev) => {
       if (ws !== socket) return;
       closeDirect();
+      clearTimeout(directRetryTimer);
+      directRetries = 0;
       hideImagePreview();
       clearTimeout(handshakeTimer);
       stopScrolling();

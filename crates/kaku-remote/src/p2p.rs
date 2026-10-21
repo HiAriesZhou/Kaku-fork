@@ -34,14 +34,63 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A message for the page: text (JSON) or a desktop picture.
 type Outgoing = (bool, Vec<u8>);
-type Slot = Arc<Mutex<Option<mpsc::Sender<Outgoing>>>>;
 
+/// The open direct path: its number, which the page's messages about it
+/// carry, and where the session's messages for it go.
+#[derive(Clone)]
+struct Path {
+    id: u64,
+    tx: mpsc::Sender<Outgoing>,
+}
+type Slot = Arc<Mutex<Option<Path>>>;
+
+/// The page's messages about the direct path: `rtc_offer` starts one,
+/// `rtc_ready` says the page sends on it from here on, `rtc_close` says the
+/// page gave it up.
 #[derive(serde::Deserialize)]
-struct Offer {
+struct Control {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
     sdp: String,
+    #[serde(default)]
+    id: u64,
 }
+
+fn control(text: &str) -> Option<Control> {
+    if !text.contains("\"rtc_") {
+        return None;
+    }
+    serde_json::from_str::<Control>(text)
+        .ok()
+        .filter(|c| c.kind.starts_with("rtc_"))
+}
+
+/// Told to the helper whenever the pictures move to the other path: those
+/// still on the old one may never arrive, and its round trip says nothing
+/// about the new one.
+const PATH_CHANGED: &str = r#"{"type":"desktop_keyframe","path_changed":true}"#;
+
+/// The last message a lane sends by the relay before it moves to path `id`,
+/// so the page takes what comes on the path only after what was already on
+/// the way through the relay.
+fn ready_text(id: u64) -> String {
+    serde_json::json!({ "type": "rtc_ready", "lane": "text", "id": id }).to_string()
+}
+
+fn ready_frame(id: u64) -> Vec<u8> {
+    let header = serde_json::json!({ "type": "rtc_ready", "lane": "frames", "id": id }).to_string();
+    let mut out = Vec::with_capacity(5 + header.len());
+    out.push(0);
+    out.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    out.extend_from_slice(header.as_bytes());
+    out
+}
+
+/// Messages the page sent on the path before its `rtc_ready` came through
+/// the relay are held at most this many; past it the page is not following
+/// the order and they go on.
+const MAX_HELD: usize = 1024;
 
 /// Put a direct path beside the session's own: returns the inbox, outbox and
 /// frames the session uses instead.
@@ -59,24 +108,71 @@ pub(crate) fn wrap(
     let (session_frames, mut inner_frames) = mpsc::channel::<Vec<u8>>(4);
     let direct: Slot = Arc::new(Mutex::new(None));
 
-    // The page's messages: an offer starts a direct path, the rest go on.
+    // The page's messages, from the relay and from the path, in one order:
+    // what came on the path waits for the page's `rtc_ready` on the relay,
+    // after everything it sent there before.
     {
         let direct = direct.clone();
         let outbox = outbox.clone();
+        let (from_path, mut on_path) = mpsc::channel::<(u64, String)>(64);
         tokio::spawn(async move {
-            while let Some(text) = inbox.recv().await {
-                if text.contains("\"rtc_offer\"") {
-                    if let Ok(offer) = serde_json::from_str::<Offer>(&text) {
-                        if offer.kind == "rtc_offer" {
-                            answer(&offer.sdp, &outbox, &inner_in, &direct).await;
-                            continue;
-                        }
+            let mut current: Option<(u64, tokio::task::JoinHandle<()>)> = None;
+            let mut last_id = 0u64;
+            let mut ready = false;
+            let mut held: Vec<String> = Vec::new();
+            loop {
+                let (text, from) = tokio::select! {
+                    got = inbox.recv() => match got {
+                        Some(text) => (text, None),
+                        None => break,
+                    },
+                    Some((id, text)) = on_path.recv() => (text, Some(id)),
+                };
+                let current_id = current.as_ref().map(|(id, _)| *id);
+                if let Some(id) = from {
+                    if current_id != Some(id) {
+                        continue;
                     }
+                    if !ready && held.len() < MAX_HELD {
+                        held.push(text);
+                        continue;
+                    }
+                } else if let Some(c) = control(&text) {
+                    match c.kind.as_str() {
+                        "rtc_offer" => {
+                            // A new offer replaces the old path.
+                            stop(&mut current, &direct);
+                            last_id += 1;
+                            ready = false;
+                            held.clear();
+                            let path =
+                                answer(last_id, &c.sdp, &outbox, &inner_in, &from_path, &direct);
+                            if let Some(task) = path.await {
+                                current = Some((last_id, task));
+                            }
+                        }
+                        "rtc_ready" if current_id == Some(c.id) && !ready => {
+                            ready = true;
+                            for text in held.drain(..) {
+                                if inner_in.send(text).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        "rtc_close" if current_id == Some(c.id) => {
+                            stop(&mut current, &direct);
+                            log::info!("kaku-remote p2p: the page closed the direct path");
+                            let _ = inner_in.try_send(PATH_CHANGED.into());
+                        }
+                        _ => {}
+                    }
+                    continue;
                 }
                 if inner_in.send(text).await.is_err() {
                     break;
                 }
             }
+            stop(&mut current, &direct);
         });
     }
 
@@ -89,10 +185,29 @@ pub(crate) fn wrap(
         let direct = direct.clone();
         let outbox = outbox.clone();
         tokio::spawn(async move {
+            let mut on = None;
             while let Some(text) = interactive.recv().await {
-                let text = match send_direct(&direct, (false, text.into_bytes())).await {
-                    Ok(()) => continue,
-                    Err(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+                let path = direct.lock().clone();
+                let text = match path {
+                    Some(path) => {
+                        if on != Some(path.id) {
+                            if outbox.send(ready_text(path.id)).await.is_err() {
+                                break;
+                            }
+                            on = Some(path.id);
+                        }
+                        match path.tx.send((false, text.into_bytes())).await {
+                            Ok(()) => continue,
+                            Err(mpsc::error::SendError((_, bytes))) => {
+                                on = None;
+                                String::from_utf8(bytes).unwrap_or_default()
+                            }
+                        }
+                    }
+                    None => {
+                        on = None;
+                        text
+                    }
                 };
                 if outbox.send(text).await.is_err() {
                     break;
@@ -111,10 +226,29 @@ pub(crate) fn wrap(
         });
     }
     tokio::spawn(async move {
+        let mut on = None;
         while let Some(frame) = inner_frames.recv().await {
-            let frame = match send_direct(&direct, (true, frame)).await {
-                Ok(()) => continue,
-                Err(frame) => frame,
+            let path = direct.lock().clone();
+            let frame = match path {
+                Some(path) => {
+                    if on != Some(path.id) {
+                        if frames.send(ready_frame(path.id)).await.is_err() {
+                            break;
+                        }
+                        on = Some(path.id);
+                    }
+                    match path.tx.send((true, frame)).await {
+                        Ok(()) => continue,
+                        Err(mpsc::error::SendError((_, frame))) => {
+                            on = None;
+                            frame
+                        }
+                    }
+                }
+                None => {
+                    on = None;
+                    frame
+                }
             };
             if frames.send(frame).await.is_err() {
                 break;
@@ -124,38 +258,47 @@ pub(crate) fn wrap(
     (session_in, session_out, session_frames)
 }
 
-/// Send on the direct path if one is open; hands the message back if not.
-async fn send_direct(direct: &Slot, (binary, bytes): Outgoing) -> Result<(), Vec<u8>> {
-    let Some(tx) = direct.lock().clone() else {
-        return Err(bytes);
+/// End the current path, if any, and stop sending on it.
+fn stop(current: &mut Option<(u64, tokio::task::JoinHandle<()>)>, direct: &Slot) {
+    let Some((id, task)) = current.take() else {
+        return;
     };
-    tx.send((binary, bytes))
-        .await
-        .map_err(|mpsc::error::SendError((_, bytes))| bytes)
+    task.abort();
+    let mut slot = direct.lock();
+    if slot.as_ref().is_some_and(|p| p.id == id) {
+        *slot = None;
+    }
 }
 
-/// Answer the page's offer through the session and start the direct path.
+/// Answer the page's offer through the session and start path `id`.
 async fn answer(
+    id: u64,
     sdp: &str,
     outbox: &queue::Sender<String>,
     inbox: &mpsc::Sender<String>,
+    from_path: &mpsc::Sender<(u64, String)>,
     direct: &Slot,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     let started = match start(sdp).await {
         Ok(started) => started,
         Err(e) => {
             log::info!("kaku-remote p2p: no direct path: {e:#}");
-            return;
+            let closed = serde_json::json!({ "type": "rtc_closed", "id": id }).to_string();
+            let _ = outbox.send(closed).await;
+            return None;
         }
     };
     let (rtc, sockets, answer) = started;
-    let reply = serde_json::json!({ "type": "rtc_answer", "sdp": answer }).to_string();
-    if outbox.send(reply).await.is_err() {
-        return;
-    }
-    // A new offer replaces the old path.
-    *direct.lock() = None;
-    tokio::spawn(run(rtc, sockets, inbox.clone(), direct.clone()));
+    let reply = serde_json::json!({ "type": "rtc_answer", "sdp": answer, "id": id }).to_string();
+    outbox.send(reply).await.ok()?;
+    let ends = Ends {
+        id,
+        outbox: outbox.clone(),
+        inbox: inbox.clone(),
+        from_path: from_path.clone(),
+        direct: direct.clone(),
+    };
+    Some(tokio::spawn(run(rtc, sockets, ends)))
 }
 
 async fn start(sdp: &str) -> anyhow::Result<(Rtc, Sockets, String)> {
@@ -299,18 +442,56 @@ fn pieces(binary: bool, bytes: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-async fn run(mut rtc: Rtc, mut sockets: Sockets, inbox: mpsc::Sender<String>, direct: Slot) {
+/// What a path needs beyond its connection: where the page's messages on it
+/// go, and who to tell when it ends.
+struct Ends {
+    id: u64,
+    outbox: queue::Sender<String>,
+    inbox: mpsc::Sender<String>,
+    from_path: mpsc::Sender<(u64, String)>,
+    direct: Slot,
+}
+
+/// Run path `ends.id` until it ends, then go back to the relay and tell the
+/// page, which otherwise keeps sending on a channel nobody reads until its
+/// browser notices, about 30 seconds later.
+async fn run(rtc: Rtc, sockets: Sockets, ends: Ends) {
     let began = Instant::now();
+    let mut sent = 0u64;
+    let mut opened = false;
+    let why = carry(rtc, sockets, &ends, began, &mut sent, &mut opened).await;
+    {
+        let mut slot = ends.direct.lock();
+        if slot.as_ref().is_some_and(|p| p.id == ends.id) {
+            *slot = None;
+        }
+    }
+    if opened {
+        log::info!(
+            "kaku-remote p2p: direct path closed after {} s, {} KB sent: {why}",
+            began.elapsed().as_secs(),
+            sent / 1024
+        );
+        let _ = ends.inbox.send(PATH_CHANGED.into()).await;
+    } else {
+        log::info!("kaku-remote p2p: no direct path: {why}");
+    }
+    let closed = serde_json::json!({ "type": "rtc_closed", "id": ends.id }).to_string();
+    let _ = ends.outbox.send(closed).await;
+}
+
+/// The path's loop; returns why it ended.
+async fn carry(
+    mut rtc: Rtc,
+    mut sockets: Sockets,
+    ends: &Ends,
+    began: Instant,
+    sent: &mut u64,
+    opened: &mut bool,
+) -> String {
     let (tx, mut rx) = mpsc::channel::<Outgoing>(8);
     let mut channel: Option<ChannelId> = None;
     let mut pending: std::collections::VecDeque<Vec<u8>> = Default::default();
-    let mut sent = 0u64;
-    let end = |direct: &Slot, tx: &mpsc::Sender<Outgoing>| {
-        let mut slot = direct.lock();
-        if slot.as_ref().is_some_and(|s| s.same_channel(tx)) {
-            *slot = None;
-        }
-    };
     loop {
         // Hand the channel what it can take.
         if let Some(id) = channel {
@@ -320,7 +501,7 @@ async fn run(mut rtc: Rtc, mut sockets: Sockets, inbox: mpsc::Sender<String>, di
                 {
                     break;
                 }
-                sent += piece.len() as u64;
+                *sent += piece.len() as u64;
                 pending.pop_front();
             }
         }
@@ -331,7 +512,12 @@ async fn run(mut rtc: Rtc, mut sockets: Sockets, inbox: mpsc::Sender<String>, di
                 Ok(Output::Event(event)) => match event {
                     Event::ChannelOpen(id, _) => {
                         channel = Some(id);
-                        *direct.lock() = Some(tx.clone());
+                        *opened = true;
+                        *ends.direct.lock() = Some(Path {
+                            id: ends.id,
+                            tx: tx.clone(),
+                        });
+                        let _ = ends.inbox.send(PATH_CHANGED.into()).await;
                         log::info!(
                             "kaku-remote p2p: direct path open in {} ms",
                             began.elapsed().as_millis()
@@ -339,37 +525,24 @@ async fn run(mut rtc: Rtc, mut sockets: Sockets, inbox: mpsc::Sender<String>, di
                     }
                     Event::ChannelData(data) => {
                         if let Ok(text) = String::from_utf8(data.data) {
-                            if inbox.send(text).await.is_err() {
-                                end(&direct, &tx);
-                                return;
+                            if ends.from_path.send((ends.id, text)).await.is_err() {
+                                return "the session ended".into();
                             }
                         }
                     }
-                    Event::ChannelClose(_)
-                    | Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-                        end(&direct, &tx);
-                        log::info!(
-                            "kaku-remote p2p: direct path closed after {} s, {} KB sent",
-                            began.elapsed().as_secs(),
-                            sent / 1024
-                        );
-                        return;
+                    Event::ChannelClose(_) => return "the channel closed".into(),
+                    // The page offers again when it can; a path that comes
+                    // back on its own would need the lanes ordered again.
+                    Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                        return "the connection dropped".into()
                     }
                     _ => {}
                 },
-                Err(e) => {
-                    end(&direct, &tx);
-                    log::info!("kaku-remote p2p: direct path failed: {e}");
-                    return;
-                }
+                Err(e) => return e.to_string(),
             }
         };
         if channel.is_none() && began.elapsed() > CONNECT_TIMEOUT {
-            log::info!(
-                "kaku-remote p2p: no direct path within {} s",
-                CONNECT_TIMEOUT.as_secs()
-            );
-            return;
+            return format!("none within {} s", CONNECT_TIMEOUT.as_secs());
         }
         let wait = deadline
             .saturating_duration_since(Instant::now())
@@ -377,7 +550,7 @@ async fn run(mut rtc: Rtc, mut sockets: Sockets, inbox: mpsc::Sender<String>, di
         let room = pending.is_empty();
         tokio::select! {
             got = sockets.heard.recv() => {
-                let Some((local, source, bytes)) = got else { return };
+                let Some((local, source, bytes)) = got else { return "the sockets closed".into() };
                 let Ok(contents) = bytes.as_slice().try_into() else { continue };
                 let input = Input::Receive(Instant::now(), Receive {
                     proto: Protocol::Udp,
@@ -385,25 +558,20 @@ async fn run(mut rtc: Rtc, mut sockets: Sockets, inbox: mpsc::Sender<String>, di
                     destination: local,
                     contents,
                 });
-                if rtc.handle_input(input).is_err() {
-                    end(&direct, &tx);
-                    return;
+                if let Err(e) = rtc.handle_input(input) {
+                    return e.to_string();
                 }
             }
             msg = rx.recv(), if room => {
-                let Some((binary, bytes)) = msg else { return };
+                let Some((binary, bytes)) = msg else { return "the session ended".into() };
                 pending.extend(pieces(binary, &bytes));
             }
             _ = tokio::time::sleep(wait) => {
-                if rtc.handle_input(Input::Timeout(Instant::now())).is_err() {
-                    end(&direct, &tx);
-                    return;
+                if let Err(e) = rtc.handle_input(Input::Timeout(Instant::now())) {
+                    return e.to_string();
                 }
             }
-            _ = inbox.closed() => {
-                end(&direct, &tx);
-                return;
-            }
+            _ = ends.inbox.closed() => return "the session ended".into(),
         }
     }
 }
@@ -469,16 +637,27 @@ mod tests {
         false
     }
 
-    #[tokio::test]
-    async fn an_offered_channel_carries_frames_and_page_messages() {
-        let Some(&ip) = local_ips().first() else {
-            return;
-        };
+    /// The session's ends of a wrapped pipe, and the page's side of an
+    /// open path.
+    struct Opened {
+        page: Rtc,
+        socket: UdpSocket,
+        channel: ChannelId,
+        path: u64,
+        page_in: mpsc::Sender<String>,
+        relay_out: queue::Receiver<String>,
+        relay_frames: mpsc::Receiver<Vec<u8>>,
+        session_in: mpsc::Receiver<String>,
+        session_out: queue::Sender<String>,
+        session_frames: mpsc::Sender<Vec<u8>>,
+    }
+
+    async fn open() -> Option<Opened> {
+        let &ip = local_ips().first()?;
         let (page_in, inbox) = mpsc::channel::<String>(8);
         let (outbox, mut relay_out) = queue::channel::<String>(8);
-        let (frames, mut relay_frames) = mpsc::channel::<Vec<u8>>(4);
-        let (session_in, session_out, session_frames) = wrap(inbox, outbox, frames);
-        let mut session_in = session_in;
+        let (frames, relay_frames) = mpsc::channel::<Vec<u8>>(8);
+        let (mut session_in, session_out, session_frames) = wrap(inbox, outbox, frames);
 
         // The page's side, offering one channel.
         let socket = UdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap();
@@ -487,7 +666,7 @@ mod tests {
             .build(Instant::now());
         page.add_local_candidate(Candidate::host(socket.local_addr().unwrap(), "udp").unwrap());
         let mut change = page.sdp_api();
-        let id = change.add_channel("kaku".into());
+        let channel = change.add_channel("kaku".into());
         let (offer, pending) = change.apply().unwrap();
         let offer = serde_json::json!({ "type": "rtc_offer", "sdp": offer.to_sdp_string() });
         page_in.send(offer.to_string()).await.unwrap();
@@ -496,6 +675,7 @@ mod tests {
         let answer = relay_out.recv().await.unwrap();
         let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
         assert_eq!(answer["type"], "rtc_answer");
+        let path = answer["id"].as_u64().unwrap();
         let answer =
             str0m::change::SdpAnswer::from_sdp_string(answer["sdp"].as_str().unwrap()).unwrap();
         page.sdp_api().accept_answer(pending, answer).unwrap();
@@ -506,53 +686,142 @@ mod tests {
             ))
             .await
         );
+        // Kaku's side opens a moment later and tells the helper.
+        let told = tokio::select! {
+            told = session_in.recv() => told,
+            _ = drive(&mut page, &socket, |_, _| false) => None,
+        };
+        assert_eq!(told.as_deref(), Some(PATH_CHANGED));
+        Some(Opened {
+            page,
+            socket,
+            channel,
+            path,
+            page_in,
+            relay_out,
+            relay_frames,
+            session_in,
+            session_out,
+            session_frames,
+        })
+    }
 
-        // Kaku's side opens a moment later; wait until it takes the path.
-        let mut frame = vec![0u8; 40 * 1024];
-        frame[1] = 9;
+    /// What the page hears on the path until it has `count` messages.
+    async fn heard(o: &mut Opened, count: usize) -> Vec<(bool, Vec<u8>)> {
         let mut got = Vec::new();
-        let sent = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            session_frames.send(frame).await.unwrap();
-            session_out
-                .send("{\"type\":\"pong\"}".into())
-                .await
-                .unwrap();
-        });
-        let mut texts = Vec::new();
+        let mut whole = Vec::new();
         assert!(
-            drive(&mut page, &socket, |_, e| {
+            drive(&mut o.page, &o.socket, |_, e| {
                 if let Event::ChannelData(data) = e {
                     got.extend_from_slice(&data.data[1..]);
                     if data.data[0] & 1 == 1 {
-                        texts.push((data.data[0] & 2 == 2, std::mem::take(&mut got)));
+                        whole.push((data.data[0] & 2 == 2, std::mem::take(&mut got)));
                     }
                 }
-                texts.len() == 2
+                whole.len() == count
             })
             .await
         );
-        sent.await.unwrap();
-        assert!(
-            relay_frames.try_recv().is_err(),
-            "the frame went by the relay"
-        );
+        whole
+    }
+
+    #[tokio::test]
+    async fn an_offered_channel_carries_frames_and_page_messages() {
+        let Some(mut o) = open().await else { return };
+        let mut frame = vec![0u8; 40 * 1024];
+        frame[1] = 9;
+        o.session_frames.send(frame).await.unwrap();
+        o.session_out
+            .send("{\"type\":\"pong\"}".into())
+            .await
+            .unwrap();
+        let texts = heard(&mut o, 2).await;
         assert!(!texts[0].0);
         assert_eq!(texts[0].1.len(), 40 * 1024);
         assert_eq!(texts[0].1[1], 9);
         assert_eq!(texts[1], (true, b"{\"type\":\"pong\"}".to_vec()));
 
-        // What the page sends on the channel reaches the session.
-        assert!(page
-            .channel(id)
+        // Each lane's last word on the relay says it moved, so the page
+        // takes the path's messages after those still on the way.
+        let marker = o.relay_frames.try_recv().unwrap();
+        assert_eq!(marker, ready_frame(o.path));
+        assert!(
+            o.relay_frames.try_recv().is_err(),
+            "the frame went by the relay"
+        );
+        assert_eq!(o.relay_out.recv().await.unwrap(), ready_text(o.path));
+
+        // What the page sends on the channel waits for its own `rtc_ready`
+        // on the relay, then reaches the session after what came before it.
+        let ping = b"{\"type\":\"ping\"}";
+        assert!(o
+            .page
+            .channel(o.channel)
             .unwrap()
-            .write(false, b"{\"type\":\"ping\"}")
+            .write(false, ping)
             .unwrap());
-        let heard = tokio::select! {
-            heard = session_in.recv() => heard,
-            _ = drive(&mut page, &socket, |_, _| false) => None,
+        let early = tokio::select! {
+            got = o.session_in.recv() => got,
+            _ = async {
+                drive(&mut o.page, &o.socket, |_, _| false).await;
+            } => None,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => None,
         };
-        assert_eq!(heard.as_deref(), Some("{\"type\":\"ping\"}"));
+        assert_eq!(early, None, "taken before the page's rtc_ready");
+        o.page_in
+            .send("{\"type\":\"key\",\"data\":\"a\"}".into())
+            .await
+            .unwrap();
+        let ready = serde_json::json!({ "type": "rtc_ready", "id": o.path }).to_string();
+        o.page_in.send(ready).await.unwrap();
+        assert_eq!(
+            o.session_in.recv().await.as_deref(),
+            Some("{\"type\":\"key\",\"data\":\"a\"}")
+        );
+        assert_eq!(
+            o.session_in.recv().await.as_deref(),
+            Some("{\"type\":\"ping\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_the_page_gives_up_sends_everything_by_the_relay_again() {
+        let Some(mut o) = open().await else { return };
+        let close = serde_json::json!({ "type": "rtc_close", "id": o.path }).to_string();
+        o.page_in.send(close).await.unwrap();
+        assert_eq!(o.session_in.recv().await.as_deref(), Some(PATH_CHANGED));
+        o.session_out
+            .send("{\"type\":\"pong\"}".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            o.relay_out.recv().await.as_deref(),
+            Some("{\"type\":\"pong\"}")
+        );
+        o.session_frames.send(vec![0, 1]).await.unwrap();
+        assert_eq!(o.relay_frames.recv().await, Some(vec![0, 1]));
+    }
+
+    #[tokio::test]
+    async fn a_path_that_ends_on_its_own_is_told_to_the_page() {
+        let Some(mut o) = open().await else { return };
+        o.page.direct_api().close_data_channel(o.channel);
+        let closed = tokio::select! {
+            closed = o.relay_out.recv() => closed,
+            _ = drive(&mut o.page, &o.socket, |_, _| false) => None,
+        };
+        let closed: serde_json::Value = serde_json::from_str(&closed.unwrap()).unwrap();
+        assert_eq!(closed["type"], "rtc_closed");
+        assert_eq!(closed["id"], o.path);
+        assert_eq!(o.session_in.recv().await.as_deref(), Some(PATH_CHANGED));
+        o.session_out
+            .send("{\"type\":\"pong\"}".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            o.relay_out.recv().await.as_deref(),
+            Some("{\"type\":\"pong\"}")
+        );
     }
 
     /// A real browser on the other side: `tests/p2p_probe.cjs` writes the
@@ -579,8 +848,14 @@ mod tests {
             .unwrap();
         let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
         std::fs::write(dir.join("answer.sdp"), answer["sdp"].as_str().unwrap()).unwrap();
+        // The probe sends nothing by the relay: its path messages go on at once.
+        let ready = serde_json::json!({ "type": "rtc_ready", "id": answer["id"] });
+        page_in.send(ready.to_string()).await.unwrap();
         let until = Instant::now() + Duration::from_secs(20);
         while let Ok(Some(text)) = tokio::time::timeout_at(until.into(), session_in.recv()).await {
+            if text == PATH_CHANGED {
+                continue;
+            }
             let mut frame = vec![0u8; 300 * 1024];
             frame[1] = 7;
             session_frames.send(frame).await.unwrap();

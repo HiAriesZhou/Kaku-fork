@@ -2990,7 +2990,7 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
   });
   await p.waitForFunction(() => messages.some(m => m.type === 'rtc_offer'));
   assert.equal(await p.evaluate(() => messages.find(m => m.type === 'rtc_offer').sdp), 'v=0 offer');
-  await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'rtc_answer', sdp: 'v=0 answer' }) }));
+  await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'rtc_answer', sdp: 'v=0 answer', id: 3 }) }));
   await p.waitForFunction(() => peer.answer);
   assert.deepEqual(await p.evaluate(() => peer.answer), { type: 'answer', sdp: 'v=0 answer' });
 
@@ -2998,12 +2998,14 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
   await p.evaluate(() => { messages.length = 0; probe.attach({ pane_id: 4, tab_id: 1 }); });
   assert.deepEqual(await p.evaluate(() => [messages.map(m => m.type), peer.sent.length]), [['attach'], 0]);
 
-  // Open: a message larger than one piece arrives whole.
+  // Open: the page's last word on the session says so, and what Kaku sends
+  // on the path waits for Kaku's own word that its lane moved.
   const detail = 'direct '.repeat(4000);
   await p.evaluate((detail) => {
+    messages.length = 0;
     peer.dc.readyState = 'open';
     peer.dc.onopen();
-    const deliver = (flags, bytes) => {
+    window.deliver = (flags, bytes) => {
       const cut = 16 * 1024 - 1;
       for (let at = 0; at < bytes.length; at += cut) {
         const part = bytes.subarray(at, at + cut);
@@ -3015,6 +3017,14 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
     };
     deliver(2, new TextEncoder().encode(JSON.stringify({ type: 'error', detail })));
   }, detail);
+  assert.deepEqual(await p.evaluate(() => messages), [{ type: 'rtc_ready', id: 3 }]);
+  await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'error', detail: 'by the relay' }) }));
+  assert.equal(await p.evaluate(() => document.getElementById('toast').textContent), 'by the relay');
+  // Another path's word moves nothing.
+  await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'rtc_ready', lane: 'text', id: 2 }) }));
+  assert.equal(await p.evaluate(() => document.getElementById('toast').textContent), 'by the relay');
+  await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'rtc_ready', lane: 'text', id: 3 }) }));
+  // A message larger than one piece arrives whole.
   await p.waitForFunction((n) => document.getElementById('toast').textContent.length === n, detail.length);
 
   // Small messages now go direct.
@@ -3022,9 +3032,49 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
   assert.deepEqual(await p.evaluate(() => peer.sent.map(d => JSON.parse(d).type)), ['attach']);
   assert.deepEqual(await p.evaluate(() => messages.map(m => m.type)), []);
 
-  // Closed: back to the session.
-  await p.evaluate(() => { peer.dc.readyState = 'closed'; peer.dc.onclose(); messages.length = 0; probe.attach({ pane_id: 4, tab_id: 1 }); });
+  // A path that stops answering leaves the page's messages to the session
+  // until it answers again.
+  await p.evaluate(() => {
+    peer.pc.iceConnectionState = 'disconnected';
+    peer.pc.oniceconnectionstatechange();
+    messages.length = 0;
+    peer.sent.length = 0;
+    probe.attach({ pane_id: 5, tab_id: 1 });
+  });
+  assert.deepEqual(await p.evaluate(() => [messages.map(m => m.type), peer.sent.length]), [['attach'], 0]);
+  await p.evaluate(() => {
+    peer.pc.iceConnectionState = 'connected';
+    peer.pc.oniceconnectionstatechange();
+    messages.length = 0;
+    probe.attach({ pane_id: 5, tab_id: 1 });
+  });
+  assert.deepEqual(await p.evaluate(() => [messages.length, peer.sent.length]), [0, 1]);
+
+  // Kaku ends it: back to the session, the screen starts over, and a new
+  // offer follows once the wait is up.
+  await p.evaluate(() => {
+    messages.length = 0;
+    connections[0].onmessage({ data: JSON.stringify({ type: 'rtc_closed', id: 3 }) });
+  });
+  assert.deepEqual(await p.evaluate(() => messages.map(m => m.type)), ['hello', 'attach']);
+  await p.evaluate(() => { messages.length = 0; probe.attach({ pane_id: 4, tab_id: 1 }); });
   assert.deepEqual(await p.evaluate(() => messages.map(m => m.type)), ['attach']);
+  await p.waitForFunction(() => messages.some(m => m.type === 'rtc_offer'), null, { timeout: 5000 });
+
+  // The browser gives up on the new one: Kaku is told by the session.
+  await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'rtc_answer', sdp: 'v=0 answer', id: 4 }) }));
+  await p.evaluate(() => {
+    peer.dc.readyState = 'open';
+    peer.dc.onopen();
+    messages.length = 0;
+    peer.pc.iceConnectionState = 'failed';
+    peer.pc.oniceconnectionstatechange();
+  });
+  assert.deepEqual(await p.evaluate(() => messages), [
+    { type: 'rtc_close', id: 4 },
+    { type: 'hello', frame_ack: true },
+    { type: 'attach', pane_id: 4 },
+  ]);
   assert.deepEqual(errors, []);
 });
 

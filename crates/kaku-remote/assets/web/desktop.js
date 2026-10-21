@@ -1256,6 +1256,10 @@
       sessionStarted() {
         if (active && !document.hidden) start();
       },
+      // Pictures may have been lost on the way: start again from a key frame.
+      resync() {
+        if (active && !document.hidden) wantKey();
+      },
       get active() { return active; },
       get lastDrawn() { return lastDrawn; },
       enter,
