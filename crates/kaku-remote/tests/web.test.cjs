@@ -8,6 +8,9 @@ const root = path.resolve(__dirname, '../../..');
 let browser;
 const launchOptions = (args = []) => ({ args,
   ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
+// Headless Chromium on a Mac gives WebGL2 only on Metal and with its GPU
+// blocklist off; without these the WebGL tests skip.
+const GPU_ARGS = ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist'];
 // Most tests read the DOM renderer's rows, so this browser has no WebGL and
 // also covers the page's fallback; the WebGL test launches its own.
 before(async () => {
@@ -39,7 +42,7 @@ async function page(t, hash = '#t=fixture', options = {}, context = browser) {
   });
   const html = fs.readFileSync(process.env.KAKU_WEB_SOURCE || path.join(root, 'crates/kaku-remote/assets/web/index.html'), 'utf8')
     .replace('term.registerLinkProvider({', 'term.registerLinkProvider(window.testLinkProvider = {')
-    .replace(/\}\)\(\);\s*<\/script>/, 'window.probe = {term, handle, attach, openPast, onHistory, pastScroll, sendFile, sendFiles, sendOnce, snapshots, download, get desktop() { return desktop; }};\n})();\n</script>');
+    .replace(/\}\)\(\);\s*<\/script>/, 'window.probe = {term, handle, attach, openPast, onHistory, pastScroll, sendFile, sendFiles, sendOnce, snapshots, download, get desktop() { return desktop; }, get webgl() { return webgl; }};\n})();\n</script>');
   await p.route('http://localhost:9988/**', route => {
     const name = new URL(route.request().url()).pathname.split('/').pop();
     if (!name) return route.fulfill({ contentType: 'text/html', body: html });
@@ -1537,7 +1540,7 @@ test('terminal menu fits narrow and short viewport corners', async t => {
 // over at once (the addon itself waits about 3 s, showing a blank or broken
 // grid), and WebGL must come back once the page is in front again.
 test('a lost WebGL context hands the grid to the DOM at once and comes back', async t => {
-  const gpu = await chromium.launch(launchOptions());
+  const gpu = await chromium.launch(launchOptions(GPU_ARGS));
   t.after(() => gpu.close());
   const { p, errors } = await page(t, '#t=fixture', {}, gpu);
   const hasWebgl = await p.evaluate(() => !!document.createElement('canvas').getContext('webgl2'));
@@ -1563,13 +1566,69 @@ test('a lost WebGL context hands the grid to the DOM at once and comes back', as
   assert.deepEqual(errors, []);
 });
 
+// Once its glyph pages are full, the WebGL addon merges four of them in the
+// middle of a frame, and that frame drew wrong letters until the next redraw
+// (maintainer, 2026-10-21, switching tabs). Six tabs of colored CJK fill the
+// pages; every frame in which a merge happened must equal the same screen
+// drawn again a frame later.
+test('switching tabs never shows a frame of wrong letters while WebGL merges glyph pages', async t => {
+  const gpu = await chromium.launch(launchOptions(GPU_ARGS));
+  t.after(() => gpu.close());
+  // Room for 80x24 at that size: a grid larger than the window shrinks the
+  // font on every switch, and each new size starts the atlas over.
+  const { p, errors } = await page(t, '#t=fixture', { viewport: { width: 2000, height: 1300 } }, gpu);
+  const hasWebgl = await p.evaluate(() => !!document.createElement('canvas').getContext('webgl2'));
+  if (!hasWebgl) return t.skip('this Chromium has no WebGL2');
+  const result = await p.evaluate(async () => {
+    const tabs = [1, 2, 3, 4, 5, 6].map(i => ({ tab_id: i, pane_id: i, panes: [], title: 'tab' + i, active: i === 1 }));
+    // The maintainer's 16px at 2.2x is about 35 device pixels a glyph.
+    probe.handle({ type: 'config', font_size: 36 });
+    probe.handle({ type: 'tabs', tabs });
+    const HAN = '的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应开它合还因由其些然前外天政四日那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变条只没结解问意建月公无系军很情者最立代想已通并提直题党程展五果料象员革位入常文总次品式活设及管特件长求老头基资边流路级少图山统接知较将组见计别她手角期根论运农指几九区强放决西被干做必战先回则任取据处府';
+    const screenOf = k => {
+      let seed = k * 7919 + 1;
+      const rnd = n => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) % n; };
+      let s = '\x1b[2J';
+      for (let r = 1; r <= 24; r++) {
+        s += `\x1b[${r};1H`;
+        for (let c = 0; c < 60; c++) s += `\x1b[38;5;${rnd(256)}m` + (rnd(3) ? HAN[rnd(HAN.length)] : String.fromCharCode(33 + rnd(90)));
+      }
+      return s;
+    };
+    const canvas = () => [...document.querySelectorAll('.xterm-screen canvas')].find(c => c.getContext('webgl2'));
+    const frame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+    let merges = 0, checked = 0, wrong = 0, merged = false, pending = null;
+    probe.webgl.onRemoveTextureAtlasCanvas(() => { merges++; merged = true; });
+    // Registered after the page's own listener, so it sees what the frame shows.
+    probe.term.onRender(() => {
+      if (pending !== null) { if (canvas().toDataURL() !== pending) wrong++; pending = null; return; }
+      if (!merged) return;
+      merged = false; checked++;
+      pending = canvas().toDataURL();
+      requestAnimationFrame(() => probe.term.refresh(0, probe.term.rows - 1));
+    });
+    let seq = 1;
+    for (let i = 0; i < 36; i++) {
+      const k = i % 6 + 1;
+      probe.attach(tabs[k - 1]);
+      // No cursor: its blink would differ between the two pictures.
+      probe.handle({ type: 'frame', seq: seq++, pane_id: k, cols: 80, rows: 24, data: screenOf(k) + '\x1b[?25l' });
+      await frame(); await frame();
+    }
+    return { merges, checked, wrong };
+  });
+  assert.ok(result.merges > 0, `the tabs merged no glyph pages: ${JSON.stringify(result)}`);
+  assert.equal(result.wrong, 0, `frames with wrong letters: ${JSON.stringify(result)}`);
+  assert.deepEqual(errors, []);
+});
+
 test('the grid draws with WebGL where the browser has it, and with the DOM otherwise', async t => {
   const { p: dom, errors: domErrors } = await page(t);
   await screen(dom, 'DOM-GRID');
   assert.equal(await dom.locator('.xterm-rows').count(), 1);
   assert.deepEqual(domErrors, []);
 
-  const gpu = await chromium.launch(launchOptions());
+  const gpu = await chromium.launch(launchOptions(GPU_ARGS));
   t.after(() => gpu.close());
   const { p, errors } = await page(t, '#t=fixture', {}, gpu);
   const hasWebgl = await p.evaluate(() => !!document.createElement('canvas').getContext('webgl2'));
@@ -1825,7 +1884,7 @@ test('a font this browser already has is not fetched', async t => {
 // The icon font loads only once an icon is drawn, after WebGL already
 // rasterized a box for it; the grid must redraw with the icon by itself.
 test('an icon drawn before its font loaded is redrawn once the font is in', async t => {
-  const gpu = await chromium.launch(launchOptions());
+  const gpu = await chromium.launch(launchOptions(GPU_ARGS));
   t.after(() => gpu.close());
   const { p, errors } = await page(t, '#t=fixture', {}, gpu);
   if (!await p.evaluate(() => !!document.createElement('canvas').getContext('webgl2'))) return t.skip('this Chromium has no WebGL2');

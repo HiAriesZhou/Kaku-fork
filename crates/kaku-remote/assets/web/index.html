@@ -651,6 +651,12 @@
     try {
       const addon = new WebglAddon.WebglAddon();
       addon.onContextLoss(dropWebgl);
+      // Once its glyph pages are full, the addon merges four into one in
+      // the middle of a frame, moving glyphs the rest of that frame still
+      // draws from their old places: one frame of wrong letters, which stays
+      // until something else redraws (maintainer, 2026-10-16 and 2026-10-21,
+      // switching tabs). Draw the whole grid again before that frame shows.
+      addon.onRemoveTextureAtlasCanvas(() => { atlasMerged = true; });
       term.loadAddon(addon);
       webgl = addon;
       for (const canvas of termEl.querySelectorAll("canvas")) {
@@ -658,19 +664,26 @@
       }
     } catch (_) {}
   };
+  let atlasMerged = false;
+  term.onRender(() => {
+    const renderer = term._core?._renderService?._renderer?.value;
+    for (let i = 0; atlasMerged && i < 3; i++) {
+      atlasMerged = false;
+      try { renderer.renderRows(0, term.rows - 1); } catch (_) { term.refresh(0, term.rows - 1); }
+    }
+  });
   useWebgl();
   document.addEventListener("visibilitychange", useWebgl);
-  // The context can also survive with its glyph atlas wrong: letters drawn
-  // as other glyphs across the newly shown tab (maintainer, 2026-10-16,
-  // switching tabs). Rebuild the atlas whenever a different screen comes up
-  // or the page comes back, a few milliseconds of re-rasterizing.
+  // Rebuilding the atlas is kept for fonts that arrive late. It used to run
+  // on every tab switch and focus too, against the wrong letters above, but
+  // a rebuild never hands merged pages back, so it only made merges, and
+  // their bad frames, several times more frequent (Helium on Metal, 60
+  // switches over six tabs: 52 merges with it, 12 without).
   // Counted for the Mac's log, next to how the page draws.
   let atlasResets = 0;
   const freshGlyphs = () => {
     if (webgl && !document.hidden) { try { term.clearTextureAtlas(); atlasResets++; } catch (_) {} }
   };
-  document.addEventListener("visibilitychange", freshGlyphs);
-  window.addEventListener("focus", freshGlyphs);
   // A font that arrives after its characters were drawn: the bundled icons
   // load only once one is on screen, and the user's fonts come from the Mac.
   // WebGL keeps the box it drew in the meantime until the atlas is rebuilt.
@@ -1748,7 +1761,6 @@
     }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     renderTabs();
-    freshGlyphs();
     term.focus();
   };
 
