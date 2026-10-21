@@ -1187,7 +1187,7 @@
           else first.set(line, i);
         }
       }
-      view.trace = `lines ${lines?.length ?? "?"} shared [${shared.slice(0, 12).join(" ")}${shared.length > 12 ? ` +${shared.length - 12}` : ""}]`
+      view.trace = `repairs ${bufferRepairs} lines ${lines?.length ?? "?"} shared [${shared.slice(0, 12).join(" ")}${shared.length > 12 ? ` +${shared.length - 12}` : ""}]`
         + ` cursor ${buf.cursorX},${buf.cursorY} region ${region?.scrollTop ?? "?"}-${region?.scrollBottom ?? "?"}`
         + ` wrap ${modes.wraparoundMode} origin ${modes.originMode} insert ${modes.insertMode}; writes ${writeTrace.join(" | ")}`;
       send({ type: "verify", frames: framesSeen, seq: appliedSeq || undefined, rows, view });
@@ -1627,6 +1627,43 @@
   // and its frames place every row, so this xterm holds no modes of its own.
   const resizeTerm = (cols, rows) => {
     if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows);
+    repairBuffer();
+  };
+  // After the window left and re-entered full screen, xterm's buffer (no
+  // scrollback) was found with its view starting a row past its last line
+  // (base 1 over 34 lines for 34 rows) and up to 27 rows sharing one line
+  // object, so writing any of them showed in all: the status line of
+  // Claude Code stacked down the page, and Kaku's full redraws could not
+  // undo it (maintainer, 2026-10-20 and 2026-10-21). Put the view back
+  // inside the buffer and give each shared row its own copy; the caller
+  // asks Kaku for every row again when the screen already showed it.
+  let bufferRepairs = 0;
+  const repairBuffer = () => {
+    const buf = term._core?.buffer;
+    const lines = buf?.lines;
+    if (!lines || typeof lines.get !== "function") return false;
+    let fixed = false;
+    const top = Math.max(0, lines.length - term.rows);
+    if (buf.ybase > top) { buf.ybase = top; fixed = true; }
+    if (buf.ydisp > buf.ybase) { buf.ydisp = buf.ybase; fixed = true; }
+    const seen = new Set();
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines.get(i);
+      if (!line) continue;
+      if (seen.has(line)) { lines.set(i, line.clone()); fixed = true; }
+      else seen.add(line);
+    }
+    if (fixed) bufferRepairs++;
+    return fixed;
+  };
+  let redrawAskedAt = 0;
+  const repairShown = () => {
+    if (!repairBuffer()) return;
+    term.refresh(0, term.rows - 1);
+    const now = Date.now();
+    if (now - redrawAskedAt < 1000) return;
+    redrawAskedAt = now;
+    send({ type: "redraw" });
   };
   const CLEAR = "\x1b[0m\x1b[2J\x1b[3J";
   // For the Mac's drift report: the last writes into xterm with the text
@@ -2483,6 +2520,7 @@
         if (msg.seq) appliedSeq = msg.seq;
         liveWrapped = msg.wrapped || [];
         markFound();
+        repairShown();
       }
       if (msg.seq) send({ type: "frame_ack", seq: msg.seq });
     });

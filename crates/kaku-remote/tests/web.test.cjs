@@ -1629,6 +1629,44 @@ test('switching tabs never shows a frame of wrong letters while WebGL merges gly
   assert.deepEqual(errors, []);
 });
 
+// The state the maintainer's page reported after leaving and re-entering
+// full screen: the view one row past the buffer's last line, and rows
+// 18-29 one line object with row 17, so every write to any of them showed
+// in all and Kaku's full redraws left the status line stacked down the page.
+test('a buffer whose rows share one line object is repaired and drawn again', async t => {
+  const { p, errors } = await page(t);
+  const result = await p.evaluate(async () => {
+    probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] });
+    const screenOf = tag => { let d = ''; for (let r = 1; r <= 34; r++) d += `\x1b[${r};1H${tag} row ${r}\x1b[K`; return d; };
+    const applied = seq => new Promise(r => { const t = setInterval(() => { if (messages.some(m => m.type === 'frame_ack' && m.seq === seq)) { clearInterval(t); r(); } }, 5); });
+    probe.handle({ type: 'frame', seq: 1, pane_id: 1, cols: 100, rows: 34, data: '\x1b[2J' + screenOf('first') });
+    await applied(1);
+    const buf = probe.term._core.buffer;
+    const shared = buf.lines.get(16);
+    for (let i = 17; i <= 28; i++) buf.lines.set(i, shared);
+    buf.ybase = 1; buf.ydisp = 1;
+    messages.length = 0;
+    probe.handle({ type: 'frame', seq: 2, pane_id: 1, cols: 100, rows: 34, data: '\x1b[34;1Hstatus line\x1b[K' });
+    await applied(2);
+    const asked = messages.some(m => m.type === 'redraw');
+    // Kaku answers a redraw with every row.
+    probe.handle({ type: 'frame', seq: 3, pane_id: 1, cols: 100, rows: 34, data: screenOf('again') });
+    await applied(3);
+    const b = probe.term.buffer.active;
+    const rows = [];
+    for (let y = 0; y < 34; y++) rows.push(b.getLine(b.viewportY + y).translateToString(true));
+    const lines = probe.term._core.buffer.lines;
+    const objects = new Set();
+    for (let i = 0; i < lines.length; i++) objects.add(lines.get(i));
+    return { asked, rows, distinct: objects.size, length: lines.length, base: b.baseY };
+  });
+  assert.equal(result.asked, true, 'the page asks Kaku for every row again');
+  assert.equal(result.distinct, result.length, 'every row is its own line object');
+  assert.ok(result.base + 34 <= result.length, `view inside the buffer: base ${result.base} of ${result.length}`);
+  assert.deepEqual(result.rows, Array.from({ length: 34 }, (_, i) => `again row ${i + 1}`));
+  assert.deepEqual(errors, []);
+});
+
 test('the grid draws with WebGL where the browser has it, and with the DOM otherwise', async t => {
   const { p: dom, errors: domErrors } = await page(t);
   await screen(dom, 'DOM-GRID');
@@ -1814,7 +1852,7 @@ test('the drift check names the last frame drawn, so it runs while output stream
   assert.ok(last.view.font > 0 && last.view.cell_w > 0 && last.view.cell_h > 0 && last.view.icon > 0, JSON.stringify(last.view));
   assert.equal(last.view.past, false);
   // The buffer's own lines, and rows sharing one line object, which no redraw fixes.
-  assert.match(last.view.trace, /^lines 24 shared \[\] cursor /);
+  assert.match(last.view.trace, /^repairs 0 lines 24 shared \[\] cursor /);
   const resets = last.view.atlas;
   await p.evaluate(() => window.dispatchEvent(new Event('focus')));
   await p.evaluate(() => probe.handle({ type: 'frame', seq: 5, pane_id: 1, cols: 90, rows: 24, data: '\x1b[2;1Hmore' }));
