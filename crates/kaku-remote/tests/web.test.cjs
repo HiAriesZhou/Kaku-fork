@@ -426,7 +426,7 @@ test('local token stays tab-only', async t => {
   assert.ok(await p.evaluate(() => sessionStorage.getItem('kaku.link:/')));
 });
 
-test('image paths preview after 300ms and cancel on leave without downloading', async t => {
+test('image paths preview after 150ms, scaled by the Mac, again from memory, and cancel on leave', async t => {
   const { p, errors } = await page(t);
   await screen(p, '~/Desktop/shot.png');
   await p.evaluate(() => new Promise(resolve => testLinkProvider.provideLinks(1, links => {
@@ -434,12 +434,14 @@ test('image paths preview after 300ms and cancel on leave without downloading', 
     previewLink.hover({ clientX: 980, clientY: 580, buttons: 0 });
     resolve();
   })));
-  await p.waitForTimeout(180);
+  await p.waitForTimeout(80);
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
   await p.waitForFunction(() => messages.some(m => m.type === 'download'));
   const request = await p.evaluate(() => messages.find(m => m.type === 'download'));
   assert.equal(request.path, '~/Desktop/shot.png');
   assert.equal(request.pane_id, 1);
+  // The preview's longest side in device pixels, for the Mac to scale to.
+  assert.equal(request.preview, await p.evaluate(() => Math.round(420 * devicePixelRatio)));
   let saves = 0;
   p.on('download', () => saves++);
   await p.evaluate(id => {
@@ -464,6 +466,11 @@ test('image paths preview after 300ms and cancel on leave without downloading', 
   await p.evaluate(() => previewLink.hover({ clientX: 100, clientY: 100, buttons: 1 }));
   await p.waitForTimeout(350);
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
+  // Pointing at it again shows the picture already fetched, with no transfer.
+  await p.evaluate(() => previewLink.hover({ clientX: 100, clientY: 100, buttons: 0 }));
+  await p.waitForFunction(() => !document.querySelector('#image-preview').hidden);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
+  await p.evaluate(() => previewLink.leave());
   assert.deepEqual(errors, []);
 });
 

@@ -2747,15 +2747,54 @@
   // the page saves the whole file through the browser's downloads.
   let downloadSeq = 0;
   const incoming = new Map();
-  // Image paths preview after 300ms; use the authenticated file channel,
-  // and cancel the transfer as soon as the pointer leaves the path.
+  // Image paths preview after 150ms; use the authenticated file channel,
+  // and cancel the transfer as soon as the pointer leaves the path. Kaku
+  // sends the picture scaled to the preview's size (a screenshot of several
+  // megabytes took seconds over the relay), and the last few stay for a
+  // while, so pointing at one again shows it at once.
   const previewEl = document.createElement("img");
   previewEl.id = "image-preview";
   previewEl.alt = "";
   previewEl.hidden = true;
   document.body.append(previewEl);
-  let previewTimer = 0, previewId = null, previewUrl = null;
+  let previewTimer = 0, previewId = null;
   const PREVIEW_LIMIT = 8 * 1024 * 1024;
+  const PREVIEW_KEPT = 8;
+  const PREVIEW_FRESH = 30000;
+  // The preview's longest side on screen (CSS max-width), in device pixels.
+  const previewSide = () => Math.round(420 * (window.devicePixelRatio || 1));
+  const previewCache = new Map();
+  const cachedPreview = (path) => {
+    const hit = previewCache.get(path);
+    if (!hit) return null;
+    previewCache.delete(path);
+    if (Date.now() - hit.at > PREVIEW_FRESH) { URL.revokeObjectURL(hit.url); return null; }
+    previewCache.set(path, hit);
+    return hit.url;
+  };
+  const keepPreview = (path, url) => {
+    const old = previewCache.get(path);
+    if (old && old.url !== url) URL.revokeObjectURL(old.url);
+    previewCache.delete(path);
+    previewCache.set(path, { url, at: Date.now() });
+    while (previewCache.size > PREVIEW_KEPT) {
+      const [first, entry] = previewCache.entries().next().value;
+      URL.revokeObjectURL(entry.url);
+      previewCache.delete(first);
+    }
+  };
+  const showPreview = (url, at) => {
+    previewEl.onload = () => {
+      if (at.target !== paneId) { hideImagePreview(); return; }
+      previewEl.hidden = false;
+      const box = previewEl.getBoundingClientRect();
+      previewEl.style.left = Math.max(12, Math.min(at.x + 12, innerWidth - box.width - 12)) + "px";
+      previewEl.style.top = Math.max(12, at.y + 16 + box.height <= innerHeight - 12
+        ? at.y + 16 : at.y - box.height - 16) + "px";
+    };
+    previewEl.onerror = hideImagePreview;
+    previewEl.src = url;
+  };
   const hideImagePreview = () => {
     clearTimeout(previewTimer);
     if (previewId !== null) {
@@ -2766,20 +2805,21 @@
     previewEl.onload = previewEl.onerror = null;
     previewEl.hidden = true;
     previewEl.removeAttribute("src");
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    previewUrl = null;
   };
   const previewImage = (ev, path) => {
     hideImagePreview();
     if (ev.buttons || !/\.(png|jpe?g|gif|webp|avif|bmp|ico)$/i.test(path) || term.hasSelection()) return;
     const x = ev.clientX, y = ev.clientY, target = paneId;
     previewTimer = setTimeout(() => {
-      if (target !== paneId || term.hasSelection() || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (target !== paneId || term.hasSelection()) return;
+      const cached = cachedPreview(path);
+      if (cached) { showPreview(cached, { x, y, target }); return; }
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const id = ++downloadSeq;
       previewId = id;
-      incoming.set(id, { preview: { x, y, target }, parts: [], received: 0 });
-      send({ type: "download", id, path, pane_id: target });
-    }, 300);
+      incoming.set(id, { preview: { x, y, target, path }, parts: [], received: 0 });
+      send({ type: "download", id, path, pane_id: target, preview: previewSide() });
+    }, 150);
   };
   document.addEventListener("pointerdown", hideImagePreview, true);
   document.addEventListener("keydown", hideImagePreview, true);
@@ -2815,17 +2855,10 @@
         send({ type: "download_ack", id: msg.id, received: file.received });
       } else if (msg.type === "file_end") {
         incoming.delete(msg.id);
-        previewUrl = URL.createObjectURL(new Blob(file.parts));
-        previewEl.onload = () => {
-          if (previewId !== msg.id || file.preview.target !== paneId) { hideImagePreview(); return; }
-          previewEl.hidden = false;
-          const box = previewEl.getBoundingClientRect();
-          previewEl.style.left = Math.max(12, Math.min(file.preview.x + 12, innerWidth - box.width - 12)) + "px";
-          previewEl.style.top = Math.max(12, file.preview.y + 16 + box.height <= innerHeight - 12
-            ? file.preview.y + 16 : file.preview.y - box.height - 16) + "px";
-        };
-        previewEl.onerror = hideImagePreview;
-        previewEl.src = previewUrl;
+        if (previewId === msg.id) previewId = null;
+        const url = URL.createObjectURL(new Blob(file.parts));
+        keepPreview(file.preview.path, url);
+        showPreview(url, file.preview);
       } else if (msg.type === "file_error") hideImagePreview();
       return;
     }

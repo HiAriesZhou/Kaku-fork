@@ -555,6 +555,11 @@ enum WebClientMsg {
         path: String,
         #[serde(default)]
         pane_id: Option<usize>,
+        /// An image to preview on hover: the longest side, in device pixels,
+        /// the page shows it at. Kaku sends a picture scaled to fit instead
+        /// of the whole file. Older Kakus ignore it and send the file.
+        #[serde(default)]
+        preview: Option<u32>,
     },
     DownloadAck {
         id: u32,
@@ -909,7 +914,7 @@ impl Drop for Uploads {
 struct Downloads(HashMap<u32, Download>);
 
 struct Download {
-    file: std::fs::File,
+    file: Box<dyn std::io::Read + Send>,
     size: u64,
     sent: u64,
     acked: u64,
@@ -920,6 +925,72 @@ const DOWNLOAD_CHUNK: usize = 64 << 10;
 /// leave room on the shared socket for terminal input during a download.
 const DOWNLOAD_WINDOW: u64 = 256 << 10;
 const MAX_DOWNLOAD_BYTES: u64 = 50 << 20;
+/// Images up to this size go to a hover preview as they are; decoding and
+/// scaling them would save little.
+const PREVIEW_AS_IS: u64 = 256 << 10;
+/// The longest side a preview is scaled to, whatever the page asks.
+const PREVIEW_MAX_SIDE: u32 = 2048;
+
+/// A picture for a hover preview: the image scaled to fit `side` pixels,
+/// as JPEG, or PNG when it has transparency. A small file, one the image
+/// decoder does not know, or one that scaling would not shrink goes as it
+/// is. A screenshot is several megabytes, seconds over the relay, and the
+/// preview shows it a few hundred pixels wide.
+fn preview_bytes(path: &std::path::Path, side: u32) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let (mut file, _, size) = open_download(path)?;
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("read failed: {e}"))?;
+    if bytes.len() as u64 <= PREVIEW_AS_IS {
+        return Ok(bytes);
+    }
+    let Ok(picture) = image::load_from_memory(&bytes) else {
+        return Ok(bytes);
+    };
+    let side = side.clamp(64, PREVIEW_MAX_SIDE);
+    let picture = if picture.width() > side || picture.height() > side {
+        picture.thumbnail(side, side)
+    } else {
+        picture
+    };
+    let mut out = std::io::Cursor::new(Vec::new());
+    let encoded = if picture.color().has_alpha() {
+        picture.write_to(&mut out, image::ImageFormat::Png)
+    } else {
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+            .encode_image(&picture.to_rgb8())
+    };
+    let out = out.into_inner();
+    Ok(if encoded.is_ok() && out.len() < bytes.len() {
+        out
+    } else {
+        bytes
+    })
+}
+
+/// Start sending a preview made by `preview_bytes`.
+fn start_preview(id: u32, bytes: Vec<u8>, downloads: &mut HashMap<u32, Download>) -> Vec<String> {
+    let mut out = Vec::new();
+    let size = bytes.len() as u64;
+    if let Some(json) = encode(&WebServerMsg::FileStart {
+        id,
+        name: "preview",
+        size,
+    }) {
+        out.push(json);
+    }
+    let mut download = Download {
+        file: Box::new(std::io::Cursor::new(bytes)),
+        size,
+        sent: 0,
+        acked: 0,
+    };
+    if !pump_download(id, &mut download, &mut out) {
+        downloads.insert(id, download);
+    }
+    out
+}
 
 /// Where a path the user clicked points: `~` is the home folder, and a
 /// relative path is taken from the pane's working directory.
@@ -1003,7 +1074,9 @@ fn handle_download(
 ) -> Option<Vec<String>> {
     let mut out = Vec::new();
     match msg {
-        WebClientMsg::Download { id, path, pane_id } => {
+        WebClientMsg::Download {
+            id, path, pane_id, ..
+        } => {
             let opened = download_path(path, cwd(*pane_id))
                 .ok_or_else(|| format!("{path}: no working directory to find it from"))
                 .and_then(|path| open_download(&path));
@@ -1017,7 +1090,7 @@ fn handle_download(
                         out.push(json);
                     }
                     let mut download = Download {
-                        file,
+                        file: Box::new(file),
                         size,
                         sent: 0,
                         acked: 0,
@@ -2496,6 +2569,10 @@ pub(crate) async fn run_session(
     let mut sent_images: HashSet<String> = HashSet::new();
     let mut uploads = Uploads::default();
     let mut downloads = Downloads::default();
+    // Hover previews being scaled off the session's task, by download id;
+    // one cancelled meanwhile is dropped when it is ready.
+    let (previews_ready, mut previews_done) = mpsc::channel::<(u32, Result<Vec<u8>, String>)>(4);
+    let mut previewing: HashSet<u32> = HashSet::new();
     let mut next_render = tokio::time::Instant::now();
     let mut idle = tokio::time::interval(IDLE_REFRESH);
     let mut last_heard = std::time::Instant::now();
@@ -2549,6 +2626,20 @@ pub(crate) async fn run_session(
                         .to_file_path()
                         .ok()
                 };
+                if let WebClientMsg::Download { id, path, pane_id, preview: Some(side) } = &msg {
+                    let resolved = download_path(path, cwd(*pane_id))
+                        .ok_or_else(|| format!("{path}: no working directory to find it from"));
+                    let (id, side, ready) = (*id, *side, previews_ready.clone());
+                    previewing.insert(id);
+                    tokio::task::spawn_blocking(move || {
+                        let made = resolved.and_then(|path| preview_bytes(&path, side));
+                        let _ = ready.blocking_send((id, made));
+                    });
+                    continue;
+                }
+                if let WebClientMsg::DownloadCancel { id } = &msg {
+                    previewing.remove(id);
+                }
                 if let Some(replies) = handle_download(&msg, &mut downloads.0, cwd) {
                     for json in replies {
                         if outbox.send_bulk(json).await.is_err() {
@@ -2699,6 +2790,23 @@ pub(crate) async fn run_session(
                     let msg = WebServerMsg::Notify { pane_id: n.pane_id, title: &n.title, body: &n.body };
                     let Some(json) = encode(&msg) else { continue };
                     if outbox.send(json).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            done = previews_done.recv() => {
+                let Some((id, made)) = done else { continue };
+                if !previewing.remove(&id) {
+                    continue;
+                }
+                let replies = match made {
+                    Ok(bytes) => start_preview(id, bytes, &mut downloads.0),
+                    Err(detail) => encode(&WebServerMsg::FileError { id, detail: &detail })
+                        .into_iter()
+                        .collect(),
+                };
+                for json in replies {
+                    if outbox.send_bulk(json).await.is_err() {
                         break;
                     }
                 }
@@ -3514,6 +3622,63 @@ mod tests {
     }
 
     #[test]
+    fn a_hover_preview_is_scaled_to_the_side_the_page_shows() {
+        let dir = std::env::temp_dir().join(format!("kaku-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A Retina screenshot: noisy enough that its PNG runs to megabytes.
+        let mut seed = 7u32;
+        let shot = image::RgbImage::from_fn(3024, 1964, |x, y| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, (seed & 0x3f) as u8])
+        });
+        let path = dir.join("shot.png");
+        shot.save(&path).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 4 << 20, "fixture is {size} bytes");
+        let started = std::time::Instant::now();
+        let bytes = preview_bytes(&path, 924).unwrap();
+        let took = started.elapsed();
+        let picture = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(
+            image::guess_format(&bytes).unwrap(),
+            image::ImageFormat::Jpeg
+        );
+        assert_eq!((picture.width(), picture.height()), (924, 600));
+        assert!(bytes.len() < 400 << 10, "{} bytes in {took:?}", bytes.len());
+
+        // Transparency stays: PNG.
+        let clear = image::RgbaImage::from_fn(3000, 2000, |x, y| {
+            image::Rgba([
+                (x % 256) as u8,
+                (y % 256) as u8,
+                ((x ^ y) % 256) as u8,
+                (x % 200) as u8,
+            ])
+        });
+        let path = dir.join("clear.png");
+        clear.save(&path).unwrap();
+        let bytes = preview_bytes(&path, 600).unwrap();
+        assert_eq!(
+            image::guess_format(&bytes).unwrap(),
+            image::ImageFormat::Png
+        );
+        assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 600);
+
+        // Small files and files the decoder does not know go as they are.
+        let small = dir.join("small.png");
+        std::fs::write(&small, b"not really a png").unwrap();
+        assert_eq!(preview_bytes(&small, 600).unwrap(), b"not really a png");
+        let odd = dir.join("odd.bmp");
+        let odd_bytes: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&odd, &odd_bytes).unwrap();
+        assert_eq!(preview_bytes(&odd, 600).unwrap(), odd_bytes);
+        assert!(preview_bytes(&dir.join("missing.png"), 600).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_download_sends_a_bounded_window_and_the_exact_bytes() {
         use base64::Engine as _;
         let dir = std::env::temp_dir().join(format!("kaku-dl-{}", std::process::id()));
@@ -3531,6 +3696,7 @@ mod tests {
             id: 1,
             path: path.display().to_string(),
             pane_id: None,
+            preview: None,
         };
         let first = parse(handle_download(&request, &mut downloads, |_| None).unwrap());
         assert_eq!(first[0]["type"], "file_start");
@@ -3592,6 +3758,7 @@ mod tests {
                 id: 9,
                 path: path.display().to_string(),
                 pane_id: None,
+                preview: None,
             };
             let out = handle_download(&msg, &mut downloads, |_| None).unwrap();
             let reply: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
