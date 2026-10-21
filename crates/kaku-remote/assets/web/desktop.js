@@ -17,6 +17,10 @@
   body.desktop #bar .tab[aria-current="true"] .close { opacity: 0; pointer-events: none; }
   #desktop canvas { display: block; max-width: none; outline: none; opacity: 0; transition: opacity 0.18s ease-out; touch-action: none; image-rendering: auto; transform-origin: 0 0; }
   #desktop.live canvas { opacity: 1; }
+  /* Where a held finger is about to press the Mac's button. */
+  #desktop .press { position: absolute; left: 0; top: 0; width: 44px; height: 44px; margin: -22px 0 0 -22px; border: 2px solid var(--fg); border-radius: 50%; opacity: 0; pointer-events: none; transform: scale(0.5); transition: opacity 0.15s, transform 0.15s, background-color 0.15s; }
+  #desktop .press.on { opacity: 0.55; transform: scale(1); }
+  #desktop .press.held { opacity: 0.8; background: rgba(127,127,127,0.3); }
   #desktop .sink { position: absolute; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; resize: none; }
   #desktop .status { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 24px; text-align: center; pointer-events: none; transition: opacity 0.18s; }
   #desktop.live .status { opacity: 0; }
@@ -39,8 +43,25 @@
 
   // Pictures the page may hold undrawn; the helper paces itself on our acks.
   const WHEEL_LINE = 16;
-  const LONG_PRESS_MS = 450;
+  // A finger moves the Mac's pointer the way a trackpad does. One held
+  // still this long presses the button, so moving it then drags; the ring
+  // shows from the first mark.
+  const PRESS_RING_MS = 150;
+  const PRESS_HOLD_MS = 300;
   const TAP_SLOP = 10;
+  // Two fingers lifted this soon after landing, without moving, right-click.
+  const TWO_TAP_MS = 350;
+  // A touch screen opens at about this many CSS pixels per Mac point, the
+  // size the Mac's text reads at from a phone held at hand's length.
+  const TOUCH_SCALE = 0.6;
+  // Zoomed in, the view follows the pointer to keep it this far inside.
+  const FOLLOW_INSET = 80;
+  // Two fingers scroll twice their travel; let go moving, the scroll glides
+  // on and slows (velocity per millisecond), as on the Mac's trackpad.
+  const TOUCH_SCROLL = 2;
+  const GLIDE_DECAY = 0.994;
+  const GLIDE_START = 50;
+  const GLIDE_STOP = 10;
   // A pinch that changes the fingers' spread by more than this zooms
   // instead of scrolling.
   const PINCH_START = 0.12;
@@ -140,7 +161,7 @@
 
     const view = document.createElement("div");
     view.id = "desktop";
-    view.innerHTML = '<canvas tabindex="0" aria-label="Mac screen"></canvas><textarea class="sink" tabindex="-1" aria-hidden="true" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea><div class="status"><div class="spin"></div><div class="title"></div><div class="detail"></div></div>';
+    view.innerHTML = '<canvas tabindex="0" aria-label="Mac screen"></canvas><div class="press"></div><textarea class="sink" tabindex="-1" aria-hidden="true" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea><div class="status"><div class="spin"></div><div class="title"></div><div class="detail"></div></div>';
     stageEl.append(view);
     const canvas = view.querySelector("canvas");
     // With a keyboard, focus sits in a hidden text field: only an editable
@@ -151,6 +172,7 @@
     const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
     const statusTitle = view.querySelector(".status .title");
     const statusDetail = view.querySelector(".status .detail");
+    const press = view.querySelector(".press");
 
     const button = document.createElement("button");
     button.type = "button";
@@ -178,6 +200,10 @@
     let haveKey = false;
     let videoW = 0;
     let videoH = 0;
+    // The Mac screen's width in points, and whether this stream's view has
+    // been framed for a touch screen yet.
+    let screenPoints = 0;
+    let framed = false;
     let canControl = true;
     let warnedControl = false;
     let lastDrawn = 0;
@@ -219,17 +245,62 @@
     // in and moves around. The zoom is the page's alone; the pointer
     // positions sent to the Mac come from the canvas's on-screen rectangle,
     // so they follow it without any extra math.
+    // The zoomed picture covers the view along a side where it is larger
+    // and sits centered along one where it is not.
     const zoom = { z: 1, x: 0, y: 0 };
     const setZoom = (z, x, y) => {
-      const w = canvas.offsetWidth;
-      const h = canvas.offsetHeight;
       z = Math.min(MAX_ZOOM, Math.max(1, z));
+      const place = (at, size, base, room) => (size * z <= room
+        ? (room - size * z) / 2 - base
+        : Math.min(-base, Math.max(room - size * z - base, at)));
       zoom.z = z;
-      zoom.x = Math.min(0, Math.max(w - w * z, x));
-      zoom.y = Math.min(0, Math.max(h - h * z, y));
+      zoom.x = z === 1 ? 0 : place(x, canvas.offsetWidth, canvas.offsetLeft, view.clientWidth);
+      zoom.y = z === 1 ? 0 : place(y, canvas.offsetHeight, canvas.offsetTop, view.clientHeight);
       canvas.style.transform = z === 1 ? "" : `translate(${zoom.x}px, ${zoom.y}px) scale(${z})`;
     };
-    new ResizeObserver(() => { layout(); resized(); }).observe(view);
+    // The Mac's pointer on screen, in the view's own coordinates.
+    const pointerOnView = () => ({
+      x: canvas.offsetLeft + zoom.x + lastPoint.x * canvas.offsetWidth * zoom.z,
+      y: canvas.offsetTop + zoom.y + lastPoint.y * canvas.offsetHeight * zoom.z,
+    });
+    // Zoomed in, the view moves to keep the pointer in sight, or puts it in
+    // the middle.
+    const follow = (center = false) => {
+      if (zoom.z <= 1.01) return;
+      const c = pointerOnView();
+      const vw = view.clientWidth;
+      const vh = view.clientHeight;
+      let { x, y } = zoom;
+      if (center) {
+        x += vw / 2 - c.x;
+        y += vh / 2 - c.y;
+      } else {
+        const ix = Math.min(FOLLOW_INSET, vw / 4);
+        const iy = Math.min(FOLLOW_INSET, vh / 4);
+        if (c.x < ix) x += ix - c.x; else if (c.x > vw - ix) x -= c.x - (vw - ix);
+        if (c.y < iy) y += iy - c.y; else if (c.y > vh - iy) y -= c.y - (vh - iy);
+      }
+      setZoom(zoom.z, x, y);
+    };
+    // A touch screen opens zoomed in to a readable size around the pointer,
+    // which goes where the view shows it, and frames itself again when the
+    // phone turns.
+    const frameTouch = () => {
+      framed = true;
+      const w = canvas.offsetWidth;
+      if (!w) return;
+      setZoom(((screenPoints || 1440) * TOUCH_SCALE) / w, 0, 0);
+      follow(true);
+      if (live()) pointer("move", lastPoint);
+    };
+    let landscape = view.clientWidth > view.clientHeight;
+    new ResizeObserver(() => {
+      layout();
+      resized();
+      const turned = view.clientWidth > view.clientHeight;
+      if (TOUCH && framed && turned !== landscape) frameTouch();
+      landscape = turned;
+    }).observe(view);
 
     // The picture is sized to the view in device pixels, up to the Mac's
     // own (the helper never scales up), so a Retina or 4K screen gets every
@@ -295,7 +366,11 @@
       closeDecoder();
       awaitingStream = true;
       earlyStream = null;
-      setZoom(1, 0, 0);
+      // Back on the picture it left, the view keeps its zoom.
+      if (!(keep && hasPicture)) {
+        setZoom(1, 0, 0);
+        framed = false;
+      }
       fresh = false;
       if (!supported()) {
         showStatus("This browser cannot show the Mac's screen", "It needs WebCodecs: a current Chrome, Edge or Safari.", true);
@@ -451,6 +526,7 @@
           hasPicture = true;
           fresh = true;
           if (!view.classList.contains("live")) view.classList.add("live");
+          if (TOUCH && !framed) frameTouch();
           ack(seq, decodingStream);
         },
         error: (e) => {
@@ -559,6 +635,7 @@
         canControl = msg.control !== false;
         displays = Array.isArray(msg.displays) ? msg.displays : [];
         shownDisplay = msg.display || 0;
+        screenPoints = msg.screen_width || 0;
         syncScreens();
         if (!canControl && !warnedControl) {
           warnedControl = true;
@@ -618,9 +695,10 @@
     };
     let lastPoint = { x: 0.5, y: 0.5 };
 
-    // Touch: a tap clicks, a held finger right-clicks, a finger that moves
-    // drags, two fingers scroll, and a pinch zooms. Once zoomed in, two
-    // fingers move the view instead of scrolling the Mac.
+    // Touch works like a trackpad: a finger moves the Mac's pointer, a tap
+    // clicks where the pointer is, a finger held still presses the button so
+    // moving it drags, two fingers tapped right-click, two fingers scroll,
+    // and a pinch zooms. Zoomed in, the view follows the pointer.
     const touches = new Map();
     let touchPlan = null;
     const touchCenter = () => {
@@ -638,33 +716,88 @@
       const r = canvas.getBoundingClientRect();
       return { left: r.left - zoom.x, top: r.top - zoom.y };
     };
+    const showPress = (state) => {
+      const c = pointerOnView();
+      press.style.left = c.x + "px";
+      press.style.top = c.y + "px";
+      press.classList.toggle("on", state !== "");
+      press.classList.toggle("held", state === "held");
+    };
+    const endPlan = () => {
+      if (touchPlan) { clearTimeout(touchPlan.ring); clearTimeout(touchPlan.hold); }
+      showPress("");
+    };
+    // The pointer moves by the finger's travel on screen, further the faster
+    // the finger goes, so a slow finger places it and a quick one crosses.
+    const nudge = (plan, ev) => {
+      const dt = Math.max(1, ev.timeStamp - plan.last.at);
+      const dx = ev.clientX - plan.last.x;
+      const dy = ev.clientY - plan.last.y;
+      plan.last = { x: ev.clientX, y: ev.clientY, at: ev.timeStamp };
+      plan.speed = 0.7 * plan.speed + 0.3 * (Math.hypot(dx, dy) / dt) * 1000;
+      const gain = 1.2 + Math.min(plan.speed / 1200, 1.8);
+      const r = canvas.getBoundingClientRect();
+      lastPoint = {
+        x: Math.min(1, Math.max(0, lastPoint.x + (gain * dx) / Math.max(1, r.width))),
+        y: Math.min(1, Math.max(0, lastPoint.y + (gain * dy) / Math.max(1, r.height))),
+      };
+      pointer("move", lastPoint);
+      follow();
+    };
+    let glide = null;
+    const stopGlide = () => {
+      if (glide) cancelAnimationFrame(glide.frame);
+      glide = null;
+    };
+    const startGlide = (vx, vy) => {
+      if (Math.hypot(vx, vy) < GLIDE_START) return;
+      glide = { vx, vy, at: performance.now(), frame: 0 };
+      const step = (now) => {
+        if (!glide || !live()) { glide = null; return; }
+        const dt = Math.min(50, now - glide.at);
+        glide.at = now;
+        const k = Math.pow(GLIDE_DECAY, dt);
+        glide.vx *= k;
+        glide.vy *= k;
+        if (Math.hypot(glide.vx, glide.vy) < GLIDE_STOP) { glide = null; return; }
+        send({ type: "desktop_wheel", x: lastPoint.x, y: lastPoint.y, dx: (glide.vx * dt / 1000) * TOUCH_SCROLL, dy: (glide.vy * dt / 1000) * TOUCH_SCROLL });
+        glide.frame = requestAnimationFrame(step);
+      };
+      glide.frame = requestAnimationFrame(step);
+    };
 
     canvas.addEventListener("pointerdown", (ev) => {
       if (!live()) return;
       ev.preventDefault();
       focusView();
       flushCopy();
-      const p = where(ev);
-      lastPoint = p;
+      stopGlide();
       if (ev.pointerType === "touch") {
         touches.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
         if (touches.size === 1) {
-          const startAt = { x: ev.clientX, y: ev.clientY };
-          touchPlan = { mode: "maybe", start: startAt, point: p, timer: setTimeout(() => {
-            if (touchPlan && touchPlan.mode === "maybe") {
-              touchPlan.mode = "done";
-              pointer("move", p);
-              pointer("down", p, 2);
-              pointer("up", p, 2);
-            }
-          }, LONG_PRESS_MS) };
+          const plan = { mode: "maybe", start: { x: ev.clientX, y: ev.clientY }, last: { x: ev.clientX, y: ev.clientY, at: ev.timeStamp }, speed: 0 };
+          plan.ring = setTimeout(() => { if (touchPlan === plan && plan.mode === "maybe") showPress("on"); }, PRESS_RING_MS);
+          plan.hold = setTimeout(() => {
+            if (touchPlan !== plan || plan.mode !== "maybe" || !live()) return;
+            plan.mode = "drag";
+            showPress("held");
+            pointer("move", lastPoint);
+            pointer("down", lastPoint, 0);
+          }, PRESS_HOLD_MS);
+          touchPlan = plan;
         } else {
-          if (touchPlan) { clearTimeout(touchPlan.timer); if (touchPlan.mode === "drag") pointer("up", lastPoint, 0); }
+          if (touchPlan) {
+            endPlan();
+            if (touchPlan.mode === "drag") pointer("up", lastPoint, 0);
+          }
           const center = touchCenter();
-          touchPlan = { mode: zoom.z > 1 ? "zoom" : "scroll", center, from: { center, spread: touchSpread(), z: zoom.z, x: zoom.x, y: zoom.y } };
+          touchPlan = { mode: "scroll", center, from: { center, spread: touchSpread(), z: zoom.z, x: zoom.x, y: zoom.y },
+            tapAt: touches.size === 2 ? performance.now() : 0, travel: 0, v: { x: 0, y: 0 }, movedAt: performance.now() };
         }
         return;
       }
+      const p = where(ev);
+      lastPoint = p;
       canvas.setPointerCapture(ev.pointerId);
       const button = ev.button === 2 ? 2 : ev.button === 1 ? 1 : 0;
       pointer("down", p, button, ev);
@@ -672,7 +805,6 @@
 
     canvas.addEventListener("pointermove", (ev) => {
       if (!live()) return;
-      const p = where(ev);
       if (ev.pointerType === "touch") {
         if (!touches.has(ev.pointerId)) return;
         touches.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
@@ -696,19 +828,25 @@
           const c = touchCenter();
           const dx = touchPlan.center.x - c.x;
           const dy = touchPlan.center.y - c.y;
+          const now = performance.now();
+          const dt = Math.max(1, now - touchPlan.movedAt);
           touchPlan.center = c;
-          send({ type: "desktop_wheel", x: lastPoint.x, y: lastPoint.y, dx: dx * 2, dy: dy * 2 });
+          touchPlan.travel += Math.hypot(dx, dy);
+          touchPlan.v = { x: 0.6 * (dx / dt) * 1000 + 0.4 * touchPlan.v.x, y: 0.6 * (dy / dt) * 1000 + 0.4 * touchPlan.v.y };
+          touchPlan.movedAt = now;
+          // Fingers settling for a tap or a pinch do not scroll yet.
+          if (touchPlan.travel < TAP_SLOP) return;
+          send({ type: "desktop_wheel", x: lastPoint.x, y: lastPoint.y, dx: dx * TOUCH_SCROLL, dy: dy * TOUCH_SCROLL });
           return;
         }
         if (touchPlan.mode === "maybe" && Math.hypot(ev.clientX - touchPlan.start.x, ev.clientY - touchPlan.start.y) > TAP_SLOP) {
-          clearTimeout(touchPlan.timer);
-          touchPlan.mode = "drag";
-          pointer("move", touchPlan.point);
-          pointer("down", touchPlan.point, 0);
+          endPlan();
+          touchPlan.mode = "move";
         }
-        if (touchPlan.mode === "drag") { lastPoint = p; pointer("move", p); }
+        if (touchPlan.mode === "move" || touchPlan.mode === "drag") nudge(touchPlan, ev);
         return;
       }
+      const p = where(ev);
       lastPoint = p;
       pointer("move", p, 0, ev);
     });
@@ -718,14 +856,28 @@
         touches.delete(ev.pointerId);
         if (!touchPlan) return;
         if (touchPlan.mode === "maybe") {
-          clearTimeout(touchPlan.timer);
+          endPlan();
           if (live()) {
-            pointer("move", touchPlan.point);
-            pointer("down", touchPlan.point, 0);
-            pointer("up", touchPlan.point, 0);
+            pointer("move", lastPoint);
+            pointer("down", lastPoint, 0);
+            pointer("up", lastPoint, 0);
           }
+          touchPlan.mode = "done";
         } else if (touchPlan.mode === "drag") {
+          endPlan();
           pointer("up", lastPoint, 0);
+          touchPlan.mode = "done";
+        } else if (touchPlan.mode === "move") {
+          touchPlan.mode = "done";
+        }
+        if (touchPlan.mode === "scroll" && touchPlan.tapAt && touches.size === 1) {
+          if (touchPlan.travel < TAP_SLOP && performance.now() - touchPlan.tapAt < TWO_TAP_MS && live()) {
+            pointer("move", lastPoint);
+            pointer("down", lastPoint, 2);
+            pointer("up", lastPoint, 2);
+            touchPlan.mode = "done";
+          }
+          touchPlan.tapAt = 0;
         }
         if (touchPlan.mode === "zoom") {
           if (zoom.z < 1.08) setZoom(1, 0, 0);
@@ -735,7 +887,11 @@
             touchPlan.from = { center, spread: 1, z: zoom.z, x: zoom.x, y: zoom.y };
           }
         }
-        if (touches.size === 0) touchPlan = null;
+        if (touches.size === 0) {
+          // A scroll let go while still moving glides on.
+          if (touchPlan.mode === "scroll" && performance.now() - touchPlan.movedAt < 80) startGlide(touchPlan.v.x, touchPlan.v.y);
+          touchPlan = null;
+        }
         return;
       }
       if (!active) return;
@@ -746,7 +902,7 @@
     canvas.addEventListener("pointercancel", (ev) => {
       if (ev.pointerType === "touch") {
         touches.clear();
-        if (touchPlan?.timer) clearTimeout(touchPlan.timer);
+        endPlan();
         touchPlan = null;
       }
       releaseButtons();
@@ -850,8 +1006,9 @@
     // on the Mac.
     const releaseAll = () => {
       touches.clear();
-      if (touchPlan?.timer) clearTimeout(touchPlan.timer);
+      endPlan();
       touchPlan = null;
+      stopGlide();
       if (wheelFrame) cancelAnimationFrame(wheelFrame);
       wheelFrame = 0;
       wheel = null;

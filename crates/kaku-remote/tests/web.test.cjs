@@ -2479,7 +2479,9 @@ for (const cancel of [false, true]) test('real desktop touch ' + (cancel ? 'canc
   const scale = await p.evaluate(() => localStorage.getItem('kaku.scale'));
   await p.evaluate(() => { messages.length = 0; });
   if (cancel) {
+    // A finger held still presses the button; moving it then drags.
     await touch('touchStart', [[1, x, y]]);
+    await p.waitForTimeout(400);
     await touch('touchMove', [[1, x + 30, y + 30]]);
     await touch('touchCancel', []);
     await p.waitForTimeout(50);
@@ -2516,7 +2518,7 @@ test('losing focus cancels a desktop long press before it clicks', async t => {
   assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'desktop_pointer')), []);
 });
 
-test('on a phone the desktop view pinches to zoom and taps where the zoom shows', async t => {
+test('on a phone the desktop view opens zoomed in and works like a trackpad', async t => {
   const { p, errors } = await page(t, '#t=fixture', { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
   // CI's Chromium has not always reported a coarse pointer for an emulated
   // phone; the page's touch layout is what this test is about.
@@ -2537,52 +2539,113 @@ test('on a phone the desktop view pinches to zoom and taps where the zoom shows'
   assert.ok(start.max_width >= 1920, 'enough detail to zoom into: ' + JSON.stringify(start));
   assert.equal(await p.locator('#keys').isVisible(), false, 'the terminal keys would type into the terminal');
 
+  await p.evaluate(() => probe.handle({ type: 'desktop_status', state: 'streaming', screen_width: 1512 }));
   await showPicture(p);
-  const box = await p.evaluate(() => {
+  const rect = () => p.evaluate(() => {
     const r = document.querySelector('#desktop canvas').getBoundingClientRect();
-    return { x: r.left, y: r.top, w: r.width, h: r.height };
+    const v = document.getElementById('desktop').getBoundingClientRect();
+    return { x: r.left, y: r.top, w: r.width, h: r.height, vx: v.left, vy: v.top, vw: v.width, vh: v.height };
   });
+  const pointers = () => p.evaluate(() => messages.filter(m => m.type === 'desktop_pointer'));
+  // The Mac's pointer on screen, from the last position sent.
+  const onScreen = async () => {
+    const r = await rect();
+    const last = (await pointers()).at(-1);
+    return { x: r.x + last.x * r.w, y: r.y + last.y * r.h, r };
+  };
+
+  // It opens at about 0.6 CSS pixels per Mac point, the pointer in the middle.
+  const opened = await rect();
+  assert.ok(Math.abs(opened.w - 1512 * 0.6) < 2, 'readable size: ' + opened.w);
+  assert.ok(opened.h > opened.vh * 0.6, 'the picture uses the phone\'s height too: ' + JSON.stringify(opened));
+  const first = (await pointers()).at(-1);
+  assert.deepEqual([first.kind, first.x, first.y], ['move', 0.5, 0.5]);
+  const middle = await onScreen();
+  assert.ok(Math.abs(middle.x - (opened.vx + opened.vw / 2)) < 2 && Math.abs(middle.y - (opened.vy + opened.vh / 2)) < 2, JSON.stringify(middle));
+
   const touch = (type, id, x, y) => p.evaluate(([type, id, x, y]) => {
     document.querySelector('#desktop canvas').dispatchEvent(new PointerEvent(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, bubbles: true, cancelable: true, isPrimary: id === 1 }));
   }, [type, id, x, y]);
-  const cx = box.x + box.w / 2;
-  const cy = box.y + box.h / 2;
-  await p.evaluate(() => { messages.length = 0; });
+  const cx = opened.vx + opened.vw / 2;
+  const cy = opened.vy + opened.vh / 2;
+  const flush = () => p.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
 
-  // Fingers spreading apart zoom in, around their midpoint; nothing scrolls.
+  // A finger moves the pointer by its travel, not to where it touches, and
+  // the view follows the pointer before it reaches the edge.
+  await p.evaluate(() => { messages.length = 0; });
+  await touch('pointerdown', 1, 60, cy);
+  for (let x = 60; x <= 180; x += 10) { await touch('pointermove', 1, x, cy); await flush(); }
+  await touch('pointerup', 1, 180, cy);
+  await flush();
+  let sent = await pointers();
+  assert.equal(sent.some(m => m.kind === 'down'), false, 'moving is not a click: ' + JSON.stringify(sent));
+  assert.ok(sent.at(-1).x > 0.6 && sent.at(-1).x < 0.9, 'the pointer went right: ' + sent.at(-1).x);
+  let seen = await onScreen();
+  assert.ok(seen.x <= opened.vx + opened.vw - 79 && seen.x >= opened.vx, 'still in sight: ' + JSON.stringify(seen));
+  assert.ok(seen.r.x < opened.x - 10, 'the view moved with it');
+
+  // A tap clicks where the pointer is, wherever the finger lands.
+  const at = sent.at(-1);
+  await p.evaluate(() => { messages.length = 0; });
+  await touch('pointerdown', 1, 30, cy + 100);
+  await touch('pointerup', 1, 30, cy + 100);
+  sent = await pointers();
+  assert.deepEqual(sent.filter(m => m.kind !== 'move').map(m => [m.kind, m.button, m.x, m.y]), [['down', 0, at.x, at.y], ['up', 0, at.x, at.y]]);
+
+  // Two fingers tapped right-click there.
+  await p.evaluate(() => { messages.length = 0; });
   await touch('pointerdown', 1, cx - 20, cy);
   await touch('pointerdown', 2, cx + 20, cy);
-  for (let d = 30; d <= 60; d += 10) {
+  await touch('pointerup', 1, cx - 20, cy);
+  await touch('pointerup', 2, cx + 20, cy);
+  sent = await pointers();
+  assert.deepEqual(sent.filter(m => m.kind !== 'move').map(m => [m.kind, m.button]), [['down', 2], ['up', 2]]);
+
+  // Two fingers moving together scroll the Mac and leave the view alone.
+  const before = await rect();
+  await p.evaluate(() => { messages.length = 0; });
+  await touch('pointerdown', 1, cx - 20, cy);
+  await touch('pointerdown', 2, cx + 20, cy);
+  for (let d = 10; d <= 60; d += 10) {
+    await touch('pointermove', 1, cx - 20, cy - d);
+    await touch('pointermove', 2, cx + 20, cy - d);
+  }
+  await touch('pointerup', 1, cx - 20, cy - 60);
+  await touch('pointerup', 2, cx + 20, cy - 60);
+  const wheels = await p.evaluate(() => messages.filter(m => m.type === 'desktop_wheel'));
+  assert.ok(wheels.length >= 6 && wheels.every(m => m.dy > 0), JSON.stringify(wheels));
+  assert.equal((await pointers()).some(m => m.kind === 'down'), false);
+  assert.deepEqual(await rect(), before);
+
+  // A pinch zooms around the fingers' midpoint and sends nothing to the Mac.
+  await p.waitForTimeout(300);
+  await p.evaluate(() => { messages.length = 0; });
+  await touch('pointerdown', 1, cx - 20, cy);
+  await touch('pointerdown', 2, cx + 20, cy);
+  for (let d = 22; d <= 30; d += 2) {
     await touch('pointermove', 1, cx - d, cy);
     await touch('pointermove', 2, cx + d, cy);
   }
-  await touch('pointerup', 1, cx - 60, cy);
-  await touch('pointerup', 2, cx + 60, cy);
-  const zoomed = await p.evaluate(() => {
-    const r = document.querySelector('#desktop canvas').getBoundingClientRect();
-    return { w: r.width, left: r.left };
-  });
-  assert.ok(Math.abs(zoomed.w / box.w - 3) < 0.05, 'three times the spread, three times the size: ' + zoomed.w);
-  assert.ok(Math.abs(zoomed.left + zoomed.w / 2 - cx) < 2, 'the midpoint stayed put');
+  await touch('pointerup', 1, cx - 30, cy);
+  await touch('pointerup', 2, cx + 30, cy);
+  const zoomed = await rect();
+  assert.ok(Math.abs(zoomed.w / before.w - 1.5) < 0.05, 'one and a half times the spread: ' + zoomed.w / before.w);
+  const mid = (cx - before.x) / before.w;
+  assert.ok(Math.abs(zoomed.x + mid * zoomed.w - cx) < 2, 'the midpoint stayed put');
   assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type.startsWith('desktop_'))), []);
 
-  // Zoomed in, two fingers move the view rather than scroll the Mac.
-  await touch('pointerdown', 1, cx - 10, cy);
-  await touch('pointerdown', 2, cx + 10, cy);
-  await touch('pointermove', 1, cx - 10 + 40, cy);
-  await touch('pointermove', 2, cx + 10 + 40, cy);
-  await touch('pointerup', 1, cx + 30, cy);
-  await touch('pointerup', 2, cx + 50, cy);
-  const moved = await p.evaluate(() => document.querySelector('#desktop canvas').getBoundingClientRect().left);
-  assert.ok(Math.abs(moved - zoomed.left - 40) < 2, 'the view followed the fingers: ' + (moved - zoomed.left));
-  assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'desktop_wheel')), []);
-
-  // A tap lands on the Mac where the zoomed picture shows it.
+  // A finger held still presses the button, with a ring, and moving drags.
   await touch('pointerdown', 1, cx, cy);
-  await touch('pointerup', 1, cx, cy);
-  const click = await p.evaluate(() => messages.find(m => m.type === 'desktop_pointer' && m.kind === 'down'));
-  const expectX = (cx - moved) / zoomed.w;
-  assert.ok(Math.abs(click.x - expectX) < 0.01 && Math.abs(click.y - 0.5) < 0.01, JSON.stringify(click) + ' vs ' + expectX);
+  await p.waitForTimeout(400);
+  assert.equal(await p.evaluate(() => document.querySelector('#desktop .press').classList.contains('held')), true);
+  await touch('pointermove', 1, cx + 40, cy);
+  await touch('pointermove', 1, cx + 80, cy);
+  await flush();
+  await touch('pointerup', 1, cx + 80, cy);
+  sent = await pointers();
+  assert.deepEqual(sent.filter(m => m.kind !== 'move').map(m => [m.kind, m.button]), [['down', 0], ['up', 0]]);
+  assert.ok(sent.at(-1).x > sent.find(m => m.kind === 'down').x, 'dragged to the right');
+  assert.equal(await p.evaluate(() => document.querySelector('#desktop .press').classList.contains('on')), false);
   assert.deepEqual(errors, []);
 });
 
