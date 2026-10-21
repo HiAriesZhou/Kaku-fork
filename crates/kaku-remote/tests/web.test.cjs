@@ -2344,6 +2344,7 @@ test('the desktop view reports its timings, and a filled view asks again only wh
   assert.equal(report.clicks, undefined, 'do not report next-frame timing as click response');
   assert.ok(report.decode_max >= report.decode_p50, JSON.stringify(report));
   assert.match(report.view, /^\d+x\d+@\d/);
+  assert.match(report.view, / pointer \S+.* shown \S+$/);
   assert.deepEqual(errors, []);
 });
 

@@ -163,7 +163,11 @@
         ...(report.unposted ? { input_unposted: report.unposted } : {}),
         ...(report.unframed ? { input_unframed: report.unframed } : {}),
         ...(report.cancelled ? { input_cancelled: report.cancelled } : {}),
-        view: `${view.clientWidth}x${view.clientHeight}@${round(window.devicePixelRatio || 1)}`,
+        // The pointer as the Mac named it and as this browser shows it, for a
+        // pointer that looks the wrong size (maintainer, 2026-10-21).
+        view: `${view.clientWidth}x${view.clientHeight}@${round(window.devicePixelRatio || 1)}`
+          + ` on ${navigator.platform || "?"}, pointer ${lastCursor ? lastCursor.name || `picture ${lastCursor.hot_x | 0},${lastCursor.hot_y | 0}` : "none"}`
+          + ` shown ${(canvas.style.cursor || "unset").slice(0, 12)}`,
       });
       report.drawn = 0;
       report.decode = [];
