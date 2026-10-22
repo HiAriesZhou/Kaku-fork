@@ -5,7 +5,7 @@
     <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/readme-logo-light.svg" alt="Kaku" width="120" />
   </picture>
   <h1>Kaku</h1>
-  <p><em>Un terminal Mac adapté à l'IA, avec des réglages par défaut judicieux, prêt à l'emploi.</em></p>
+  <p><em>Un terminal Mac moderne, beau, rapide et prêt pour l'IA dès l'installation.</em></p>
   <p><a href="README.md">English</a> · <a href="README_CN.md">中文</a> · <a href="README_TW.md">繁體</a> · <a href="README_JA.md">日本語</a> · <a href="README_KR.md">한국어</a> · <a href="README_DE.md">Deutsch</a> · Français</p>
   <p>
     <a href="https://kaku.fun">Site web</a> ·
@@ -116,7 +116,7 @@ Un grand merci à toutes les personnes qui contribuent à Kaku. N'hésitez pas �
 ## Soutien
 
 - La manière la plus directe de me soutenir est d'acheter [Mole for Mac](https://mole.fit), mon application de nettoyage pour Mac
-- Si Kaku vous est utile, donnez-lui une étoile, [partagez-le](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20An%20AI-friendly%20Mac%20terminal.) ou participez aux issues et PR
+- Si Kaku vous est utile, donnez-lui une étoile, [partagez-le](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20A%20modern%2C%20AI-friendly%20Mac%20terminal.) ou participez aux issues et PR
 - J'ai deux chats, TangYuan et Coke, et si Kaku embellit votre quotidien, vous pouvez leur offrir de la <a href="https://cats.tw93.fun?name=Kaku" target="_blank">pâtée 🥩</a>
 
 <details>

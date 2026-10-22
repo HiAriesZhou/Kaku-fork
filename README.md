@@ -5,7 +5,7 @@
     <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/readme-logo-light.svg" alt="Kaku" width="120" />
   </picture>
   <h1>Kaku</h1>
-  <p><em>An AI-friendly Mac terminal with sensible defaults, ready out of the box.</em></p>
+  <p><em>A modern Mac terminal that looks good, runs fast, and works with AI out of the box.</em></p>
   <p>English · <a href="README_CN.md">中文</a> · <a href="README_TW.md">繁體</a> · <a href="README_JA.md">日本語</a> · <a href="README_KR.md">한국어</a> · <a href="README_DE.md">Deutsch</a> · <a href="README_FR.md">Français</a></p>
   <p>
     <a href="https://kaku.fun">Website</a> ·
@@ -116,7 +116,7 @@ Big thanks to all contributors who helped build Kaku. Go follow them! ❤️
 ## Support
 
 - The most direct way to support me is getting [Mole for Mac](https://mole.fit), my paid Mac cleanup app
-- If Kaku helped you, give it a star, [share it](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20An%20AI-friendly%20Mac%20terminal.), or open an issue or PR
+- If Kaku helped you, give it a star, [share it](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20A%20modern%2C%20AI-friendly%20Mac%20terminal.), or open an issue or PR
 - I have two cats, TangYuan and Coke, and if Kaku has been helpful to you, feel free to treat them to <a href="https://cats.tw93.fun?name=Kaku" target="_blank">canned food 🥩</a>
 
 <details>

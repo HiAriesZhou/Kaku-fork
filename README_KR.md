@@ -5,7 +5,7 @@
     <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/readme-logo-light.svg" alt="Kaku" width="120" />
   </picture>
   <h1>Kaku</h1>
-  <p><em>합리적인 기본 설정으로 바로 쓸 수 있는 AI 친화적인 Mac 터미널.</em></p>
+  <p><em>보기 좋고 빠르며 바로 AI와 함께 쓸 수 있는 현대적인 Mac 터미널.</em></p>
   <p><a href="README.md">English</a> · <a href="README_CN.md">中文</a> · <a href="README_TW.md">繁體</a> · <a href="README_JA.md">日本語</a> · 한국어 · <a href="README_DE.md">Deutsch</a> · <a href="README_FR.md">Français</a></p>
   <p>
     <a href="https://kaku.fun">공식 웹사이트</a> ·
@@ -116,7 +116,7 @@ Kaku 개발에 기여해 주신 모든 분들께 감사드립니다. 이분들�
 ## 후원
 
 - 제가 만든 유료 Mac 정리 앱 [Mole for Mac](https://mole.fit)을 이용해 주시는 것이 가장 직접적인 후원입니다
-- Kaku가 유용했다면 Star를 누르거나, [공유](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20An%20AI-friendly%20Mac%20terminal.)하거나, 이슈 및 PR을 남겨주세요
+- Kaku가 유용했다면 Star를 누르거나, [공유](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20A%20modern%2C%20AI-friendly%20Mac%20terminal.)하거나, 이슈 및 PR을 남겨주세요
 - 탕위안(TangYuan)과 콜라(Coke)라는 두 마리의 고양이를 키우고 있는데, Kaku가 즐거움을 주었다면 <a href="https://cats.tw93.fun?name=Kaku" target="_blank">캔 간식 🥩</a>을 후원해 주세요
 
 <details>

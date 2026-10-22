@@ -5,7 +5,7 @@
     <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/readme-logo-light.svg" alt="Kaku" width="120" />
   </picture>
   <h1>Kaku</h1>
-  <p><em>実用的なデフォルト設定で、すぐに使える AI フレンドリーな Mac ターミナル。</em></p>
+  <p><em>見た目がよく、速く、すぐに AI と使えるモダンな Mac ターミナル。</em></p>
   <p><a href="README.md">English</a> · <a href="README_CN.md">中文</a> · <a href="README_TW.md">繁體</a> · 日本語 · <a href="README_KR.md">한국어</a> · <a href="README_DE.md">Deutsch</a> · <a href="README_FR.md">Français</a></p>
   <p>
     <a href="https://kaku.fun">公式サイト</a> ·
@@ -116,7 +116,7 @@ Kaku の構築に貢献してくれたすべての皆様に感謝します。ぜ
 ## サポート
 
 - 私が作った有料の Mac クリーナー [Mole for Mac](https://mole.fit) を使っていただくのが、いちばん直接的な支援になります
-- Kaku が役に立ったら、Star を付けたり、[共有](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20An%20AI-friendly%20Mac%20terminal.)したり、Issue や PR をお寄せください
+- Kaku が役に立ったら、Star を付けたり、[共有](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20A%20modern%2C%20AI-friendly%20Mac%20terminal.)したり、Issue や PR をお寄せください
 - 私にはタンユエン（湯円）とコーラ（可楽）という2匹の猫がいて、Kaku を気に入っていただけたら、<a href="https://cats.tw93.fun?name=Kaku" target="_blank">缶詰 🥩</a> をプレゼントしていただけると嬉しいです
 
 <details>

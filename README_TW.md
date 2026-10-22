@@ -5,7 +5,7 @@
     <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/readme-logo-light.svg" alt="Kaku" width="120" />
   </picture>
   <h1>Kaku</h1>
-  <p><em>一個開箱即用、預設好用、AI 友善的 Mac 終端機</em></p>
+  <p><em>現代的 Mac 終端機，開箱即用，好看、夠快，對 AI 友善</em></p>
   <p><a href="README.md">English</a> · <a href="README_CN.md">中文</a> · 繁體 · <a href="README_JA.md">日本語</a> · <a href="README_KR.md">한국어</a> · <a href="README_DE.md">Deutsch</a> · <a href="README_FR.md">Français</a></p>
   <p>
     <a href="https://kaku.fun">官網</a> ·
@@ -116,7 +116,7 @@ WezTerm 很穩，也很好改，我很感謝它的引擎和生態，於是在它
 ## 支持
 
 - 最直接的支持方式是購買我製作的 Mac 付費清理工具 [Mole for Mac](https://mole.fit)
-- 如果 Kaku 對你有幫助，歡迎給它一個 Star、[分享推薦](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20An%20AI-friendly%20Mac%20terminal.)，或提交 Issue 與 PR
+- 如果 Kaku 對你有幫助，歡迎給它一個 Star、[分享推薦](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20A%20modern%2C%20AI-friendly%20Mac%20terminal.)，或提交 Issue 與 PR
 - 我養了兩隻貓，湯圓和可樂，如果 Kaku 讓你覺得好用，歡迎請她們吃一頓 <a href="https://cats.tw93.fun?name=Kaku" target="_blank">罐頭 🥩</a>
 
 <details>
