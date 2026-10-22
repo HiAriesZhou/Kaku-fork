@@ -678,7 +678,10 @@
     const renderer = term._core?._renderService?._renderer?.value;
     for (let i = 0; atlasMerged && i < 3; i++) {
       atlasMerged = false;
-      try { renderer.renderRows(0, term.rows - 1); } catch (_) { term.refresh(0, term.rows - 1); }
+      // Every cell, not only the ones the renderer thinks changed: a cell
+      // whose text stayed kept the glyph place it had before the merge, and
+      // the last column showed the previous tab's letter until a redraw.
+      try { renderer._clearModel(true); renderer.renderRows(0, term.rows - 1); } catch (_) { term.refresh(0, term.rows - 1); }
     }
   });
   useWebgl();
