@@ -19,6 +19,7 @@ WEB="$ROOT/crates/kaku-remote/assets/web"
 OUT="$(mktemp -d "${TMPDIR:-/tmp}/kaku-web.XXXXXX")"
 mkdir -p "$OUT/assets"
 for name in xterm.js xterm-webgl.js xterm-unicode11.js desktop.js xterm.css icon.png \
+	icon-192.png icon-512.png icon-maskable.png manifest.webmanifest \
 	LICENSE-xterm LICENSE-xterm-webgl LICENSE-xterm-unicode11 \
 	font-regular.woff2 font-medium.woff2 font-symbols.woff2; do
 	cp "$WEB/$name" "$OUT/assets/$name"
@@ -46,6 +47,7 @@ csp = "; ".join([
     # xterm sets element styles directly.
     "style-src 'self' 'unsafe-inline'",
     "font-src 'self'",
+    "manifest-src 'self'",
     "img-src 'self' data: blob:",
     "connect-src 'self' %s %s" % (relay, http),
     "base-uri 'none'",

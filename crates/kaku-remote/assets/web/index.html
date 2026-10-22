@@ -10,7 +10,11 @@
 <meta name="kaku-relay" content="">
 <title>Kaku</title>
 <link rel="icon" type="image/png" href="assets/icon.png">
-<link rel="apple-touch-icon" href="assets/icon.png">
+<link rel="apple-touch-icon" href="assets/icon-maskable.png">
+<!-- Installs as its own app: the manifest's start_url and scope are relative
+     to it, so each Mac's page (t.kaku.fun/<id>/) installs separately. -->
+<link rel="manifest" href="assets/manifest.webmanifest">
+<meta name="theme-color" content="#16161a">
 <link rel="stylesheet" href="assets/xterm.css">
 <style>
   @font-face { font-family: "Kaku Mono"; src: url("assets/font-regular.woff2") format("woff2"); font-weight: 400; }
@@ -2410,6 +2414,9 @@
       ["--tab-fg", bar.inactive_fg], ["--tab-hover-bg", bar.hover_bg], ["--tab-hover-fg", bar.hover_fg]]) {
       if (value) root.setProperty(name, value);
     }
+    // An installed page tints the system bar like the strip right under it.
+    const edge = cfg.tab_bar_at_bottom ? cfg.background : bar.background || cfg.background;
+    if (edge) document.querySelector('meta[name="theme-color"]').content = edge;
     // One pixel under Kaku's size reads closer to the native window.
     if (cfg.font_size) { baseFontSize = Math.max(8, cfg.font_size - 1); setFont(baseFontSize); }
     // The size is claimed once the bundled font and the user's fonts this

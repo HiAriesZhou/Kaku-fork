@@ -48,6 +48,10 @@ const FONT_REGULAR: &[u8] = include_bytes!("../assets/web/font-regular.woff2");
 const FONT_MEDIUM: &[u8] = include_bytes!("../assets/web/font-medium.woff2");
 const FONT_SYMBOLS: &[u8] = include_bytes!("../assets/web/font-symbols.woff2");
 const ICON_PNG: &[u8] = include_bytes!("../assets/web/icon.png");
+const ICON_192_PNG: &[u8] = include_bytes!("../assets/web/icon-192.png");
+const ICON_512_PNG: &[u8] = include_bytes!("../assets/web/icon-512.png");
+const ICON_MASKABLE_PNG: &[u8] = include_bytes!("../assets/web/icon-maskable.png");
+const MANIFEST: &str = include_str!("../assets/web/manifest.webmanifest");
 
 /// At most one frame per interval. Output after a quiet spell goes out at
 /// once, so a keystroke's echo never waits for a tick; a burst is coalesced
@@ -319,6 +323,10 @@ pub(crate) fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
         "assets/font-medium.woff2" => ("font/woff2", FONT_MEDIUM),
         "assets/font-symbols.woff2" => ("font/woff2", FONT_SYMBOLS),
         "assets/icon.png" => ("image/png", ICON_PNG),
+        "assets/icon-192.png" => ("image/png", ICON_192_PNG),
+        "assets/icon-512.png" => ("image/png", ICON_512_PNG),
+        "assets/icon-maskable.png" => ("image/png", ICON_MASKABLE_PNG),
+        "assets/manifest.webmanifest" => ("application/manifest+json", MANIFEST.as_bytes()),
         _ => return None,
     })
 }
