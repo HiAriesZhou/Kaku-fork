@@ -128,19 +128,24 @@ define_class!(
             response: &UNNotificationResponse,
             completion_handler: &Block<dyn Fn()>,
         ) {
-            let action = response.actionIdentifier();
+            let action = response.actionIdentifier().to_string();
             let user_info = response.notification().request().content().userInfo();
             let url = user_info.valueForKey(ns_string!("url"));
 
             log::debug!("did_receive_notification -> action={action:?} url={url:?}");
 
-            if let Some(url) = url {
-                if let Ok(url_str) = url.downcast::<NSString>() {
-                    let url_string = url_str.to_string();
-                    if url_string == "kaku://update" {
-                        spawn_kaku_update();
-                    } else {
-                        wezterm_open_url::open_url(&url_string);
+            // The category registers CustomDismissAction, so dismissing the
+            // notification also reaches this handler; only an explicit tap
+            // or the Show button acts on the url.
+            if action_opens_url(&action) {
+                if let Some(url) = url {
+                    if let Ok(url_str) = url.downcast::<NSString>() {
+                        let url_string = url_str.to_string();
+                        if url_string == "kaku://update" {
+                            spawn_kaku_update();
+                        } else {
+                            wezterm_open_url::open_url(&url_string);
+                        }
                     }
                 }
             }
@@ -300,6 +305,19 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// `UNNotificationDefaultActionIdentifier`: the user tapped the notification.
+const DEFAULT_ACTION_IDENTIFIER: &str = "com.apple.UNNotificationDefaultActionIdentifier";
+
+/// Identifier of the Show action registered in `initialize`.
+const SHOW_URL_ACTION_IDENTIFIER: &str = "SHOW_URL";
+
+/// The notification category opts into CustomDismissAction, so a dismissal is
+/// delivered to the delegate too; only a tap or the Show action may act on
+/// the url (e.g. start the in-app update for `kaku://update`).
+fn action_opens_url(action: &str) -> bool {
+    action == DEFAULT_ACTION_IDENTIFIER || action == SHOW_URL_ACTION_IDENTIFIER
+}
+
 fn spawn_kaku_update() {
     if crate::invoke_update_callback() {
         log::info!("spawn_kaku_update: handled via registered callback");
@@ -351,5 +369,16 @@ mod tests {
         // Later drops in the same launch stay quiet.
         assert!(!mark_blocked(&state));
         assert!(!take_blocked(&state));
+    }
+
+    #[test]
+    fn only_explicit_actions_open_the_url() {
+        assert!(action_opens_url(DEFAULT_ACTION_IDENTIFIER));
+        assert!(action_opens_url(SHOW_URL_ACTION_IDENTIFIER));
+        // Dismissal (CustomDismissAction) and unknown actions must not act.
+        assert!(!action_opens_url(
+            "com.apple.UNNotificationDismissActionIdentifier"
+        ));
+        assert!(!action_opens_url(""));
     }
 }
