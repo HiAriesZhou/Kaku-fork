@@ -110,3 +110,5 @@
 41	远程网页使用 Mac 上的字体，并显示 Agent 标题
 41	The emoji and Nerd Font picker is back in the command palette
 41	emoji 和 Nerd Font 选择器回到命令面板
+42	Restart to Update installs the new version instead of reopening the old one
+42	重启以更新会装好新版本，不再回到旧版本
