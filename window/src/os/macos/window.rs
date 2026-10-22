@@ -567,6 +567,12 @@ fn hotkey_height_percent_from(frame_height: f64, screen_height: f64) -> Option<f
     (screen_height > 0.).then(|| (frame_height / screen_height * 100.).clamp(10., 100.))
 }
 
+// AppKit brackets pointer-driven window resizing with live-resize callbacks.
+// Programmatic reframing must keep the existing user/config percentage.
+fn should_remember_drawer_height(live_resizing: bool, slide_active: bool) -> bool {
+    live_resizing && !slide_active
+}
+
 impl HotkeySlide {
     fn should_hide_when_cancelled(self, is_key: bool) -> bool {
         !(self.showing || self.hide_on_focus_loss && is_key)
@@ -5947,6 +5953,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn drawer_height_memory_only_accepts_user_live_resize() {
+        for (case, live_resizing, slide_active, expected) in [
+            ("programmatic cross-screen resize", false, false, false),
+            ("user live resize", true, false, true),
+            ("drawer animation during live resize", true, true, false),
+            ("drawer animation outside live resize", false, true, false),
+        ] {
+            assert_eq!(
+                should_remember_drawer_height(live_resizing, slide_active),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
     /// The drawer opens at the height the user last dragged to, and the
     /// config's height applies until then or after it changes; a slide that
     /// would pass over a display stacked above happens at once instead.
@@ -5973,7 +5995,7 @@ mod tests {
         assert!(reload.contains("window_view.hotkey_height_percent.set(None)"));
         let resize = production_method(source, "extern \"C\" fn did_resize(");
         assert!(resize.contains("this.hotkey_height_percent.set(Some(percent))"));
-        assert!(resize.contains("this.hotkey_slide.get().is_none()"));
+        assert!(resize.contains("should_remember_drawer_height("));
         let animate = production_method(source, "fn animate_hotkey_slide(");
         assert!(animate.contains("reduce_motion == YES || instant"));
     }
@@ -9350,7 +9372,12 @@ impl WindowView {
             });
             // Remember a drawer height the user dragged to; animation steps
             // and our own reframing keep the percent they already had.
-            if hotkey_panel && this.hotkey_slide.get().is_none() {
+            if hotkey_panel
+                && should_remember_drawer_height(
+                    inner.live_resizing,
+                    this.hotkey_slide.get().is_some(),
+                )
+            {
                 if let Some(window) = inner.window.as_ref() {
                     let window = window.load();
                     let frame = unsafe { NSWindow::frame(*window) };
