@@ -25,6 +25,13 @@ async function page(t, hash = '#t=fixture', options = {}, context = browser) {
   t.after(() => p.close());
   const errors = [];
   p.on('pageerror', e => errors.push(e.message));
+  // A test page that navigates on its own loses its probe ("Execution
+  // context was destroyed", twice in the WebGL merge test, cause unknown):
+  // name every load after the first so the next one says when. Loads, not
+  // navigations: the page drops its own fragment, which navigates in place.
+  const loads = [];
+  p.on('load', () => loads.push(`${p.url()} at ${Date.now()}`));
+  t.after(() => { if (loads.length > 1) console.log(`${t.name}: the page loaded ${loads.length} times: ${loads.join(' , ')}`); });
   await p.addInitScript(() => {
     window.messages = [];
     window.connections = [];
@@ -1604,14 +1611,15 @@ test('switching tabs never shows a frame of wrong letters while WebGL merges gly
     };
     const canvas = () => [...document.querySelectorAll('.xterm-screen canvas')].find(c => c.getContext('webgl2'));
     const frame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-    let merges = 0, checked = 0, wrong = 0, merged = false, pending = null;
+    let merges = 0, checked = 0, wrong = 0, merged = false, pending = null, checking = false;
     probe.webgl.onRemoveTextureAtlasCanvas(() => { merges++; merged = true; });
     // Registered after the page's own listener, so it sees what the frame shows.
     probe.term.onRender(() => {
-      if (pending !== null) { if (canvas().toDataURL() !== pending) wrong++; pending = null; return; }
+      if (pending !== null) { if (canvas().toDataURL() !== pending) wrong++; pending = null; checking = false; return; }
       if (!merged) return;
       merged = false; checked++;
       pending = canvas().toDataURL();
+      checking = true;
       requestAnimationFrame(() => probe.term.refresh(0, probe.term.rows - 1));
     });
     let seq = 1;
@@ -1621,6 +1629,9 @@ test('switching tabs never shows a frame of wrong letters while WebGL merges gly
       // No cursor: its blink would differ between the two pictures.
       probe.handle({ type: 'frame', seq: seq++, pane_id: k, cols: 80, rows: 24, data: screenOf(k) + '\x1b[?25l' });
       await frame(); await frame();
+      // The next tab's screen waits for a pending check: drawn into the
+      // redraw, it read as wrong letters in a merge frame that had none.
+      while (checking) await frame();
     }
     return { merges, checked, wrong };
   });
@@ -2741,9 +2752,10 @@ test('on a phone the desktop view opens zoomed in and works like a trackpad', as
   assert.deepEqual(await rect(), before);
 
   // A pinch zooms around the fingers' midpoint and sends nothing to the Mac.
-  await p.waitForTimeout(300);
-  await p.evaluate(() => { messages.length = 0; });
+  // The scroll above still glides until a finger lands (on a slow runner a
+  // glide frame came after a fixed 300 ms wait), so count from that finger.
   await touch('pointerdown', 1, cx - 20, cy);
+  await p.evaluate(() => { messages.length = 0; });
   await touch('pointerdown', 2, cx + 20, cy);
   for (let d = 22; d <= 30; d += 2) {
     await touch('pointermove', 1, cx - d, cy);
