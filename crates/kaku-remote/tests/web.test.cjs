@@ -2645,6 +2645,31 @@ for (const cancel of [false, true]) test('real desktop touch ' + (cancel ? 'canc
   assert.deepEqual(errors, []);
 });
 
+test('on a touch screen switching tabs leaves the keyboard down, a tap on the terminal raises it', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  if (!(await p.evaluate(() => document.body.classList.contains('touch')))) {
+    await p.addInitScript(() => {
+      const real = window.matchMedia.bind(window);
+      window.matchMedia = q => q === '(pointer: coarse)' ? { matches: true, media: q, addEventListener() {}, removeEventListener() {} } : real(q);
+    });
+    await p.reload();
+    await p.waitForTimeout(100);
+    await p.evaluate(() => { probe.handle({ type: 'config' }); return document.fonts.load('16px "Kaku Mono"'); });
+  }
+  await screen(p, 'first');
+  await p.evaluate(() => probe.attach({ pane_id: 2, tab_id: 2 }));
+  await screen(p, 'second', 2);
+  const typing = () => p.evaluate(() => document.activeElement?.classList.contains('xterm-helper-textarea') ?? false);
+  await p.evaluate(() => document.activeElement?.blur());
+  await p.locator('#bar .tab').first().tap();
+  await p.waitForTimeout(50);
+  assert.equal(await typing(), false, 'a tab switch raised the keyboard');
+  const box = await p.locator('#stage .xterm-screen').boundingBox();
+  await p.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
+  await p.waitForTimeout(50);
+  assert.equal(await typing(), true);
+});
+
 test('losing focus cancels a desktop long press before it clicks', async t => {
   const { p } = await page(t, '#t=fixture', { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
   await screen(p);

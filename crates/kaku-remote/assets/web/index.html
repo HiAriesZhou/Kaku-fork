@@ -546,6 +546,10 @@
   // resized the tab to this window.
   let baseFontSize = 15;
   const TOUCH = matchMedia("(pointer: coarse)").matches;
+  // Back to the terminal after a tab, a pane, a dialog or a menu. On a touch
+  // screen focus raises the keyboard, which then came up on every tab switch
+  // (#597), so there only a tap on the terminal itself asks for it.
+  const refocus = () => { if (!TOUCH) term.focus(); };
   if (TOUCH) document.body.classList.add("touch");
   let fontSize = baseFontSize;
   let size = { cols: 0, rows: 0 };
@@ -1522,9 +1526,12 @@
   let pinchFrom = 0;
   let pinchRatio = 1;
   const fingerGap = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  let stoppedFling = false;
   stage.addEventListener("touchstart", (ev) => {
     if (desktop?.active) return;
+    stoppedFling = flingFrame !== 0;
     cancelAnimationFrame(flingFrame);
+    flingFrame = 0;
     if (ev.touches.length === 2 && TOUCH) {
       touchY = null;
       pinchFrom = fingerGap(ev.touches);
@@ -1584,7 +1591,7 @@
       v *= Math.pow(0.95, (now - last) / 16);
       scrollInput(v * (now - last));
       last = now;
-      if (Math.abs(v) > 0.05) flingFrame = requestAnimationFrame(step);
+      flingFrame = Math.abs(v) > 0.05 ? requestAnimationFrame(step) : 0;
     };
     if (Math.abs(v) > 0.3) flingFrame = requestAnimationFrame(step);
   }, { passive: false, capture: true });
@@ -1603,11 +1610,14 @@
     stopScrolling();
     closePast();
     send({ type: "scroll", lines: -1e9 });
-    term.focus();
+    refocus();
   });
   // A press in the history view selects its text; elsewhere it focuses the
-  // terminal.
-  stage.addEventListener("mousedown", (ev) => { if (!pastEl.contains(ev.target)) term.focus(); });
+  // terminal, unless the tap only stopped a fling.
+  stage.addEventListener("mousedown", (ev) => {
+    if (!pastEl.contains(ev.target) && !stoppedFling) term.focus();
+    stoppedFling = false;
+  });
   // ── Tabs ───────────────────────────────────────────────────────────────
   let tabs = [];
   let wasSplit = false;
@@ -1816,7 +1826,7 @@
     }
     try { localStorage.setItem("kaku.tab", String(tabId)); } catch (_) {}
     renderTabs();
-    term.focus();
+    refocus();
   };
 
   // Close confirmation in the page's own style: Enter closes, Esc cancels.
@@ -1831,7 +1841,7 @@
     dialogDone = (ok) => {
       dialogDone = null;
       dialogEl.classList.remove("show");
-      term.focus();
+      refocus();
       resolve(ok);
     };
     dialogEl.focus();
@@ -1873,7 +1883,7 @@
       if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
       document.documentElement.requestFullscreen().then(() => {
         if (navigator.keyboard && navigator.keyboard.lock) return navigator.keyboard.lock(LOCKED_KEYS);
-      }).catch(() => {}).finally(() => term.focus());
+      }).catch(() => {}).finally(refocus);
     });
     // The system's own full-screen keys do the same in the terminal; in the
     // desktop view they go to the Mac, for its own windows.
@@ -1946,7 +1956,7 @@
         ? "Bookmark this address to return in this browser. To add another browser, run kaku remote on the Mac."
         : "Pairing this browser with the Mac.";
     }
-    if (!on) term.focus();
+    if (!on) refocus();
   };
   helpEl.addEventListener("click", () => toggleHelp(false));
   window.addEventListener("keydown", (ev) => {
@@ -2032,7 +2042,7 @@
       else dotted.delete(t.tab_id);
       slot.append(close);
       b.append(label, slot);
-      b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t, true); else term.focus(); });
+      b.addEventListener("click", () => { if (t.tab_id !== tabId) attach(t, true); else refocus(); });
       // Double click renames, as on the Mac; right click opens the tab menu.
       b.addEventListener("auxclick", ev => { if (ev.button === 1) { ev.preventDefault(); closeTab(t); } });
       b.addEventListener("mousedown", ev => { if (ev.button === 1) ev.preventDefault(); });
@@ -2135,7 +2145,7 @@
         send({ type: "rename_tab", tab_id: t.tab_id, title: value });
       }
       renderTabs();
-      term.focus();
+      refocus();
     };
     input.addEventListener("input", () => { input.style.width = Math.max(4, input.value.length + 1) + "ch"; });
     input.addEventListener("keydown", (ev) => {
@@ -2227,7 +2237,7 @@
           paneChosen = { id: p.pane_id, until: Date.now() + 3000 };
           attach({ tab_id: t.tab_id, pane_id: p.pane_id }, true);
         }
-        else term.focus();
+        else refocus();
       });
       map.append(box);
     }
@@ -2283,7 +2293,7 @@
         const text = await navigator.clipboard.readText();
         if (paneId !== target) { toast("Pane changed. Paste again in the target pane."); return; }
         pasteText(text);
-        term.focus();
+        refocus();
       } catch (_) { toast(`The browser blocked pasting. Press ${IS_MAC ? "Cmd" : "Ctrl"}+V instead.`); }
     }], ["Search", openFind], null);
     for (const direction of ["Left", "Right", "Up", "Down"]) {
@@ -2347,7 +2357,7 @@
     script.src = "assets/desktop.js";
     script.onload = () => {
       desktop = window.KakuDesktop.init({
-        send, toolsEl, stageEl: document.getElementById("stage"), isMac: IS_MAC, touch: TOUCH, toast, focusTerminal: () => term.focus(), terminalKeys: LOCKED_KEYS,
+        send, toolsEl, stageEl: document.getElementById("stage"), isMac: IS_MAC, touch: TOUCH, toast, focusTerminal: refocus, terminalKeys: LOCKED_KEYS,
         beforeEnter: () => {
           stopScrolling();
           closePast();
@@ -2697,7 +2707,7 @@
     lastQuery = "";
     term.clearSelection();
     send({ type: "scroll", lines: -1e9 });
-    term.focus();
+    refocus();
   };
   findInput.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); findStep(!ev.shiftKey); }
@@ -3074,7 +3084,7 @@
       const path = await sendFile(f, pasted ? pastedName(f) : f.name, target, !onDesktop);
       if (path) landed.push(path);
     }
-    if (!onDesktop) term.focus();
+    if (!onDesktop) refocus();
     else if (landed.length && desktop?.active) send({ type: "desktop_reveal", paths: landed });
   };
   stage.addEventListener("dragover", (ev) => {
