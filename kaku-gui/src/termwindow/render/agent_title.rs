@@ -9,7 +9,7 @@
 
 use crate::customglyph::{BlockAlpha, Poly, PolyStyle};
 use crate::termwindow::box_model::*;
-use crate::termwindow::render::agent_marks::{CLAUDE_MARK, CODEX_MARK, KIMI_MARK};
+use crate::termwindow::render::agent_marks::{CLAUDE_MARK, CODEX_MARK, KIMI_MARK, PI_MARK};
 use crate::termwindow::render::borders::{
     integrated_buttons_top_inset, INTEGRATED_BUTTONS_TOP_CLEARANCE_POINTS,
 };
@@ -42,6 +42,7 @@ fn agent_label(program: &str) -> &'static str {
         "claude" => "Claude Code",
         "codex" => "Codex",
         "kimi" => "Kimi",
+        "pi" => "pi",
         _ => "Agent",
     }
 }
@@ -57,10 +58,12 @@ fn agent_mark(program: &str) -> Option<&'static [Poly]> {
     const CLAUDE: [Poly; 1] = mark(CLAUDE_MARK);
     const CODEX: [Poly; 1] = mark(CODEX_MARK);
     const KIMI: [Poly; 1] = mark(KIMI_MARK);
+    const PI: [Poly; 1] = mark(PI_MARK);
     match program {
         "claude" => Some(&CLAUDE),
         "codex" => Some(&CODEX),
         "kimi" => Some(&KIMI),
+        "pi" => Some(&PI),
         _ => None,
     }
 }
@@ -73,6 +76,11 @@ fn agent_mark(program: &str) -> Option<&'static [Poly]> {
 pub(crate) fn agent_topic(program: &str, pane_title: &str) -> String {
     let label = agent_label(program);
     let mut rest = pane_title.trim();
+    // pi names its sessions "π - <project>". π is alphabetic, so the glyph
+    // rule below keeps it; drop it here, the same way a spinner is dropped.
+    if program == "pi" {
+        rest = rest.strip_prefix('π').unwrap_or(rest).trim_start();
+    }
     loop {
         if let Some(prefix) = rest.get(..label.len()) {
             let suffix = &rest[label.len()..];
@@ -385,8 +393,15 @@ mod tests {
     }
 
     #[test]
+    fn pi_titles_lead_with_a_pi_glyph() {
+        // pi names its session "π - <project>".
+        assert_eq!(agent_topic("pi", "π - wiki"), "wiki");
+        assert_eq!(agent_topic("pi", "π"), "pi");
+    }
+
+    #[test]
     fn every_agent_has_a_mark() {
-        for program in ["claude", "codex", "kimi"] {
+        for program in ["claude", "codex", "kimi", "pi"] {
             assert!(agent_mark(program).is_some(), "{}", program);
         }
     }
