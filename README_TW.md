@@ -13,7 +13,7 @@
     <a href="https://kaku.fun/compare">比較</a> ·
     <a href="https://github.com/tw93/Kaku/releases/latest">下載</a>
   </p>
-  <a href="https://kaku.fun"><img src="https://img.shields.io/badge/website-kaku.fun-1B365D?style=flat-square" alt="Website"></a>
+  <a href="https://kaku.fun"><img src="https://img.shields.io/badge/website-kaku.fun-287A3D?style=flat-square" alt="Website"></a>
   <a href="https://github.com/tw93/Kaku/stargazers"><img src="https://img.shields.io/github/stars/tw93/Kaku?style=flat-square" alt="Stars"></a>
   <a href="https://github.com/tw93/Kaku/releases"><img src="https://img.shields.io/github/v/tag/tw93/Kaku?label=version&style=flat-square" alt="Version"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License"></a>
@@ -29,7 +29,7 @@
 
 Kaku（書く，かく）在日語裡是寫的意思，是一款基於 WezTerm 的 macOS 終端機，預裝了字型、主題、Shell 整合與常用 Mac 快捷鍵，同時保留完整的 Lua 自訂能力。
 
-作為三部曲中負責寫程式碼的終端機，Kaku 與規範工程習慣的 [Waza](https://github.com/tw93/Waza)（技）、負責交付文件的 [Kami](https://github.com/tw93/Kami)（紙）相互配合，從寫程式碼、養成習慣到交付文件一氣呵成。
+Kaku 用來寫程式碼，和管工程習慣的 [Waza](https://github.com/tw93/Waza)（技）、管交付文件的 [Kami](https://github.com/tw93/Kami)（紙）是同一個系列。
 
 ## 快速上手
 
@@ -44,13 +44,13 @@ brew install --cask kaku
 ## 特性
 
 - **開箱即用**：預置 JetBrains Mono 字型，自動切換淺色與深色主題，選取即複製，熟悉的 Mac 原生快捷鍵
-- **分頁與窗格**：自由分割工作區，透過 Tab Navigator 快速切換分頁，重新開啟 Kaku 時恢復視窗、窗格與工作目錄
-- **右鍵選單**：貼上、搜尋、喚起 AI 對話，分割或關閉目前的窗格，開關分頁無需死記快捷鍵
+- **分頁與窗格**：分割工作區，用 Tab Navigator 切換分頁，重新開啟 Kaku 時恢復視窗、窗格與工作目錄
+- **右鍵選單**：貼上、搜尋、打開 AI 對話，分割或關閉目前的窗格，開關分頁，不用記快捷鍵
 - **可點擊連結**：`Cmd + 點擊` 直接開啟連結與檔案路徑，終端機自動換行的長連結也能完整識別
 - **AI 友善**：右上角顯示正在工作的 agent 與它在做的事，Claude Code 需要你時會發送通知，另有可選的助手提供指令建議與對話
-- **遠端存取**：執行 `kaku remote`，即可在另一台電腦的瀏覽器裡使用這台 Mac 的終端機
+- **遠端存取**：執行 `kaku remote` 產生連結，換台電腦用任何瀏覽器打開，就能接著用這台 Mac 上的 Kaku
 - **Shell 工具鏈**：內建 zsh 自動補齊、語法高亮與目錄快速跳轉，並為可選的 Lazygit 和 Yazi 提供快捷鍵支援
-- **Lua 設定**：基於 WezTerm 的 Lua 設定系統，自由自訂字型、主題、快捷鍵與終端機行為
+- **Lua 設定**：用 WezTerm 的 Lua 設定系統自訂字型、主題、快捷鍵與終端機行為
 
 ## 使用指南
 
@@ -64,7 +64,7 @@ brew install --cask kaku
 | 垂直分割 | `Cmd + D` |
 | 水平分割 | `Cmd + Shift + D` |
 | 開啟設定面板 | `Cmd + ,` |
-| AI 面板 | `Cmd + Shift + A` |
+| AI 設定 | `Cmd + Shift + A` |
 | AI 對話 | `Cmd + L` |
 | 套用 AI 建議 | `Cmd + Shift + E` |
 | 開啟 Lazygit | `Cmd + Shift + G` |
@@ -92,7 +92,7 @@ brew install --cask kaku
 ## 文件
 
 - [快捷鍵](docs/keybindings.md) - 完整快捷鍵參考
-- [功能特性](docs/features.md) - AI 助手、lazygit、yazi、遠端檔案、Shell 工具集
+- [功能特性](docs/features.md) - AI 助手、遠端存取、lazygit、yazi、遠端檔案、Shell 工具集
 - [設定指南](docs/configuration.md) - 主題、字型、自訂快捷鍵、Lua API
 - [CLI 指令參考](docs/cli.md) - `kaku ai`、`kaku config`、`kaku doctor` 等指令
 - [常見問題](docs/faq.md) - 常見疑問與疑難排解
@@ -127,4 +127,4 @@ WezTerm 很穩，也很好改，我很感謝它的引擎和生態，於是在它
 
 ## 授權
 
-MIT License. Please feel free to use and contribute to the development. WezTerm 及內建字型的版權宣告見 [NOTICE.md](NOTICE.md)。
+MIT 授權，歡迎使用和參與貢獻。WezTerm 及內建字型的版權宣告見 [NOTICE.md](NOTICE.md)。

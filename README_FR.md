@@ -13,7 +13,7 @@
     <a href="https://kaku.fun/compare">Comparatif</a> ·
     <a href="https://github.com/tw93/Kaku/releases/latest">Télécharger</a>
   </p>
-  <a href="https://kaku.fun"><img src="https://img.shields.io/badge/website-kaku.fun-1B365D?style=flat-square" alt="Website"></a>
+  <a href="https://kaku.fun"><img src="https://img.shields.io/badge/website-kaku.fun-287A3D?style=flat-square" alt="Website"></a>
   <a href="https://github.com/tw93/Kaku/stargazers"><img src="https://img.shields.io/github/stars/tw93/Kaku?style=flat-square" alt="Stars"></a>
   <a href="https://github.com/tw93/Kaku/releases"><img src="https://img.shields.io/github/v/tag/tw93/Kaku?label=version&style=flat-square" alt="Version"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License"></a>
@@ -29,7 +29,7 @@
 
 Kaku (書く, かく) signifie « écrire » en japonais. C'est un terminal macOS basé sur WezTerm, livré avec des polices, des thèmes, l'intégration du shell et des raccourcis Mac familiers déjà configurés, tout en conservant une personnalisation Lua complète.
 
-En tant que socle de programmation de la trilogie, Kaku s'associe à [Waza](https://github.com/tw93/Waza) (技) dédié aux bonnes pratiques et à [Kami](https://github.com/tw93/Kami) (紙) dédié à la livraison de documents pour assurer une expérience fluide du code jusqu'au rendu final.
+Kaku sert à écrire du code, aux côtés de [Waza](https://github.com/tw93/Waza) (技) pour les habitudes d'ingénierie et de [Kami](https://github.com/tw93/Kami) (紙) pour les documents.
 
 ## Démarrage rapide
 
@@ -48,7 +48,7 @@ Lancez Kaku pour finaliser la configuration du shell, installez les outils optio
 - **Menu contextuel au clic droit** : coller, rechercher, lancer le chat IA, diviser ou fermer un volet, ouvrir ou fermer des onglets, sans avoir à mémoriser de combinaisons
 - **Liens interactifs** : `Cmd + Clic` ouvre directement les URL et chemins de fichiers ; les liens longs coupés sur plusieurs lignes restent entièrement cliquables
 - **Pensé pour l'IA** : l'agent en cours et sa tâche s'affichent en haut à droite, Claude Code vous notifie quand il a besoin de vous, et un assistant optionnel suggère des commandes et dialogue
-- **Accès à distance** : lancez `kaku remote` pour utiliser les terminaux de ce Mac depuis le navigateur d'un autre ordinateur
+- **Accès à distance** : lancez `kaku remote` pour obtenir un lien, ouvrez-le dans n'importe quel navigateur d'un autre ordinateur et continuez à utiliser le Kaku de ce Mac
 - **Suite d'outils shell** : autocomplétion zsh, coloration syntaxique et navigation rapide intégrées, avec des raccourcis pour Lazygit et Yazi, à installer en option
 - **Configuration en Lua** : personnalisez polices, thèmes, raccourcis et comportements grâce au moteur Lua de WezTerm
 
@@ -64,7 +64,7 @@ Lancez Kaku pour finaliser la configuration du shell, installez les outils optio
 | Séparation verticale | `Cmd + D` |
 | Séparation horizontale | `Cmd + Shift + D` |
 | Ouvrir les paramètres | `Cmd + ,` |
-| Panneau IA | `Cmd + Shift + A` |
+| Réglages IA | `Cmd + Shift + A` |
 | Chat IA | `Cmd + L` |
 | Appliquer la suggestion IA | `Cmd + Shift + E` |
 | Ouvrir Lazygit | `Cmd + Shift + G` |
@@ -92,7 +92,7 @@ Pour l'authentification, les modèles, le mode API et les réglages d'outils, co
 ## Documentation
 
 - [Raccourcis](docs/keybindings.md) - guide complet des touches
-- [Fonctionnalités](docs/features.md) - assistant IA, lazygit, yazi, fichiers distants, outils shell
+- [Fonctionnalités](docs/features.md) - assistant IA, accès à distance, lazygit, yazi, fichiers distants, outils shell
 - [Configuration](docs/configuration.md) - thèmes, typographie, raccourcis personnalisés, API Lua
 - [Référence CLI](docs/cli.md) - commandes `kaku ai`, `kaku config`, `kaku doctor`, etc.
 - [FAQ](docs/faq.md) - questions fréquentes et résolution de problèmes
@@ -127,4 +127,4 @@ Un grand merci à toutes les personnes qui contribuent à Kaku. N'hésitez pas �
 
 ## Licence
 
-MIT License. Please feel free to use and contribute to the development. Les crédits pour WezTerm et les polices incluses sont détaillés dans [NOTICE.md](NOTICE.md).
+Licence MIT. Utilisez Kaku librement et contribuez si vous le souhaitez. Les crédits pour WezTerm et les polices incluses sont détaillés dans [NOTICE.md](NOTICE.md).

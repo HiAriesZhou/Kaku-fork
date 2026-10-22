@@ -13,7 +13,7 @@
     <a href="https://kaku.fun/compare">比較</a> ·
     <a href="https://github.com/tw93/Kaku/releases/latest">ダウンロード</a>
   </p>
-  <a href="https://kaku.fun"><img src="https://img.shields.io/badge/website-kaku.fun-1B365D?style=flat-square" alt="Website"></a>
+  <a href="https://kaku.fun"><img src="https://img.shields.io/badge/website-kaku.fun-287A3D?style=flat-square" alt="Website"></a>
   <a href="https://github.com/tw93/Kaku/stargazers"><img src="https://img.shields.io/github/stars/tw93/Kaku?style=flat-square" alt="Stars"></a>
   <a href="https://github.com/tw93/Kaku/releases"><img src="https://img.shields.io/github/v/tag/tw93/Kaku?label=version&style=flat-square" alt="Version"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License"></a>
@@ -29,7 +29,7 @@
 
 Kaku（書く、かく）は日本語で「書く」という意味です。WezTerm をベースにした macOS ターミナルで、フォント、テーマ、シェル統合、馴染みのある Mac ショートカットがあらかじめ設定されており、Lua によるカスタマイズ性もそのまま保持しています。
 
-三部作のコーディングを担う基礎ターミナルとして、エンジニア習慣を鍛える [Waza](https://github.com/tw93/Waza)（技）、ドキュメントを納品する [Kami](https://github.com/tw93/Kami)（紙）と連携し、コード作成から習慣化、文書納品までを一気通貫で支えます。
+Kaku はコードを書くためのターミナルで、エンジニアリングの習慣を整える [Waza](https://github.com/tw93/Waza)（技）、ドキュメントを仕上げる [Kami](https://github.com/tw93/Kami)（紙）と同じシリーズです。
 
 ## クイックスタート
 
@@ -48,7 +48,7 @@ Kaku を起動してシェル統合を完了します。不足しているオプ
 - **右クリックメニュー**：貼り付け、検索、AI チャット呼び出し、ペインの分割や終了、タブの開閉など、ショートカットを覚えなくても直感的に操作可能
 - **クリック可能なリンク**：`Cmd + クリック` で URL やファイルパスを直接オープン、改行された長い URL も途切れず認識
 - **AI フレンドリー**：作業中の agent とその内容を右上に表示し、Claude Code が入力を待つと通知、さらにコマンド提案や対話ができるオプションのアシスタントも利用可能
-- **リモートアクセス**：`kaku remote` を実行すると、別のコンピュータのブラウザからこの Mac のターミナルを利用可能
+- **リモートアクセス**：`kaku remote` でリンクを作り、別のコンピュータのどのブラウザで開いても、この Mac の Kaku をそのまま使える
 - **シェルツール群**：zsh 補完、シンタックスハイライト、ディレクトリジャンプを標準搭載、オプションでインストールする Lazygit や Yazi 用のショートカットも用意
 - **Lua 設定**：WezTerm の Lua 設定システムを活用し、フォント、テーマ、キーバインド、動作を自由にカスタマイズ
 
@@ -64,7 +64,7 @@ Kaku を起動してシェル統合を完了します。不足しているオプ
 | 垂直分割 | `Cmd + D` |
 | 水平分割 | `Cmd + Shift + D` |
 | 設定パネルを開く | `Cmd + ,` |
-| AI パネル | `Cmd + Shift + A` |
+| AI 設定 | `Cmd + Shift + A` |
 | AI チャット | `Cmd + L` |
 | AI の提案を適用 | `Cmd + Shift + E` |
 | Lazygit を開く | `Cmd + Shift + G` |
@@ -92,7 +92,7 @@ Kaku を起動してシェル統合を完了します。不足しているオプ
 ## ドキュメント
 
 - [キーバインド](docs/keybindings.md) - 全ショートカット一覧
-- [機能一覧](docs/features.md) - AI アシスタント、Lazygit、Yazi、リモートファイル、シェル統合
+- [機能一覧](docs/features.md) - AI アシスタント、リモートアクセス、Lazygit、Yazi、リモートファイル、シェル統合
 - [設定方法](docs/configuration.md) - テーマ、フォント、キーバインド変更、Lua API
 - [CLI リファレンス](docs/cli.md) - `kaku ai`、`kaku config`、`kaku doctor` などのコマンド
 - [FAQ](docs/faq.md) - よくある質問とトラブルシューティング
@@ -127,4 +127,4 @@ Kaku の構築に貢献してくれたすべての皆様に感謝します。ぜ
 
 ## ライセンス
 
-MIT License. Please feel free to use and contribute to the development. WezTerm および同梱フォントの帰属表示は [NOTICE.md](NOTICE.md) に記載されています。
+MIT ライセンスです。自由に使って、開発にもぜひ参加してください。WezTerm および同梱フォントの帰属表示は [NOTICE.md](NOTICE.md) に記載されています。

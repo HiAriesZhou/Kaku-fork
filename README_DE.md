@@ -13,7 +13,7 @@
     <a href="https://kaku.fun/compare">Vergleich</a> ·
     <a href="https://github.com/tw93/Kaku/releases/latest">Download</a>
   </p>
-  <a href="https://kaku.fun"><img src="https://img.shields.io/badge/website-kaku.fun-1B365D?style=flat-square" alt="Website"></a>
+  <a href="https://kaku.fun"><img src="https://img.shields.io/badge/website-kaku.fun-287A3D?style=flat-square" alt="Website"></a>
   <a href="https://github.com/tw93/Kaku/stargazers"><img src="https://img.shields.io/github/stars/tw93/Kaku?style=flat-square" alt="Stars"></a>
   <a href="https://github.com/tw93/Kaku/releases"><img src="https://img.shields.io/github/v/tag/tw93/Kaku?label=version&style=flat-square" alt="Version"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License"></a>
@@ -29,7 +29,7 @@
 
 Kaku (書く, かく) bedeutet auf Japanisch „schreiben“. Es ist ein auf WezTerm basierendes macOS-Terminal, das mit Schriftarten, Themes, Shell-Integration und vertrauten Mac-Tastenkürzeln vorkonfiguriert ist, während die vollständige Lua-Konfiguration erhalten bleibt.
 
-Als Coding-Fundament der Trilogie arbeitet Kaku mit dem auf Engineering-Gewohnheiten ausgerichteten [Waza](https://github.com/tw93/Waza) (技) und dem auf Dokumentenbereitstellung fokussierten [Kami](https://github.com/tw93/Kami) (紙) zusammen, um den Ablauf von der Entwicklung bis zur Auslieferung nahtlos zu gestalten.
+Kaku ist das Terminal zum Programmieren, neben [Waza](https://github.com/tw93/Waza) (技) für Engineering-Gewohnheiten und [Kami](https://github.com/tw93/Kami) (紙) für Dokumente.
 
 ## Schnellstart
 
@@ -48,7 +48,7 @@ brew install --cask kaku
 - **Kontextmenü per Rechtsklick**: Einfügen, Suchen, KI-Chat öffnen, Splits teilen oder schließen, Tabs öffnen oder schließen, ganz ohne Tastenkürzel auswendig lernen zu müssen
 - **Klickbare Links**: `Cmd + Klick` öffnet URLs und Dateipfade direkt; auch durch Zeilenumbrüche getrennte Links bleiben vollständig erhalten
 - **KI-freundlich**: Oben rechts siehst du, welcher Agent gerade woran arbeitet, Claude Code meldet sich, wenn es dich braucht, und ein optionaler Assistent hilft mit Befehlsvorschlägen und Chat
-- **Fernzugriff**: Mit `kaku remote` nutzt du die Terminals dieses Macs im Browser eines anderen Computers
+- **Fernzugriff**: `kaku remote` erzeugt einen Link, den du auf einem anderen Computer in jedem Browser öffnest, um Kaku auf diesem Mac weiter zu nutzen
 - **Shell-Werkzeuge**: Integrierte zsh-Autovervollständigung, Syntaxhervorhebung und Verzeichnisnavigation, mit Tastenkürzeln für optional installiertes Lazygit und Yazi
 - **Lua-Konfiguration**: Passe Schriften, Farbschemata, Tastenkürzel und Terminal-Verhalten flexibel über WezTerms Lua-System an
 
@@ -64,7 +64,7 @@ brew install --cask kaku
 | Vertikal teilen | `Cmd + D` |
 | Horizontal teilen | `Cmd + Shift + D` |
 | Einstellungen öffnen | `Cmd + ,` |
-| KI-Leiste öffnen | `Cmd + Shift + A` |
+| KI-Einstellungen öffnen | `Cmd + Shift + A` |
 | KI-Chat | `Cmd + L` |
 | KI-Vorschlag anwenden | `Cmd + Shift + E` |
 | Lazygit öffnen | `Cmd + Shift + G` |
@@ -92,7 +92,7 @@ Informationen zu Authentifizierung, Modellen, API-Modus und Tools findest du in 
 ## Dokumentation
 
 - [Tastenkürzel](docs/keybindings.md) - Vollständige Tastenkürzel-Referenz
-- [Funktionen](docs/features.md) - KI-Assistent, Lazygit, Yazi, Remote-Dateien, Shell-Suite
+- [Funktionen](docs/features.md) - KI-Assistent, Fernzugriff, Lazygit, Yazi, Remote-Dateien, Shell-Suite
 - [Konfiguration](docs/configuration.md) - Farbschemata, Schriften, eigene Tastenkürzel, Lua-API
 - [CLI-Referenz](docs/cli.md) - `kaku ai`, `kaku config`, `kaku doctor` und mehr
 - [FAQ](docs/faq.md) - Häufige Fragen und Fehlerbehebung
@@ -127,4 +127,4 @@ Vielen Dank an alle Mitwirkenden, die Kaku mitgestaltet haben. Folge ihnen gern!
 
 ## Lizenz
 
-MIT License. Please feel free to use and contribute to the development. Namensnennungen für WezTerm und die mitgelieferten Schriftarten finden sich in [NOTICE.md](NOTICE.md).
+MIT-Lizenz. Nutze Kaku frei und trag gern zur Entwicklung bei. Namensnennungen für WezTerm und die mitgelieferten Schriftarten finden sich in [NOTICE.md](NOTICE.md).

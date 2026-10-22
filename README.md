@@ -13,7 +13,7 @@
     <a href="https://kaku.fun/compare">Compare</a> ·
     <a href="https://github.com/tw93/Kaku/releases/latest">Download</a>
   </p>
-  <a href="https://kaku.fun"><img src="https://img.shields.io/badge/website-kaku.fun-1B365D?style=flat-square" alt="Website"></a>
+  <a href="https://kaku.fun"><img src="https://img.shields.io/badge/website-kaku.fun-287A3D?style=flat-square" alt="Website"></a>
   <a href="https://github.com/tw93/Kaku/stargazers"><img src="https://img.shields.io/github/stars/tw93/Kaku?style=flat-square" alt="Stars"></a>
   <a href="https://github.com/tw93/Kaku/releases"><img src="https://img.shields.io/github/v/tag/tw93/Kaku?label=version&style=flat-square" alt="Version"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License"></a>
@@ -29,7 +29,7 @@
 
 Kaku (書く, かく) means "to write" in Japanese. It is a macOS terminal based on WezTerm, with fonts, themes, shell integration, and Mac shortcuts already configured, while preserving full Lua customization.
 
-As the coding foundation of the trilogy, Kaku works alongside [Waza](https://github.com/tw93/Waza) (技), built around engineering habits, and [Kami](https://github.com/tw93/Kami) (紙), built for shipping documents, so writing code, building habits, and shipping documents flow from one to the next.
+Kaku is for writing code, alongside [Waza](https://github.com/tw93/Waza) (技) for engineering habits and [Kami](https://github.com/tw93/Kami) (紙) for documents.
 
 ## Quick Start
 
@@ -48,7 +48,7 @@ Open Kaku to set up shell integration, install missing optional tools with `kaku
 - **Right-click menu**: Paste, search, open AI chat, split or close the clicked pane, and open or close tabs without remembering shortcuts
 - **Clickable links**: `Cmd + Click` opens URLs and file paths, and URLs automatically wrapped by the terminal keep their full address
 - **AI-friendly**: See which agent is working and on what at the top right, get notified when Claude Code needs you, and use an optional assistant for command suggestions and chat
-- **Remote access**: Run `kaku remote` to use this Mac's terminals from a browser on another computer
+- **Remote access**: Run `kaku remote` to get a link, open it in any browser on another computer, and keep using the Kaku on this Mac
 - **Shell tools**: Built-in zsh completion, syntax highlighting, and directory jumping, with shortcuts for optional Lazygit and Yazi installations
 - **Lua configuration**: Customize fonts, themes, shortcuts, and terminal behavior using WezTerm's Lua configuration system
 
@@ -64,7 +64,7 @@ Open Kaku to set up shell integration, install missing optional tools with `kaku
 | Split Pane Vertical | `Cmd + D` |
 | Split Pane Horizontal | `Cmd + Shift + D` |
 | Open Settings Panel | `Cmd + ,` |
-| AI Panel | `Cmd + Shift + A` |
+| AI Settings | `Cmd + Shift + A` |
 | AI Chat | `Cmd + L` |
 | Apply AI Suggestion | `Cmd + Shift + E` |
 | Open Lazygit | `Cmd + Shift + G` |
@@ -92,7 +92,7 @@ For authentication, models, API Mode, and tool settings, see the [AI assistant d
 ## Docs
 
 - [Keybindings](docs/keybindings.md) - full shortcut reference
-- [Features](docs/features.md) - AI assistant, lazygit, yazi, remote files, shell suite
+- [Features](docs/features.md) - AI assistant, remote access, lazygit, yazi, remote files, shell suite
 - [Configuration](docs/configuration.md) - themes, fonts, custom keybindings, Lua API
 - [CLI Reference](docs/cli.md) - `kaku ai`, `kaku config`, `kaku doctor`, and more
 - [FAQ](docs/faq.md) - common questions and troubleshooting
