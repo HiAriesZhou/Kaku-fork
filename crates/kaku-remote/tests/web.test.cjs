@@ -3047,8 +3047,12 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
       addEventListener() {}
       close() {}
     };
-    connections[0].onmessage({ data: JSON.stringify({ type: 'config', desktop: true }) });
+    // A Kaku that does not say it answers gets no offer.
+    connections[0].onmessage({ data: JSON.stringify({ type: 'config' }) });
   });
+  await new Promise(r => setTimeout(r, 200));
+  assert.equal(await p.evaluate(() => messages.some(m => m.type === 'rtc_offer')), false);
+  await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'config', direct: true }) }));
   await p.waitForFunction(() => messages.some(m => m.type === 'rtc_offer'));
   assert.equal(await p.evaluate(() => messages.find(m => m.type === 'rtc_offer').sdp), 'v=0 offer');
   await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'rtc_answer', sdp: 'v=0 answer', id: 3 }) }));

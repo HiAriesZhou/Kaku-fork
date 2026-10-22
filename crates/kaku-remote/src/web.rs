@@ -2545,14 +2545,16 @@ pub(crate) async fn run_session(
     dirty: WebDirty,
 ) {
     let _awake = crate::awake::Awake::hold();
+    let (direct_inbox, outbox, frames) = crate::p2p::wrap(inbox, outbox, frames);
     #[cfg(feature = "desktop")]
-    let outbox = {
-        let (direct_inbox, outbox, frames) = crate::p2p::wrap(inbox, outbox, frames);
+    {
         inbox = crate::desktop::tap(direct_inbox, outbox.clone(), frames);
-        outbox
-    };
+    }
     #[cfg(not(feature = "desktop"))]
-    drop(frames);
+    {
+        inbox = direct_inbox;
+        drop(frames);
+    }
     if let Some(json) = encode(&WebServerMsg::Config(&crate::config_info())) {
         if outbox.send(json).await.is_err() {
             return;

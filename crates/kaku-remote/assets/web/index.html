@@ -3198,7 +3198,8 @@
   };
   // ── Direct path ──
   // Beside the relay, a WebRTC data channel straight to the Mac, offered
-  // once Kaku says it can show the desktop. The offer and answer go through
+  // once Kaku says it answers one (`direct`, or `desktop` from the private
+  // builds that had it first). The offer and answer go through
   // the sealed session, so the DTLS fingerprints in them are the Mac's and
   // this page's own. Once open, small messages and everything Kaku sends
   // interactively take it; files stay on the relay. `?p2p` tries it on a
@@ -3253,7 +3254,7 @@
   const openDirect = async (socket, deliver) => {
     if (direct || typeof RTCPeerConnection !== "function") return;
     let pc;
-    try { pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }] }); } catch (_) { return; }
+    try { pc = new RTCPeerConnection({ iceServers: [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }] }); } catch (_) { return; }
     const dc = pc.createDataChannel("kaku");
     dc.binaryType = "arraybuffer";
     const path = {
@@ -3365,7 +3366,7 @@
       if (msg.type === "rtc_answer") { answered(socket, msg); return; }
       if (msg.type === "rtc_ready") { laneReady(socket, msg); return; }
       if (msg.type === "rtc_closed") { directClosed(socket, msg); return; }
-      if (msg.type === "config" && msg.desktop && (relay || DIRECT_FORCED)) openDirect(socket, (m) => onMessage(socket, m));
+      if (msg.type === "config" && (msg.direct || msg.desktop) && (relay || DIRECT_FORCED)) openDirect(socket, (m) => onMessage(socket, m));
       lastHeard = Date.now();
       if (msg.type === "config" || msg.type === "tabs" || msg.type === "frame" || msg.type === "pong") {
         clearTimeout(handshakeTimer);

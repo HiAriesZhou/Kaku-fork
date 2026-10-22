@@ -16,7 +16,6 @@ mod awake;
 #[cfg(feature = "desktop")]
 mod desktop;
 mod fonts;
-#[cfg(feature = "desktop")]
 mod p2p;
 mod pairing;
 mod queue;
@@ -68,6 +67,9 @@ struct ConfigInfo {
     /// with its helper installed). Left out when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     desktop: bool,
+    /// This Kaku answers the page's offer of a direct path beside the
+    /// relay; a page talking to an older one offers nothing.
+    direct: bool,
     font_size: f64,
     line_height: f64,
     copy_on_select: bool,
@@ -139,6 +141,7 @@ fn config_info() -> ConfigInfo {
         font_families: page_fonts.families,
         font_files: page_fonts.files,
         desktop: desktop_available(),
+        direct: true,
         font_size: cfg.font_size,
         line_height: cfg.line_height,
         copy_on_select: cfg.copy_on_select,
