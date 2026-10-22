@@ -2746,8 +2746,15 @@ test('on a phone the desktop view opens zoomed in and works like a trackpad', as
   // A finger moves the pointer by its travel, not to where it touches, and
   // the view follows the pointer before it reaches the edge.
   await p.evaluate(() => { messages.length = 0; });
-  await touch('pointerdown', 1, 60, cy);
-  for (let x = 60; x <= 180; x += 10) { await touch('pointermove', 1, x, cy); await flush(); }
+  // The finger leaves the tap range in the same task it lands in: one round
+  // trip per step took a slow runner past the hold, which then pressed.
+  await p.evaluate(([cy]) => {
+    const canvas = document.querySelector('#desktop canvas');
+    for (const [type, x] of [['pointerdown', 60], ['pointermove', 80]]) {
+      canvas.dispatchEvent(new PointerEvent(type, { pointerId: 1, pointerType: 'touch', clientX: x, clientY: cy, bubbles: true, cancelable: true, isPrimary: true }));
+    }
+  }, [cy]);
+  for (let x = 90; x <= 180; x += 10) { await touch('pointermove', 1, x, cy); await flush(); }
   await touch('pointerup', 1, 180, cy);
   await flush();
   let sent = await pointers();
