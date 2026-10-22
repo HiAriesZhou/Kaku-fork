@@ -2679,8 +2679,12 @@ test('losing focus cancels a desktop long press before it clicks', async t => {
   const box = await p.locator('#desktop canvas').boundingBox();
   const cdp = await p.context().newCDPSession(p);
   await p.evaluate(() => { messages.length = 0; });
+  // Focus goes away right after the finger lands, well inside the hold: a
+  // separate evaluate after the touch could arrive past the hold on a slow
+  // runner and see the press it meant to prevent.
+  await p.evaluate(() => document.querySelector('#desktop canvas').addEventListener('pointerdown',
+    () => setTimeout(() => window.dispatchEvent(new Event('blur'))), { once: true }));
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ id: 1, x: box.x + box.width / 2, y: box.y + box.height / 2 }] });
-  await p.evaluate(() => window.dispatchEvent(new Event('blur')));
   await p.waitForTimeout(500);
   assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'desktop_pointer')), []);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
