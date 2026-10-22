@@ -114,6 +114,7 @@ fn run_one_shot(engine: &mut Engine, prompt: String) -> anyhow::Result<()> {
     let mut reasoning_buf = String::new();
     let mut responses_items = Vec::new();
     let mut completed_successfully = false;
+    let mut allow_all = false;
     let stdout = std::io::stdout();
 
     for msg in rx {
@@ -139,14 +140,20 @@ fn run_one_shot(engine: &mut Engine, prompt: String) -> anyhow::Result<()> {
                 eprintln!("     [error] {}", error);
             }
             StreamMsg::ApprovalRequired { summary, reply_tx } => {
-                eprint!("Allow: {}? [y/N] ", summary);
+                if allow_all {
+                    eprintln!("Allowed: {}", summary);
+                    let _ = reply_tx.send(true);
+                    continue;
+                }
+                eprint!("Allow: {}? [y/N, a = allow all] ", summary);
                 let _ = std::io::stderr().flush();
                 let mut line = String::new();
-                let approved = std::io::stdin()
+                let answer = std::io::stdin()
                     .read_line(&mut line)
-                    .map(|_| line.trim().to_lowercase() == "y")
-                    .unwrap_or(false);
-                let _ = reply_tx.send(approved);
+                    .map(|_| approval_answer(&line))
+                    .unwrap_or(ApprovalAnswer::Deny);
+                allow_all = answer == ApprovalAnswer::AllowAll;
+                let _ = reply_tx.send(answer != ApprovalAnswer::Deny);
             }
             StreamMsg::Done => {
                 completed_successfully = true;
@@ -238,6 +245,8 @@ struct Tui {
     stream_completed_successfully: bool,
     /// Pending approval request waiting for user y/N.
     pending_approval: Option<(String, SyncSender<bool>)>,
+    /// Set by answering `a`: the rest of this k session runs without asking.
+    allow_all: bool,
     scroll_offset: usize,
     cols: usize,
     rows: usize,
@@ -260,6 +269,7 @@ impl Tui {
             pending_responses_items: Vec::new(),
             stream_completed_successfully: false,
             pending_approval: None,
+            allow_all: false,
             scroll_offset: 0,
             cols,
             rows,
@@ -384,8 +394,15 @@ impl Tui {
                     changed = true;
                 }
                 Ok(StreamMsg::ApprovalRequired { summary, reply_tx }) => {
+                    if self.allow_all {
+                        let _ = reply_tx.send(true);
+                        self.streaming_buf
+                            .push_str(&format!("[approved: {}]\n", summary));
+                        changed = true;
+                        continue;
+                    }
                     self.streaming_buf
-                        .push_str(&format!("[approve: {}? y/N] ", summary));
+                        .push_str(&format!("[approve: {}? y/N, a = allow all] ", summary));
                     self.pending_approval = Some((summary, reply_tx));
                     changed = true;
                     self.stream_rx = Some(rx);
@@ -610,9 +627,14 @@ fn run_repl(engine: &mut Engine) -> anyhow::Result<()> {
                 ..
             })) if tui.pending_approval.is_some() => {
                 let (summary, reply_tx) = tui.pending_approval.take().unwrap();
-                let approved = ch == 'y' || ch == 'Y';
-                let _ = reply_tx.send(approved);
-                let label = if approved { "approved" } else { "denied" };
+                let answer = approval_answer(&ch.to_string());
+                tui.allow_all = answer == ApprovalAnswer::AllowAll;
+                let _ = reply_tx.send(answer != ApprovalAnswer::Deny);
+                let label = match answer {
+                    ApprovalAnswer::Allow => "approved",
+                    ApprovalAnswer::AllowAll => "approved, not asking again this session",
+                    ApprovalAnswer::Deny => "denied",
+                };
                 tui.streaming_buf
                     .push_str(&format!("[{}: {}]\n", label, summary));
                 needs_redraw = true;
@@ -853,11 +875,71 @@ fn print_recent_conversations() {
     eprintln!("Use /resume <id> to switch.");
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ApprovalAnswer {
+    Allow,
+    AllowAll,
+    Deny,
+}
+
+/// `y` allows one request, `a` allows it and every later one in this k
+/// session, anything else denies.
+fn approval_answer(input: &str) -> ApprovalAnswer {
+    match input.trim().to_lowercase().as_str() {
+        "y" => ApprovalAnswer::Allow,
+        "a" => ApprovalAnswer::AllowAll,
+        _ => ApprovalAnswer::Deny,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{truncate_to_chars, KMsg, Tui};
+    use super::{approval_answer, truncate_to_chars, ApprovalAnswer, KMsg, Tui};
     use crate::ai_chat_engine::StreamMsg;
     use std::sync::mpsc::sync_channel;
+
+    #[test]
+    fn approval_answer_reads_yes_all_and_defaults_to_deny() {
+        assert_eq!(approval_answer("y\n"), ApprovalAnswer::Allow);
+        assert_eq!(approval_answer("Y"), ApprovalAnswer::Allow);
+        assert_eq!(approval_answer("a\n"), ApprovalAnswer::AllowAll);
+        assert_eq!(approval_answer("A"), ApprovalAnswer::AllowAll);
+        assert_eq!(approval_answer(""), ApprovalAnswer::Deny);
+        assert_eq!(approval_answer("yes please"), ApprovalAnswer::Deny);
+    }
+
+    #[test]
+    fn allow_all_answers_later_approvals_without_asking() {
+        let (tx, rx) = sync_channel(4);
+        let mut tui = Tui::new(80, 24);
+        tui.is_streaming = true;
+        tui.stream_rx = Some(rx);
+
+        let (reply_tx, reply_rx) = sync_channel(1);
+        tx.send(StreamMsg::ApprovalRequired {
+            summary: "shell: rm build.log".into(),
+            reply_tx,
+        })
+        .unwrap();
+        assert!(tui.drain_stream());
+        assert!(tui.pending_approval.is_some());
+        assert!(reply_rx.try_recv().is_err());
+
+        tui.pending_approval = None;
+        tui.allow_all = true;
+        let (reply_tx, reply_rx) = sync_channel(1);
+        tx.send(StreamMsg::ApprovalRequired {
+            summary: "shell: rm build.log".into(),
+            reply_tx,
+        })
+        .unwrap();
+        assert!(tui.drain_stream());
+        assert!(tui.pending_approval.is_none());
+        assert_eq!(reply_rx.try_recv(), Ok(true));
+        assert!(tui
+            .streaming_buf
+            .contains("[approved: shell: rm build.log]"));
+    }
 
     #[test]
     fn truncate_to_chars_handles_utf8_boundaries() {
