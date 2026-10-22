@@ -1611,14 +1611,23 @@ test('switching tabs never shows a frame of wrong letters while WebGL merges gly
     };
     const canvas = () => [...document.querySelectorAll('.xterm-screen canvas')].find(c => c.getContext('webgl2'));
     const frame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-    let merges = 0, checked = 0, wrong = 0, merged = false, pending = null, checking = false;
+    let merges = 0, checked = 0, wrong = 0, moved = 0, merged = false, pending = null, pendingRows = null, checking = false;
+    // A screen written in slices draws between them: a merge on such a frame
+    // is compared only if the redraw shows the same rows.
+    const rowsNow = () => { const b = probe.term.buffer.active; let s = ''; for (let y = 0; y < probe.term.rows; y++) s += b.getLine(b.viewportY + y)?.translateToString(true) + '\n'; return s; };
     probe.webgl.onRemoveTextureAtlasCanvas(() => { merges++; merged = true; });
     // Registered after the page's own listener, so it sees what the frame shows.
     probe.term.onRender(() => {
-      if (pending !== null) { if (canvas().toDataURL() !== pending) wrong++; pending = null; checking = false; return; }
+      if (pending !== null) {
+        if (rowsNow() !== pendingRows) moved++;
+        else if (canvas().toDataURL() !== pending) wrong++;
+        pending = null; checking = false;
+        return;
+      }
       if (!merged) return;
       merged = false; checked++;
       pending = canvas().toDataURL();
+      pendingRows = rowsNow();
       checking = true;
       requestAnimationFrame(() => probe.term.refresh(0, probe.term.rows - 1));
     });
@@ -1633,9 +1642,10 @@ test('switching tabs never shows a frame of wrong letters while WebGL merges gly
       // redraw, it read as wrong letters in a merge frame that had none.
       while (checking) await frame();
     }
-    return { merges, checked, wrong };
+    return { merges, checked, wrong, moved };
   });
   assert.ok(result.merges > 0, `the tabs merged no glyph pages: ${JSON.stringify(result)}`);
+  assert.ok(result.checked > result.moved, `no merge frame could be compared: ${JSON.stringify(result)}`);
   assert.equal(result.wrong, 0, `frames with wrong letters: ${JSON.stringify(result)}`);
   assert.deepEqual(errors, []);
 });
