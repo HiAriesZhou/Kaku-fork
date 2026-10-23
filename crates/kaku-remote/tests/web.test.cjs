@@ -557,6 +557,29 @@ test('returning to a cached tab attaches before claiming its new size', async t 
   assert.ok(commands.some(m => m.type === 'resize'));
 });
 
+test('a page opened on a Mac-sized tab shows the terminal once its own grid arrives', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 900, height: 560 } });
+  const shown = () => p.evaluate(() => document.body.classList.contains('drawn') && !document.body.classList.contains('sizing'));
+  const frame = (seq, cols, rows) => p.evaluate(([seq, cols, rows]) => probe.handle({ type: 'frame', seq, pane_id: 1, cols, rows, data: '\x1b[1;1Hterminal' }), [seq, cols, rows]);
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }));
+  // The Mac window's grid comes first: parsed, not shown.
+  await frame(1, 200, 50);
+  await p.waitForFunction(() => messages.some(m => m.type === 'resize'));
+  assert.equal(await shown(), false);
+  const claim = await p.evaluate(() => messages.filter(m => m.type === 'resize').at(-1));
+  await frame(2, claim.cols, claim.rows);
+  assert.equal(await shown(), true);
+  assert.ok(await p.evaluate(() => document.querySelector('.xterm-rows').textContent.includes('terminal')));
+});
+
+test('a page whose grid never arrives shows the terminal after a moment', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 900, height: 560 } });
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }));
+  await p.evaluate(() => probe.handle({ type: 'frame', seq: 1, pane_id: 1, cols: 200, rows: 50, data: '\x1b[1;1Hterminal' }));
+  assert.equal(await p.evaluate(() => document.body.classList.contains('drawn') && !document.body.classList.contains('sizing')), false);
+  await p.waitForFunction(() => document.body.classList.contains('drawn') && !document.body.classList.contains('sizing'), null, { timeout: 1500 });
+});
+
 test('typing or leaving the desktop view claims back a tab the Mac took for its own window', async t => {
   const { p } = await page(t, '#t=fixture', { viewport: { width: 900, height: 560 } });
   await screen(p, 'terminal');
@@ -1742,6 +1765,8 @@ test('the grid draws with WebGL where the browser has it, and with the DOM other
   assert.equal(await p.locator('.xterm-rows').count(), 0);
   // And it really draws the text: a canvas with only the background passes
   // every buffer check above.
+  // Shown once its own grid arrives, or after a moment.
+  await p.waitForFunction(() => !document.body.classList.contains('sizing'));
   const shot = (await p.locator('.xterm-screen').screenshot()).toString('base64');
   const lit = await p.evaluate(async png => {
     const img = await createImageBitmap(await (await fetch('data:image/png;base64,' + png)).blob());
@@ -2000,6 +2025,8 @@ test('an icon drawn before its font loaded is redrawn once the font is in', asyn
   await p.evaluate(() => document.fonts.load('16px "Kaku Symbols"', '\uf115'));
   await p.waitForFunction(() => [...document.fonts].some(f => f.family.includes('Kaku Symbols') && f.status === 'loaded'));
   await p.waitForTimeout(300);
+  // Shown once its own grid arrives, or after a moment.
+  await p.waitForFunction(() => !document.body.classList.contains('sizing'));
   const box = await p.locator('.xterm-screen').boundingBox();
   const clip = { x: box.x, y: box.y, width: 80, height: 24 };
   const drawn = await p.screenshot({ clip });

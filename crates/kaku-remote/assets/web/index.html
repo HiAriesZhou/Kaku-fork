@@ -114,6 +114,8 @@
      shows before the theme and the screen arrive. */
   #term { position: absolute; top: 8px; left: 8px; visibility: hidden; }
   body.drawn #term { visibility: visible; }
+  /* Drawn but not yet at its own grid: kept focusable, just not seen. */
+  body.sizing #term { opacity: 0; }
   /* Find bar and toast share the tab bar's look. */
   #find { position: absolute; top: 10px; right: 16px; display: none; align-items: center; gap: 2px; height: 32px; padding: 0 4px 0 10px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); z-index: 5; }
   #find.show { display: flex; }
@@ -834,6 +836,27 @@
     const tab = tabs.find((t) => t.tab_id === tabId);
     return !!tab && (tab.panes || []).length > 1 && !tab.zoomed;
   };
+  // A page opened on a tab the Mac had sized gets its first frames at the
+  // Mac window's grid, before its own claim lands, and showed them for a
+  // moment. The first time, the terminal stays unseen (still focusable)
+  // until a frame has the grid it claimed, or a split's own, or for at most
+  // REVEAL_WAIT.
+  const REVEAL_WAIT = 600;
+  let revealTimer = 0;
+  let sized = false;
+  const reveal = () => {
+    clearTimeout(revealTimer);
+    sized = true;
+    document.body.classList.remove("sizing");
+  };
+  const revealWhenSized = () => {
+    if (sized || !size.cols) return;
+    if (claimed === size.cols + "x" + size.rows || splitView()) { reveal(); return; }
+    if (!revealTimer) {
+      document.body.classList.add("sizing");
+      revealTimer = setTimeout(reveal, REVEAL_WAIT);
+    }
+  };
   const fit = () => {
     if (stage.clientWidth <= MARGIN * 2 || stage.clientHeight <= MARGIN * 2) return;
     const want = claimFont();
@@ -860,6 +883,7 @@
         claimed = key;
         send({ type: "resize", cols, rows });
       }
+      revealWhenSized();
     }
     // Until Kaku applies that size, the current grid may be larger than the
     // window; shrink the font just enough for it to fit. A split, smaller
@@ -2554,6 +2578,7 @@
       clearPending = true;
       verifySoon();
     }
+    revealWhenSized();
     localScroll = !!msg.local_scroll;
     if (!localScroll) closePast();
     // Autowrap off first: each row is placed by position, so a row that
