@@ -119,11 +119,9 @@ Big thanks to all contributors who helped build Kaku. Go follow them! ❤️
 - If Kaku helped you, give it a star, [share it](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20A%20modern%2C%20AI-friendly%20Mac%20terminal.), or open an issue or PR
 - I have two cats, TangYuan and Coke, and if Kaku has been helpful to you, feel free to treat them to <a href="https://cats.tw93.fun?name=Kaku" target="_blank">canned food 🥩</a>
 
-<details>
-<summary>These lovely people already did 🐱</summary>
-<br/>
+These lovely people already did 🐱
+
 <a href="https://cats.tw93.fun?name=Kaku"><img src="https://cdn.jsdelivr.net/gh/tw93/sponsors@main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
-</details>
 
 ## License
 

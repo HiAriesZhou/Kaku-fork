@@ -119,11 +119,9 @@ Kaku 개발에 기여해 주신 모든 분들께 감사드립니다. 이분들�
 - Kaku가 유용했다면 Star를 누르거나, [공유](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20A%20modern%2C%20AI-friendly%20Mac%20terminal.)하거나, 이슈 및 PR을 남겨주세요
 - 탕위안(TangYuan)과 콜라(Coke)라는 두 마리의 고양이를 키우고 있는데, Kaku가 즐거움을 주었다면 <a href="https://cats.tw93.fun?name=Kaku" target="_blank">캔 간식 🥩</a>을 후원해 주세요
 
-<details>
-<summary>후원해 주신 분들 🐱</summary>
-<br/>
+후원해 주신 분들 🐱
+
 <a href="https://cats.tw93.fun?name=Kaku"><img src="https://cdn.jsdelivr.net/gh/tw93/sponsors@main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
-</details>
 
 ## 라이선스
 
