@@ -2289,6 +2289,27 @@ test('desktop pictures arrive as binary messages, locally and through the relay'
   assert.deepEqual(relayed.errors, []);
 });
 
+test('a locked Mac says so over its picture until it is unlocked', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+  const notice = p.locator('#desktop .locked');
+  const visible = () => notice.evaluate(e => getComputedStyle(e).opacity === '1');
+  assert.equal(await visible(), false);
+  await p.evaluate(() => probe.handle({ type: 'desktop_locked', locked: true }));
+  await p.waitForFunction(() => getComputedStyle(document.querySelector('#desktop .locked')).opacity === '1');
+  assert.match(await notice.textContent(), /locked/);
+  await p.evaluate(() => probe.handle({ type: 'desktop_locked', locked: false }));
+  await p.waitForFunction(() => getComputedStyle(document.querySelector('#desktop .locked')).opacity === '0');
+  // Leaving forgets it; the helper says again when the view opens.
+  await p.evaluate(() => probe.handle({ type: 'desktop_locked', locked: true }));
+  await p.locator('#bar .tool.desktop').click();
+  assert.equal(await p.evaluate(() => document.getElementById('desktop').classList.contains('locked')), false);
+  assert.deepEqual(errors, []);
+});
+
 test('the desktop view takes the Mac\'s pointer shape, its displays and dropped files', async t => {
   const { p, errors } = await page(t);
   await screen(p);
