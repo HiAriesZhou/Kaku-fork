@@ -557,6 +557,40 @@ test('returning to a cached tab attaches before claiming its new size', async t 
   assert.ok(commands.some(m => m.type === 'resize'));
 });
 
+test('typing or leaving the desktop view claims back a tab the Mac took for its own window', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 900, height: 560 } });
+  await screen(p, 'terminal');
+  const claims = () => p.evaluate(() => messages.filter(m => m.type === 'resize').map(m => m.cols + 'x' + m.rows));
+  let seq = 2;
+  const frame = (cols, rows) => p.evaluate(([seq, cols, rows]) => probe.handle({ type: 'frame', seq, pane_id: 1, cols, rows, data: '\x1b[1;1Hterminal' }), [seq++, cols, rows]);
+  // Kaku applies the page's grid.
+  const [cols, rows] = (await claims()).at(-1).split('x').map(Number);
+  await frame(cols, rows);
+  await p.waitForTimeout(150);
+  // Someone uses the Kaku window on the Mac: the tab goes back to its size,
+  // and the page waits, as it does while the Mac is in use.
+  await p.evaluate(() => { messages.length = 0; });
+  await frame(60, 18);
+  await p.waitForTimeout(150);
+  assert.deepEqual(await claims(), []);
+  // The first key typed here claims the page's grid again, once.
+  await p.keyboard.type('ab');
+  assert.deepEqual(await claims(), [cols + 'x' + rows]);
+  await frame(cols, rows);
+  await p.keyboard.type('c');
+  assert.deepEqual(await claims(), [cols + 'x' + rows]);
+
+  // Back from the Mac's screen, where clicking into Kaku took the tab.
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').waitFor();
+  await p.locator('#bar .tool.desktop').click();
+  await frame(60, 18);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.locator('#bar .tool.desktop').click();
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
+  assert.deepEqual(await claims(), [cols + 'x' + rows]);
+});
+
 test('clicking back to a cached tab shows it in the next frame, never blank', async t => {
   const { p } = await page(t);
   await screen(p, 'first');
