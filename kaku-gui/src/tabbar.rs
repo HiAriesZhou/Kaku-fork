@@ -1145,6 +1145,16 @@ impl TabBarState {
         } else {
             BatchTabTitles::without_callback(0)
         };
+        // The page's tab bar scrolls, so it gets titles cut at
+        // `tab_max_width`, not at this window's share per tab: eleven tabs in
+        // one window sent every title to the page as "www/m…".
+        #[cfg(feature = "remote")]
+        let remote_titles = (config.remote.enabled
+            && precomputed_titles.callback_present
+            && tab_title_max_width_for_callback < config.tab_max_width)
+            .then(|| {
+                call_format_tab_titles_batch(tab_info, pane_info, config, config.tab_max_width)
+            });
 
         for tab_idx in 0..number_of_tabs {
             let active = tab_idx == active_tab_no;
@@ -1157,10 +1167,19 @@ impl TabBarState {
             let mut tab_title =
                 compute_tab_title_from_precomputed(&tab_info[tab_idx], config, precomputed.clone());
             #[cfg(feature = "remote")]
-            kaku_remote::publish_tab_title(
-                tab_info[tab_idx].tab_id.into(),
-                &title_plain_text(&tab_title),
-            );
+            {
+                let remote_title = remote_titles.as_ref().map(|batch| {
+                    compute_tab_title_from_precomputed(
+                        &tab_info[tab_idx],
+                        config,
+                        batch.titles.get(tab_idx).and_then(|t| t.clone()),
+                    )
+                });
+                kaku_remote::publish_tab_title(
+                    tab_info[tab_idx].tab_id.into(),
+                    &title_plain_text(remote_title.as_ref().unwrap_or(&tab_title)),
+                );
+            }
             #[cfg(feature = "remote")]
             {
                 let agent = config

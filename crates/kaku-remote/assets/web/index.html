@@ -114,6 +114,8 @@
      shows before the theme and the screen arrive. */
   #term { position: absolute; top: 8px; left: 8px; visibility: hidden; }
   body.drawn #term { visibility: visible; }
+  /* Drawn but not yet at its own grid: kept focusable, just not seen. */
+  body.sizing #term { opacity: 0; }
   /* Find bar and toast share the tab bar's look. */
   #find { position: absolute; top: 10px; right: 16px; display: none; align-items: center; gap: 2px; height: 32px; padding: 0 4px 0 10px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); z-index: 5; }
   #find.show { display: flex; }
@@ -481,7 +483,7 @@
   const send = (msg) => {
     const socket = ws;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    if (INPUT_TYPES.has(msg.type)) { stopScrolling(); closePast(); }
+    if (INPUT_TYPES.has(msg.type)) { stopScrolling(); closePast(); takeBack(); }
     // Zoom changes the pane's share of its tab. Let its next frame reclaim
     // our grid after the Mac has applied the zoom, even if our size is unchanged.
     if (msg.type === "zoom_pane" && msg.pane_id === paneId) claimed = "";
@@ -810,6 +812,9 @@
   // size. The Mac takes the tab back on its next local input, and the page
   // claims it again on its own next input.
   let claimed = "";
+  // The last frame's grid is not the one this page claimed: the Mac took
+  // the tab back for its own window.
+  let macSized = false;
   // On a phone, Kaku's own size leaves about 38 columns on a portrait screen,
   // and the tab on the Mac narrows to match. Size the font for about 50
   // columns across the screen's shorter side, so landscape gets more. The
@@ -830,6 +835,27 @@
   const splitView = () => {
     const tab = tabs.find((t) => t.tab_id === tabId);
     return !!tab && (tab.panes || []).length > 1 && !tab.zoomed;
+  };
+  // A page opened on a tab the Mac had sized gets its first frames at the
+  // Mac window's grid, before its own claim lands, and showed them for a
+  // moment. The first time, the terminal stays unseen (still focusable)
+  // until a frame has the grid it claimed, or a split's own, or for at most
+  // REVEAL_WAIT.
+  const REVEAL_WAIT = 600;
+  let revealTimer = 0;
+  let sized = false;
+  const reveal = () => {
+    clearTimeout(revealTimer);
+    sized = true;
+    document.body.classList.remove("sizing");
+  };
+  const revealWhenSized = () => {
+    if (sized || !size.cols) return;
+    if (claimed === size.cols + "x" + size.rows || splitView()) { reveal(); return; }
+    if (!revealTimer) {
+      document.body.classList.add("sizing");
+      revealTimer = setTimeout(reveal, REVEAL_WAIT);
+    }
   };
   const fit = () => {
     if (stage.clientWidth <= MARGIN * 2 || stage.clientHeight <= MARGIN * 2) return;
@@ -857,6 +883,7 @@
         claimed = key;
         send({ type: "resize", cols, rows });
       }
+      revealWhenSized();
     }
     // Until Kaku applies that size, the current grid may be larger than the
     // window; shrink the font just enough for it to fit. A split, smaller
@@ -901,7 +928,12 @@
   setInterval(densityChanged, 2000);
   // Coming back to the page means using it here: claim the tab's size again,
   // in case the Mac took it back meanwhile.
-  const reclaim = () => { if (desktop?.active) return; claimed = ""; fit(); };
+  const reclaim = () => { if (desktop?.active) return; macSized = false; claimed = ""; fit(); };
+  // Typing here after the Mac took the tab back (its own keys or clicks,
+  // the desktop view's among them) claims it again, as a click or coming
+  // back to the page does; otherwise the grid stayed the Mac window's size
+  // until the next click.
+  const takeBack = () => { if (macSized) reclaim(); };
   window.addEventListener("focus", reclaim);
   // A press anywhere on the page means this side is in use, as a click in
   // the Mac window is for the Mac.
@@ -1812,6 +1844,7 @@
     liveWrapped = [];
     tabId = tab.tab_id;
     claimed = "";
+    macSized = false;
     wasSplit = splitView();
     imagePlacements = [];
     imagesEl.textContent = "";
@@ -2366,7 +2399,7 @@
     script.src = "assets/desktop.js";
     script.onload = () => {
       desktop = window.KakuDesktop.init({
-        send, toolsEl, stageEl: document.getElementById("stage"), isMac: IS_MAC, touch: TOUCH, toast, focusTerminal: refocus, terminalKeys: LOCKED_KEYS,
+        send, toolsEl, stageEl: document.getElementById("stage"), isMac: IS_MAC, touch: TOUCH, toast, focusTerminal: () => { refocus(); reclaim(); }, terminalKeys: LOCKED_KEYS,
         beforeEnter: () => {
           stopScrolling();
           closePast();
@@ -2538,12 +2571,14 @@
     document.body.classList.add("drawn");
     if (msg.cols !== size.cols || msg.rows !== size.rows) {
       closePast();
-        size = { cols: msg.cols, rows: msg.rows };
+      size = { cols: msg.cols, rows: msg.rows };
+      macSized = !!claimed && claimed !== msg.cols + "x" + msg.rows && !splitView();
       resizeTerm(msg.cols, msg.rows);
       fit();
       clearPending = true;
       verifySoon();
     }
+    revealWhenSized();
     localScroll = !!msg.local_scroll;
     if (!localScroll) closePast();
     // Autowrap off first: each row is placed by position, so a row that

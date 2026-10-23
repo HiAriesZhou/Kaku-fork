@@ -557,6 +557,63 @@ test('returning to a cached tab attaches before claiming its new size', async t 
   assert.ok(commands.some(m => m.type === 'resize'));
 });
 
+test('a page opened on a Mac-sized tab shows the terminal once its own grid arrives', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 900, height: 560 } });
+  const shown = () => p.evaluate(() => document.body.classList.contains('drawn') && !document.body.classList.contains('sizing'));
+  const frame = (seq, cols, rows) => p.evaluate(([seq, cols, rows]) => probe.handle({ type: 'frame', seq, pane_id: 1, cols, rows, data: '\x1b[1;1Hterminal' }), [seq, cols, rows]);
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }));
+  // The Mac window's grid comes first: parsed, not shown.
+  await frame(1, 200, 50);
+  await p.waitForFunction(() => messages.some(m => m.type === 'resize'));
+  assert.equal(await shown(), false);
+  const claim = await p.evaluate(() => messages.filter(m => m.type === 'resize').at(-1));
+  await frame(2, claim.cols, claim.rows);
+  assert.equal(await shown(), true);
+  assert.ok(await p.evaluate(() => document.querySelector('.xterm-rows').textContent.includes('terminal')));
+});
+
+test('a page whose grid never arrives shows the terminal after a moment', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 900, height: 560 } });
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }));
+  await p.evaluate(() => probe.handle({ type: 'frame', seq: 1, pane_id: 1, cols: 200, rows: 50, data: '\x1b[1;1Hterminal' }));
+  assert.equal(await p.evaluate(() => document.body.classList.contains('drawn') && !document.body.classList.contains('sizing')), false);
+  await p.waitForFunction(() => document.body.classList.contains('drawn') && !document.body.classList.contains('sizing'), null, { timeout: 1500 });
+});
+
+test('typing or leaving the desktop view claims back a tab the Mac took for its own window', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 900, height: 560 } });
+  await screen(p, 'terminal');
+  const claims = () => p.evaluate(() => messages.filter(m => m.type === 'resize').map(m => m.cols + 'x' + m.rows));
+  let seq = 2;
+  const frame = (cols, rows) => p.evaluate(([seq, cols, rows]) => probe.handle({ type: 'frame', seq, pane_id: 1, cols, rows, data: '\x1b[1;1Hterminal' }), [seq++, cols, rows]);
+  // Kaku applies the page's grid.
+  const [cols, rows] = (await claims()).at(-1).split('x').map(Number);
+  await frame(cols, rows);
+  await p.waitForTimeout(150);
+  // Someone uses the Kaku window on the Mac: the tab goes back to its size,
+  // and the page waits, as it does while the Mac is in use.
+  await p.evaluate(() => { messages.length = 0; });
+  await frame(60, 18);
+  await p.waitForTimeout(150);
+  assert.deepEqual(await claims(), []);
+  // The first key typed here claims the page's grid again, once.
+  await p.keyboard.type('ab');
+  assert.deepEqual(await claims(), [cols + 'x' + rows]);
+  await frame(cols, rows);
+  await p.keyboard.type('c');
+  assert.deepEqual(await claims(), [cols + 'x' + rows]);
+
+  // Back from the Mac's screen, where clicking into Kaku took the tab.
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').waitFor();
+  await p.locator('#bar .tool.desktop').click();
+  await frame(60, 18);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.locator('#bar .tool.desktop').click();
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
+  assert.deepEqual(await claims(), [cols + 'x' + rows]);
+});
+
 test('clicking back to a cached tab shows it in the next frame, never blank', async t => {
   const { p } = await page(t);
   await screen(p, 'first');
@@ -1708,6 +1765,8 @@ test('the grid draws with WebGL where the browser has it, and with the DOM other
   assert.equal(await p.locator('.xterm-rows').count(), 0);
   // And it really draws the text: a canvas with only the background passes
   // every buffer check above.
+  // Shown once its own grid arrives, or after a moment.
+  await p.waitForFunction(() => !document.body.classList.contains('sizing'));
   const shot = (await p.locator('.xterm-screen').screenshot()).toString('base64');
   const lit = await p.evaluate(async png => {
     const img = await createImageBitmap(await (await fetch('data:image/png;base64,' + png)).blob());
@@ -1966,6 +2025,8 @@ test('an icon drawn before its font loaded is redrawn once the font is in', asyn
   await p.evaluate(() => document.fonts.load('16px "Kaku Symbols"', '\uf115'));
   await p.waitForFunction(() => [...document.fonts].some(f => f.family.includes('Kaku Symbols') && f.status === 'loaded'));
   await p.waitForTimeout(300);
+  // Shown once its own grid arrives, or after a moment.
+  await p.waitForFunction(() => !document.body.classList.contains('sizing'));
   const box = await p.locator('.xterm-screen').boundingBox();
   const clip = { x: box.x, y: box.y, width: 80, height: 24 };
   const drawn = await p.screenshot({ clip });
@@ -2226,6 +2287,27 @@ test('desktop pictures arrive as binary messages, locally and through the relay'
   assert.deepEqual(relaySeen, ['desktop_frame', 'desktop_status']);
   assert.notEqual(await relayed.p.evaluate(() => connections.at(-1).readyState), 3);
   assert.deepEqual(relayed.errors, []);
+});
+
+test('a locked Mac says so over its picture until it is unlocked', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+  const notice = p.locator('#desktop .locked');
+  const visible = () => notice.evaluate(e => getComputedStyle(e).opacity === '1');
+  assert.equal(await visible(), false);
+  await p.evaluate(() => probe.handle({ type: 'desktop_locked', locked: true }));
+  await p.waitForFunction(() => getComputedStyle(document.querySelector('#desktop .locked')).opacity === '1');
+  assert.match(await notice.textContent(), /locked/);
+  await p.evaluate(() => probe.handle({ type: 'desktop_locked', locked: false }));
+  await p.waitForFunction(() => getComputedStyle(document.querySelector('#desktop .locked')).opacity === '0');
+  // Leaving forgets it; the helper says again when the view opens.
+  await p.evaluate(() => probe.handle({ type: 'desktop_locked', locked: true }));
+  await p.locator('#bar .tool.desktop').click();
+  assert.equal(await p.evaluate(() => document.getElementById('desktop').classList.contains('locked')), false);
+  assert.deepEqual(errors, []);
 });
 
 test('the desktop view takes the Mac\'s pointer shape, its displays and dropped files', async t => {
