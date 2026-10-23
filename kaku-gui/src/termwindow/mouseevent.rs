@@ -110,11 +110,11 @@ fn terminal_context_menu_actions(has_selection: bool) -> Vec<(&'static str, KeyA
         ),
         (
             "Close Pane",
-            KeyAssignment::CloseCurrentPane { confirm: true },
+            KeyAssignment::CloseCurrentPane { confirm: false },
         ),
         (
             "Close Tab",
-            KeyAssignment::CloseCurrentTab { confirm: true },
+            KeyAssignment::CloseCurrentTab { confirm: false },
         ),
     ]);
     actions
@@ -122,7 +122,9 @@ fn terminal_context_menu_actions(has_selection: bool) -> Vec<(&'static str, KeyA
 
 /// Right-click menu for a tab in the tab bar. Closing a tab otherwise needs a
 /// middle button or the keyboard, which pointer-only setups such as touch over
-/// remote desktop do not have.
+/// remote desktop do not have. Picking Close from a context menu (a right
+/// click or a long press) is already a deliberate choice, so the close items
+/// here and in the terminal menu skip the running-process confirmation.
 fn tab_context_menu_actions() -> [(&'static str, KeyAssignment); 3] {
     [
         (
@@ -132,7 +134,7 @@ fn tab_context_menu_actions() -> [(&'static str, KeyAssignment); 3] {
         ("Tab Navigator", KeyAssignment::ShowTabNavigator),
         (
             "Close Tab",
-            KeyAssignment::CloseCurrentTab { confirm: true },
+            KeyAssignment::CloseCurrentTab { confirm: false },
         ),
     ]
 }
@@ -3103,10 +3105,10 @@ mod tests {
     }
 
     #[test]
-    fn context_menus_offer_tab_lifecycle_with_confirmation() {
+    fn context_menus_close_without_a_second_confirmation() {
         use config::keyassignment::SpawnTabDomain;
         let new_tab = KeyAssignment::SpawnTab(SpawnTabDomain::CurrentPaneDomain);
-        let close_tab = KeyAssignment::CloseCurrentTab { confirm: true };
+        let close_tab = KeyAssignment::CloseCurrentTab { confirm: false };
         let terminal = terminal_context_menu_actions(false);
         assert!(terminal.contains(&("New Tab", new_tab.clone())));
         assert!(terminal.contains(&("Close Tab", close_tab.clone())));
@@ -3173,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    fn context_menu_close_uses_confirmation_policy() {
+    fn context_menu_close_pane_skips_confirmation() {
         let close = terminal_context_menu_actions(false)
             .into_iter()
             .find(|(title, _)| *title == "Close Pane")
@@ -3181,7 +3183,7 @@ mod tests {
 
         assert_eq!(
             close,
-            Some(KeyAssignment::CloseCurrentPane { confirm: true })
+            Some(KeyAssignment::CloseCurrentPane { confirm: false })
         );
     }
 
