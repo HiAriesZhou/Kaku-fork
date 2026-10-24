@@ -1219,6 +1219,25 @@ local function is_dangerous_command(command)
       return true
     end
   end
+
+  -- Quitting or killing apps anywhere in the line: a fix once quit Stash (the
+  -- proxy) and Kaku itself, the terminal running the command, in one Enter.
+  if lower:find("osascript", 1, true) and lower:find("%f[%w]quit%f[%W]") then
+    return true
+  end
+  local process_patterns = {
+    "%f[%w]killall%f[%W]",
+    "%f[%w]pkill%f[%W]",
+    "%f[%w]kill%f[%W]",
+    "%f[%w]launchctl%s+bootout%f[%W]",
+    "%f[%w]launchctl%s+unload%f[%W]",
+    "%f[%w]launchctl%s+kill%f[%W]",
+  }
+  for _, pattern in ipairs(process_patterns) do
+    if lower:find(pattern) then
+      return true
+    end
+  end
   return false
 end
 

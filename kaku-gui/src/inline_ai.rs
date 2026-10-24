@@ -280,6 +280,46 @@ mod tests {
     }
 
     #[test]
+    fn fixes_that_quit_or_kill_apps_are_pasted_not_run() {
+        use config::lua::mlua::{Function, Lua};
+        let script = format!(
+            "{}\n{}\nreturn is_dangerous_command",
+            bundled_lua_section(
+                "local function trim_surrounding_whitespace",
+                "local function strip_wrapping_quotes"
+            ),
+            bundled_lua_section(
+                "local function is_dangerous_command",
+                "\n-- Detect AI-generated commands"
+            ),
+        );
+        let lua = Lua::new();
+        let dangerous: Function = lua.load(&script).eval().unwrap();
+        // The suggestion that quit the proxy and Kaku itself after `mo slim`.
+        for command in [
+            "osascript -e 'tell application \"Stash\" to quit' -e 'tell application \"Kaku\" to quit'; mo slim",
+            "killall Stash",
+            "pkill -f helium && mo slim",
+            "kill -9 4242",
+            "sudo kill 4242",
+            "launchctl bootout gui/501/com.example.agent",
+            "rm -rf build",
+        ] {
+            assert!(dangerous.call::<_, bool>(command).unwrap(), "{}", command);
+        }
+        for command in [
+            "mo slim",
+            "npm install",
+            "git pull --rebase",
+            "open -a Stash",
+            "echo skilled killer",
+            "osascript -e 'display notification \"done\"'",
+        ] {
+            assert!(!dangerous.call::<_, bool>(command).unwrap(), "{}", command);
+        }
+    }
+
+    #[test]
     fn inline_details_preserve_commands() {
         use config::lua::mlua::Lua;
         let script = format!(
