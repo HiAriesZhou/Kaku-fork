@@ -121,7 +121,7 @@ Big thanks to all contributors who helped build Kaku. Go follow them! ❤️
 
 These lovely people already did 🐱
 
-<a href="https://cats.tw93.fun?name=Kaku"><img src="https://cdn.jsdelivr.net/gh/tw93/sponsors@main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
+<a href="https://cats.tw93.fun?name=Kaku"><img src="https://raw.githubusercontent.com/tw93/sponsors/main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
 
 ## License
 

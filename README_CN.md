@@ -121,7 +121,7 @@ WezTerm 很稳，也很好折腾，我很感谢它的引擎和生态，于是在
 
 这些可爱的小伙伴已经投喂过了 🐱
 
-<a href="https://cats.tw93.fun?name=Kaku"><img src="https://cdn.jsdelivr.net/gh/tw93/sponsors@main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
+<a href="https://cats.tw93.fun?name=Kaku"><img src="https://raw.githubusercontent.com/tw93/sponsors/main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
 
 ## 协议
 

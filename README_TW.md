@@ -121,7 +121,7 @@ WezTerm 很穩，也很好改，我很感謝它的引擎和生態，於是在它
 
 已經請客的好心人 🐱
 
-<a href="https://cats.tw93.fun?name=Kaku"><img src="https://cdn.jsdelivr.net/gh/tw93/sponsors@main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
+<a href="https://cats.tw93.fun?name=Kaku"><img src="https://raw.githubusercontent.com/tw93/sponsors/main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
 
 ## 授權
 

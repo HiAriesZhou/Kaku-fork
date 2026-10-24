@@ -121,7 +121,7 @@ Vielen Dank an alle Mitwirkenden, die Kaku mitgestaltet haben. Folge ihnen gern!
 
 Unterstützer 🐱
 
-<a href="https://cats.tw93.fun?name=Kaku"><img src="https://cdn.jsdelivr.net/gh/tw93/sponsors@main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
+<a href="https://cats.tw93.fun?name=Kaku"><img src="https://raw.githubusercontent.com/tw93/sponsors/main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
 
 ## Lizenz
 
