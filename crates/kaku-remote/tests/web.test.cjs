@@ -63,6 +63,13 @@ async function page(t, hash = '#t=fixture', options = {}, context = browser) {
   if (!noConfig) await p.evaluate(() => { if (!window.probe) return; probe.handle({ type: 'config' }); return document.fonts.load('16px "Kaku Mono"'); });
   return { p, errors };
 }
+// The terminal fades in (#term's opacity transition) once its own grid
+// arrives, or after a moment; a screenshot taken during the fade catches it
+// half drawn, which on CI's slower runner failed the icon redraw check.
+async function fadedIn(p) {
+  await p.waitForFunction(() => !document.body.classList.contains('sizing')
+    && getComputedStyle(document.getElementById('term')).opacity === '1');
+}
 async function screen(p, text = 'Password: ', pane = 1) {
   await p.evaluate(({ text, pane }) => {
     probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }, { tab_id: 2, pane_id: 2, panes: [], title: 'two' }] });
@@ -1765,8 +1772,7 @@ test('the grid draws with WebGL where the browser has it, and with the DOM other
   assert.equal(await p.locator('.xterm-rows').count(), 0);
   // And it really draws the text: a canvas with only the background passes
   // every buffer check above.
-  // Shown once its own grid arrives, or after a moment.
-  await p.waitForFunction(() => !document.body.classList.contains('sizing'));
+  await fadedIn(p);
   const shot = (await p.locator('.xterm-screen').screenshot()).toString('base64');
   const lit = await p.evaluate(async png => {
     const img = await createImageBitmap(await (await fetch('data:image/png;base64,' + png)).blob());
@@ -2025,8 +2031,7 @@ test('an icon drawn before its font loaded is redrawn once the font is in', asyn
   await p.evaluate(() => document.fonts.load('16px "Kaku Symbols"', '\uf115'));
   await p.waitForFunction(() => [...document.fonts].some(f => f.family.includes('Kaku Symbols') && f.status === 'loaded'));
   await p.waitForTimeout(300);
-  // Shown once its own grid arrives, or after a moment.
-  await p.waitForFunction(() => !document.body.classList.contains('sizing'));
+  await fadedIn(p);
   const box = await p.locator('.xterm-screen').boundingBox();
   const clip = { x: box.x, y: box.y, width: 80, height: 24 };
   const drawn = await p.screenshot({ clip });
