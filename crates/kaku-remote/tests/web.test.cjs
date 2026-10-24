@@ -59,8 +59,18 @@ async function page(t, hash = '#t=fixture', options = {}, context = browser) {
   await p.goto('http://localhost:9988/' + hash);
   await p.waitForTimeout(100);
   // Kaku sends its config first on every session; the page claims no size
-  // before it and the bundled font are in.
-  if (!noConfig) await p.evaluate(() => { if (!window.probe) return; probe.handle({ type: 'config' }); return document.fonts.load('16px "Kaku Mono"'); });
+  // before it and the bundled font are in. It comes through the socket, as
+  // from Kaku, so the page counts itself connected: handled directly, the
+  // "Connecting to Kaku" notice still showed 400 ms in on CI's slower runner
+  // and kept the notice a test checks from showing. A relay page only takes
+  // sealed messages, so it is handed the config directly.
+  if (!noConfig) await p.evaluate(direct => {
+    if (!window.probe) return;
+    const socket = connections.at(-1);
+    if (direct && socket) socket.onmessage({ data: '{"type":"config"}' });
+    else probe.handle({ type: 'config' });
+    return document.fonts.load('16px "Kaku Mono"');
+  }, hash.startsWith('#t='));
   return { p, errors };
 }
 // The terminal fades in (#term's opacity transition) once its own grid
