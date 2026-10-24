@@ -255,12 +255,7 @@ pub fn ai_chat_overlay(
                     || app.pending_approval.is_some()
                     || matches!(app.model_fetch, ModelFetch::Loading))
                     && app.try_advance_spinner();
-                if app.pending_approval.is_none()
-                    && (app.is_streaming
-                        || !app.grapheme_queue.is_empty()
-                        || app.stream_pending_done
-                        || spinner_changed)
-                {
+                if redraw_after_poll_timeout(spinner_changed, app.pending_approval.is_some()) {
                     needs_redraw = true;
                 }
             }
@@ -276,6 +271,13 @@ pub fn ai_chat_overlay(
     crate::ai_tools::cleanup_spill_files();
 
     Ok(())
+}
+
+/// A poll timeout only changes the chat screen when its visible spinner frame
+/// changed. Stream tokens and completion state are drained before polling and
+/// already request their own redraws.
+fn redraw_after_poll_timeout(spinner_changed: bool, approval_pending: bool) -> bool {
+    spinner_changed && !approval_pending
 }
 
 fn drain_palette_updates(

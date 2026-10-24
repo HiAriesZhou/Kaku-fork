@@ -967,6 +967,13 @@ mod interaction_tests {
     }
 
     #[test]
+    fn poll_timeout_redraws_only_for_a_changed_visible_spinner() {
+        assert!(!redraw_after_poll_timeout(false, false));
+        assert!(redraw_after_poll_timeout(true, false));
+        assert!(!redraw_after_poll_timeout(true, true));
+    }
+
+    #[test]
     fn reading_position_stays_fixed_when_stream_appends_lines() {
         let mut app = app();
         app.messages.push(Message::text(
