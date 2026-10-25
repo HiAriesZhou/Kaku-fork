@@ -46,6 +46,7 @@ use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
 use mux::pane::{
     CachePolicy, CloseReason, Pane, PaneId, Pattern as MuxPattern, PerformAssignmentResult,
+    WithPaneLines,
 };
 use mux::renderable::RenderableDimensions;
 use mux::tab::{
@@ -67,7 +68,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
-use termwiz::surface::SequenceNo;
+use termwiz::surface::{Line, SequenceNo};
 use wezterm_dynamic::Value;
 use wezterm_font::units::PixelLength;
 use wezterm_font::FontConfiguration;
@@ -1101,6 +1102,9 @@ pub struct TermWindow {
 
     /// The URL over which we are currently hovering
     current_highlight: Option<Arc<Hyperlink>>,
+    /// The hovered token last checked for a TUI-wrapped link, so the check
+    /// runs once per token rather than on every mouse move.
+    wrapped_link_probe: Option<(PaneId, StableRowIndex, SequenceNo, usize)>,
 
     quad_generation: usize,
     shape_generation: usize,
@@ -1800,6 +1804,7 @@ impl TermWindow {
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
             current_highlight: None,
+            wrapped_link_probe: None,
             quad_generation: 0,
             shape_generation: 0,
             shape_cache: RefCell::new(LfuCache::new(
@@ -5488,34 +5493,14 @@ impl TermWindow {
         // perform below; here we allow the user to define an `open-uri` event
         // handler that can bypass the normal `open_url` functionality.
         if let Some(link) = self.current_highlight.as_ref().cloned() {
-            let mut uri = link.uri().to_string();
+            let uri = link.uri().to_string();
             let is_file_uri = uri.starts_with("file://");
             let is_explicit_file_link = is_file_uri && !link.is_implicit();
-            let mut resolved_target = if is_file_uri {
+            let resolved_target = if is_file_uri {
                 self.resolve_file_path(pane, &uri)
             } else {
                 None
             };
-            if is_file_uri && link.is_implicit() {
-                // A path the TUI hard-wrapped scans as two fragments; a
-                // fragment that is an existing directory (the break fell
-                // after a `/`) may still be the head of a longer path.
-                let fragment = resolved_target.as_ref().map(|target| &target.path);
-                let retry = match fragment {
-                    Some(path) if path.is_dir() => Some(true),
-                    Some(path) if path.exists() => None,
-                    _ => Some(false),
-                };
-                if let Some(require_edge) = retry {
-                    if let Some((joined, target)) =
-                        self.rejoin_wrapped_file_link(pane, require_edge)
-                    {
-                        log::info!("Rejoined wrapped file link {uri} as {joined}");
-                        uri = joined;
-                        resolved_target = Some(target);
-                    }
-                }
-            }
             let file_link_editor = self.config.file_link_editor.clone();
 
             let window = GuiWin::new(self);
@@ -5597,25 +5582,75 @@ impl TermWindow {
         }
     }
 
-    /// Find the full path when the clicked file link is one fragment of a
-    /// path that a TUI wrapped with a real newline. Only a joined path that
-    /// exists is returned, so unrelated rows cannot produce a target.
-    fn rejoin_wrapped_file_link(
-        &self,
+    /// When the hovered token is one fragment of a link that a TUI wrapped
+    /// with a real newline, give every fragment the joined link so hover,
+    /// underline and click all see one target. A file path is joined only
+    /// when the joined path exists; a URL only on the alternate screen and
+    /// across rows that the URL fills to the last column.
+    pub(super) fn rejoin_wrapped_link(
+        &mut self,
         pane: &Arc<dyn Pane>,
-        require_edge: bool,
-    ) -> Option<(String, FileLinkTarget)> {
-        let (position, stable_row) = self
-            .pane_state(pane.pane_id())
-            .mouse_terminal_coords
-            .clone()?;
+        stable_row: StableRowIndex,
+        column: usize,
+    ) {
         let span = wrapped_link::MAX_SPAN as StableRowIndex;
         let (top, lines) = pane.get_lines(stable_row - span..stable_row + span + 1);
-        let click_row = Some(stable_row - top)
-            .filter(|&row| row >= 0 && (row as usize) < lines.len())?
-            as usize;
-        let click_byte = wrapped_link::byte_offset_of_column(&lines[click_row], position.column)?;
+        let hover_row = stable_row - top;
+        if hover_row < 0 || hover_row as usize >= lines.len() {
+            return;
+        }
+        let hover_row = hover_row as usize;
+        let line = &lines[hover_row];
+        let Some(hover_byte) = wrapped_link::byte_offset_of_column(line, column) else {
+            return;
+        };
+        let text = line.as_str();
+        let (Some(before), Some(after)) = (text.get(..hover_byte), text.get(hover_byte..)) else {
+            return;
+        };
+        let token_start = before
+            .char_indices()
+            .rfind(|(_, c)| c.is_whitespace())
+            .map(|(idx, c)| idx + c.len_utf8())
+            .unwrap_or(0);
+        let probe = (
+            pane.pane_id(),
+            stable_row,
+            line.current_seqno(),
+            token_start,
+        );
+        if self.wrapped_link_probe == Some(probe) {
+            return;
+        }
+        self.wrapped_link_probe = Some(probe);
+
+        // Only the first or last token of a row can continue on another row.
+        let token_end = after
+            .find(char::is_whitespace)
+            .map_or(text.len(), |idx| hover_byte + idx);
+        if token_end == hover_byte
+            || (!before[..token_start].trim().is_empty() && !text[token_end..].trim().is_empty())
+        {
+            return;
+        }
+        let hovered = line
+            .get_cell(column)
+            .and_then(|cell| cell.attrs().hyperlink().cloned());
+        let require_edge = match &hovered {
+            Some(link) if !link.is_implicit() => return,
+            Some(link) if link.uri().starts_with("file://") => {
+                match self.resolve_file_path(pane, link.uri()) {
+                    // The break fell after a `/` of a longer path.
+                    Some(target) if target.path.is_dir() => true,
+                    Some(target) if target.path.exists() => return,
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+
         let cols = pane.get_dimensions().cols;
+        let alt_screen = pane.is_alt_screen_active();
         let texts: Vec<String> = lines
             .iter()
             .map(|line| line.as_str().into_owned())
@@ -5625,19 +5660,66 @@ impl TermWindow {
             .zip(&texts)
             .map(|(line, text)| wrapped_link::LinkRow::new(line, text, cols))
             .collect();
-        wrapped_link::rejoined_file_links(
+        let Some(rejoined) = wrapped_link::rejoined_links(
             &rows,
-            click_row,
-            click_byte,
+            hover_row,
+            hover_byte,
             &self.config.hyperlink_rules,
             require_edge,
         )
         .into_iter()
-        .find_map(|link| {
-            let uri = link.uri().to_string();
-            let target = self.resolve_file_path(pane, &uri)?;
-            target.path.exists().then_some((uri, target))
-        })
+        .find(|rejoined| {
+            if rejoined.is_file() {
+                self.resolve_file_path(pane, rejoined.link.uri())
+                    .is_some_and(|target| target.path.exists())
+            } else {
+                alt_screen && wrapped_link::breaks_at_full_width(&rows, rejoined)
+            }
+        }) else {
+            return;
+        };
+        log::debug!("Rejoined wrapped link {}", rejoined.link.uri());
+
+        struct ApplyRejoined<'a> {
+            top: StableRowIndex,
+            texts: &'a [String],
+            rejoined: &'a wrapped_link::Rejoined,
+        }
+        impl WithPaneLines for ApplyRejoined<'_> {
+            fn with_lines_mut(&mut self, stable_top: StableRowIndex, lines: &mut [&mut Line]) {
+                for (row, bytes) in &self.rejoined.segments {
+                    let idx = self.top + *row as StableRowIndex - stable_top;
+                    if idx < 0 || idx as usize >= lines.len() {
+                        continue;
+                    }
+                    let line = &mut lines[idx as usize];
+                    // The rows were read a moment ago; skip one that changed.
+                    if line.as_str() != self.texts[*row] {
+                        continue;
+                    }
+                    let targets = wrapped_link::cells_in_byte_range(line, bytes);
+                    let cells = line.cells_mut_for_attr_changes_only();
+                    for idx in targets {
+                        if let Some(cell) = cells.get_mut(idx) {
+                            let attrs = cell.attrs_mut();
+                            if attrs.hyperlink().map_or(true, |link| link.is_implicit()) {
+                                attrs.set_hyperlink(Some(Arc::clone(&self.rejoined.link)));
+                            }
+                        }
+                    }
+                    line.clear_appdata();
+                }
+            }
+        }
+        let end = top + lines.len() as StableRowIndex;
+        pane.with_lines_mut(
+            top..end,
+            &mut ApplyRejoined {
+                top,
+                texts: &texts,
+                rejoined: &rejoined,
+            },
+        );
     }
 
     fn resolve_file_path(&self, pane: &Arc<dyn Pane>, uri: &str) -> Option<FileLinkTarget> {
