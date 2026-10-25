@@ -1105,6 +1105,9 @@ pub struct TermWindow {
     /// The hovered token last checked for a TUI-wrapped link, so the check
     /// runs once per token rather than on every mouse move.
     wrapped_link_probe: Option<(PaneId, StableRowIndex, SequenceNo, usize)>,
+    /// Pane that last received the IME caret, so input tools that track the
+    /// focused accessibility element hear about pane and tab switches.
+    text_input_pane: Option<PaneId>,
 
     quad_generation: usize,
     shape_generation: usize,
@@ -1805,6 +1808,7 @@ impl TermWindow {
             pane_state: RefCell::new(HashMap::new()),
             current_highlight: None,
             wrapped_link_probe: None,
+            text_input_pane: None,
             quad_generation: 0,
             shape_generation: 0,
             shape_cache: RefCell::new(LfuCache::new(
@@ -3974,6 +3978,10 @@ impl TermWindow {
                 self.render_metrics.cell_size,
             );
             win.set_text_cursor_position(r);
+            let pane_id = pos.pane.pane_id();
+            if self.text_input_pane.replace(pane_id) != Some(pane_id) {
+                win.notify_text_input_target_changed();
+            }
         }
     }
 

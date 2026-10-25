@@ -89,6 +89,12 @@ const NS_WINDOW_COLLECTION_BEHAVIOR_FULLSCREEN_DISALLOWS_TILING_BITS: NSUInteger
 const AX_ROLE_TEXT_AREA: &[u8] = b"AXTextArea\0";
 const AX_ROLE_DESCRIPTION_TERMINAL_TEXT_AREA: &[u8] = b"terminal text area\0";
 
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {
+    fn NSAccessibilityPostNotification(element: id, notification: id);
+    static NSAccessibilityFocusedUIElementChangedNotification: id;
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGSMainConnectionID() -> id;
@@ -2244,6 +2250,13 @@ impl WindowOps for Window {
     fn set_text_cursor_position(&self, cursor: Rect) {
         Connection::with_window_inner(self.id, move |inner| {
             inner.set_text_cursor_position(cursor);
+            Ok(())
+        });
+    }
+
+    fn notify_text_input_target_changed(&self) {
+        Connection::with_window_inner(self.id, move |inner| {
+            WindowView::post_focused_element_changed(*inner.view);
             Ok(())
         });
     }
@@ -6061,6 +6074,25 @@ mod tests {
     }
 
     #[test]
+    fn text_area_view_exposes_a_caret_and_reports_focus_moves() {
+        let source = include_str!("window.rs");
+        let class = production_method(source, "fn define_class() -> &'static Class {");
+        // Input tools such as WeType read these from the focused AXTextArea.
+        for selector in [
+            "sel!(accessibilityValue)",
+            "sel!(accessibilityNumberOfCharacters)",
+            "sel!(accessibilitySelectedTextRange)",
+            "sel!(accessibilityFrameForRange:)",
+        ] {
+            assert!(class.contains(selector), "{selector} is not registered");
+        }
+        let become_key = production_method(source, "extern \"C\" fn did_become_key(");
+        assert!(become_key.contains("post_focused_element_changed("));
+        let pane_switch = production_method(source, "fn notify_text_input_target_changed(&self)");
+        assert!(pane_switch.contains("post_focused_element_changed("));
+    }
+
+    #[test]
     fn boundary_ordinary_move_updates_fill_cache_before_topology_observer() {
         let source = production_method(include_str!("window.rs"), "extern \"C\" fn did_move(");
         assert!(source.contains("refresh_windowed_screen_state("));
@@ -7954,17 +7986,22 @@ impl WindowView {
             range,
             actual
         );
-        let window: id = unsafe { msg_send![this, window] };
-        let frame = unsafe { NSWindow::frame(window) };
-        let content: NSRect = unsafe { msg_send![window, contentRectForFrameRect: frame] };
-        let backing_frame: NSRect = unsafe { msg_send![this, convertRectToBacking: frame] };
-        let scale = frame.size.width / backing_frame.size.width;
-
         if !actual.0.is_null() {
             unsafe {
                 *actual.0 = range;
             }
         }
+        Self::caret_screen_rect(this)
+    }
+
+    /// The terminal cursor cell in screen coordinates, shared by the input
+    /// method (firstRectForCharacterRange) and accessibility clients.
+    fn caret_screen_rect(this: &Object) -> NSRect {
+        let window: id = unsafe { msg_send![this, window] };
+        let frame = unsafe { NSWindow::frame(window) };
+        let content: NSRect = unsafe { msg_send![window, contentRectForFrameRect: frame] };
+        let backing_frame: NSRect = unsafe { msg_send![this, convertRectToBacking: frame] };
+        let scale = frame.size.width / backing_frame.size.width;
 
         if let Some(this) = Self::get_this(this) {
             let cursor_pos = this
@@ -8102,10 +8139,12 @@ impl WindowView {
     }
 
     extern "C" fn did_become_key(this: &mut Object, _sel: Sel, _id: id) {
+        let view = this as *mut Object as id;
         if let Some(this) = Self::get_this(this) {
             this.dispatch_event(WindowEvent::FocusChanged(true));
             this.update_application_presentation(true);
         }
+        Self::post_focused_element_changed(view);
     }
 
     extern "C" fn did_resign_key(this: &mut Object, _sel: Sel, _id: id) {
@@ -8202,6 +8241,66 @@ impl WindowView {
                 class!(NSString),
                 stringWithUTF8String: AX_ROLE_DESCRIPTION_TERMINAL_TEXT_AREA.as_ptr()
             ]
+        }
+    }
+
+    // A text area must also say where its insertion point is. Without these,
+    // WeType and other input tools that read AXSelectedTextRange and
+    // AXNumberOfCharacters of the focused element find no text target in a
+    // view that only claims to be a text area. The values mirror the
+    // NSTextInputClient side: an empty document with the caret at 0, located
+    // at the terminal cursor. Terminal contents are deliberately not exposed.
+    extern "C" fn accessibility_value(_this: &Object, _sel: Sel) -> id {
+        log::trace!("ax: accessibilityValue");
+        nsstring("").autorelease()
+    }
+
+    extern "C" fn accessibility_selected_text(_this: &Object, _sel: Sel) -> id {
+        log::trace!("ax: accessibilitySelectedText");
+        nsstring("").autorelease()
+    }
+
+    extern "C" fn accessibility_number_of_characters(_this: &Object, _sel: Sel) -> NSInteger {
+        log::trace!("ax: accessibilityNumberOfCharacters");
+        0
+    }
+
+    extern "C" fn accessibility_selected_text_range(_this: &Object, _sel: Sel) -> NSRange {
+        log::trace!("ax: accessibilitySelectedTextRange");
+        NSRange::new(0, 0)
+    }
+
+    extern "C" fn accessibility_visible_character_range(_this: &Object, _sel: Sel) -> NSRange {
+        NSRange::new(0, 0)
+    }
+
+    extern "C" fn accessibility_insertion_point_line_number(
+        _this: &Object,
+        _sel: Sel,
+    ) -> NSInteger {
+        0
+    }
+
+    extern "C" fn accessibility_frame_for_range(this: &Object, _sel: Sel, range: NSRange) -> NSRect {
+        let rect = Self::caret_screen_rect(this);
+        log::trace!(
+            "ax: accessibilityFrameForRange {:?} -> ({}, {}) {}x{}",
+            range,
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height
+        );
+        rect
+    }
+
+    /// Tell accessibility clients to read the focused element again. Input
+    /// tools cache it and only refresh on this notification, which AppKit
+    /// does not send when Kaku switches the pane behind the same view.
+    fn post_focused_element_changed(view: id) {
+        log::trace!("ax: post AXFocusedUIElementChanged");
+        unsafe {
+            NSAccessibilityPostNotification(view, NSAccessibilityFocusedUIElementChangedNotification);
         }
     }
 
@@ -10205,6 +10304,36 @@ impl WindowView {
             cls.add_method(
                 sel!(accessibilityRoleDescription),
                 Self::accessibility_role_description as extern "C" fn(&Object, Sel) -> id,
+            );
+            cls.add_method(
+                sel!(accessibilityValue),
+                Self::accessibility_value as extern "C" fn(&Object, Sel) -> id,
+            );
+            cls.add_method(
+                sel!(accessibilitySelectedText),
+                Self::accessibility_selected_text as extern "C" fn(&Object, Sel) -> id,
+            );
+            cls.add_method(
+                sel!(accessibilityNumberOfCharacters),
+                Self::accessibility_number_of_characters as extern "C" fn(&Object, Sel) -> NSInteger,
+            );
+            cls.add_method(
+                sel!(accessibilitySelectedTextRange),
+                Self::accessibility_selected_text_range as extern "C" fn(&Object, Sel) -> NSRange,
+            );
+            cls.add_method(
+                sel!(accessibilityVisibleCharacterRange),
+                Self::accessibility_visible_character_range
+                    as extern "C" fn(&Object, Sel) -> NSRange,
+            );
+            cls.add_method(
+                sel!(accessibilityInsertionPointLineNumber),
+                Self::accessibility_insertion_point_line_number
+                    as extern "C" fn(&Object, Sel) -> NSInteger,
+            );
+            cls.add_method(
+                sel!(accessibilityFrameForRange:),
+                Self::accessibility_frame_for_range as extern "C" fn(&Object, Sel, NSRange) -> NSRect,
             );
         }
 
