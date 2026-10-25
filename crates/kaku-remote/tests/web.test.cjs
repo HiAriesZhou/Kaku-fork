@@ -136,6 +136,8 @@ async function handshake(p, signer, { admit = true, secret = null, tag = secret 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     const unb64 = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    // The page connects once it has read its device store and keys.
+    while (!connections.length) await sleep(5);
     const socket = connections.at(-1);
     const sent = () => socket.binary?.length || 0;
     const eph = await sub.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
@@ -213,6 +215,9 @@ const storedDevice = p => p.evaluate(() => new Promise(resolve => {
 test('incomplete, old or missing pairing fails visibly without throwing', async t => {
   for (const [hash, message] of [['#p=bad&m=YQ', /incomplete/], ['#k=' + Buffer.alloc(32, 1).toString('base64url'), /earlier Kaku/], ['', /Pair this browser first/]]) {
     const { p, errors } = await page(t, hash);
+    // Shown once the device store has been read, which a slow runner took
+    // past the fixture's first 100 ms.
+    await p.locator('#stage', { hasText: message }).waitFor();
     assert.match(await p.locator('#stage').innerText(), message);
     assert.equal(await p.evaluate(() => location.hash), '');
     assert.equal(await p.evaluate(() => connections.length), 0);
@@ -234,11 +239,14 @@ test('a pairing link proves itself once and the device signs in afterwards', asy
   assert.equal(first.signed, true);
   assert.equal(first.paired, true);
   assert.match(first.proof.name, /on /);
+  // Said once the device is saved, after the Mac's admission.
+  await p.locator('#toast', { hasText: /Paired/ }).waitFor({ state: 'attached' });
   assert.match(await p.locator('#toast').innerText(), /Paired/);
   const kept = await storedDevice(p);
   assert.ok(kept);
   // Back later with no link: the same device signs in, with no pairing proof.
   const next = await page(t, '', {}, context);
+  await next.p.waitForFunction(() => connections.length > 0);
   assert.equal(await next.p.evaluate(() => connections.length), 1);
   const again = await handshake(next.p, mac);
   assert.equal(again.proof.type, 'auth');
@@ -370,9 +378,12 @@ test('a paired device survives closing and relaunching the browser process', asy
   const secret = Buffer.alloc(16, 8);
   const first = await page(t, pairingLink(mac, secret), {}, context);
   await handshake(first.p, mac, { secret });
+  // Closed before the device is saved, the browser would come back unpaired.
+  await first.p.locator('#toast', { hasText: /Paired/ }).waitFor({ state: 'attached' });
   await context.close();
   context = await chromium.launchPersistentContext(profile, options);
   const next = await page(t, '', {}, context);
+  await next.p.waitForFunction(() => connections.length > 0);
   assert.equal(await next.p.evaluate(() => connections.length), 1);
   assert.equal((await handshake(next.p, mac)).proof.type, 'auth');
   assert.deepEqual(next.errors, []);
@@ -2181,7 +2192,14 @@ const showPicture = (p, seq = 1, inputSeq, streamId) => p.evaluate(async ({ seq,
     };
   }
   probe.handle({ type: 'desktop_frame', seq, input_seq: inputSeq, stream_id: streamId, key: true, codec: 'avc1.640028', desc: 'AAAA', data: 'AAAA' });
-  await new Promise(r => setTimeout(r, 30));
+  // Drawn, and acked, once the decoder hands it back; a touch screen then
+  // frames its first picture and sends the pointer there on the next
+  // animation frame. On a slow runner both came after a test had cleared
+  // its messages, or before it read the pointer. A frame the page drops is
+  // never acked, so the wait is bounded.
+  const t1 = performance.now();
+  while (!messages.some(m => m.type === 'desktop_ack' && m.seq === seq) && performance.now() - t1 < 500) await new Promise(r => setTimeout(r, 10));
+  for (let i = 0; i < 2; i++) await new Promise(r => requestAnimationFrame(r));
 }, { seq, inputSeq, streamId });
 
 test('desktop stream IDs reject old frames and recover a frame that overtakes status', async t => {
