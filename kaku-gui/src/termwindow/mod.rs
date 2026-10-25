@@ -93,6 +93,7 @@ pub mod spawn;
 pub mod tab_rename;
 mod touch;
 pub mod webgpu;
+mod wrapped_link;
 
 fn window_configuration(window_state: WindowState, overrides: &Value) -> ConfigHandle {
     let result = if window_state.contains(WindowState::HOTKEY_WINDOW) {
@@ -5487,14 +5488,34 @@ impl TermWindow {
         // perform below; here we allow the user to define an `open-uri` event
         // handler that can bypass the normal `open_url` functionality.
         if let Some(link) = self.current_highlight.as_ref().cloned() {
-            let uri = link.uri().to_string();
+            let mut uri = link.uri().to_string();
             let is_file_uri = uri.starts_with("file://");
             let is_explicit_file_link = is_file_uri && !link.is_implicit();
-            let resolved_target = if is_file_uri {
+            let mut resolved_target = if is_file_uri {
                 self.resolve_file_path(pane, &uri)
             } else {
                 None
             };
+            if is_file_uri && link.is_implicit() {
+                // A path the TUI hard-wrapped scans as two fragments; a
+                // fragment that is an existing directory (the break fell
+                // after a `/`) may still be the head of a longer path.
+                let fragment = resolved_target.as_ref().map(|target| &target.path);
+                let retry = match fragment {
+                    Some(path) if path.is_dir() => Some(true),
+                    Some(path) if path.exists() => None,
+                    _ => Some(false),
+                };
+                if let Some(require_edge) = retry {
+                    if let Some((joined, target)) =
+                        self.rejoin_wrapped_file_link(pane, require_edge)
+                    {
+                        log::info!("Rejoined wrapped file link {uri} as {joined}");
+                        uri = joined;
+                        resolved_target = Some(target);
+                    }
+                }
+            }
             let file_link_editor = self.config.file_link_editor.clone();
 
             let window = GuiWin::new(self);
@@ -5574,6 +5595,49 @@ impl TermWindow {
             }))
             .detach();
         }
+    }
+
+    /// Find the full path when the clicked file link is one fragment of a
+    /// path that a TUI wrapped with a real newline. Only a joined path that
+    /// exists is returned, so unrelated rows cannot produce a target.
+    fn rejoin_wrapped_file_link(
+        &self,
+        pane: &Arc<dyn Pane>,
+        require_edge: bool,
+    ) -> Option<(String, FileLinkTarget)> {
+        let (position, stable_row) = self
+            .pane_state(pane.pane_id())
+            .mouse_terminal_coords
+            .clone()?;
+        let span = wrapped_link::MAX_SPAN as StableRowIndex;
+        let (top, lines) = pane.get_lines(stable_row - span..stable_row + span + 1);
+        let click_row = Some(stable_row - top)
+            .filter(|&row| row >= 0 && (row as usize) < lines.len())?
+            as usize;
+        let click_byte = wrapped_link::byte_offset_of_column(&lines[click_row], position.column)?;
+        let cols = pane.get_dimensions().cols;
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|line| line.as_str().into_owned())
+            .collect();
+        let rows: Vec<wrapped_link::LinkRow> = lines
+            .iter()
+            .zip(&texts)
+            .map(|(line, text)| wrapped_link::LinkRow::new(line, text, cols))
+            .collect();
+        wrapped_link::rejoined_file_links(
+            &rows,
+            click_row,
+            click_byte,
+            &self.config.hyperlink_rules,
+            require_edge,
+        )
+        .into_iter()
+        .find_map(|link| {
+            let uri = link.uri().to_string();
+            let target = self.resolve_file_path(pane, &uri)?;
+            target.path.exists().then_some((uri, target))
+        })
     }
 
     fn resolve_file_path(&self, pane: &Arc<dyn Pane>, uri: &str) -> Option<FileLinkTarget> {
