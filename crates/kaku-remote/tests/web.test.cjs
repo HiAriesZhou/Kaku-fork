@@ -1701,6 +1701,34 @@ test('switching tabs never shows a frame of wrong letters while WebGL merges gly
     // is compared only if the redraw shows the same rows.
     const rowsNow = () => { const b = probe.term.buffer.active; let s = ''; for (let y = 0; y < probe.term.rows; y++) s += b.getLine(b.viewportY + y)?.translateToString(true) + '\n'; return s; };
     probe.webgl.onRemoveTextureAtlasCanvas(() => { merges++; merged = true; });
+    // A texture slot left holding another page's glyphs draws them wrong in
+    // every frame alike, which comparing two frames cannot see: read each
+    // slot the addon counts as uploaded back and compare it with its page.
+    const renderer = () => probe.term._core._renderService._renderer.value;
+    const staleSlots = () => {
+      const glyphs = renderer()._glyphRenderer.value, gl = glyphs._gl, atlas = renderer()._charAtlas;
+      const before = gl.getParameter(gl.FRAMEBUFFER_BINDING), fb = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      const stale = [];
+      let compared = 0;
+      atlas.pages.forEach((page, i) => {
+        const slot = glyphs._atlasTextures[i];
+        if (!slot || slot.version !== page.version) return;
+        compared++;
+        const { width: w, height: h } = page.canvas;
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, slot.texture, 0);
+        const read = new Uint8Array(w * h * 4);
+        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, read);
+        const drawn = page.ctx.getImageData(0, 0, w, h).data;
+        // Alpha alone: it is the same either side of premultiplying.
+        let a = 0, b = 0;
+        for (let k = 3; k < read.length; k += 4) { a += read[k]; b += drawn[k]; }
+        if (a !== b) stale.push(i);
+      });
+      gl.bindFramebuffer(gl.FRAMEBUFFER, before);
+      gl.deleteFramebuffer(fb);
+      return { stale, compared };
+    };
     // Registered after the page's own listener, so it sees what the frame shows.
     probe.term.onRender(() => {
       if (pending !== null) {
@@ -1727,11 +1755,16 @@ test('switching tabs never shows a frame of wrong letters while WebGL merges gly
       // redraw, it read as wrong letters in a merge frame that had none.
       while (checking) await frame();
     }
-    return { merges, checked, wrong, moved };
+    // Once, at the end: reading the pages back during the switches made
+    // Helium draw a wrong frame now and then by itself.
+    const slots = staleSlots();
+    return { merges, checked, wrong, moved, ...slots };
   });
   assert.ok(result.merges > 0, `the tabs merged no glyph pages: ${JSON.stringify(result)}`);
   assert.ok(result.checked > result.moved, `no merge frame could be compared: ${JSON.stringify(result)}`);
   assert.equal(result.wrong, 0, `frames with wrong letters: ${JSON.stringify(result)}`);
+  assert.ok(result.compared > 0, `no texture slot could be read back: ${JSON.stringify(result)}`);
+  assert.deepEqual(result.stale, [], `texture slots holding another page's glyphs: ${JSON.stringify(result)}`);
   assert.deepEqual(errors, []);
 });
 
