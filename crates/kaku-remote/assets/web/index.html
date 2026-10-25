@@ -687,7 +687,18 @@
       // Every cell, not only the ones the renderer thinks changed: a cell
       // whose text stayed kept the glyph place it had before the merge, and
       // the last column showed the previous tab's letter until a redraw.
-      try { renderer._clearModel(true); renderer.renderRows(0, term.rows - 1); } catch (_) { term.refresh(0, term.rows - 1); }
+      // And every texture again: the addon uploads a page to its slot only
+      // when the page's version differs from the slot's last upload, a merge
+      // moves pages to other slots, and versions repeat (every merged page
+      // starts at 1), so a slot kept another page's glyphs (2026-10-25, the
+      // merge test at 10x CPU throttling: a slot's texture and its page
+      // differed with both at version 4). setAtlas forgets what each slot
+      // holds.
+      try {
+        renderer._glyphRenderer.value?.setAtlas(renderer._charAtlas);
+        renderer._clearModel(true);
+        renderer.renderRows(0, term.rows - 1);
+      } catch (_) { term.refresh(0, term.rows - 1); }
     }
   });
   useWebgl();
