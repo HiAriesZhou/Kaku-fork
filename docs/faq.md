@@ -112,9 +112,9 @@ config.window_padding = { left = '24px', right = '24px', top = '40px', bottom = 
 
 Since V0.12.1 the viewport no longer jumps to the top during streaming output. If you scroll up mid-stream, pressing the down arrow or scrolling back down returns you to the current output.
 
-## How does Cmd+Shift+Y work inside an SSH session or Codex?
+## Cmd+Shift+Y sends a local path when inside an SSH session.
 
-`Cmd+Shift+Y` starts local yazi in a separate tab without sending input to the current application. It inherits a local pane's working directory; from an SSH session, it uses your local home directory. Closing the yazi tab returns to the source tab. The yazi remote-files feature (`Cmd+Shift+R`) mounts the remote filesystem via sshfs; use it to browse files from an SSH pane.
+The yazi remote-files feature (`Cmd+Shift+R`) is designed for SSH sessions and mounts the remote filesystem via sshfs. `Cmd+Shift+Y` is for local yazi. Use `Cmd+Shift+R` when you are inside an SSH pane.
 
 ## Kaku's prompt shows up in other terminals, or is missing from them.
 
@@ -251,7 +251,7 @@ Kaku is compatible with yabai and AeroSpace. If you see continuous flickering, i
 
 Hold anywhere for about half a second, then lift, to open the menu a right click would: on a tab you get New Tab, Tab Navigator and Close Tab, and on the terminal you get Copy, Paste, Split and the rest. This works in every window, as long as the remote client forwards a held press as a held left button, which UU does. In panes where a program such as vim or tmux takes mouse input, the hold stays with that program.
 
-**Window > Touch Mode** adds a close button to every tab, since a finger has no hover. The tab bar keeps its height and look, and the terminal font and line height do not change.
+**Window > Touch Mode** adds a close button to every tab, since a finger has no hover, and lets a tap on the lower part of the last terminal row reach the bottom tab bar, which is hard to hit with a finger. The tab bar keeps its height and look, and the terminal font and line height do not change.
 
 ## Is remote access free?
 

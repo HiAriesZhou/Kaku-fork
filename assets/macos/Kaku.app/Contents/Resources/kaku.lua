@@ -14,8 +14,6 @@ local function basename(path)
   return path:match('([^/]+)$')
 end
 
-local yazi_tabs = {}
-
 -- URL decode helper for Chinese characters in paths
 -- Converts %E9%9F%B3%E4%B9%90 -> 音乐
 local function url_decode(str)
@@ -2948,6 +2946,63 @@ local function schedule_lazygit_hint_probe(window, pane)
   end)
 end
 
+-- Cmd+Shift+G and Cmd+Shift+Y type their command into the pane, which only
+-- works when a shell reads it: at a prompt, or through a terminal that hands
+-- input on to one (ssh, tmux, Herdr). Typing keeps the shell's own cwd and
+-- reaches remote and nested shells. Any other foreground program, such as
+-- Codex, Claude Code or vim, would take the text as its own input (#602), so
+-- the tool opens in a new tab instead, and closing that tab returns to the
+-- tab it came from. One table keeps the top-level chunk under 200 locals.
+local tool_launcher = { tabs = {} }
+
+function tool_launcher.types_into(pane)
+  if is_shell_foreground(pane) or resolve_remote_target_from_pane(pane) then
+    return true
+  end
+  local name = (basename(pane_foreground_process_name(pane):lower()) or ""):gsub("^%-", "")
+  local forwarders = {
+    ssh = true, mosh = true, ["mosh-client"] = true, et = true,
+    tmux = true, screen = true, zellij = true, herdr = true,
+  }
+  return forwarders[name] == true
+end
+
+function tool_launcher.spawn(window, pane, args)
+  local cwd = pane_cwd(pane)
+  local mux_window = window:mux_window()
+  local source_tab_id = window:active_tab():tab_id()
+  local tab = mux_window:spawn_tab({
+    domain = "DefaultDomain",
+    cwd = cwd ~= "" and cwd or nil,
+    args = args,
+  })
+  tool_launcher.tabs[tab:tab_id()] = {
+    source = source_tab_id,
+    window = mux_window:window_id(),
+  }
+  tab:activate()
+end
+
+function tool_launcher.restore(window)
+  if next(tool_launcher.tabs) == nil then
+    return
+  end
+  local mux_window = window:mux_window()
+  local window_id = mux_window:window_id()
+  local tabs = {}
+  for _, tab in ipairs(mux_window:tabs()) do
+    tabs[tab:tab_id()] = tab
+  end
+  for tab_id, origin in pairs(tool_launcher.tabs) do
+    if origin.window == window_id and not tabs[tab_id] then
+      if tabs[origin.source] then
+        tabs[origin.source]:activate()
+      end
+      tool_launcher.tabs[tab_id] = nil
+    end
+  end
+end
+
 local function launch_lazygit(window, pane)
   pane = resolve_active_pane(window, pane)
   if not pane then
@@ -2962,6 +3017,10 @@ local function launch_lazygit(window, pane)
   end
 
   local ok = pcall(function()
+    if not tool_launcher.types_into(pane) then
+      tool_launcher.spawn(window, pane, { lazygit_cmd })
+      return
+    end
     -- Send Ctrl+U first to clear any partially typed input at the prompt,
     -- preventing the command from being appended to existing line content.
     window:perform_action(
@@ -2986,61 +3045,42 @@ local function launch_yazi(window, pane)
     return
   end
 
-  local yazi_cmd = resolve_yazi_command()
-  if not yazi_cmd then
-    show_yazi_toast(window, pane, "kaku-toast-yazi-missing")
-    return
+  local remote_target = resolve_remote_target_from_pane(pane)
+  local yazi_cmd = nil
+  local send_command = "\x15y 2>/dev/null || yazi\r"
+  if not remote_target then
+    sync_managed_yazi_theme(window)
+
+    yazi_cmd = resolve_yazi_command()
+    if not yazi_cmd then
+      show_yazi_toast(window, pane, "kaku-toast-yazi-missing")
+      return
+    end
+
+    send_command = "\x15y 2>/dev/null || " .. yazi_cmd .. "\r"
   end
 
-  sync_managed_yazi_theme(window)
-  -- This shortcut always opens local Yazi. Remote paths belong to the
-  -- sshfs workflow (Cmd+Shift+R), not the local filesystem or SSH domain.
-  local cwd = os.getenv('HOME')
-  if not resolve_remote_target_from_pane(pane) then
-    local path = pane_cwd(pane)
-    if path ~= '' then
-      cwd = path
-    end
+  -- A remote pane always types, so the new-tab path has a local yazi_cmd.
+  local typed = tool_launcher.types_into(pane)
+  if typed then
+    local dims = window:get_dimensions()
+    update_window_config(window, dims.is_full_screen, pane)
   end
 
   local ok = pcall(function()
-    local mux_window = window:mux_window()
-    local source_tab_id = window:active_tab():tab_id()
-    -- Spawn directly: SendString would type a shell command into Codex or
-    -- whichever interactive application currently owns the source pane.
-    local tab = mux_window:spawn_tab({
-      domain = { DomainName = 'local' },
-      cwd = cwd,
-      args = { yazi_cmd },
-    })
-    yazi_tabs[tab:tab_id()] = {
-      source = source_tab_id,
-      window = mux_window:window_id(),
-    }
-    tab:activate()
+    if not typed then
+      tool_launcher.spawn(window, pane, { yazi_cmd })
+      return
+    end
+    -- Prefer the shell wrapper `y` for cwd sync. Remote panes must not receive
+    -- a locally resolved absolute yazi path.
+    window:perform_action(
+      wezterm.action.SendString(send_command),
+      pane
+    )
   end)
   if not ok then
     show_yazi_toast(window, pane, "kaku-toast-yazi-dispatch-failed")
-  end
-end
-
-local function restore_yazi_tab(window)
-  if next(yazi_tabs) == nil then
-    return
-  end
-  local mux_window = window:mux_window()
-  local window_id = mux_window:window_id()
-  local tabs = {}
-  for _, tab in ipairs(mux_window:tabs()) do
-    tabs[tab:tab_id()] = tab
-  end
-  for tab_id, origin in pairs(yazi_tabs) do
-    if origin.window == window_id and not tabs[tab_id] then
-      if tabs[origin.source] then
-        tabs[origin.source]:activate()
-      end
-      yazi_tabs[tab_id] = nil
-    end
   end
 end
 
@@ -3864,7 +3904,7 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
 end)
 
 wezterm.on('update-right-status', function(window, pane)
-  restore_yazi_tab(window)
+  tool_launcher.restore(window)
   pane = resolve_active_pane(window, pane)
   if should_remember_last_cwd() then
     local ok, cwd = pcall(function() return pane:get_current_working_dir() end)

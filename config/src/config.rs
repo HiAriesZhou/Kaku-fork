@@ -2736,6 +2736,27 @@ mod tests {
         }
     }
 
+    /// #602: Cmd+Shift+Y and Cmd+Shift+G typed their command into Codex.
+    /// The fixture lives in `scripts/test_yazi_launcher.lua` so it also runs
+    /// under plain `luajit`; here it runs on the crate's own Lua, so CI needs
+    /// no extra install.
+    #[test]
+    fn bundled_tool_launchers_type_only_into_shells() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let bundled = root.join("assets/macos/Kaku.app/Contents/Resources/kaku.lua");
+        let script = std::fs::read_to_string(root.join("scripts/test_yazi_launcher.lua"))
+            .expect("read the launcher test script");
+        let lua = mlua::Lua::new();
+        let arg = lua
+            .create_sequence_from([bundled.to_str().expect("utf-8 path")])
+            .unwrap();
+        lua.globals().set("arg", arg).unwrap();
+        lua.load(&script)
+            .set_name("test_yazi_launcher.lua")
+            .exec()
+            .unwrap();
+    }
+
     #[test]
     fn bundled_lua_with_hotkey_follow_mouse_compiles() {
         let source = include_str!("../../assets/macos/Kaku.app/Contents/Resources/kaku.lua");
