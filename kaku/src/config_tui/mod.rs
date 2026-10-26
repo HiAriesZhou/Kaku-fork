@@ -826,11 +826,7 @@ impl App {
                 return Some(Self::strip_trailing_comment(value_part));
             }
             if value_part.starts_with('\'') || value_part.starts_with('"') {
-                // Quoted string
-                let quote = value_part.chars().next().unwrap();
-                if let Some(end) = value_part[1..].find(quote) {
-                    return Some(value_part[1..1 + end].to_string());
-                }
+                return Self::parse_lua_short_string(value_part);
             }
             let value = Self::strip_trailing_comment(value_part);
             if key == "color_scheme" && Self::is_kaku_auto_color_scheme_expr(&value) {
@@ -841,6 +837,32 @@ impl App {
                 return Some(value);
             }
             return None;
+        }
+        None
+    }
+
+    /// Reads a quoted Lua string literal at the start of `s`, undoing the
+    /// escapes `escape_lua_string` writes (`\\`, `\'`, `\"`, `\n`, `\r`) and
+    /// `\t`. Any other escape, or a missing closing quote, returns None so the
+    /// line is left untouched rather than rewritten with a guessed value.
+    fn parse_lua_short_string(s: &str) -> Option<String> {
+        let mut chars = s.chars();
+        let quote = chars.next()?;
+        let mut value = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => value.push(match chars.next()? {
+                    '\\' => '\\',
+                    '\'' => '\'',
+                    '"' => '"',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    _ => return None,
+                }),
+                c if c == quote => return Some(value),
+                c => value.push(c),
+            }
         }
         None
     }
@@ -1770,6 +1792,50 @@ mod tests {
         app.fields[idx].value = "O'Brien Dark".to_string();
 
         assert_eq!(app.to_lua_value(&app.fields[idx]), "'O\\'Brien Dark'");
+    }
+
+    /// A name with a quote or backslash is escaped on write, so the reader
+    /// must undo Lua's escapes or the next load truncates it at the `\'`.
+    #[test]
+    fn user_scheme_names_with_quotes_survive_a_save_and_reload() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("kaku.lua");
+        for name in [
+            "O'Brien Dark",
+            r"Back\slash",
+            r"Trailing\",
+            "Say \"hi\"",
+            "中文 主题",
+        ] {
+            std::fs::write(&config_path, "config.color_scheme = 'Kaku Dark'\n")
+                .expect("write config");
+            let mut app = App::with_theme_choices(
+                config_path.clone(),
+                choices(&["Auto", "Kaku Dark", "Kaku Light", name]),
+            );
+            app.load_config();
+            let idx = app
+                .fields
+                .iter()
+                .position(|f| f.lua_key == "color_scheme")
+                .expect("color_scheme field to exist");
+            app.fields[idx].value = name.to_string();
+            app.save_config().expect("save_config");
+
+            let mut reloaded = test_app_at(config_path.clone());
+            reloaded.load_config();
+            assert_eq!(theme_field(&reloaded).value, name, "round trip of {name:?}");
+            assert!(!theme_field(&reloaded).skip_write);
+        }
+        assert_eq!(
+            App::extract_lua_value(r#"config.color_scheme = "A \"B\" \\ C""#, "color_scheme"),
+            Some(r#"A "B" \ C"#.to_string())
+        );
+        assert_eq!(
+            App::extract_lua_value(r"config.color_scheme = 'A\x41'", "color_scheme"),
+            None,
+            "an escape the reader does not decode is left alone"
+        );
     }
 
     /// A scheme the user config selects without a matching `colors/*.toml`, for
