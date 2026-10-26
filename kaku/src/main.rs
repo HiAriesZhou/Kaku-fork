@@ -305,7 +305,13 @@ impl TmuxPassthru {
 }
 
 fn terminate_with_error_message(err: &str) -> ! {
-    log::error!("{}; terminating", err);
+    // Only `start` and `cli` set up a logger. Without one log::error! goes
+    // nowhere and a failing `kaku remote` or `kaku doctor` exits silently.
+    if log::max_level() == log::LevelFilter::Off {
+        eprintln!("kaku: {err}");
+    } else {
+        log::error!("{}; terminating", err);
+    }
     std::process::exit(1);
 }
 
@@ -359,13 +365,20 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
     } else {
         kaku_remote::load_or_create_identity()?
     };
-    let state = kaku_remote::read_state()?;
+    let state = kaku_remote::read_state().map_err(|_| {
+        anyhow::anyhow!(
+            "Remote access is on, but Kaku is not serving it right now. Open Kaku, or quit and reopen it, then run `kaku remote` again."
+        )
+    })?;
     if state.tunnel_relay.is_some() {
         ensure_relay_access()?;
     }
     let Some(relay) = &state.tunnel_relay else {
         // Without the relay the page is only reachable on this Mac, and its
         // token changes with every Kaku launch.
+        if state.port == 0 {
+            anyhow::bail!("Another app holds Kaku's local page port, so Kaku is not serving the page. Set `config.remote.port` to a free port, or quit that app.");
+        }
         let url = format!("http://127.0.0.1:{}/#t={}", state.port, state.token);
         println!("{url}");
         return Ok(());
@@ -375,6 +388,13 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
     }
     // A link printed while this Mac cannot reach the relay only ever opens
     // to "offline" in the browser; say why here instead.
+    // A browser already waiting on the current link: answer it rather than
+    // printing a new link, which would turn it away.
+    if !reset {
+        if let Some(request) = kaku_remote::pending_request() {
+            return confirm_pairing(&request);
+        }
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut down = relay_down_note(kaku_remote::read_relay_status().as_ref(), relay);
     while down.is_some() && std::time::Instant::now() < deadline {
@@ -382,6 +402,100 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
         down = relay_down_note(kaku_remote::read_relay_status().as_ref(), relay);
     }
     print_pairing(&identity.pairing_link(relay)?, down.as_deref());
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        println!("Run `kaku remote` in a terminal to confirm the browser once it opens the link.");
+        return Ok(());
+    }
+    println!();
+    println!("Waiting for the browser to open the link…");
+    let link_lasts = std::time::Instant::now() + kaku_remote::OFFER_LIFETIME;
+    loop {
+        if let Some(request) = kaku_remote::pending_request() {
+            return confirm_pairing(&request);
+        }
+        if std::time::Instant::now() > link_lasts {
+            anyhow::bail!("The link expired. Run `kaku remote` for a new one.");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+/// Wait for Enter on stdin. Ctrl+C (or the end of input) returns false
+/// instead of ending the process, so a refused browser is told at once
+/// rather than when the link runs out. `read_line` would retry the read
+/// that Ctrl+C interrupts, so this reads the descriptor itself.
+#[cfg(feature = "remote")]
+fn enter_pressed() -> bool {
+    extern "C" fn interrupted(_: libc::c_int) {}
+    // SAFETY: an empty handler, installed without SA_RESTART so read(2)
+    // returns EINTR; reads go into a one-byte buffer we own.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = interrupted as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        let mut byte = 0u8;
+        loop {
+            match libc::read(libc::STDIN_FILENO, (&mut byte as *mut u8).cast(), 1) {
+                1 if byte == b'\n' => return true,
+                1 => continue,
+                _ => return false,
+            }
+        }
+    }
+}
+
+/// Show the browser waiting to pair and its code; Enter lets it in, Ctrl+C
+/// turns it away.
+#[cfg(feature = "remote")]
+fn confirm_pairing(request: &kaku_remote::PairRequest) -> anyhow::Result<()> {
+    let color = std::io::stdout().is_terminal();
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("{code}{text}{RESET}")
+        } else {
+            text.to_string()
+        }
+    };
+    println!();
+    println!(
+        "{}",
+        paint(
+            PURPLE_BOLD,
+            &format!("{} wants to use this Mac's terminals", request.device.name)
+        )
+    );
+    println!("Code {}", paint(GREEN, &request.code));
+    println!(
+        "{}",
+        paint(
+            GRAY,
+            "If your browser shows the same code, press Enter to allow it. Otherwise press Ctrl+C."
+        )
+    );
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("Run `kaku remote` in a terminal to answer it.");
+    }
+    if !enter_pressed() {
+        println!();
+        kaku_remote::answer_request(&request.code, false)?;
+        println!("Refused. Run `kaku remote` for a new link.");
+        return Ok(());
+    }
+    if !kaku_remote::answer_request(&request.code, true)? {
+        anyhow::bail!("That browser is no longer waiting. Run `kaku remote` for a new link.");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !kaku_remote::is_paired(&request.device.public_key) {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("Allowed, but Kaku has not let the browser in. Check that Kaku is open, then run `kaku remote` again.");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    println!(
+        "{}",
+        paint(GREEN, "Paired. The browser is opening your terminals.")
+    );
     Ok(())
 }
 
@@ -431,7 +545,7 @@ fn print_pairing(url: &str, relay_down: Option<&str>) {
         println!();
     }
     for (step, note) in [
-        format!("It works once, within {minutes} minutes. Whoever opens it first gets your terminals, so keep it private."),
+        format!("It works once, within {minutes} minutes, and only after you press Enter here for the code the browser shows."),
         "Bookmark the page it opens. That browser stays paired, so next time open the bookmark, no new link needed.".to_string(),
         "Keep Kaku open on this Mac; the page shows offline while it is closed or cannot reach the relay.".to_string(),
     ]

@@ -52,6 +52,15 @@ if grep -Fq "local: can only be used in a function" "$output_log" "$error_log"; 
   fail "setup_zsh.sh used local outside a function"
 fi
 
+# Bash expands backticks and $(...) in an unquoted heredoc while generating
+# kaku.zsh, so an unescaped one runs as a command and leaves its error here
+# (#450: `[comment]` in a comment). zsh -n below cannot see it, since the
+# substitution only empties part of a comment.
+if grep -Fq ": command not found" "$error_log"; then
+  cat "$error_log" >&2
+  fail "setup_zsh.sh ran a command while generating kaku.zsh"
+fi
+
 [[ -f "$tmp_home/.config/starship.toml" ]] || fail "starship.toml was not initialized"
 python3 - "$tmp_home/.config/starship.toml" <<'PY'
 import sys
@@ -92,9 +101,8 @@ grep -Fq '_kaku_set_ai_user_var "kaku_ai_query" "[mode:${mode}] ${body}"' \
   || fail "generated kaku.zsh did not authenticate inline AI queries"
 
 # The generated file is sourced by the user's real zsh, so it must parse under
-# zsh. A corrupted heredoc (e.g. an unescaped backtick that bash expanded at
-# generation time, #450) or a stray top-level construct surfaces here even when
-# setup_zsh.sh itself exited 0.
+# zsh. A corrupted heredoc or a stray top-level construct surfaces here even
+# when setup_zsh.sh itself exited 0.
 if command -v zsh >/dev/null 2>&1; then
   if ! zsh -n "$tmp_home/.config/kaku/zsh/kaku.zsh" 2>"$tmp_dir/zsh_parse.log"; then
     cat "$tmp_dir/zsh_parse.log" >&2

@@ -749,7 +749,11 @@ fn build_remote_check() -> DoctorCheck {
     };
     let devices = kaku_remote::list_devices();
     let mut details = vec![
-        format!("Local page on port {}", state.port),
+        if state.port == 0 {
+            "Local page not served: another app holds its port".to_string()
+        } else {
+            format!("Local page on port {}", state.port)
+        },
         format!("Paired browsers: {}", devices.len()),
     ];
     details.extend(devices.iter().map(|d| format!("{}  {}", d.id, d.name)));

@@ -4,7 +4,16 @@
 # surface is local/system plist data rather than remote unauthenticated XML.
 # Remove these ignores once starship-battery can resolve to plist using
 # quick-xml >=0.41.
+#
+# crypto-bigint 0.5 (RUSTSEC-2026-0387, fixed only in 0.7.6+) comes in through
+# str0m -> dimpl -> ecdsa/p256 for the remote direct path; str0m 0.24.1 is
+# the latest and apple-crypto fails to link. Every path builds a new Rtc, so
+# each DTLS key signs one handshake, and only a paired page can start one:
+# the offer arrives inside the sealed session and ICE checks need its
+# credentials. A timing leak there tells nothing to anyone without terminal
+# access already. Remove this once str0m depends on crypto-bigint 0.7.
 ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0387",
 ]

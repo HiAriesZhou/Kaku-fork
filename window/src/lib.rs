@@ -431,6 +431,11 @@ pub trait WindowOps {
     /// the platform specific input method editor
     fn set_text_cursor_position(&self, _cursor: Rect) {}
 
+    /// The text input target moved to another pane or tab while the same
+    /// window keeps focus, so input tools should read the focused element
+    /// again.
+    fn notify_text_input_target_changed(&self) {}
+
     /// Initiate textual transfer from the clipboard
     fn get_clipboard(&self, clipboard: Clipboard) -> Future<String>;
 

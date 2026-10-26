@@ -2024,6 +2024,9 @@ impl super::TermWindow {
         // which already walks backwards/forwards to cover the full logical line, so
         // passing the hovered row is sufficient even when the URL wraps across physical rows.
         pane.apply_hyperlinks(stable_row..stable_row + 1, &self.config.hyperlink_rules);
+        // A TUI that wraps a long path or URL itself emits a real newline,
+        // so the rule scan above sees each fragment on its own (#547).
+        self.rejoin_wrapped_link(&pane, stable_row, column);
 
         struct FindCurrentLink {
             current: Option<Arc<Hyperlink>>,

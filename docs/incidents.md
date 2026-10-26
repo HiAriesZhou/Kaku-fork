@@ -1,0 +1,34 @@
+# Incidents
+
+Defects that reached users in a tagged release, kept as the eval set for every review layer: a review prompt, skill or model is as good as the rows it would have found. A row is added in the same change that fixes such a defect: the fix commit, the commit that introduced it when known, the earliest layer that should have caught it, and the test or gate that catches it now. `scripts/check_incidents.py` (run by `make check` and the Scripts and Release Checks CI job) fails a row whose commit does not resolve, whose layer is not one of the names below, or whose catcher is not defined in this repository.
+
+Layers, earliest first:
+
+- `write-time`: the author's own check before committing, such as a grep of same-shape sites or a test run red on the old code.
+- `unit`: Rust tests (`make test`, the Unit Tests job).
+- `guard`: clippy and the source guards in the Clippy job (`check_logs.sh`, `check_prompts.sh`, the write/flush guard).
+- `ci`: the Scripts and Release Checks job: shell integration smoke tests, shellcheck, `scripts/test_*.py`, release config checks.
+- `review`: a diff review or the `bugs` skill.
+- `build-validation`: the release-shaped builds in `build-validation.yml`.
+- `release-preflight`: `scripts/release.sh` preflight and the `check_release_*` scripts.
+- `hand-test`: the pre-release smoke checklist in `.agents/skills/release/SKILL.md`, run in the built `dist/Kaku.app`.
+- `field`: only a user's machine or environment shows it.
+
+A catcher is a Rust `#[test]` function name, a Python `test_*` function, a tracked file path (a smoke script or gate), or the name of a step in `.github/workflows/`. When a review prompt, skill or model changes, rerun it on the files each fix touched as they were at `<Fixed>^` and count the rows it finds.
+
+## Incidents
+
+| ID | Reported | Symptom | Introduced | Fixed | Layer | Caught by |
+|---|---|---|---|---|---|---|
+| K-01 | 2026-05-19 | `kaku init` failed with `local: can only be used in a function` from a top-level `local` in `setup_zsh.sh` (#396, #432, #441) | f6101d97 | 28a5e064 | ci | `Shell script lint (shellcheck)` |
+| K-02 | 2026-06-06 | `kaku init` printed `[comment]: command not found` and wrote a broken comment, an unescaped backtick in the `kaku.zsh` heredoc (#450) | 6fe6de07 | 9d5f57b6 | ci | `assets/shell-integration/tests/setup_zsh_update_only_smoke.sh` |
+| K-03 | 2026-06-06 | Quitting asked for confirmation even at an idle shell, counting background daemons as running programs (#449) | unknown | ed6249aa | unit | `group_filter_ignores_background_daemon`, `group_filter_keeps_foreground_job_children` |
+| K-04 | 2026-06-17 | A TUI selection list moved up and down left garbled rows, a line erase kept the wrapped state (#465) | unknown | 889204a3 | unit | `clack_style_rerender_clears_wrapped_lines` |
+| K-05 | 2026-07-03 | Zooming the window rendered an extra zsh prompt line into scrollback (#482) | unknown | 6acf86c8 | unit | `test_resize_482_shrink_keeps_blanks_out_of_scrollback`, `test_resize_482_zoom_cycles_do_not_accumulate_scrollback` |
+| K-06 | 2026-09-27 | Typing stalled in a pane with inline images, the minute session snapshot encoded one image per cell (12.5 GB) on the GUI thread (#559) | 52657794 | 027ae93d | review | `image_cells_do_not_blow_up_the_scrollback_sidecar` |
+| K-07 | 2026-09-30 | Escape did nothing in a TUI with the Kitty keyboard protocol enabled (#565) | unknown | 7da1acb7 | unit | `encode_escape_disambiguate`, `encode_forward_delete_disambiguate` |
+| K-08 | 2026-10-15 | The paint path scanned every process on the system for any foreground app, costly with cursor blink and AI TUIs (#583) | unknown | c13f5101 | review | `other_foreground_processes_never_fetch_process_tree` |
+| K-09 | 2026-10-21 | Restart to Update quit Kaku and relaunched the old version, launchd killed the helper with Kaku's process group (#591) | unknown | 121af142 | hand-test | `update_helper_leads_its_own_process_group` |
+| K-10 | 2026-10-21 | Dismissing the new-version notification started the update flow (#593) | f3528f57 | 05d61f0e | review | `only_explicit_actions_open_the_url` |
+| K-11 | 2026-06-11 | After sleep or unplugging a display the window froze on its last frame while keys still reached the shell: a lost WebGpu surface was retried through a same-size resize that does nothing, and earlier wake fixes covered only OpenGL (#458) | unknown | c8f8470c | hand-test | `webgpu_surface_errors_force_a_fresh_swapchain` |
+| K-12 | 2026-08-08 | On a Mac where WebGpu cannot initialize, every New Window and Settings spun for about 20 seconds, the failed attempt was retried per window (#524) | unknown | 49a353d9 | review | `webgpu_failure_is_remembered_for_later_windows` |

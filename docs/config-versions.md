@@ -42,5 +42,6 @@ instruction files; read the txt file instead.
 | v40 | V0.25.0 | Adds `show_agent_title` (default true), which is new in this release, so no migration is needed. Bumps so existing installs regenerate `kaku.zsh`, which loads the completion dump from cache again and refreshes it after a successful full check, and pick up the Yazi `init.lua` that leaves a row under the path when none exists. |
 | v41 | V0.26.0 | No schema change. Increments because the release gate requires a bump every release; the highlights cover the remote page's fonts and agent title, and the character picker's return to the command palette. |
 | v42 | V0.26.1 | No schema change. Increments because the release gate requires a bump every release; the highlight covers Restart to Update installing the new version. |
+| v43 | V0.27.0 | No schema change. Increments because the release gate requires a bump every release; the highlight covers TUI-wrapped paths and URLs opening in full. |
 
 When you bump the version, add a row here in the same change.

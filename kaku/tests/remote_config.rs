@@ -135,3 +135,30 @@ fn remote_off_write_failure_keeps_the_original_config() {
         0o640
     );
 }
+
+#[test]
+fn remote_errors_reach_the_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    default_config(home.path());
+
+    // Remote access is on in the config, but no Kaku has written its state.
+    let output = command(home.path()).arg("remote").output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Kaku is not serving it right now"),
+        "kaku remote failed silently: {:?}",
+        output
+    );
+
+    let output = command(home.path())
+        .args(["remote", "revoke", "missing"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no paired browser missing"),
+        "{:?}",
+        output
+    );
+}
