@@ -83,7 +83,7 @@ name = "Example Dark"
 
 The selected value is the scheme's `[metadata].name`, or the file name when that field is absent. Keep the file name equal to `name` so the scheme loads without scanning the whole directory. A scheme your `kaku.lua` defines directly (`config.color_schemes["Name"] = { ... }`) is listed too.
 
-After the file is in place, open `kaku config` and pick it from **Theme**; the command writes `config.color_scheme = "Example Dark"` for you. **Auto** still switches only between Kaku Dark and Kaku Light, so a custom theme is a manual choice.
+After the file is in place, open `kaku config` and pick it from **Theme**; the command writes `config.color_scheme = "Example Dark"` for you. **Auto** still switches only between Kaku Dark and Kaku Light, so a custom theme is a manual choice. With a custom theme, the title bar, the Yazi theme and the Claude Code theme Kaku keeps in sync stay on Kaku Dark colors, even when the theme itself is light.
 
 **Color overrides**
 
