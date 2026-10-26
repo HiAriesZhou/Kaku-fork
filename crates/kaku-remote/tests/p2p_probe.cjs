@@ -1,5 +1,5 @@
 // Interop check for the direct path against a real browser: run with
-// `cargo test -p kaku-remote --features desktop browser_probe -- --ignored`
+// `cargo test -p kaku-remote browser_probe -- --ignored`
 // in another shell, both with the same KAKU_P2P_DIR.
 const fs = require('node:fs');
 const path = require('node:path');

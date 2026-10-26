@@ -2,9 +2,11 @@
 //!
 //! Kaku keeps a share identity on disk: a secret that registers this Mac with
 //! the relay and a key that signs each connection's exchange (see
-//! `pairing`). The relay knows the Mac only by the SHA-256 of the secret, so
-//! nobody else can register as this Mac, and it only ever forwards sealed
-//! bytes. Resetting the identity forgets every paired browser: the running
+//! `pairing`). The secret goes only to the relay, over TLS, when this Mac
+//! registers; the relay checks it against the id (SHA-256 of the secret) and
+//! keeps nothing, so nobody else can register as this Mac, and it only ever
+//! forwards sealed bytes. Someone holding the secret could take the id
+//! offline, never a terminal: pages trust only this Mac's signing key. Resetting the identity forgets every paired browser: the running
 //! Kaku notices the new file and re-registers under the new id.
 
 use crate::pairing::{self, Exchange, MacKey, PageAuth, SessionKeys};
@@ -29,6 +31,8 @@ const FROM_HOST: &[u8] = b"kaku-web h2c";
 const KIND_DATA: u8 = 0;
 const KIND_ASSET: u8 = 1;
 const IDENTITY_CHECK: Duration = Duration::from_secs(3);
+/// How often a browser waiting to pair checks for the answer.
+const CONFIRM_CHECK: Duration = Duration::from_millis(300);
 /// Pings keep NATs and proxies from dropping an idle link, and their pongs
 /// prove the relay is still there.
 const KEEPALIVE: Duration = Duration::from_secs(20);
@@ -51,7 +55,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ShareIdentity {
-    /// Registers this Mac with the relay. Never leaves the Mac.
+    /// Registers this Mac with the relay; sent only to the relay, which keeps
+    /// nothing of it.
     secret: String,
     /// This Mac's ECDSA P-256 signing key, PKCS#8 base64url. Never leaves the
     /// Mac; pairing links carry its public half. Identities from before
@@ -261,6 +266,14 @@ enum Stage {
         transcript: [u8; 32],
         keys: Arc<SessionKeys>,
     },
+    /// A new browser with a valid link, waiting for Enter in `kaku remote`.
+    /// What it sends meanwhile (its hello, attach) is kept for the session.
+    Confirm {
+        keys: Arc<SessionKeys>,
+        device: pairing::Device,
+        held: Vec<String>,
+        since: tokio::time::Instant,
+    },
     Session {
         keys: Arc<SessionKeys>,
         device: String,
@@ -283,13 +296,60 @@ enum Step {
     Send(Vec<u8>),
     /// Turn it away with this close code.
     Close(u16),
-    /// It proved it is `device` (`new`: paired just now); start its session.
+    /// Send it these bytes, then turn it away with this close code.
+    Refuse(Vec<u8>, u16),
+    /// It proved it is `device` (`new`: paired just now); start its session,
+    /// numbering Kaku's messages from `first_seq`, and hand it `held`.
     Admitted {
         device: pairing::Device,
         new: bool,
+        first_seq: u64,
+        held: Vec<String>,
     },
     /// A message for its session.
     Input(String),
+}
+
+/// Messages a page waiting for confirmation may have kept for its session.
+const HELD_WHILE_CONFIRMING: usize = 16;
+
+/// How long a new browser may wait for Enter in `kaku remote`; the link
+/// itself expires sooner unless it was printed just before.
+const CONFIRM_LIMIT: Duration = pairing::OFFER_LIFETIME;
+
+/// Whether the person at the Mac answered a browser waiting to pair: the
+/// step to take, or None while it still waits.
+fn resolve_pending(browser: &mut Browser, store: &mut dyn pairing::DeviceStore) -> Option<Step> {
+    let Stage::Confirm { device, since, .. } = &browser.stage else {
+        return None;
+    };
+    let answer = match store.answer(device) {
+        None if since.elapsed() < CONFIRM_LIMIT => return None,
+        None => false,
+        Some(allowed) => allowed,
+    };
+    let Stage::Confirm {
+        keys, device, held, ..
+    } = std::mem::replace(&mut browser.stage, Stage::Gone)
+    else {
+        return None;
+    };
+    store.settle(&device, answer);
+    if !answer {
+        return Some(Step::Close(pairing::DECLINED));
+    }
+    browser.stage = Stage::Session {
+        keys,
+        device: device.id.clone(),
+        inbox: None,
+    };
+    // Message 0 was Kaku's signature, 1 the note that it waits.
+    Some(Step::Admitted {
+        device,
+        new: true,
+        first_seq: 2,
+        held,
+    })
 }
 
 /// The page's first message is its hello; one that is not (a `KCB2`
@@ -353,16 +413,68 @@ fn advance(
                 return Step::Close(4403);
             };
             match pairing::admit(&auth, &transcript, store) {
-                Ok((device, new)) => {
+                Ok(pairing::Admission::Known(device)) => {
                     browser.stage = Stage::Session {
                         keys,
                         device: device.id.clone(),
                         inbox: None,
                     };
-                    Step::Admitted { device, new }
+                    // Kaku's own signature was message 0.
+                    Step::Admitted {
+                        device,
+                        new: false,
+                        first_seq: 1,
+                        held: Vec::new(),
+                    }
+                }
+                Ok(pairing::Admission::Pending(device)) => {
+                    let note = r#"{"type":"pair_pending"}"#;
+                    let Some(sealed) = seal(&keys.from_host, rng, &aad(FROM_HOST, 1), note.as_bytes())
+                    else {
+                        return Step::Close(4403);
+                    };
+                    browser.stage = Stage::Confirm {
+                        keys,
+                        device,
+                        held: Vec::new(),
+                        since: tokio::time::Instant::now(),
+                    };
+                    Step::Send(sealed)
+                }
+                // Sealed, so a page forgets its key only when this Mac says
+                // so, never on a close code anyone on the way can send.
+                Err(pairing::Refusal::UnknownDevice) => {
+                    let note = r#"{"type":"revoked"}"#;
+                    match seal(&keys.from_host, rng, &aad(FROM_HOST, 1), note.as_bytes()) {
+                        Some(sealed) => Step::Refuse(sealed, 4403),
+                        None => Step::Close(4403),
+                    }
                 }
                 Err(refusal) => Step::Close(refusal.close_code()),
             }
+        }
+        Stage::Confirm {
+            keys,
+            device,
+            mut held,
+            since,
+        } => {
+            let Some(text) = open(&keys.to_host, &aad(TO_HOST, browser.next_in), data) else {
+                return Step::Close(4403);
+            };
+            browser.next_in += 1;
+            // Hello and attach come first; past this, what a waiting page
+            // sends is not needed and would only pile up.
+            if held.len() < HELD_WHILE_CONFIRMING {
+                held.push(text);
+            }
+            browser.stage = Stage::Confirm {
+                keys,
+                device,
+                held,
+                since,
+            };
+            Step::Nothing
         }
         Stage::Session {
             keys,
@@ -386,6 +498,19 @@ fn advance(
         }
         Stage::Gone => Step::Nothing,
     }
+}
+
+/// The relay's refusal as `kaku remote` and `kaku doctor` print it. The
+/// relay is not trusted with the terminal: escape sequences in its text
+/// (a clipboard write, a title, a link) are dropped, not printed.
+fn refusal_text(body: &[u8]) -> String {
+    String::from_utf8_lossy(body)
+        .chars()
+        .filter(|&c| !c.is_control() && !pairing::is_invisible_format(c))
+        .take(120)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 // ── Relay framing ─────────────────────────────────────────────────────────────
@@ -638,15 +763,7 @@ async fn connect_relay(
         // The relay says why in plain text: an access code it needs or did
         // not accept, a full address, a busy relay.
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-            let why = response
-                .body()
-                .as_deref()
-                .map(String::from_utf8_lossy)
-                .unwrap_or_default()
-                .trim()
-                .chars()
-                .take(120)
-                .collect::<String>();
+            let why = refusal_text(response.body().as_deref().unwrap_or_default());
             anyhow::bail!("relay refused this Mac ({}): {why}", response.status())
         }
         Err(e) => Err(anyhow::Error::new(e).context("connect to relay")),
@@ -677,7 +794,9 @@ async fn serve(
     }
     let socket = connect_relay(request, CONNECT_TIMEOUT).await?;
     *connected_at = Some(tokio::time::Instant::now());
-    log::info!("kaku-share: registered with relay as {id}");
+    // The id is half of every link to this Mac; the log, which goes into
+    // `kaku doctor` bundles, keeps only enough of it to tell links apart.
+    log::info!("kaku-share: registered with relay as {}…", &id[..8.min(id.len())]);
     crate::record_relay_status(relay_url, true, None);
     let (mut relay_tx, mut relay_rx) = socket.split();
 
@@ -706,6 +825,10 @@ async fn serve(
     let (ended_tx, mut ended_rx) = mpsc::unbounded_channel();
     let mut identity_check = tokio::time::interval(IDENTITY_CHECK);
     identity_check.tick().await;
+    // Short, so Enter in `kaku remote` lets the browser in at once; it reads
+    // a file only while a browser waits.
+    let mut confirm_check = tokio::time::interval(CONFIRM_CHECK);
+    confirm_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut keepalive = tokio::time::interval(KEEPALIVE);
     keepalive.tick().await;
     let mut last_heard = tokio::time::Instant::now();
@@ -774,21 +897,21 @@ async fn serve(
                                 }
                                 continue;
                             }
-                            Step::Admitted { device, new } => {
-                                if new {
-                                    log::info!("kaku-share: paired {} ({})", device.name, device.id);
-                                    pairing::announce(&device);
-                                } else {
-                                    pairing::announce_return(&device);
+                            Step::Refuse(bytes, code) => {
+                                browsers.remove(&c);
+                                let sent = to_relay.interactive.try_send(Outbound::Protocol(Message::Binary(frame(KIND_DATA, c, &bytes).into())));
+                                if sent.is_err() || to_relay.interactive.try_send(Outbound::Protocol(close_browser(c, code))).is_err() {
+                                    break Err(anyhow::anyhow!("relay output queue is full"));
                                 }
-                                if let Stage::Session { keys, inbox, .. } = &mut browser.stage {
-                                    // Kaku's own signature was message 0.
-                                    *inbox = Some(start_session(c, keys.clone(), 1, dirty.clone(), to_relay.clone(), ended_tx.clone()));
+                                continue;
+                            }
+                            Step::Admitted { device, new, first_seq, held } => {
+                                if !begin_session(c, browser, &device, new, first_seq, held, dirty, &to_relay, &ended_tx) {
+                                    browsers.remove(&c);
+                                    if to_relay.interactive.try_send(Outbound::Protocol(close_browser(c, 4413))).is_err() {
+                                        break Err(anyhow::anyhow!("relay output queue is full"));
+                                    }
                                 }
-                                // Tell the relay this socket is a paired browser, so
-                                // sockets that only know the id cannot push it out.
-                                let ok = serde_json::json!({ "t": "ok", "c": c }).to_string();
-                                let _ = to_relay.interactive.try_send(Outbound::Protocol(Message::Text(ok.into())));
                                 continue;
                             }
                             Step::Input(text) => text,
@@ -816,12 +939,36 @@ async fn serve(
                     break Ok(());
                 }
             }
+            _ = confirm_check.tick() => {
+                let mut ended = Vec::new();
+                for (&c, browser) in browsers.iter_mut() {
+                    match resolve_pending(browser, &mut pairing::DiskStore) {
+                        None => {}
+                        Some(Step::Admitted { device, new, first_seq, held }) => {
+                            let started = begin_session(c, browser, &device, new, first_seq, held, dirty, &to_relay, &ended_tx);
+                            if !started {
+                                ended.push((c, 4413));
+                            }
+                        }
+                        Some(Step::Close(code)) => ended.push((c, code)),
+                        Some(_) => {}
+                    }
+                }
+                for (c, code) in ended {
+                    browsers.remove(&c);
+                    if to_relay.interactive.try_send(Outbound::Protocol(close_browser(c, code))).is_err() {
+                        break 'connection Err(anyhow::anyhow!("relay output queue is full"));
+                    }
+                }
+            }
             _ = identity_check.tick() => {
                 let paired = pairing::paired_ids();
                 let ended: Vec<(u32, u16)> = browsers.iter().filter_map(|(&c, browser)| match &browser.stage {
                     // Removed with `kaku remote revoke`: end its session.
                     Stage::Session { device, .. } if !paired.contains(device) => Some((c, 4403)),
                     Stage::Session { .. } => None,
+                    // Waiting for Enter has its own limit.
+                    Stage::Confirm { .. } => None,
                     _ if browser.connected_at.elapsed() >= AUTH_TIMEOUT => Some((c, 4408)),
                     _ => None,
                 }).collect();
@@ -843,6 +990,44 @@ async fn serve(
     drop(browsers);
     writer.abort();
     result
+}
+
+/// Start the session of browser `c`, which just proved it is `device`, and
+/// tell the relay it is a paired browser, so sockets that only know the id
+/// cannot push it out. False when its session could not take what it sent
+/// while it waited.
+#[allow(clippy::too_many_arguments)]
+fn begin_session(
+    c: u32,
+    browser: &mut Browser,
+    device: &pairing::Device,
+    new: bool,
+    first_seq: u64,
+    held: Vec<String>,
+    dirty: &WebDirty,
+    to_relay: &crate::queue::Sender<Outbound>,
+    ended: &mpsc::UnboundedSender<u32>,
+) -> bool {
+    if new {
+        log::info!("kaku-share: paired {} ({})", device.name, device.id);
+    } else {
+        pairing::announce_return(device);
+    }
+    let Stage::Session { keys, inbox, .. } = &mut browser.stage else {
+        return false;
+    };
+    let session = start_session(c, keys.clone(), first_seq, dirty.clone(), to_relay.clone(), ended.clone());
+    for text in held {
+        if session.inbox.try_send(text).is_err() {
+            return false;
+        }
+    }
+    *inbox = Some(session);
+    let ok = serde_json::json!({ "t": "ok", "c": c }).to_string();
+    let _ = to_relay
+        .interactive
+        .try_send(Outbound::Protocol(Message::Text(ok.into())));
+    true
 }
 
 /// Start the session for browser `c`; returns where its messages go. Kaku's
@@ -1394,13 +1579,19 @@ mod tests {
         let mut fx = Fixture::new();
         let mut conn = fx.connect();
         let id = fx.pair(&conn);
-        let Step::Admitted { device, new } = ({
+        let Step::Admitted {
+            device,
+            new,
+            first_seq,
+            ..
+        } = ({
             let m = sign_in(&conn);
             fx.send(&mut conn, &m)
-        }) else {
+        })
+        else {
             panic!("a paired device signs in");
         };
-        assert_eq!((device.id, new), (id, false));
+        assert_eq!((device.id, new, first_seq), (id, false, 1));
         // Its session takes input in order; a replayed message ends it.
         assert!(matches!(
             fx.send(&mut conn, r#"{"type":"ping"}"#),
@@ -1413,28 +1604,105 @@ mod tests {
         ));
     }
 
+    /// What Kaku sent the page as message `seq`, opened the way the page
+    /// opens it.
+    fn opened(conn: &Connected, sealed: &[u8], seq: u64) -> serde_json::Value {
+        let text = open(&conn.keys.from_host, &aad(FROM_HOST, seq), sealed).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
     #[test]
-    fn a_pairing_link_admits_a_new_browser_which_then_signs_in_without_it() {
+    fn a_pairing_link_waits_for_enter_then_the_browser_signs_in_without_it() {
         let mut fx = Fixture::new();
         fx.store.offer = Some((vec![1u8; 16], false));
         let mut conn = fx.connect();
-        let Step::Admitted { device, new } = ({
+        let Step::Send(note) = ({
             let m = join(&conn, &[1u8; 16]);
             fx.send(&mut conn, &m)
         }) else {
-            panic!("a pairing link admits the browser");
+            panic!("a valid link waits for confirmation");
+        };
+        assert_eq!(opened(&conn, &note, 1)["type"], "pair_pending");
+        // The page's hello and attach wait with it; nothing is paired yet.
+        assert!(matches!(
+            fx.send(&mut conn, r#"{"type":"hello","frame_ack":true}"#),
+            Step::Nothing
+        ));
+        assert!(fx.store.devices.is_empty());
+        assert!(resolve_pending(&mut conn.browser, &mut fx.store).is_none());
+        let code = fx.store.request.as_ref().unwrap().code.clone();
+        assert_eq!(
+            code,
+            pairing::pairing_code(&[1u8; 16], conn.device.public_key())
+        );
+        // Enter in `kaku remote`.
+        fx.store.request.as_mut().unwrap().allowed = Some(true);
+        let Some(Step::Admitted {
+            device,
+            new,
+            first_seq,
+            held,
+        }) = resolve_pending(&mut conn.browser, &mut fx.store)
+        else {
+            panic!("an allowed browser starts its session");
         };
         assert!(new);
+        assert_eq!(first_seq, 2);
+        assert_eq!(held, vec![r#"{"type":"hello","frame_ack":true}"#.to_string()]);
         assert_eq!(device.name, "Safari on iPhone");
+        assert!(fx.store.devices.contains_key(&device.id));
         let mut again = fx.connect();
         again.device = conn.device;
-        let Step::Admitted { device: same, new } = ({
+        let Step::Admitted {
+            device: same, new, ..
+        } = ({
             let m = sign_in(&again);
             fx.send(&mut again, &m)
-        }) else {
+        })
+        else {
             panic!("the paired browser signs in later");
         };
         assert_eq!((same.id, new), (device.id, false));
+    }
+
+    #[test]
+    fn a_pairing_refused_on_the_mac_closes_with_its_own_code() {
+        let mut fx = Fixture::new();
+        fx.store.offer = Some((vec![1u8; 16], false));
+        let mut conn = fx.connect();
+        let m = join(&conn, &[1u8; 16]);
+        assert!(matches!(fx.send(&mut conn, &m), Step::Send(_)));
+        fx.store.request.as_mut().unwrap().allowed = Some(false);
+        assert!(matches!(
+            resolve_pending(&mut conn.browser, &mut fx.store),
+            Some(Step::Close(pairing::DECLINED))
+        ));
+        assert!(fx.store.devices.is_empty());
+    }
+
+    #[test]
+    fn a_second_browser_on_a_link_in_use_is_turned_away() {
+        let mut fx = Fixture::new();
+        fx.store.offer = Some((vec![1u8; 16], false));
+        let mut first = fx.connect();
+        let m = join(&first, &[1u8; 16]);
+        assert!(matches!(fx.send(&mut first, &m), Step::Send(_)));
+        let mut second = fx.connect();
+        let m = join(&second, &[1u8; 16]);
+        assert!(matches!(fx.send(&mut second, &m), Step::Close(4429)));
+    }
+
+    /// Only this sealed note makes a page forget its key; a bare 4403 close
+    /// can come from anyone on the way.
+    #[test]
+    fn a_removed_browser_is_told_so_sealed() {
+        let mut fx = Fixture::new();
+        let mut conn = fx.connect();
+        let m = sign_in(&conn);
+        let Step::Refuse(note, 4403) = fx.send(&mut conn, &m) else {
+            panic!("an unknown device gets the sealed note, then 4403");
+        };
+        assert_eq!(opened(&conn, &note, 1)["type"], "revoked");
     }
 
     #[test]
@@ -1472,12 +1740,17 @@ mod tests {
             tag
         );
         // Once the link is used, Kaku no longer vouches with it.
-        let Step::Admitted { new: true, .. } = ({
+        let Step::Send(_) = ({
             let m = join(&conn, &[9u8; 16]);
             fx.send(&mut conn, &m)
         }) else {
-            panic!("the link pairs the browser");
+            panic!("the link waits for confirmation");
         };
+        fx.store.request.as_mut().unwrap().allowed = Some(true);
+        assert!(matches!(
+            resolve_pending(&mut conn.browser, &mut fx.store),
+            Some(Step::Admitted { new: true, .. })
+        ));
         assert!(fx.connect().mac_auth.get("tag").is_none());
     }
 
@@ -1490,7 +1763,7 @@ mod tests {
                 let m = sign_in(&conn);
                 fx.send(&mut conn, &m)
             },
-            Step::Close(4403)
+            Step::Refuse(_, 4403)
         ));
         // Skipping the proof and going straight to the terminal is refused too.
         let mut conn = fx.connect();
@@ -1520,6 +1793,13 @@ mod tests {
             },
             Step::Close(4401)
         ));
+    }
+
+    #[test]
+    fn a_relays_refusal_cannot_write_escape_sequences_to_the_terminal() {
+        let body = b"  access code \x1b]52;c;ZWNobyBoaQ==\x07wrong\x1b[2J\r\n";
+        assert_eq!(refusal_text(body), "access code ]52;c;ZWNobyBoaQ==wrong[2J");
+        assert!(!refusal_text(body).contains('\x1b'));
     }
 
     #[test]

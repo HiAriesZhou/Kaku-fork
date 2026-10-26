@@ -119,11 +119,9 @@ Kaku の構築に貢献してくれたすべての皆様に感謝します。ぜ
 - Kaku が役に立ったら、Star を付けたり、[共有](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20A%20modern%2C%20AI-friendly%20Mac%20terminal.)したり、Issue や PR をお寄せください
 - 私にはタンユエン（湯円）とコーラ（可楽）という2匹の猫がいて、Kaku を気に入っていただけたら、<a href="https://cats.tw93.fun?name=Kaku" target="_blank">缶詰 🥩</a> をプレゼントしていただけると嬉しいです
 
-<details>
-<summary>支援してくださった方々 🐱</summary>
-<br/>
-<a href="https://cats.tw93.fun?name=Kaku"><img src="https://cdn.jsdelivr.net/gh/tw93/sponsors@main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
-</details>
+支援してくださった方々 🐱
+
+<a href="https://cats.tw93.fun?name=Kaku"><img src="https://raw.githubusercontent.com/tw93/sponsors/main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
 
 ## ライセンス
 

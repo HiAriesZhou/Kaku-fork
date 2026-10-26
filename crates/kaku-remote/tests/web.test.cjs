@@ -59,9 +59,26 @@ async function page(t, hash = '#t=fixture', options = {}, context = browser) {
   await p.goto('http://localhost:9988/' + hash);
   await p.waitForTimeout(100);
   // Kaku sends its config first on every session; the page claims no size
-  // before it and the bundled font are in.
-  if (!noConfig) await p.evaluate(() => { if (!window.probe) return; probe.handle({ type: 'config' }); return document.fonts.load('16px "Kaku Mono"'); });
+  // before it and the bundled font are in. It comes through the socket, as
+  // from Kaku, so the page counts itself connected: handled directly, the
+  // "Connecting to Kaku" notice still showed 400 ms in on CI's slower runner
+  // and kept the notice a test checks from showing. A relay page only takes
+  // sealed messages, so it is handed the config directly.
+  if (!noConfig) await p.evaluate(direct => {
+    if (!window.probe) return;
+    const socket = connections.at(-1);
+    if (direct && socket) socket.onmessage({ data: '{"type":"config"}' });
+    else probe.handle({ type: 'config' });
+    return document.fonts.load('16px "Kaku Mono"');
+  }, hash.startsWith('#t='));
   return { p, errors };
+}
+// The terminal fades in (#term's opacity transition) once its own grid
+// arrives, or after a moment; a screenshot taken during the fade catches it
+// half drawn, which on CI's slower runner failed the icon redraw check.
+async function fadedIn(p) {
+  await p.waitForFunction(() => !document.body.classList.contains('sizing')
+    && getComputedStyle(document.getElementById('term')).opacity === '1');
 }
 async function screen(p, text = 'Password: ', pane = 1) {
   await p.evaluate(({ text, pane }) => {
@@ -119,6 +136,8 @@ async function handshake(p, signer, { admit = true, secret = null, tag = secret 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     const unb64 = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    // The page connects once it has read its device store and keys.
+    while (!connections.length) await sleep(5);
     const socket = connections.at(-1);
     const sent = () => socket.binary?.length || 0;
     const eph = await sub.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
@@ -196,6 +215,9 @@ const storedDevice = p => p.evaluate(() => new Promise(resolve => {
 test('incomplete, old or missing pairing fails visibly without throwing', async t => {
   for (const [hash, message] of [['#p=bad&m=YQ', /incomplete/], ['#k=' + Buffer.alloc(32, 1).toString('base64url'), /earlier Kaku/], ['', /Pair this browser first/]]) {
     const { p, errors } = await page(t, hash);
+    // Shown once the device store has been read, which a slow runner took
+    // past the fixture's first 100 ms.
+    await p.locator('#stage', { hasText: message }).waitFor();
     assert.match(await p.locator('#stage').innerText(), message);
     assert.equal(await p.evaluate(() => location.hash), '');
     assert.equal(await p.evaluate(() => connections.length), 0);
@@ -217,11 +239,14 @@ test('a pairing link proves itself once and the device signs in afterwards', asy
   assert.equal(first.signed, true);
   assert.equal(first.paired, true);
   assert.match(first.proof.name, /on /);
+  // Said once the device is saved, after the Mac's admission.
+  await p.locator('#toast', { hasText: /Paired/ }).waitFor({ state: 'attached' });
   assert.match(await p.locator('#toast').innerText(), /Paired/);
   const kept = await storedDevice(p);
   assert.ok(kept);
   // Back later with no link: the same device signs in, with no pairing proof.
   const next = await page(t, '', {}, context);
+  await next.p.waitForFunction(() => connections.length > 0);
   assert.equal(await next.p.evaluate(() => connections.length), 1);
   const again = await handshake(next.p, mac);
   assert.equal(again.proof.type, 'auth');
@@ -326,8 +351,19 @@ test('a removed device forgets its pairing and an expired link keeps nothing', a
   t.after(() => context.close());
   const { p } = await page(t, pairingLink(mac, secret), {}, context);
   await handshake(p, mac, { secret });
+  // A bare 4403 can come from anyone on the way: the key stays and the
+  // page connects again.
+  const blip = await page(t, '', {}, context);
+  await handshake(blip.p, mac);
+  await blip.p.evaluate(() => connections.at(-1).close(4403));
+  await blip.p.waitForFunction(() => connections.length > 1);
+  assert.notEqual(await storedDevice(blip.p), null);
+  assert.doesNotMatch(await blip.p.locator('#notice').innerText(), /not paired/);
+  // The Mac's sealed note is what removes it.
   const next = await page(t, '', {}, context);
-  await handshake(next.p, mac);
+  await handshake(next.p, mac, { admit: false });
+  await next.p.evaluate(() => fromMac({ type: 'revoked' }));
+  await next.p.waitForTimeout(50);
   await next.p.evaluate(() => connections.at(-1).close(4403));
   assert.match(await next.p.locator('#notice').innerText(), /not paired/);
   await next.p.waitForTimeout(100);
@@ -342,6 +378,46 @@ test('a removed device forgets its pairing and an expired link keeps nothing', a
   assert.equal(await late.p.evaluate(() => connections.length), 1);
 });
 
+test('a new browser shows the code kaku remote shows and pairs once it is allowed', async t => {
+  const mac = await newMac();
+  const secret = Buffer.alloc(16, 13);
+  const { p, errors } = await page(t, pairingLink(mac, secret));
+  const { proof } = await handshake(p, mac, { secret, admit: false });
+  await p.evaluate(() => fromMac({ type: 'pair_pending' }));
+  const digits = require('node:crypto').createHmac('sha256', secret)
+    .update(Buffer.concat([Buffer.from('kaku-remote pairing code'), Buffer.from(proof.device, 'base64url')]))
+    .digest().readUInt32BE(0) % 1000000;
+  const code = String(digits).padStart(6, '0');
+  await p.waitForFunction(() => /Confirm/.test(document.querySelector('#notice').innerText));
+  assert.ok((await p.locator('#notice').innerText()).includes(code.slice(0, 3) + ' ' + code.slice(3)));
+  // Nothing is saved while it waits, and the heartbeat stays quiet.
+  assert.equal(await storedDevice(p), null);
+  const before = await p.evaluate(() => connections.at(-1).binary.length);
+  await p.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await p.waitForTimeout(100);
+  assert.equal(await p.evaluate(() => connections.at(-1).binary.length), before);
+  // Enter on the Mac: the session starts and the browser is kept.
+  await p.evaluate(() => fromMac({ type: 'pong' }));
+  await p.waitForFunction(() => !/Confirm/.test(document.querySelector('#notice').innerText));
+  await p.waitForTimeout(100);
+  assert.notEqual(await storedDevice(p), null);
+  assert.deepEqual(errors, []);
+});
+
+test('a pairing refused on the Mac or taken by another browser says so and stops', async t => {
+  const mac = await newMac();
+  for (const [code, said] of [[4409, /Not confirmed/], [4429, /Another browser/]]) {
+    const secret = Buffer.alloc(16, code % 256);
+    const { p } = await page(t, pairingLink(mac, secret));
+    await handshake(p, mac, { secret, admit: false });
+    await p.evaluate(code => connections.at(-1).close(code), code);
+    assert.match(await p.locator('#notice').innerText(), said);
+    await p.waitForTimeout(700);
+    assert.equal(await p.evaluate(() => connections.length), 1);
+    assert.equal(await storedDevice(p), null);
+  }
+});
+
 test('a paired device survives closing and relaunching the browser process', async t => {
   const profile = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'kaku-browser-'));
   const options = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
@@ -353,9 +429,12 @@ test('a paired device survives closing and relaunching the browser process', asy
   const secret = Buffer.alloc(16, 8);
   const first = await page(t, pairingLink(mac, secret), {}, context);
   await handshake(first.p, mac, { secret });
+  // Closed before the device is saved, the browser would come back unpaired.
+  await first.p.locator('#toast', { hasText: /Paired/ }).waitFor({ state: 'attached' });
   await context.close();
   context = await chromium.launchPersistentContext(profile, options);
   const next = await page(t, '', {}, context);
+  await next.p.waitForFunction(() => connections.length > 0);
   assert.equal(await next.p.evaluate(() => connections.length), 1);
   assert.equal((await handshake(next.p, mac)).proof.type, 'auth');
   assert.deepEqual(next.errors, []);
@@ -555,6 +634,63 @@ test('returning to a cached tab attaches before claiming its new size', async t 
   assert.equal(commands[0].type, 'attach');
   assert.equal(commands[0].pane_id, 1);
   assert.ok(commands.some(m => m.type === 'resize'));
+});
+
+test('a page opened on a Mac-sized tab shows the terminal once its own grid arrives', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 900, height: 560 } });
+  const shown = () => p.evaluate(() => document.body.classList.contains('drawn') && !document.body.classList.contains('sizing'));
+  const frame = (seq, cols, rows) => p.evaluate(([seq, cols, rows]) => probe.handle({ type: 'frame', seq, pane_id: 1, cols, rows, data: '\x1b[1;1Hterminal' }), [seq, cols, rows]);
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }));
+  // The Mac window's grid comes first: parsed, not shown.
+  await frame(1, 200, 50);
+  await p.waitForFunction(() => messages.some(m => m.type === 'resize'));
+  assert.equal(await shown(), false);
+  const claim = await p.evaluate(() => messages.filter(m => m.type === 'resize').at(-1));
+  await frame(2, claim.cols, claim.rows);
+  assert.equal(await shown(), true);
+  assert.ok(await p.evaluate(() => document.querySelector('.xterm-rows').textContent.includes('terminal')));
+});
+
+test('a page whose grid never arrives shows the terminal after a moment', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 900, height: 560 } });
+  await p.evaluate(() => probe.handle({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }));
+  await p.evaluate(() => probe.handle({ type: 'frame', seq: 1, pane_id: 1, cols: 200, rows: 50, data: '\x1b[1;1Hterminal' }));
+  assert.equal(await p.evaluate(() => document.body.classList.contains('drawn') && !document.body.classList.contains('sizing')), false);
+  await p.waitForFunction(() => document.body.classList.contains('drawn') && !document.body.classList.contains('sizing'), null, { timeout: 1500 });
+});
+
+test('typing or leaving the desktop view claims back a tab the Mac took for its own window', async t => {
+  const { p } = await page(t, '#t=fixture', { viewport: { width: 900, height: 560 } });
+  await screen(p, 'terminal');
+  const claims = () => p.evaluate(() => messages.filter(m => m.type === 'resize').map(m => m.cols + 'x' + m.rows));
+  let seq = 2;
+  const frame = (cols, rows) => p.evaluate(([seq, cols, rows]) => probe.handle({ type: 'frame', seq, pane_id: 1, cols, rows, data: '\x1b[1;1Hterminal' }), [seq++, cols, rows]);
+  // Kaku applies the page's grid.
+  const [cols, rows] = (await claims()).at(-1).split('x').map(Number);
+  await frame(cols, rows);
+  await p.waitForTimeout(150);
+  // Someone uses the Kaku window on the Mac: the tab goes back to its size,
+  // and the page waits, as it does while the Mac is in use.
+  await p.evaluate(() => { messages.length = 0; });
+  await frame(60, 18);
+  await p.waitForTimeout(150);
+  assert.deepEqual(await claims(), []);
+  // The first key typed here claims the page's grid again, once.
+  await p.keyboard.type('ab');
+  assert.deepEqual(await claims(), [cols + 'x' + rows]);
+  await frame(cols, rows);
+  await p.keyboard.type('c');
+  assert.deepEqual(await claims(), [cols + 'x' + rows]);
+
+  // Back from the Mac's screen, where clicking into Kaku took the tab.
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').waitFor();
+  await p.locator('#bar .tool.desktop').click();
+  await frame(60, 18);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.locator('#bar .tool.desktop').click();
+  assert.equal(await p.evaluate(() => document.body.classList.contains('desktop')), false);
+  assert.deepEqual(await claims(), [cols + 'x' + rows]);
 });
 
 test('clicking back to a cached tab shows it in the next frame, never blank', async t => {
@@ -1616,6 +1752,34 @@ test('switching tabs never shows a frame of wrong letters while WebGL merges gly
     // is compared only if the redraw shows the same rows.
     const rowsNow = () => { const b = probe.term.buffer.active; let s = ''; for (let y = 0; y < probe.term.rows; y++) s += b.getLine(b.viewportY + y)?.translateToString(true) + '\n'; return s; };
     probe.webgl.onRemoveTextureAtlasCanvas(() => { merges++; merged = true; });
+    // A texture slot left holding another page's glyphs draws them wrong in
+    // every frame alike, which comparing two frames cannot see: read each
+    // slot the addon counts as uploaded back and compare it with its page.
+    const renderer = () => probe.term._core._renderService._renderer.value;
+    const staleSlots = () => {
+      const glyphs = renderer()._glyphRenderer.value, gl = glyphs._gl, atlas = renderer()._charAtlas;
+      const before = gl.getParameter(gl.FRAMEBUFFER_BINDING), fb = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      const stale = [];
+      let compared = 0;
+      atlas.pages.forEach((page, i) => {
+        const slot = glyphs._atlasTextures[i];
+        if (!slot || slot.version !== page.version) return;
+        compared++;
+        const { width: w, height: h } = page.canvas;
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, slot.texture, 0);
+        const read = new Uint8Array(w * h * 4);
+        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, read);
+        const drawn = page.ctx.getImageData(0, 0, w, h).data;
+        // Alpha alone: it is the same either side of premultiplying.
+        let a = 0, b = 0;
+        for (let k = 3; k < read.length; k += 4) { a += read[k]; b += drawn[k]; }
+        if (a !== b) stale.push(i);
+      });
+      gl.bindFramebuffer(gl.FRAMEBUFFER, before);
+      gl.deleteFramebuffer(fb);
+      return { stale, compared };
+    };
     // Registered after the page's own listener, so it sees what the frame shows.
     probe.term.onRender(() => {
       if (pending !== null) {
@@ -1642,11 +1806,16 @@ test('switching tabs never shows a frame of wrong letters while WebGL merges gly
       // redraw, it read as wrong letters in a merge frame that had none.
       while (checking) await frame();
     }
-    return { merges, checked, wrong, moved };
+    // Once, at the end: reading the pages back during the switches made
+    // Helium draw a wrong frame now and then by itself.
+    const slots = staleSlots();
+    return { merges, checked, wrong, moved, ...slots };
   });
   assert.ok(result.merges > 0, `the tabs merged no glyph pages: ${JSON.stringify(result)}`);
   assert.ok(result.checked > result.moved, `no merge frame could be compared: ${JSON.stringify(result)}`);
   assert.equal(result.wrong, 0, `frames with wrong letters: ${JSON.stringify(result)}`);
+  assert.ok(result.compared > 0, `no texture slot could be read back: ${JSON.stringify(result)}`);
+  assert.deepEqual(result.stale, [], `texture slots holding another page's glyphs: ${JSON.stringify(result)}`);
   assert.deepEqual(errors, []);
 });
 
@@ -1708,6 +1877,7 @@ test('the grid draws with WebGL where the browser has it, and with the DOM other
   assert.equal(await p.locator('.xterm-rows').count(), 0);
   // And it really draws the text: a canvas with only the background passes
   // every buffer check above.
+  await fadedIn(p);
   const shot = (await p.locator('.xterm-screen').screenshot()).toString('base64');
   const lit = await p.evaluate(async png => {
     const img = await createImageBitmap(await (await fetch('data:image/png;base64,' + png)).blob());
@@ -1966,6 +2136,7 @@ test('an icon drawn before its font loaded is redrawn once the font is in', asyn
   await p.evaluate(() => document.fonts.load('16px "Kaku Symbols"', '\uf115'));
   await p.waitForFunction(() => [...document.fonts].some(f => f.family.includes('Kaku Symbols') && f.status === 'loaded'));
   await p.waitForTimeout(300);
+  await fadedIn(p);
   const box = await p.locator('.xterm-screen').boundingBox();
   const clip = { x: box.x, y: box.y, width: 80, height: 24 };
   const drawn = await p.screenshot({ clip });
@@ -2105,7 +2276,14 @@ const showPicture = (p, seq = 1, inputSeq, streamId) => p.evaluate(async ({ seq,
     };
   }
   probe.handle({ type: 'desktop_frame', seq, input_seq: inputSeq, stream_id: streamId, key: true, codec: 'avc1.640028', desc: 'AAAA', data: 'AAAA' });
-  await new Promise(r => setTimeout(r, 30));
+  // Drawn, and acked, once the decoder hands it back; a touch screen then
+  // frames its first picture and sends the pointer there on the next
+  // animation frame. On a slow runner both came after a test had cleared
+  // its messages, or before it read the pointer. A frame the page drops is
+  // never acked, so the wait is bounded.
+  const t1 = performance.now();
+  while (!messages.some(m => m.type === 'desktop_ack' && m.seq === seq) && performance.now() - t1 < 500) await new Promise(r => setTimeout(r, 10));
+  for (let i = 0; i < 2; i++) await new Promise(r => requestAnimationFrame(r));
 }, { seq, inputSeq, streamId });
 
 test('desktop stream IDs reject old frames and recover a frame that overtakes status', async t => {
@@ -2226,6 +2404,27 @@ test('desktop pictures arrive as binary messages, locally and through the relay'
   assert.deepEqual(relaySeen, ['desktop_frame', 'desktop_status']);
   assert.notEqual(await relayed.p.evaluate(() => connections.at(-1).readyState), 3);
   assert.deepEqual(relayed.errors, []);
+});
+
+test('a locked Mac says so over its picture until it is unlocked', async t => {
+  const { p, errors } = await page(t);
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+  const notice = p.locator('#desktop .locked');
+  const visible = () => notice.evaluate(e => getComputedStyle(e).opacity === '1');
+  assert.equal(await visible(), false);
+  await p.evaluate(() => probe.handle({ type: 'desktop_locked', locked: true }));
+  await p.waitForFunction(() => getComputedStyle(document.querySelector('#desktop .locked')).opacity === '1');
+  assert.match(await notice.textContent(), /locked/);
+  await p.evaluate(() => probe.handle({ type: 'desktop_locked', locked: false }));
+  await p.waitForFunction(() => getComputedStyle(document.querySelector('#desktop .locked')).opacity === '0');
+  // Leaving forgets it; the helper says again when the view opens.
+  await p.evaluate(() => probe.handle({ type: 'desktop_locked', locked: true }));
+  await p.locator('#bar .tool.desktop').click();
+  assert.equal(await p.evaluate(() => document.getElementById('desktop').classList.contains('locked')), false);
+  assert.deepEqual(errors, []);
 });
 
 test('the desktop view takes the Mac\'s pointer shape, its displays and dropped files', async t => {
@@ -3047,8 +3246,12 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
       addEventListener() {}
       close() {}
     };
-    connections[0].onmessage({ data: JSON.stringify({ type: 'config', desktop: true }) });
+    // A Kaku that does not say it answers gets no offer.
+    connections[0].onmessage({ data: JSON.stringify({ type: 'config' }) });
   });
+  await new Promise(r => setTimeout(r, 200));
+  assert.equal(await p.evaluate(() => messages.some(m => m.type === 'rtc_offer')), false);
+  await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'config', direct: true }) }));
   await p.waitForFunction(() => messages.some(m => m.type === 'rtc_offer'));
   assert.equal(await p.evaluate(() => messages.find(m => m.type === 'rtc_offer').sdp), 'v=0 offer');
   await p.evaluate(() => connections[0].onmessage({ data: JSON.stringify({ type: 'rtc_answer', sdp: 'v=0 answer', id: 3 }) }));

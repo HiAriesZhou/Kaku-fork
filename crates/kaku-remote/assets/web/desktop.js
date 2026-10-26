@@ -44,6 +44,10 @@
   body.desktop #notice { z-index: 5; }
   body.desktop.offline #stage:has(#desktop.live) #notice .title { color: #fff; }
   body.desktop.offline #stage:has(#desktop.live) #notice .detail { color: rgba(255,255,255,0.75); }
+  /* The Mac is locked: its picture is the lock screen, which takes the
+     password typed here. */
+  #desktop .locked { position: absolute; top: 12px; left: 50%; z-index: 1; transform: translateX(-50%); padding: 6px 12px; border-radius: 999px; background: rgba(0,0,0,0.65); color: #fff; font-size: 13px; white-space: nowrap; pointer-events: none; opacity: 0; transition: opacity 0.18s; }
+  #desktop.live.locked .locked { opacity: 1; }
   /* Timings over the picture, only with ?debug in the page's address. */
   #desktop .hud { position: absolute; top: 8px; left: 8px; z-index: 1; padding: 6px 8px; border-radius: 6px; background: rgba(0,0,0,0.65); color: #fff; font: 11px/1.45 ui-monospace, Menlo, monospace; white-space: nowrap; pointer-events: none; }
   #desktop .hud .warn { color: #f5c542; }
@@ -185,7 +189,7 @@
 
     const view = document.createElement("div");
     view.id = "desktop";
-    view.innerHTML = '<canvas tabindex="0" aria-label="Mac screen"></canvas><div class="press"></div><textarea class="sink" tabindex="-1" aria-hidden="true" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea><div class="status"><div class="spin"></div><div class="title"></div><div class="detail"></div></div>';
+    view.innerHTML = '<canvas tabindex="0" aria-label="Mac screen"></canvas><div class="press"></div><textarea class="sink" tabindex="-1" aria-hidden="true" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea><div class="status"><div class="spin"></div><div class="title"></div><div class="detail"></div></div><div class="locked" role="status">This Mac is locked. Type its password to unlock it.</div>';
     stageEl.append(view);
     const canvas = view.querySelector("canvas");
     // With a keyboard, focus sits in a hidden text field: only an editable
@@ -547,6 +551,7 @@
       closeDecoder();
       // The last picture stays on the hidden canvas for the way back.
       document.body.classList.remove("desktop");
+      view.classList.remove("locked");
       canvas.style.cursor = "";
       lastCursor = null;
       syncScreens();
@@ -1251,6 +1256,7 @@
         else if (msg.type === "desktop_clipboard") onClipboard(msg);
         else if (msg.type === "desktop_clipboard_part") onClipboardPart(msg);
         else if (msg.type === "desktop_cursor") onCursor(msg);
+        else if (msg.type === "desktop_locked") view.classList.toggle("locked", active && msg.locked === true);
       },
       // A new session (a reconnect) has no helper running yet.
       sessionStarted() {

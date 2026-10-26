@@ -119,11 +119,9 @@ WezTerm 很稳，也很好折腾，我很感谢它的引擎和生态，于是在
 - 如果 Kaku 对你有帮助，欢迎给它一个 Star、[分享推荐](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20A%20modern%2C%20AI-friendly%20Mac%20terminal.)，或提交 Issue 与 PR
 - 我养了两只猫，汤圆和可乐，如果 Kaku 让你觉得好用，欢迎投喂她们一顿 <a href="https://cats.tw93.fun?name=Kaku" target="_blank">罐头 🥩</a>
 
-<details>
-<summary>这些可爱的小伙伴已经投喂过了 🐱</summary>
-<br/>
-<a href="https://cats.tw93.fun?name=Kaku"><img src="https://cdn.jsdelivr.net/gh/tw93/sponsors@main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
-</details>
+这些可爱的小伙伴已经投喂过了 🐱
+
+<a href="https://cats.tw93.fun?name=Kaku"><img src="https://raw.githubusercontent.com/tw93/sponsors/main/assets/sponsors.svg" width="1000" loading="lazy" /></a>
 
 ## 协议
 

@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "kaku"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3259,6 +3259,7 @@ dependencies = [
  "humantime",
  "kaku-ai-utils",
  "kaku-remote",
+ "libc",
  "log",
  "mux",
  "portable-pty",
@@ -3291,7 +3292,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kaku-gui"
-version = "0.26.1"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3386,6 +3387,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "config",
+ "dimpl",
  "fastrand",
  "futures-util",
  "getrandom 0.3.4",
@@ -3401,6 +3403,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "shlex",
  "str0m",
  "termwiz",
  "tokio",

@@ -7,7 +7,7 @@ publish = false
 [features]
 # The page's view of the Mac's screen, through a bundled or separately
 # installed kaku-desktop helper. Off by default.
-desktop = ["tokio/process", "tokio/io-util", "dep:str0m"]
+desktop = ["tokio/process", "tokio/io-util"]
 
 [dependencies]
 anyhow.workspace = true
@@ -26,8 +26,8 @@ parking_lot.workspace = true
 promise.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-# The direct path beside the relay (desktop builds only), in pure Rust crypto.
-str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"], optional = true }
+# The direct path beside the relay, in pure Rust crypto.
+str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
 termwiz.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
 tokio-tungstenite.workspace = true
@@ -35,7 +35,13 @@ wezterm-font.workspace = true
 wezterm-term.workspace = true
 wezterm-toast-notification.workspace = true
 rustls.workspace = true
+shlex.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-foundation.workspace = true
+
+[dev-dependencies]
+# A stranger's DTLS ClientHello for the direct path's tests; the same
+# version and features str0m already builds.
+dimpl = { version = "0.7.1", default-features = false, features = ["rust-crypto", "rcgen"] }

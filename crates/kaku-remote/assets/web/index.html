@@ -114,6 +114,8 @@
      shows before the theme and the screen arrive. */
   #term { position: absolute; top: 8px; left: 8px; visibility: hidden; }
   body.drawn #term { visibility: visible; }
+  /* Drawn but not yet at its own grid: kept focusable, just not seen. */
+  body.sizing #term { opacity: 0; }
   /* Find bar and toast share the tab bar's look. */
   #find { position: absolute; top: 10px; right: 16px; display: none; align-items: center; gap: 2px; height: 32px; padding: 0 4px 0 10px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); z-index: 5; }
   #find.show { display: flex; }
@@ -352,6 +354,21 @@
     }
   }
   let paired = !pairing;
+  // Waiting for Enter in `kaku remote` on the Mac: only the handshake's
+  // messages go out meanwhile.
+  let pendingPair = false;
+  // The six digits `kaku remote` shows for this browser: an HMAC under the
+  // link's secret of this browser's key, as the Mac computes it.
+  const pairingCode = async () => {
+    const label = enc.encode("kaku-remote pairing code");
+    const key = await crypto.subtle.importKey("raw", pairing.secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const data = new Uint8Array(label.length + device.publicKey.length);
+    data.set(label);
+    data.set(device.publicKey, label.length);
+    const tag = new DataView(await crypto.subtle.sign("HMAC", key, data));
+    const n = String(tag.getUint32(0) % 1000000).padStart(6, "0");
+    return n.slice(0, 3) + " " + n.slice(3);
+  };
   const finishPairing = () => {
     if (!pairing) return;
     pairing = null;
@@ -481,7 +498,8 @@
   const send = (msg) => {
     const socket = ws;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    if (INPUT_TYPES.has(msg.type)) { stopScrolling(); closePast(); }
+    if (pendingPair) return;
+    if (INPUT_TYPES.has(msg.type)) { stopScrolling(); closePast(); takeBack(); }
     // Zoom changes the pane's share of its tab. Let its next frame reclaim
     // our grid after the Mac has applied the zoom, even if our size is unchanged.
     if (msg.type === "zoom_pane" && msg.pane_id === paneId) claimed = "";
@@ -685,7 +703,18 @@
       // Every cell, not only the ones the renderer thinks changed: a cell
       // whose text stayed kept the glyph place it had before the merge, and
       // the last column showed the previous tab's letter until a redraw.
-      try { renderer._clearModel(true); renderer.renderRows(0, term.rows - 1); } catch (_) { term.refresh(0, term.rows - 1); }
+      // And every texture again: the addon uploads a page to its slot only
+      // when the page's version differs from the slot's last upload, a merge
+      // moves pages to other slots, and versions repeat (every merged page
+      // starts at 1), so a slot kept another page's glyphs (2026-10-25, the
+      // merge test at 10x CPU throttling: a slot's texture and its page
+      // differed with both at version 4). setAtlas forgets what each slot
+      // holds.
+      try {
+        renderer._glyphRenderer.value?.setAtlas(renderer._charAtlas);
+        renderer._clearModel(true);
+        renderer.renderRows(0, term.rows - 1);
+      } catch (_) { term.refresh(0, term.rows - 1); }
     }
   });
   useWebgl();
@@ -810,6 +839,9 @@
   // size. The Mac takes the tab back on its next local input, and the page
   // claims it again on its own next input.
   let claimed = "";
+  // The last frame's grid is not the one this page claimed: the Mac took
+  // the tab back for its own window.
+  let macSized = false;
   // On a phone, Kaku's own size leaves about 38 columns on a portrait screen,
   // and the tab on the Mac narrows to match. Size the font for about 50
   // columns across the screen's shorter side, so landscape gets more. The
@@ -830,6 +862,27 @@
   const splitView = () => {
     const tab = tabs.find((t) => t.tab_id === tabId);
     return !!tab && (tab.panes || []).length > 1 && !tab.zoomed;
+  };
+  // A page opened on a tab the Mac had sized gets its first frames at the
+  // Mac window's grid, before its own claim lands, and showed them for a
+  // moment. The first time, the terminal stays unseen (still focusable)
+  // until a frame has the grid it claimed, or a split's own, or for at most
+  // REVEAL_WAIT.
+  const REVEAL_WAIT = 600;
+  let revealTimer = 0;
+  let sized = false;
+  const reveal = () => {
+    clearTimeout(revealTimer);
+    sized = true;
+    document.body.classList.remove("sizing");
+  };
+  const revealWhenSized = () => {
+    if (sized || !size.cols) return;
+    if (claimed === size.cols + "x" + size.rows || splitView()) { reveal(); return; }
+    if (!revealTimer) {
+      document.body.classList.add("sizing");
+      revealTimer = setTimeout(reveal, REVEAL_WAIT);
+    }
   };
   const fit = () => {
     if (stage.clientWidth <= MARGIN * 2 || stage.clientHeight <= MARGIN * 2) return;
@@ -857,6 +910,7 @@
         claimed = key;
         send({ type: "resize", cols, rows });
       }
+      revealWhenSized();
     }
     // Until Kaku applies that size, the current grid may be larger than the
     // window; shrink the font just enough for it to fit. A split, smaller
@@ -901,7 +955,12 @@
   setInterval(densityChanged, 2000);
   // Coming back to the page means using it here: claim the tab's size again,
   // in case the Mac took it back meanwhile.
-  const reclaim = () => { if (desktop?.active) return; claimed = ""; fit(); };
+  const reclaim = () => { if (desktop?.active) return; macSized = false; claimed = ""; fit(); };
+  // Typing here after the Mac took the tab back (its own keys or clicks,
+  // the desktop view's among them) claims it again, as a click or coming
+  // back to the page does; otherwise the grid stayed the Mac window's size
+  // until the next click.
+  const takeBack = () => { if (macSized) reclaim(); };
   window.addEventListener("focus", reclaim);
   // A press anywhere on the page means this side is in use, as a click in
   // the Mac window is for the Mac.
@@ -1812,6 +1871,7 @@
     liveWrapped = [];
     tabId = tab.tab_id;
     claimed = "";
+    macSized = false;
     wasSplit = splitView();
     imagePlacements = [];
     imagesEl.textContent = "";
@@ -2366,7 +2426,7 @@
     script.src = "assets/desktop.js";
     script.onload = () => {
       desktop = window.KakuDesktop.init({
-        send, toolsEl, stageEl: document.getElementById("stage"), isMac: IS_MAC, touch: TOUCH, toast, focusTerminal: refocus, terminalKeys: LOCKED_KEYS,
+        send, toolsEl, stageEl: document.getElementById("stage"), isMac: IS_MAC, touch: TOUCH, toast, focusTerminal: () => { refocus(); reclaim(); }, terminalKeys: LOCKED_KEYS,
         beforeEnter: () => {
           stopScrolling();
           closePast();
@@ -2538,12 +2598,14 @@
     document.body.classList.add("drawn");
     if (msg.cols !== size.cols || msg.rows !== size.rows) {
       closePast();
-        size = { cols: msg.cols, rows: msg.rows };
+      size = { cols: msg.cols, rows: msg.rows };
+      macSized = !!claimed && claimed !== msg.cols + "x" + msg.rows && !splitView();
       resizeTerm(msg.cols, msg.rows);
       fit();
       clearPending = true;
       verifySoon();
     }
+    revealWhenSized();
     localScroll = !!msg.local_scroll;
     if (!localScroll) closePast();
     // Autowrap off first: each row is placed by position, so a row that
@@ -3148,7 +3210,7 @@
   let pingSentAt = 0;
   const PONG_WAIT = 15000;
   setInterval(() => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN || pendingPair) return;
     if (pingSentAt > lastHeard && Date.now() - pingSentAt > PONG_WAIT) { ws.close(); return; }
     if (pingSentAt > lastHeard) return;
     pingSentAt = Date.now();
@@ -3198,7 +3260,8 @@
   };
   // ── Direct path ──
   // Beside the relay, a WebRTC data channel straight to the Mac, offered
-  // once Kaku says it can show the desktop. The offer and answer go through
+  // once Kaku says it answers one (`direct`, or `desktop` from the private
+  // builds that had it first). The offer and answer go through
   // the sealed session, so the DTLS fingerprints in them are the Mac's and
   // this page's own. Once open, small messages and everything Kaku sends
   // interactively take it; files stay on the relay. `?p2p` tries it on a
@@ -3253,7 +3316,7 @@
   const openDirect = async (socket, deliver) => {
     if (direct || typeof RTCPeerConnection !== "function") return;
     let pc;
-    try { pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }] }); } catch (_) { return; }
+    try { pc = new RTCPeerConnection({ iceServers: [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302", "stun:stun.miwifi.com:3478"] }] }); } catch (_) { return; }
     const dc = pc.createDataChannel("kaku");
     dc.binaryType = "arraybuffer";
     const path = {
@@ -3330,6 +3393,8 @@
 
   let reconnectTimer = 0;
   let linkRejected = false;
+  // Bare 4403 closes in a row, without the Mac's sealed `revoked`.
+  let refusals = 0;
   let handshakeTimer = 0;
   const connect = () => {
     clearTimeout(reconnectTimer);
@@ -3362,14 +3427,27 @@
     };
     const onMessage = (socket, msg) => {
       if (ws !== socket) return;
+      if (msg.type === "pair_pending" && pairing) {
+        pendingPair = true;
+        clearTimeout(handshakeTimer);
+        pairingCode().then((code) => {
+          if (ws === socket && pendingPair) setNotice("Confirm " + code + " on your Mac", "Press Enter where you ran kaku remote if it shows the same code.");
+        });
+        return;
+      }
+      // Sealed by the Mac, so unlike a bare close code nobody on the way
+      // can send it: this browser was removed, forget its key.
+      if (msg.type === "revoked") { socket.revoked = true; forgetDevice(); return; }
       if (msg.type === "rtc_answer") { answered(socket, msg); return; }
       if (msg.type === "rtc_ready") { laneReady(socket, msg); return; }
       if (msg.type === "rtc_closed") { directClosed(socket, msg); return; }
-      if (msg.type === "config" && msg.desktop && (relay || DIRECT_FORCED)) openDirect(socket, (m) => onMessage(socket, m));
+      if (msg.type === "config" && (msg.direct || msg.desktop) && (relay || DIRECT_FORCED)) openDirect(socket, (m) => onMessage(socket, m));
       lastHeard = Date.now();
       if (msg.type === "config" || msg.type === "tabs" || msg.type === "frame" || msg.type === "pong") {
         clearTimeout(handshakeTimer);
         retry = 0;
+        refusals = 0;
+        pendingPair = false;
         if (everConnected && !checkedPage) {
           checkedPage = true;
           checkPageFresh();
@@ -3389,16 +3467,32 @@
       clearTimeout(handshakeTimer);
       stopScrolling();
       closePast();
-      if (ev.code === 4403 || ev.code === 1008) {
+      const wasPending = pendingPair;
+      pendingPair = false;
+      if (!relay && (ev.code === 4403 || ev.code === 1008)) {
         linkRejected = true;
-        if (!relay) {
-          setNotice("This link no longer works", "Run kaku remote on the Mac for the new one.", { stale: true });
-          return;
-        }
-        if (paired) forgetDevice();
-        setNotice("This browser is not paired", "Run kaku remote on the Mac to pair again.", { stale: true });
+        setNotice("This link no longer works", "Run kaku remote on the Mac for the new one.", { stale: true });
         return;
       }
+      // Only the Mac's sealed note removes this browser; a bare close code
+      // (a relay, or a message that did not open) is retried a few times.
+      if (socket.revoked || ((ev.code === 4403 || ev.code === 1008) && ++refusals >= 3)) {
+        linkRejected = true;
+        setNotice(socket.revoked ? "This browser is not paired" : "Kaku refused this browser", "Run kaku remote on the Mac to pair again.", { stale: true });
+        return;
+      }
+      if (ev.code === 4409) {
+        linkRejected = true;
+        setNotice("Not confirmed on the Mac", "Run kaku remote on the Mac for a new link.", { stale: true });
+        return;
+      }
+      if (ev.code === 4429) {
+        linkRejected = true;
+        setNotice("Another browser opened this link first", "Do not confirm it on the Mac. Run kaku remote there for a new link.", { stale: true });
+        return;
+      }
+      // Still waiting for Enter: reconnect at once and wait again.
+      if (wasPending) retry = 0;
       if (ev.code === 4401) {
         linkRejected = true;
         setNotice("This pairing link has expired", "Run kaku remote on the Mac for a new one.", { stale: true });
@@ -3454,7 +3548,7 @@
       connect();
       return;
     }
-    if (ws.readyState !== WebSocket.OPEN) return;
+    if (ws.readyState !== WebSocket.OPEN || pendingPair) return;
     const socket = ws;
     pingSentAt = Date.now();
     send({ type: "ping" });

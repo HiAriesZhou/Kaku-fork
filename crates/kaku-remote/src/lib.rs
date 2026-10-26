@@ -16,14 +16,16 @@ mod awake;
 #[cfg(feature = "desktop")]
 mod desktop;
 mod fonts;
-#[cfg(feature = "desktop")]
 mod p2p;
 mod pairing;
 mod queue;
 mod share;
 mod web;
 
-pub use pairing::{list_devices, revoke_device, Device, OFFER_LIFETIME};
+pub use pairing::{
+    answer_request, is_paired, list_devices, pending_request, revoke_device, Device, PairRequest,
+    OFFER_LIFETIME,
+};
 pub use share::{
     access_fingerprint, load_or_create_identity, reset_identity, save_access_code, ShareIdentity,
 };
@@ -68,6 +70,9 @@ struct ConfigInfo {
     /// with its helper installed). Left out when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     desktop: bool,
+    /// This Kaku answers the page's offer of a direct path beside the
+    /// relay; a page talking to an older one offers nothing.
+    direct: bool,
     font_size: f64,
     line_height: f64,
     copy_on_select: bool,
@@ -139,6 +144,7 @@ fn config_info() -> ConfigInfo {
         font_families: page_fonts.families,
         font_files: page_fonts.files,
         desktop: desktop_available(),
+        direct: true,
         font_size: cfg.font_size,
         line_height: cfg.line_height,
         copy_on_select: cfg.copy_on_select,
@@ -240,16 +246,45 @@ fn state_path() -> std::path::PathBuf {
     std::env::temp_dir().join("kaku-remote.json")
 }
 
-fn write_state(port: u16, token: &str, tunnel_relay: Option<&str>) {
+/// Remove the state file unless another running Kaku wrote it. A copy with
+/// remote access off (say a test instance with its own HOME, whose lock file
+/// cannot see this one) used to delete the serving Kaku's file, and `kaku
+/// remote` then failed until that Kaku restarted.
+fn remove_state_unless_live_owner(path: &std::path::Path) {
+    let owner = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|state| state.get("pid")?.as_u64())
+        .and_then(|pid| u32::try_from(pid).ok());
+    if let Some(pid) = owner {
+        if pid != std::process::id() && process_alive(pid) {
+            log::info!("kaku-remote: state file belongs to running Kaku {pid}; leaving it");
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // Signal 0 only checks that the process exists; EPERM still means it does.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn write_state_at(path: &std::path::Path, port: u16, token: &str, tunnel_relay: Option<&str>) {
     let mut val = serde_json::json!({
         "port": port,
         "token": token,
+        "pid": std::process::id(),
     });
     if let Some(relay) = tunnel_relay {
         val["tunnel_relay"] = serde_json::Value::String(relay.to_string());
     }
     if let Ok(json) = serde_json::to_string(&val) {
-        if let Err(e) = write_private(&state_path(), json.as_bytes()) {
+        if let Err(e) = write_private(path, json.as_bytes()) {
             log::warn!("kaku-remote: failed to write state file: {e}");
         }
     }
@@ -447,7 +482,7 @@ fn follow_config() {
         if !RUNNING.load(Ordering::SeqCst) {
             // A state file left by an earlier run would tell `kaku remote`
             // that sharing is on.
-            let _ = std::fs::remove_file(state_path());
+            remove_state_unless_live_owner(&state_path());
         }
         return;
     }
@@ -599,7 +634,7 @@ fn launch() {
             });
             // Dropping the runtime ends the relay link and every session.
             drop(rt);
-            let _ = std::fs::remove_file(state_path());
+            remove_state_unless_live_owner(&state_path());
             if let Some(relay) = relay_for_status {
                 record_relay_status(&relay, false, Some("remote access is off".into()));
             }
@@ -608,6 +643,30 @@ fn launch() {
             follow_config();
         })
         .expect("spawn kaku-remote thread");
+}
+
+/// Bind the local page's port, then record the state `kaku remote` reads.
+/// The token and port go into the state only once the port is Kaku's: with
+/// another app (another account, a sandboxed one) holding it, the printed
+/// link would hand that app the token and a page of its own to type into.
+/// Port 0 then says the local page is not served; the relay link still is.
+async fn bind_and_record(
+    path: &std::path::Path,
+    addr: SocketAddr,
+    token: &str,
+    tunnel_relay: Option<&str>,
+) -> Option<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            write_state_at(path, addr.port(), token, tunnel_relay);
+            Some(listener)
+        }
+        Err(e) => {
+            log::error!("kaku-remote: failed to bind {addr}: {e}");
+            write_state_at(path, 0, "", tunnel_relay);
+            None
+        }
+    }
 }
 
 async fn serve_all(
@@ -631,21 +690,18 @@ async fn serve_all(
     // must not take it down with this task.
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
+    let Some(listener) =
+        bind_and_record(&state_path(), addr, token, tunnel_relay_opt.as_deref()).await
+    else {
+        return std::future::pending().await;
+    };
     log::info!("kaku-remote: listening on http://{}", addr);
-    write_state(port, token, tunnel_relay_opt.as_deref());
-
     // Keystrokes and frames are small writes; Nagle would hold one back
     // until the previous is acknowledged, as the relay already avoids on its
     // own sockets.
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l.tap_io(|tcp| {
-            let _ = tcp.set_nodelay(true);
-        }),
-        Err(e) => {
-            log::error!("kaku-remote: failed to bind {addr}: {e}");
-            return std::future::pending().await;
-        }
-    };
+    let listener = listener.tap_io(|tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     if let Err(e) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -660,6 +716,35 @@ async fn serve_all(
 #[cfg(test)]
 mod relay_status_tests {
     use super::*;
+
+    /// Another app on the port must not be handed the token in the link
+    /// `kaku remote` prints.
+    #[tokio::test]
+    async fn a_port_held_by_another_app_keeps_the_token_out_of_the_state() {
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = squatter.local_addr().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("kaku-remote-squat-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(bind_and_record(&path, addr, "secret-token", Some("wss://relay"))
+            .await
+            .is_none());
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(state["port"], 0);
+        assert_eq!(state["token"], "");
+        assert_eq!(state["tunnel_relay"], "wss://relay");
+        drop(squatter);
+        // Free, the port and token are recorded.
+        assert!(bind_and_record(&path, addr, "secret-token", None)
+            .await
+            .is_some());
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(state["port"], addr.port());
+        assert_eq!(state["token"], "secret-token");
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn only_one_kaku_per_data_dir_serves_remote_access() {
@@ -679,6 +764,45 @@ mod relay_status_tests {
             .is_err());
         drop(first);
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_kaku_with_remote_off_leaves_a_running_kakus_state_file() {
+        let dir = std::env::temp_dir().join(format!("kaku-remote-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kaku-remote.json");
+        let write = |pid: Option<u32>| {
+            let mut state = serde_json::json!({"port": 9988, "token": "t"});
+            if let Some(pid) = pid {
+                state["pid"] = pid.into();
+            }
+            std::fs::write(&path, state.to_string()).unwrap();
+        };
+
+        // Another Kaku that is still running keeps its file.
+        let mut serving = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        write(Some(serving.id()));
+        remove_state_unless_live_owner(&path);
+        assert!(path.exists(), "a running Kaku lost its state file");
+
+        // Once it has exited, the file is stale.
+        serving.kill().unwrap();
+        serving.wait().unwrap();
+        remove_state_unless_live_owner(&path);
+        assert!(!path.exists());
+
+        // This Kaku removes its own file, and so does one written before
+        // the file recorded a pid.
+        write(Some(std::process::id()));
+        remove_state_unless_live_owner(&path);
+        assert!(!path.exists());
+        write(None);
+        remove_state_unless_live_owner(&path);
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
