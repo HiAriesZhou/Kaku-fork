@@ -60,6 +60,87 @@ const HOST_SILENCE: Duration = Duration::from_secs(75);
 const BROWSER_SILENCE: Duration = Duration::from_secs(150);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const KIND_DATA: u8 = 0;
+/// What a browser the Mac has not admitted may pass on to it. Before the
+/// Mac's `ok` a page sends at most four messages: the 69-byte `KCB3` hello,
+/// its sealed proof (under 1 KB), then the `hello` and `attach` it queued
+/// while connecting, which can reach the relay before `ok` does. This is
+/// twice that. Past it the relay stops reading that browser until the Mac
+/// admits it, so a socket that only knows the id cannot flood the Mac's one
+/// relay link, and nothing a slow admission overlaps is lost.
+const PENDING_MESSAGES: u32 = 8;
+const PENDING_BYTES: usize = 16 << 10;
+/// Longest a browser may stay unadmitted. Pairing can wait for the user to
+/// confirm it on the Mac for as long as the pairing offer lives (10 minutes);
+/// the Mac's own timeout ends a socket that never proves itself well before.
+const PENDING_LIMIT: Duration = Duration::from_secs(11 * 60);
+/// Bytes per second one Mac's link carries in each direction, with a burst.
+/// 24 Mbps sustained is above what the desktop view's H.264 pictures and a
+/// 50 MB download need (a download's 256 KB window is the slower limit over
+/// most links), and the burst lets a whole file through at line speed; what
+/// it stops is a Mac and its own browser using the relay as a 150 Mbps pipe.
+/// A link starts with only `HOST_RATE_START`, so reconnecting does not buy a
+/// fresh burst. Over the rate the relay reads that side more slowly instead
+/// of dropping it.
+const HOST_RATE: f64 = (3 << 20) as f64;
+const HOST_BURST: f64 = (32 << 20) as f64;
+const HOST_RATE_START: f64 = (1 << 20) as f64;
+/// New browser sockets one host takes, from addresses none of its admitted
+/// browsers came from: a burst for a few tabs reconnecting at once, then one
+/// every two seconds. Refused before the upgrade, so they cannot push a
+/// browser out of a full host (`make_room`).
+const JOIN_BURST: f64 = 12.0;
+const JOIN_RATE: f64 = 0.5;
+/// Addresses remembered per host as having had an admitted browser.
+const MAX_TRUSTED_ADDRS: usize = 64;
+/// Time to read a request's headers; a client that trickles them in holds a
+/// connection for at most this long.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A token bucket. `take` may go into debt and returns how long the caller
+/// should wait for it to clear, which paces a stream without refusing a
+/// message larger than what is left; `try_take` refuses instead.
+struct TokenBucket {
+    tokens: f64,
+    at: Instant,
+    rate: f64,
+    burst: f64,
+}
+
+impl TokenBucket {
+    fn new(start: f64, rate: f64, burst: f64, now: Instant) -> Self {
+        Self {
+            tokens: start,
+            at: now,
+            rate,
+            burst,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
+        self.at = self.at.max(now);
+    }
+
+    fn take(&mut self, n: f64, now: Instant) -> Duration {
+        self.refill(now);
+        self.tokens -= n;
+        if self.tokens >= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(-self.tokens / self.rate)
+        }
+    }
+
+    fn try_take(&mut self, n: f64, now: Instant) -> bool {
+        self.refill(now);
+        if self.tokens < n {
+            return false;
+        }
+        self.tokens -= n;
+        true
+    }
+}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -170,12 +251,21 @@ struct BrowserLink {
     /// The Mac admitted it (`{"t":"ok"}`): a paired browser, not a socket
     /// that only knows the id.
     admitted: bool,
+    /// Wakes the browser's reader, paused at `PENDING_MESSAGES` or
+    /// `PENDING_BYTES`, once the Mac admits it.
+    admit: Arc<tokio::sync::Notify>,
+    /// Messages passed on to the Mac before admission.
+    sent: u32,
 }
 
-/// Make room for one more browser of a host at `MAX_BROWSERS_PER_HOST`:
-/// the oldest socket the Mac has not admitted is let go (4413), so sockets
-/// that only know the id cannot hold every slot and lock the owner out.
-/// False when every slot holds an admitted browser.
+/// Make room for one more browser of a host at `MAX_BROWSERS_PER_HOST`: a
+/// socket the Mac has not admitted is let go (4413), so sockets that only
+/// know the id cannot hold every slot and lock the owner out. The one let go
+/// has come the shortest way through the handshake, the oldest of those
+/// first: the Mac closes a socket whose hello or proof is wrong, so one
+/// still open after both is a real browser, perhaps waiting for its pairing
+/// to be confirmed on the Mac, and new sockets from someone who only knows
+/// the id never push it out. False when every slot holds an admitted browser.
 fn make_room(browsers: &mut HashMap<u32, BrowserLink>) -> bool {
     if browsers.len() < MAX_BROWSERS_PER_HOST {
         return true;
@@ -183,8 +273,9 @@ fn make_room(browsers: &mut HashMap<u32, BrowserLink>) -> bool {
     let Some(oldest) = browsers
         .iter()
         .filter(|(_, b)| !b.admitted)
-        .map(|(c, _)| *c)
+        .map(|(c, b)| (b.sent.min(2), *c))
         .min()
+        .map(|(_, c)| c)
     else {
         return false;
     };
@@ -206,6 +297,13 @@ struct Host {
     next_id: AtomicU32,
     /// The client address it registered from (`MAX_HOSTS_PER_ADDR`).
     addr: String,
+    /// Bytes from its browsers to it, and from it to them (`HOST_RATE`).
+    upstream: Mutex<TokenBucket>,
+    downstream: Mutex<TokenBucket>,
+    /// New browser sockets (`JOIN_BURST`), and the addresses its admitted
+    /// browsers came from, which join without spending it.
+    joins: Mutex<TokenBucket>,
+    trusted: Mutex<std::collections::HashSet<String>>,
 }
 
 fn message_len(msg: &ws::Message) -> usize {
@@ -217,6 +315,51 @@ fn message_len(msg: &ws::Message) -> usize {
 }
 
 impl Host {
+    fn new(
+        generation: u64,
+        to_host: mpsc::Sender<ws::Message>,
+        addr: String,
+        global: &Arc<AtomicUsize>,
+    ) -> Self {
+        let now = Instant::now();
+        let rate = || {
+            Mutex::new(TokenBucket::new(
+                HOST_RATE_START,
+                HOST_RATE,
+                HOST_BURST,
+                now,
+            ))
+        };
+        Self {
+            generation,
+            to_host,
+            queued: Queued::new(HOST_QUEUE_BYTES, global),
+            evicted: tokio::sync::Notify::new(),
+            browsers: Mutex::new(HashMap::new()),
+            next_id: AtomicU32::new(1),
+            addr,
+            upstream: rate(),
+            downstream: rate(),
+            joins: Mutex::new(TokenBucket::new(JOIN_BURST, JOIN_RATE, JOIN_BURST, now)),
+            trusted: Mutex::new(Default::default()),
+        }
+    }
+
+    /// Whether a new browser socket from `addr` may join. Addresses an
+    /// admitted browser came from always may, so whoever spends the budget
+    /// cannot lock the owner's own browsers out. Local runs (`-`) are not
+    /// limited.
+    fn allow_join(&self, addr: &str, now: Instant) -> bool {
+        addr == "-" || self.trusted.lock().contains(addr) || self.joins.lock().try_take(1.0, now)
+    }
+
+    fn trust(&self, addr: &str) {
+        let mut trusted = self.trusted.lock();
+        if trusted.len() < MAX_TRUSTED_ADDRS {
+            trusted.insert(addr.to_string());
+        }
+    }
+
     /// Queue a message for the Mac within the byte budgets.
     fn send(&self, msg: ws::Message) -> bool {
         let len = message_len(&msg);
@@ -436,62 +579,63 @@ impl AccessCode {
 /// limited, so tests can open as many sockets as they need.
 #[derive(Default)]
 struct AddrLimits {
-    connects: HashMap<String, (Instant, u32)>,
-    failures: HashMap<String, (Instant, u32)>,
-    /// When a large map was last swept; at most once a second, or a flood of
-    /// fresh sources would make every connect scan the whole map.
+    connects: Counts,
+    failures: Counts,
+}
+
+/// Counts per address within a window, for one budget.
+#[derive(Default)]
+struct Counts {
+    map: HashMap<String, (Instant, u32)>,
+    /// When this map was last swept; at most once a second, or a flood of
+    /// fresh sources would make every connect scan the whole map. Each map
+    /// keeps its own, so sweeping one never postpones the other's sweep.
     swept_at: Option<Instant>,
 }
 
-impl AddrLimits {
-    fn count(
-        map: &mut HashMap<String, (Instant, u32)>,
-        swept_at: &mut Option<Instant>,
-        addr: &str,
-        window: Duration,
-        now: Instant,
-    ) -> u32 {
-        if map.len() > 10_000
-            && swept_at.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1))
+impl Counts {
+    fn sweep(&mut self, window: Duration, now: Instant) {
+        if self.map.len() > 10_000
+            && self
+                .swept_at
+                .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1))
         {
-            map.retain(|_, (start, _)| now.duration_since(*start) < window);
-            *swept_at = Some(now);
+            self.map
+                .retain(|_, (start, _)| now.duration_since(*start) < window);
+            self.swept_at = Some(now);
         }
-        let entry = map.entry(addr.to_string()).or_insert((now, 0));
+    }
+
+    fn count(&mut self, addr: &str, window: Duration, now: Instant) -> u32 {
+        self.sweep(window, now);
+        let entry = self.map.entry(addr.to_string()).or_insert((now, 0));
         if now.duration_since(entry.0) >= window {
             *entry = (now, 0);
         }
         entry.1 += 1;
         entry.1
     }
+}
 
+impl AddrLimits {
     fn allow_connect(&mut self, addr: &str, now: Instant) -> bool {
+        // Wrong codes are only counted when they happen, so a map full of
+        // them is also swept here rather than left to the next failure.
+        self.failures.sweep(ACCESS_WINDOW, now);
         addr == "-"
-            || Self::count(
-                &mut self.connects,
-                &mut self.swept_at,
-                addr,
-                Duration::from_secs(60),
-                now,
-            ) <= CONNECTS_PER_MINUTE
+            || self.connects.count(addr, Duration::from_secs(60), now) <= CONNECTS_PER_MINUTE
     }
 
     fn access_locked(&self, addr: &str, now: Instant) -> bool {
         addr != "-"
-            && self.failures.get(addr).is_some_and(|(start, n)| {
+            && self.failures.map.get(addr).is_some_and(|(start, n)| {
                 now.duration_since(*start) < ACCESS_WINDOW && *n >= ACCESS_FAILURES
             })
     }
 
     fn note_access_failure(&mut self, addr: &str, now: Instant) {
         if addr != "-" {
-            Self::count(
-                &mut self.failures,
-                &mut self.swept_at,
-                addr,
-                ACCESS_WINDOW,
-                now,
-            );
+            self.failures.count(addr, ACCESS_WINDOW, now);
         }
     }
 }
@@ -586,15 +730,12 @@ async fn serve_host(
 ) {
     let (mut sink, mut stream) = socket.split();
     let (to_host, mut outgoing) = mpsc::channel::<ws::Message>(QUEUE);
-    let host = Arc::new(Host {
-        generation: state.generation.fetch_add(1, Ordering::Relaxed),
+    let host = Arc::new(Host::new(
+        state.generation.fetch_add(1, Ordering::Relaxed),
         to_host,
-        queued: Queued::new(HOST_QUEUE_BYTES, &state.queued_bytes),
-        evicted: tokio::sync::Notify::new(),
-        browsers: Mutex::new(HashMap::new()),
-        next_id: AtomicU32::new(1),
         addr,
-    });
+        &state.queued_bytes,
+    ));
     // The newest registration serves; the previous one stays connected as a
     // standby, and its browsers reconnect to this one.
     match state.register(&id, host.clone()) {
@@ -640,6 +781,15 @@ async fn serve_host(
             // Older Kakus also answer page file requests (kind 1); the relay
             // serves its own copy now and asks for none.
             ws::Message::Binary(bytes) if bytes.len() >= 5 && bytes[0] == KIND_DATA => {
+                // Over `HOST_RATE` the Mac is read more slowly; a wait stays
+                // within a few seconds, well inside its write timeout.
+                let wait = host
+                    .downstream
+                    .lock()
+                    .take(bytes.len() as f64, Instant::now());
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
                 let target = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
                 let mut browsers = host.browsers.lock();
                 if let Some(link) = browsers.get(&target) {
@@ -658,6 +808,8 @@ async fn serve_host(
                         if let Some(c) = map.get("c").and_then(|c| c.as_u64()) {
                             if let Some(link) = host.browsers.lock().get_mut(&(c as u32)) {
                                 link.admitted = true;
+                                link.admit.notify_one();
+                                host.trust(&link.addr);
                             }
                         }
                     }
@@ -847,6 +999,11 @@ async fn browser_ws(
     let Some(host) = state.host(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Before the upgrade, so sockets past the budget never reach
+    // `make_room` and push out a browser that is still signing in.
+    if !host.allow_join(&addr, Instant::now()) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
     upgrade
         .max_frame_size(MAX_BROWSER_MESSAGE)
         .max_message_size(MAX_BROWSER_MESSAGE)
@@ -875,11 +1032,51 @@ fn browser_close(code: u64) -> ws::Message {
     }))
 }
 
+/// What an unadmitted browser has passed on to the Mac
+/// (`PENDING_MESSAGES`, `PENDING_BYTES`).
+#[derive(Default)]
+struct Pending {
+    messages: u32,
+    bytes: usize,
+}
+
+impl Pending {
+    /// Count a message of `len` bytes if it fits what is left.
+    fn admits(&mut self, len: usize) -> bool {
+        if self.messages >= PENDING_MESSAGES || self.bytes + len > PENDING_BYTES {
+            return false;
+        }
+        self.messages += 1;
+        self.bytes += len;
+        true
+    }
+}
+
+/// Pass one browser message to its Mac, at no more than `HOST_RATE`: the
+/// wait is time this browser is not read. False when the Mac's queue is full,
+/// which makes this browser the one flooding it, so it is let go rather than
+/// the Mac.
+async fn forward(host: &Host, c: u32, payload: axum::body::Bytes) -> bool {
+    let wait = host
+        .upstream
+        .lock()
+        .take(payload.len() as f64, Instant::now());
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(KIND_DATA);
+    frame.extend_from_slice(&c.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    host.send(ws::Message::Binary(frame.into()))
+}
+
 async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut outgoing) = mpsc::channel::<ws::Message>(QUEUE);
     let queued = Arc::new(Queued::new(BROWSER_QUEUE_BYTES, &host.queued.global));
     let (close, mut closing) = watch::channel(None);
+    let admit = Arc::new(tokio::sync::Notify::new());
     let c = host.next_id.fetch_add(1, Ordering::Relaxed);
     // Reserve atomically, after the upgrade: simultaneous handshakes would
     // all have seen space in a check made before it.
@@ -897,6 +1094,8 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
                     close,
                     addr,
                     admitted: false,
+                    admit: admit.clone(),
+                    sent: 0,
                 },
             );
             true
@@ -943,23 +1142,55 @@ async fn serve_browser(socket: ws::WebSocket, host: Arc<Host>, addr: String) {
             }
         }
     });
+    let joined = tokio::time::Instant::now();
+    // Before admission: what was passed on, and a message read past
+    // `PENDING_BYTES`, held until the Mac admits this browser.
+    let mut pending = Pending::default();
+    let mut held: Option<axum::body::Bytes> = None;
     loop {
+        // None once the host let it go: the writer is closing it with its
+        // reason, and late input is dropped.
+        let admitted = host.browsers.lock().get(&c).map(|b| b.admitted);
+        if admitted != Some(false) {
+            if let Some(payload) = held.take() {
+                if admitted.is_some() && !forward(&host, c, payload).await {
+                    break;
+                }
+            }
+        }
+        let waiting = admitted == Some(false);
+        let reading = !waiting || (held.is_none() && pending.messages < PENDING_MESSAGES);
         tokio::select! {
             _ = &mut writer => break,
-            _ = tokio::time::sleep(BROWSER_SILENCE) => break,
-            msg = stream.next() => {
+            _ = admit.notified(), if !reading => {}
+            // Unadmitted, the deadline counts from joining whatever it sends;
+            // silence counts only once it is a session.
+            _ = tokio::time::sleep_until(joined + PENDING_LIMIT), if waiting => break,
+            _ = tokio::time::sleep(BROWSER_SILENCE), if !waiting => break,
+            msg = stream.next(), if reading => {
                 let Some(Ok(msg)) = msg else { break };
                 match msg {
                     ws::Message::Binary(payload) => {
-                        // The writer owns the close reason; do not abort it for late input.
-                        if !host.browsers.lock().contains_key(&c) { continue; }
-                        let mut frame = Vec::with_capacity(5 + payload.len());
-                        frame.push(KIND_DATA);
-                        frame.extend_from_slice(&c.to_be_bytes());
-                        frame.extend_from_slice(&payload);
-                        // Past the Mac's byte budget this browser is the one
-                        // flooding it; let it go rather than the Mac.
-                        if !host.send(ws::Message::Binary(frame.into())) { break; }
+                        let pass = {
+                            let mut browsers = host.browsers.lock();
+                            match browsers.get_mut(&c) {
+                                // The writer owns the close reason; do not abort it for late input.
+                                None => continue,
+                                Some(link) if link.admitted => true,
+                                Some(link) => {
+                                    let pass = pending.admits(payload.len());
+                                    if pass {
+                                        link.sent += 1;
+                                    }
+                                    pass
+                                }
+                            }
+                        };
+                        if !pass {
+                            held = Some(payload);
+                            continue;
+                        }
+                        if !forward(&host, c, payload).await { break; }
                     }
                     ws::Message::Close(_) => break,
                     _ => {}
@@ -995,6 +1226,45 @@ fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Accept connections and serve `router` on each over HTTP/1.1 with
+/// upgrades (the WebSockets). `axum::serve` gives hyper no timer, which
+/// leaves its header read timeout off, so a client could hold a connection
+/// by trickling its headers in forever.
+async fn serve(listener: tokio::net::TcpListener, router: Router, header_timeout: Duration) {
+    loop {
+        let tcp = match listener.accept().await {
+            Ok((tcp, _)) => tcp,
+            Err(e) => {
+                // Out of file descriptors and the like: let some close.
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionRefused
+                ) {
+                    tracing::warn!("accept failed: {e}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                continue;
+            }
+        };
+        // Keystrokes and echoes are tiny frames; Nagle would hold them back.
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::warn!("set_nodelay failed: {e}");
+        }
+        let service = hyper_util::service::TowerToHyperService::new(router.clone());
+        tokio::spawn(async move {
+            let mut http = hyper::server::conn::http1::Builder::new();
+            http.timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(header_timeout);
+            let _ = http
+                .serve_connection(hyper_util::rt::TokioIo::new(tcp), service)
+                .with_upgrades()
+                .await;
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -1018,12 +1288,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // Keystrokes and echoes are tiny frames; Nagle would hold them back.
-    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
-        if let Err(e) = tcp.set_nodelay(true) {
-            tracing::warn!("set_nodelay failed: {e}");
-        }
-    });
     let access = AccessCode::from_env().map(Arc::new);
     if access.is_some() {
         info!("Macs need the access code to register");
@@ -1041,10 +1305,7 @@ async fn main() {
         page_origin,
         ..AppState::default()
     };
-    if let Err(e) = axum::serve(listener, app(state)).await {
-        eprintln!("kaku-relay: server error: {}", e);
-        std::process::exit(1);
-    }
+    serve(listener, app(state), HEADER_READ_TIMEOUT).await;
 }
 
 #[cfg(test)]
@@ -1212,15 +1473,12 @@ mod tests {
         let (to_host, rx) = mpsc::channel(QUEUE);
         // Keep the receiver alive so sends are judged by the budget alone.
         std::mem::forget(rx);
-        Arc::new(Host {
-            generation: state.generation.fetch_add(1, Ordering::Relaxed),
+        Arc::new(Host::new(
+            state.generation.fetch_add(1, Ordering::Relaxed),
             to_host,
-            queued: Queued::new(HOST_QUEUE_BYTES, &state.queued_bytes),
-            evicted: tokio::sync::Notify::new(),
-            browsers: Mutex::new(HashMap::new()),
-            next_id: AtomicU32::new(1),
-            addr: "-".into(),
-        })
+            "-".into(),
+            &state.queued_bytes,
+        ))
     }
 
     #[test]
@@ -1263,6 +1521,8 @@ mod tests {
             close: watch::channel(None).0,
             addr: String::new(),
             admitted: false,
+            admit: Default::default(),
+            sent: 0,
         }
     }
 
@@ -1424,6 +1684,8 @@ mod tests {
                     close,
                     addr: "-".into(),
                     admitted,
+                    admit: Default::default(),
+                    sent: 0,
                 },
                 closing,
             )
@@ -1471,5 +1733,264 @@ mod tests {
         assert!(!valid_id("short"));
         assert!(!valid_id(&"g".repeat(32)));
         assert!(valid_id(&"0f".repeat(16)));
+    }
+
+    #[test]
+    fn a_token_bucket_paces_into_debt_and_refills_to_its_burst() {
+        let start = Instant::now();
+        let mut bucket = TokenBucket::new(100.0, 100.0, 1000.0, start);
+        assert_eq!(bucket.take(100.0, start), Duration::ZERO);
+        // In debt: wait until it is paid back at the rate.
+        assert_eq!(bucket.take(50.0, start), Duration::from_millis(500));
+        // Refills, but never past the burst.
+        let later = start + Duration::from_secs(100);
+        assert!(bucket.try_take(1000.0, later));
+        assert!(!bucket.try_take(1.0, later));
+    }
+
+    /// A browser that came the furthest through the handshake is a real one
+    /// (the Mac closes a socket whose hello or proof is wrong), perhaps
+    /// waiting for its pairing to be confirmed; sockets from someone who only
+    /// knows the id must not push it out however fast they come.
+    #[test]
+    fn a_churning_socket_cannot_push_out_a_browser_that_has_proved_itself() {
+        let state = AppState::default();
+        let link = |sent: u32| BrowserLink {
+            sent,
+            ..test_browser(&state.queued_bytes)
+        };
+        let mut browsers = HashMap::new();
+        browsers.insert(1, link(2));
+        for c in 2..=MAX_BROWSERS_PER_HOST as u32 {
+            browsers.insert(c, link(c % 2));
+        }
+        for c in 100..200 {
+            assert!(make_room(&mut browsers));
+            assert!(browsers.contains_key(&1), "pushed out by socket {c}");
+            browsers.insert(c, link(1));
+        }
+        // When every slot is at the same stage, the oldest goes first.
+        browsers.get_mut(&1).unwrap().sent = 1;
+        assert!(make_room(&mut browsers));
+        assert!(!browsers.contains_key(&1));
+    }
+
+    #[test]
+    fn new_browser_sockets_per_host_are_limited_but_known_addresses_join() {
+        let state = AppState::default();
+        let host = test_host(&state);
+        let now = Instant::now();
+        for _ in 0..JOIN_BURST as u32 {
+            assert!(host.allow_join("198.51.100.7", now));
+        }
+        assert!(!host.allow_join("198.51.100.8", now));
+        // An address one of its browsers was admitted from always joins.
+        host.trust("203.0.113.9");
+        assert!(host.allow_join("203.0.113.9", now));
+        assert!(host.allow_join("-", now));
+        // Then one every 1 / JOIN_RATE seconds.
+        let later = now + Duration::from_secs_f64(1.0 / JOIN_RATE);
+        assert!(host.allow_join("198.51.100.8", later));
+        assert!(!host.allow_join("198.51.100.8", later));
+    }
+
+    #[test]
+    fn wrong_code_entries_are_swept_by_connects_alone() {
+        let mut limits = AddrLimits::default();
+        let start = Instant::now();
+        for n in 0..10_001u32 {
+            let addr = format!("10.{}.{}.{}", n >> 16, (n >> 8) & 255, n & 255);
+            limits.note_access_failure(&addr, start);
+        }
+        let later = start + ACCESS_WINDOW + Duration::from_secs(1);
+        // No wrong code comes in again, only connects.
+        assert!(limits.allow_connect("192.0.2.1", later));
+        assert!(limits.failures.map.is_empty());
+    }
+
+    // ── Over real sockets ─────────────────────────────────────────────────────
+
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message as T;
+    type Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn start_relay(state: AppState, header_timeout: Duration) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, app(state), header_timeout));
+        addr
+    }
+
+    /// A Mac registered under a fresh id and a browser joined to it: both
+    /// sockets and the browser's number.
+    async fn mac_and_browser(state: &AppState, relay: std::net::SocketAddr) -> (Ws, Ws, u32) {
+        let secret = "k".repeat(64);
+        let digest = Sha256::digest(secret.as_bytes());
+        let id: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        let mut request = format!("ws://{relay}/host/{id}")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("x-kaku-secret", secret.parse().unwrap());
+        let (mut mac, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        while state.host(&id).is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (browser, _) = tokio_tungstenite::connect_async(format!("ws://{relay}/{id}/ws"))
+            .await
+            .unwrap();
+        let Some(T::Text(open)) = next(&mut mac, Duration::from_secs(5)).await else {
+            panic!("the Mac hears of the browser")
+        };
+        let open: serde_json::Value = serde_json::from_str(open.as_str()).unwrap();
+        (mac, browser, open["c"].as_u64().unwrap() as u32)
+    }
+
+    async fn next(ws: &mut Ws, wait: Duration) -> Option<T> {
+        loop {
+            match tokio::time::timeout(wait, ws.next()).await {
+                Ok(Some(Ok(T::Ping(_) | T::Pong(_)))) => continue,
+                Ok(Some(Ok(msg))) => return Some(msg),
+                _ => return None,
+            }
+        }
+    }
+
+    /// Data messages that reach the Mac until it hears nothing for `wait`.
+    async fn data_at_mac(mac: &mut Ws, wait: Duration) -> Vec<Vec<u8>> {
+        let mut got = Vec::new();
+        while let Some(msg) = next(mac, wait).await {
+            if let T::Binary(bytes) = msg {
+                assert_eq!(bytes[0], KIND_DATA);
+                got.push(bytes[5..].to_vec());
+            }
+        }
+        got
+    }
+
+    async fn admit(mac: &mut Ws, c: u32) {
+        let ok = serde_json::json!({ "t": "ok", "c": c }).to_string();
+        mac.send(T::Text(ok.into())).await.unwrap();
+    }
+
+    /// Anyone who knows a Mac's id can open its page's socket; until the Mac
+    /// admits it, only what the handshake needs reaches the Mac, and the rest
+    /// waits, in order, rather than being lost.
+    #[tokio::test]
+    async fn an_unadmitted_browser_passes_on_only_its_handshake_budget() {
+        let state = AppState::default();
+        let relay = start_relay(state.clone(), HEADER_READ_TIMEOUT).await;
+        let (mut mac, mut browser, c) = mac_and_browser(&state, relay).await;
+        let total = PENDING_MESSAGES as usize + 4;
+        for n in 0..total {
+            browser
+                .send(T::Binary(vec![n as u8; 100].into()))
+                .await
+                .unwrap();
+        }
+        let before = data_at_mac(&mut mac, Duration::from_millis(300)).await;
+        assert_eq!(before.len(), PENDING_MESSAGES as usize);
+        admit(&mut mac, c).await;
+        let after = data_at_mac(&mut mac, Duration::from_millis(300)).await;
+        let all: Vec<u8> = before.iter().chain(&after).map(|m| m[0]).collect();
+        assert_eq!(all, (0..total as u8).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_message_past_the_pending_bytes_waits_for_admission() {
+        let state = AppState::default();
+        let relay = start_relay(state.clone(), HEADER_READ_TIMEOUT).await;
+        let (mut mac, mut browser, c) = mac_and_browser(&state, relay).await;
+        browser
+            .send(T::Binary(vec![7u8; PENDING_BYTES + 1].into()))
+            .await
+            .unwrap();
+        assert!(data_at_mac(&mut mac, Duration::from_millis(300))
+            .await
+            .is_empty());
+        admit(&mut mac, c).await;
+        let after = data_at_mac(&mut mac, Duration::from_millis(300)).await;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].len(), PENDING_BYTES + 1);
+    }
+
+    /// A Mac and its own browser cannot use the relay as an unmetered pipe:
+    /// past what a link starts with, each direction moves at `HOST_RATE`, by
+    /// reading the sender more slowly rather than dropping it.
+    #[tokio::test]
+    async fn a_host_link_is_paced_from_the_mac() {
+        let state = AppState::default();
+        let relay = start_relay(state.clone(), HEADER_READ_TIMEOUT).await;
+        let (mut mac, mut browser, c) = mac_and_browser(&state, relay).await;
+        admit(&mut mac, c).await;
+        // HOST_RATE bytes past the start: about a second.
+        let total = (HOST_RATE_START + HOST_RATE) as usize;
+        let chunk = 1 << 20;
+        let started = tokio::time::Instant::now();
+        for _ in 0..total.div_ceil(chunk) {
+            let mut frame = vec![KIND_DATA];
+            frame.extend_from_slice(&c.to_be_bytes());
+            frame.resize(5 + chunk, 0);
+            mac.send(T::Binary(frame.into())).await.unwrap();
+        }
+        for _ in 0..total.div_ceil(chunk) {
+            let got = next(&mut browser, Duration::from_secs(10)).await;
+            assert!(matches!(got, Some(T::Binary(_))));
+        }
+        let down = started.elapsed();
+        assert!(
+            down >= Duration::from_millis(800),
+            "Mac to browser: {down:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_link_is_paced_from_its_browsers() {
+        let state = AppState::default();
+        let relay = start_relay(state.clone(), HEADER_READ_TIMEOUT).await;
+        let (mut mac, mut browser, c) = mac_and_browser(&state, relay).await;
+        admit(&mut mac, c).await;
+        let total = (HOST_RATE_START + HOST_RATE) as usize;
+        let piece = 500_000;
+        let started = tokio::time::Instant::now();
+        for _ in 0..total.div_ceil(piece) {
+            browser
+                .send(T::Binary(vec![0u8; piece].into()))
+                .await
+                .unwrap();
+        }
+        for _ in 0..total.div_ceil(piece) {
+            let got = next(&mut mac, Duration::from_secs(10)).await;
+            assert!(matches!(got, Some(T::Binary(_))));
+        }
+        let up = started.elapsed();
+        assert!(up >= Duration::from_millis(800), "browser to Mac: {up:?}");
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_headers_never_finish_is_cut_off() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let relay = start_relay(AppState::default(), Duration::from_millis(300)).await;
+        let mut tcp = tokio::net::TcpStream::connect(relay).await.unwrap();
+        tcp.write_all(b"GET /health HTTP/1.1\r\nHost: relay\r\n")
+            .await
+            .unwrap();
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(3), tcp.read_to_end(&mut rest)).await;
+        assert!(closed.is_ok(), "the connection stays open");
+        // A whole request is still answered.
+        let mut tcp = tokio::net::TcpStream::connect(relay).await.unwrap();
+        tcp.write_all(b"GET /health HTTP/1.1\r\nHost: relay\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        tcp.read_to_string(&mut answer).await.unwrap();
+        assert!(
+            answer.starts_with("HTTP/1.1 200") && answer.ends_with("ok"),
+            "{answer}"
+        );
     }
 }
