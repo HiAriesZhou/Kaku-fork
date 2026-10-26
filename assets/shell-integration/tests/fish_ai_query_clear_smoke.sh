@@ -38,6 +38,14 @@ if [[ "$setup_status" -ne 0 ]]; then
   fail "setup_fish.sh failed with exit $setup_status"
 fi
 
+# Bash expands backticks and $(...) in an unquoted heredoc while generating the
+# fish files, so an unescaped one runs as a command and setup still exits 0
+# (the zsh form of this was #450).
+if grep -Fq ": command not found" <<<"$setup_out"; then
+  echo "$setup_out" >&2
+  fail "setup_fish.sh ran a command while generating its files"
+fi
+
 kaku_fish="$HOME/.config/kaku/fish/kaku.fish"
 [[ -f "$kaku_fish" ]] || fail "managed init file not created at $kaku_fish"
 grep -Fq 'if begin; test $_kaku_in_kaku = 1; or set -q KAKU_PROMPT_EVERYWHERE; end; and command -q starship' \

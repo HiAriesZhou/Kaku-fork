@@ -7065,6 +7065,95 @@ assert(overrides.window_padding.top == 0 and overrides.hide_tab_bar_if_only_one_
         assert!(mark < release);
     }
 
+    /// Production source of `file` without its tests or `//` comment lines,
+    /// so a comment explaining a fix cannot satisfy a gate on the code.
+    fn production_code(file: &str) -> String {
+        file.split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn webgpu_surface_errors_force_a_fresh_swapchain() {
+        // Sleep/wake and unplugging a display invalidate the Metal drawable
+        // without changing the window size (#458). resize() no-ops on equal
+        // dimensions, so recovering through it froze rendering on the last
+        // frame while the PTY kept taking input.
+        let source = production_code(include_str!("mod.rs"));
+        let paint = source
+            .split("fn do_paint_webgpu(&mut self)")
+            .nth(1)
+            .unwrap()
+            .split("fn do_paint_webgpu_impl(")
+            .next()
+            .unwrap();
+        let (_, arms) = paint
+            .split_once("Some(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {")
+            .expect("the paint path handles a lost or outdated surface");
+        let (lost, timeout) = arms
+            .split_once("Some(wgpu::SurfaceError::Timeout) => {")
+            .expect("the paint path handles a surface timeout");
+        let timeout = timeout.split("_ => {}").next().unwrap();
+        assert!(
+            lost.contains("webgpu.reconfigure_surface();"),
+            "a lost or outdated surface must be reconfigured, not resized to the same size"
+        );
+        assert!(
+            !lost.contains(".resize(dims);"),
+            "resize() no-ops on unchanged dimensions and cannot recover a lost surface"
+        );
+        assert!(
+            timeout.contains(".reconfigure_surface();"),
+            "repeated timeouts (a nil nextDrawable after wake) must reconfigure the surface"
+        );
+        assert!(
+            timeout.contains("self.schedule_webgpu_surface_recovery();"),
+            "an idle window must keep retrying until the surface recovers"
+        );
+        let webgpu = production_code(include_str!("webgpu.rs"));
+        let reconfigure = webgpu
+            .split("pub fn reconfigure_surface(&self) {")
+            .nth(1)
+            .expect("WebGpuState can reconfigure its surface at the same size")
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        assert!(reconfigure.contains("self.surface.configure(&self.device, &config);"));
+    }
+
+    #[test]
+    fn webgpu_failure_is_remembered_for_later_windows() {
+        // A failed WebGpu initialization is a property of the machine, so
+        // every later window goes straight to OpenGL instead of failing
+        // again; on an older Intel Mac each retry took 20 seconds (#524).
+        let source = production_code(include_str!("mod.rs"));
+        assert!(source.contains("static WEBGPU_UNAVAILABLE: AtomicBool = AtomicBool::new(false);"));
+        let init = source
+            .split("crate::startup_trace::mark(\"  GPU init start\");")
+            .nth(1)
+            .unwrap()
+            .split("crate::startup_trace::mark(\"  GPU init done\");")
+            .next()
+            .unwrap();
+        assert!(
+            init.contains("&& !WEBGPU_UNAVAILABLE.load(Ordering::Relaxed);"),
+            "a window must skip WebGpu once it has failed in this process"
+        );
+        let failed = init
+            .split_once("Err(err) => {")
+            .expect("the WebGpu attempt handles its failure")
+            .1;
+        let remember = failed
+            .find("WEBGPU_UNAVAILABLE.store(true, Ordering::Relaxed);")
+            .expect("a failed WebGpu initialization must be remembered");
+        let fallback = failed.find("window.enable_opengl()").unwrap();
+        assert!(remember < fallback);
+    }
+
     #[test]
     fn tab_progress_prioritizes_attention_across_panes() {
         assert_eq!(
