@@ -243,10 +243,39 @@ fn state_path() -> std::path::PathBuf {
     std::env::temp_dir().join("kaku-remote.json")
 }
 
+/// Remove the state file unless another running Kaku wrote it. A copy with
+/// remote access off (say a test instance with its own HOME, whose lock file
+/// cannot see this one) used to delete the serving Kaku's file, and `kaku
+/// remote` then failed until that Kaku restarted.
+fn remove_state_unless_live_owner(path: &std::path::Path) {
+    let owner = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|state| state.get("pid")?.as_u64())
+        .and_then(|pid| u32::try_from(pid).ok());
+    if let Some(pid) = owner {
+        if pid != std::process::id() && process_alive(pid) {
+            log::info!("kaku-remote: state file belongs to running Kaku {pid}; leaving it");
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // Signal 0 only checks that the process exists; EPERM still means it does.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 fn write_state(port: u16, token: &str, tunnel_relay: Option<&str>) {
     let mut val = serde_json::json!({
         "port": port,
         "token": token,
+        "pid": std::process::id(),
     });
     if let Some(relay) = tunnel_relay {
         val["tunnel_relay"] = serde_json::Value::String(relay.to_string());
@@ -450,7 +479,7 @@ fn follow_config() {
         if !RUNNING.load(Ordering::SeqCst) {
             // A state file left by an earlier run would tell `kaku remote`
             // that sharing is on.
-            let _ = std::fs::remove_file(state_path());
+            remove_state_unless_live_owner(&state_path());
         }
         return;
     }
@@ -602,7 +631,7 @@ fn launch() {
             });
             // Dropping the runtime ends the relay link and every session.
             drop(rt);
-            let _ = std::fs::remove_file(state_path());
+            remove_state_unless_live_owner(&state_path());
             if let Some(relay) = relay_for_status {
                 record_relay_status(&relay, false, Some("remote access is off".into()));
             }
@@ -682,6 +711,45 @@ mod relay_status_tests {
             .is_err());
         drop(first);
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_kaku_with_remote_off_leaves_a_running_kakus_state_file() {
+        let dir = std::env::temp_dir().join(format!("kaku-remote-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kaku-remote.json");
+        let write = |pid: Option<u32>| {
+            let mut state = serde_json::json!({"port": 9988, "token": "t"});
+            if let Some(pid) = pid {
+                state["pid"] = pid.into();
+            }
+            std::fs::write(&path, state.to_string()).unwrap();
+        };
+
+        // Another Kaku that is still running keeps its file.
+        let mut serving = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        write(Some(serving.id()));
+        remove_state_unless_live_owner(&path);
+        assert!(path.exists(), "a running Kaku lost its state file");
+
+        // Once it has exited, the file is stale.
+        serving.kill().unwrap();
+        serving.wait().unwrap();
+        remove_state_unless_live_owner(&path);
+        assert!(!path.exists());
+
+        // This Kaku removes its own file, and so does one written before
+        // the file recorded a pid.
+        write(Some(std::process::id()));
+        remove_state_unless_live_owner(&path);
+        assert!(!path.exists());
+        write(None);
+        remove_state_unless_live_owner(&path);
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
