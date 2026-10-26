@@ -246,11 +246,25 @@ fn tab_bar_item_starts_window_drag(item: TabBarItem) -> bool {
     )
 }
 
-/// How far a press may land above a bottom tab bar and still hit a tab. The
-/// retro bar is one glyph row (about 22pt at 2x), which is hard to hit with a
-/// finger over remote desktop; this keeps the visuals and widens the target
-/// into the bottom of the last terminal row.
+/// How far a press may land above a bottom tab bar and still hit a tab in
+/// Touch Mode. The retro bar is one glyph row (about 22pt at 2x), which is
+/// hard to hit with a finger over remote desktop; this keeps the visuals and
+/// widens the target into the bottom of the last terminal row.
 const BOTTOM_TAB_BAR_TOUCH_EXTENSION_PT: usize = 12;
+
+/// How many pixels of the last terminal row the bottom tab bar band claims.
+/// Only Touch Mode reaches into the row: with a mouse, a click on the lower
+/// half of the last row belongs to the terminal (#606), so the band is just
+/// the padding strip between the row and the bar.
+fn bottom_tab_bar_touch_extension_px(touch_mode: bool, dpi: usize) -> isize {
+    if !touch_mode {
+        return 0;
+    }
+    #[cfg(target_os = "macos")]
+    let base_dpi: usize = 72;
+    (BOTTOM_TAB_BAR_TOUCH_EXTENSION_PT * dpi / base_dpi).max(BOTTOM_TAB_BAR_TOUCH_EXTENSION_PT)
+        as isize
+}
 
 /// Maps a press just above a bottom tab bar onto the bar's top edge. The band
 /// covers the padding strip between the last terminal row and the bar, plus
@@ -785,8 +799,9 @@ impl super::TermWindow {
             .cloned()
     }
 
-    /// Resolves a plain left press (a tap) just above a bottom tab bar to the
-    /// tab under it. Middle and right presses stay with the terminal, so a
+    /// Resolves a plain left press (a tap) in the padding just above a bottom
+    /// tab bar, or in Touch Mode also the bottom of the last row, to the tab
+    /// under it. Middle and right presses stay with the terminal, so a
     /// middle-click paste on the last row can never close a tab. Hover, wheel,
     /// modified clicks and gestures already owned by the terminal keep their
     /// normal routing.
@@ -808,10 +823,7 @@ impl super::TermWindow {
             .filter(|item| matches!(item.item_type, UIItemType::TabBar(_)))
             .map(|item| item.y)
             .min()? as isize;
-        #[cfg(target_os = "macos")]
-        let base_dpi: usize = 72;
-        let extension = (BOTTOM_TAB_BAR_TOUCH_EXTENSION_PT * self.dimensions.dpi / base_dpi)
-            .max(BOTTOM_TAB_BAR_TOUCH_EXTENSION_PT) as isize;
+        let extension = bottom_tab_bar_touch_extension_px(self.touch_mode, self.dimensions.dpi);
         let y = bottom_tab_bar_touch_y(event.coords.y, bar_top, terminal_bottom, extension)?;
         self.ui_items
             .iter()
@@ -2573,8 +2585,8 @@ fn wmek_to_tmek_and_button(event: &MouseEvent) -> (TMEK, TMB) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bottom_tab_bar_touch_y, manual_drag_window_top_left, mouse_dispatch_target,
-        option_click_cursor_bytes, press_takes_touch_extension,
+        bottom_tab_bar_touch_extension_px, bottom_tab_bar_touch_y, manual_drag_window_top_left,
+        mouse_dispatch_target, option_click_cursor_bytes, press_takes_touch_extension,
         should_bypass_wheel_assignment_in_alt, should_preserve_tmux_bypass_reporting,
         should_show_terminal_context_menu, should_use_manual_window_drag,
         should_use_native_maximized_window_drag, should_zoom_title_area,
@@ -3052,6 +3064,30 @@ mod tests {
         // Maximized: no padding strip, only the extension remains.
         assert_eq!(bottom_tab_bar_touch_y(976, 1000, 1000, 24), Some(1000));
         assert_eq!(bottom_tab_bar_touch_y(975, 1000, 1000, 24), None);
+    }
+
+    /// #606: outside Touch Mode a mouse click on the lower part of the last
+    /// row went to the tab below it. Only Touch Mode reaches into the row;
+    /// otherwise the band is the padding strip between the row and the bar.
+    #[test]
+    fn only_touch_mode_reaches_into_the_last_row() {
+        // Terminal ends at 1000, 20px of padding, bar starts at 1020, at 2x.
+        let mouse = bottom_tab_bar_touch_extension_px(false, 144);
+        assert_eq!(mouse, 0);
+        assert_eq!(bottom_tab_bar_touch_y(1019, 1020, 1000, mouse), Some(1020));
+        assert_eq!(bottom_tab_bar_touch_y(1000, 1020, 1000, mouse), Some(1020));
+        assert_eq!(
+            bottom_tab_bar_touch_y(999, 1020, 1000, mouse),
+            None,
+            "the last row stays with the terminal"
+        );
+        assert_eq!(bottom_tab_bar_touch_y(999, 1000, 1000, mouse), None);
+
+        let touch = bottom_tab_bar_touch_extension_px(true, 144);
+        assert_eq!(touch, 24, "12pt at 2x");
+        assert_eq!(bottom_tab_bar_touch_y(976, 1020, 1000, touch), Some(1020));
+        assert_eq!(bottom_tab_bar_touch_y(975, 1020, 1000, touch), None);
+        assert_eq!(bottom_tab_bar_touch_extension_px(true, 72), 12);
     }
 
     #[test]
