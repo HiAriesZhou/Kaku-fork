@@ -305,7 +305,13 @@ impl TmuxPassthru {
 }
 
 fn terminate_with_error_message(err: &str) -> ! {
-    log::error!("{}; terminating", err);
+    // Only `start` and `cli` set up a logger. Without one log::error! goes
+    // nowhere and a failing `kaku remote` or `kaku doctor` exits silently.
+    if log::max_level() == log::LevelFilter::Off {
+        eprintln!("kaku: {err}");
+    } else {
+        log::error!("{}; terminating", err);
+    }
     std::process::exit(1);
 }
 
@@ -359,7 +365,11 @@ fn run_remote(reset: bool, action: Option<RemoteAction>) -> anyhow::Result<()> {
     } else {
         kaku_remote::load_or_create_identity()?
     };
-    let state = kaku_remote::read_state()?;
+    let state = kaku_remote::read_state().map_err(|_| {
+        anyhow::anyhow!(
+            "Remote access is on, but Kaku is not serving it right now. Open Kaku, or quit and reopen it, then run `kaku remote` again."
+        )
+    })?;
     if state.tunnel_relay.is_some() {
         ensure_relay_access()?;
     }
