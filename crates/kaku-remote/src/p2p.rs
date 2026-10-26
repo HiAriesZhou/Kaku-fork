@@ -327,15 +327,43 @@ async fn start(sdp: &str) -> anyhow::Result<(Rtc, Sockets, String)> {
         }
     }
     let answer = rtc.sdp_api().accept_offer(offer)?;
+    log::info!(
+        "kaku-remote p2p: offering {} local and {} public addresses for the page's {}",
+        sockets.sockets.len(),
+        sockets.reflexive.len(),
+        candidate_summary(sdp)
+    );
     Ok((rtc, sockets, answer.to_sdp_string()))
+}
+
+/// What kinds of candidates the page's offer carries, for the log: counts
+/// only, so diagnostic bundles hold no addresses.
+fn candidate_summary(sdp: &str) -> String {
+    let (mut host, mut mdns, mut public, mut relayed) = (0, 0, 0, 0);
+    for line in sdp.lines().filter(|l| l.starts_with("a=candidate")) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let kind = fields
+            .iter()
+            .position(|&f| f == "typ")
+            .and_then(|i| fields.get(i + 1));
+        match kind {
+            Some(&"host") if fields.get(4).is_some_and(|a| a.ends_with(".local")) => mdns += 1,
+            Some(&"host") => host += 1,
+            Some(&"srflx") | Some(&"prflx") => public += 1,
+            Some(&"relay") => relayed += 1,
+            _ => {}
+        }
+    }
+    format!("{host} local, {mdns} mDNS, {public} public and {relayed} relayed candidates")
 }
 
 /// The Mac's IPv4 addresses a peer may reach directly. Left out: loopback,
 /// link-local, and 198.18.0.0/15, where proxy apps in TUN mode (Stash,
 /// Clash) put a fake interface that no peer can reach; the route to the
 /// internet picked that one on the maintainer's Mac. Tailscale's 100.64/10
-/// stays, as a path that works across networks.
-fn local_ips() -> Vec<IpAddr> {
+/// stays, as a path that works across networks. Each comes with the index
+/// of the interface that owns it, for `Sockets::bind`.
+fn local_ips() -> Vec<(IpAddr, u32)> {
     let mut ips = Vec::new();
     // SAFETY: getifaddrs hands back a list that stays valid until
     // freeifaddrs, and every pointer read is checked for null first.
@@ -354,9 +382,10 @@ fn local_ips() -> Vec<IpAddr> {
                 && i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET
             {
                 let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                if reachable(ip) && !ips.contains(&IpAddr::V4(ip)) {
-                    ips.push(IpAddr::V4(ip));
+                let ip = IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
+                let index = libc::if_nametoindex(ifa.ifa_name);
+                if reachable_ip(ip) && !ips.iter().any(|&(known, _)| known == ip) {
+                    ips.push((ip, index));
                 }
             }
             at = ifa.ifa_next;
@@ -365,6 +394,13 @@ fn local_ips() -> Vec<IpAddr> {
     }
     ips.truncate(4);
     ips
+}
+
+fn reachable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => reachable(v4),
+        IpAddr::V6(_) => false,
+    }
 }
 
 fn reachable(ip: Ipv4Addr) -> bool {
@@ -384,13 +420,14 @@ struct Sockets {
 }
 
 impl Sockets {
-    async fn bind(ips: &[IpAddr]) -> anyhow::Result<Self> {
+    async fn bind(ips: &[(IpAddr, u32)]) -> anyhow::Result<Self> {
         let (tx, heard) = mpsc::channel(256);
         let mut sockets = Vec::new();
-        for &ip in ips {
+        for &(ip, index) in ips {
             let Ok(socket) = UdpSocket::bind(SocketAddr::new(ip, 0)).await else {
                 continue;
             };
+            pin_to_interface(&socket, index);
             sockets.push(Arc::new(socket));
         }
         anyhow::ensure!(!sockets.is_empty(), "no local address");
@@ -444,7 +481,40 @@ impl Drop for Sockets {
     }
 }
 
+/// Send this socket's datagrams out of the interface that owns its address.
+/// A proxy app in TUN mode (Stash, Clash) otherwise takes them through its
+/// tunnel: binding the address alone does not stop that, STUN then saw the
+/// proxy's exit or nothing within `STUN_WAIT`, and a path that did open ran
+/// through the proxy's UDP relay at seconds of round trip (2026-10-26). Only
+/// these sockets are affected; the relay link and other apps keep the proxy.
+fn pin_to_interface(socket: &UdpSocket, index: u32) {
+    use std::os::fd::AsRawFd;
+    if index == 0 {
+        return;
+    }
+    let value = index as libc::c_int;
+    // SAFETY: the fd belongs to `socket`, and the option takes a c_int.
+    let set = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if set != 0 {
+        log::info!(
+            "kaku-remote p2p: cannot pin a socket to its interface: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Ask the STUN servers about every socket at once, within `STUN_WAIT`.
+/// Each socket keeps what it learned by then: a socket that cannot reach
+/// the servers (a Parallels bridge, once sockets are pinned to their
+/// interface) must not cost the others their answers.
 async fn reflexive_all(
     sockets: &[Arc<UdpSocket>],
     names: &[&str],
@@ -452,34 +522,33 @@ async fn reflexive_all(
     if names.is_empty() {
         return Vec::new();
     }
-    let ask = async {
-        let mut servers = Vec::new();
-        for name in names {
-            if let Ok(found) = tokio::net::lookup_host(name).await {
-                servers.extend(found.filter(|a| a.is_ipv4()).take(1));
-            }
+    let deadline = tokio::time::Instant::now() + STUN_WAIT;
+    let mut servers = Vec::new();
+    for name in names {
+        if let Ok(Ok(found)) = tokio::time::timeout_at(deadline, tokio::net::lookup_host(name)).await
+        {
+            servers.extend(found.filter(|a| a.is_ipv4()).take(1));
         }
-        let asks = sockets.iter().map(|socket| {
-            let servers = &servers;
-            async move {
-                let base = socket.local_addr().ok()?;
-                let public = reflexive(socket, servers).await?;
-                (public != base && reachable_public(public.ip())).then_some((public, base))
-            }
-        });
-        futures_util::future::join_all(asks).await
-    };
-    match tokio::time::timeout(STUN_WAIT, ask).await {
-        Ok(found) => found.into_iter().flatten().collect(),
-        Err(_) => Vec::new(),
     }
+    let asks = sockets.iter().map(|socket| {
+        let servers = &servers;
+        async move {
+            let base = socket.local_addr().ok()?;
+            let public = tokio::time::timeout_at(deadline, reflexive(socket, servers))
+                .await
+                .ok()??;
+            (public != base && reachable_public(public.ip())).then_some((public, base))
+        }
+    });
+    futures_util::future::join_all(asks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn reachable_public(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => reachable(v4),
-        IpAddr::V6(_) => false,
-    }
+    reachable_ip(ip)
 }
 
 /// This socket's address as the STUN servers see it: a binding request to
@@ -610,6 +679,9 @@ async fn carry(
     let (tx, mut rx) = mpsc::channel::<Outgoing>(8);
     let mut channel: Option<ChannelId> = None;
     let mut pending: std::collections::VecDeque<Vec<u8>> = Default::default();
+    // Where the page's packets last came from, to say which kind of path
+    // opened.
+    let mut last_source: Option<SocketAddr> = None;
     loop {
         // Hand the channel what it can take.
         if let Some(id) = channel {
@@ -636,8 +708,13 @@ async fn carry(
                             tx: tx.clone(),
                         });
                         let _ = ends.inbox.send(PATH_CHANGED.into()).await;
+                        let over = match last_source.map(|a| a.ip()) {
+                            Some(IpAddr::V4(ip)) if ip.is_private() => "a local address",
+                            Some(_) => "a public address",
+                            None => "an unknown address",
+                        };
                         log::info!(
-                            "kaku-remote p2p: direct path open in {} ms",
+                            "kaku-remote p2p: direct path open in {} ms over {over}",
                             began.elapsed().as_millis()
                         );
                     }
@@ -669,6 +746,7 @@ async fn carry(
         tokio::select! {
             got = sockets.heard.recv() => {
                 let Some((local, source, bytes)) = got else { return "the sockets closed".into() };
+                last_source = Some(source);
                 let Ok(contents) = bytes.as_slice().try_into() else { continue };
                 let input = Input::Receive(Instant::now(), Receive {
                     proto: Protocol::Udp,
@@ -768,6 +846,58 @@ mod tests {
         assert_eq!(found.unwrap(), Some(public));
     }
 
+    #[tokio::test]
+    async fn every_socket_is_pinned_to_the_interface_of_its_address() {
+        use std::os::fd::AsRawFd;
+        let ips = local_ips();
+        if ips.is_empty() {
+            return;
+        }
+        let sockets = Sockets::bind(&ips).await.unwrap();
+        for socket in &sockets.sockets {
+            let local = socket.local_addr().unwrap().ip();
+            let &(_, index) = ips.iter().find(|(ip, _)| *ip == local).unwrap();
+            let mut value: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: reads one c_int option from a socket this test owns.
+            let got = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_BOUND_IF,
+                    (&mut value as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(got, 0);
+            assert_ne!(index, 0);
+            assert_eq!(value as u32, index, "{local} is not pinned");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_socket_the_servers_never_answer_leaves_the_others_their_address() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let public: SocketAddr = "203.0.113.7:40123".parse().unwrap();
+        let heard = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let deaf = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let answered = heard.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            // Only one socket gets answers, as when another one is pinned
+            // to an interface with no route to the servers.
+            while let Ok((_, from)) = server.recv_from(&mut buf).await {
+                if from == answered {
+                    let reply = binding_response(&buf[8..20], public);
+                    let _ = server.send_to(&reply, from).await;
+                }
+            }
+        });
+        let found = reflexive_all(&[heard, deaf], &[addr.as_str()]).await;
+        assert_eq!(found, vec![(public, answered)]);
+    }
+
     /// The public servers answer from this network: `cargo test -p
     /// kaku-remote public_stun -- --ignored --nocapture`.
     #[tokio::test]
@@ -840,7 +970,7 @@ mod tests {
     }
 
     async fn open() -> Option<Opened> {
-        let &ip = local_ips().first()?;
+        let &(ip, _) = local_ips().first()?;
         let (page_in, inbox) = mpsc::channel::<String>(8);
         let (outbox, mut relay_out) = queue::channel::<String>(8);
         let (frames, relay_frames) = mpsc::channel::<Vec<u8>>(8);
