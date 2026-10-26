@@ -3300,7 +3300,7 @@
   const openDirect = async (socket, deliver) => {
     if (direct || typeof RTCPeerConnection !== "function") return;
     let pc;
-    try { pc = new RTCPeerConnection({ iceServers: [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }] }); } catch (_) { return; }
+    try { pc = new RTCPeerConnection({ iceServers: [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302", "stun:stun.miwifi.com:3478"] }] }); } catch (_) { return; }
     const dc = pc.createDataChannel("kaku");
     dc.binaryType = "arraybuffer";
     const path = {
