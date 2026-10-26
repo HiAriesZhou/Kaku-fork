@@ -4,19 +4,27 @@ on:
   push:
     branches:
       - main
-    paths-ignore:
-      - '**.md'
-      - 'CONTRIBUTORS.svg'
-      - 'assets/screenshots/**'
-      - 'assets/logo.*'
-      - '.github/ISSUE_TEMPLATE/**'
+    # paths, not paths-ignore: a later positive pattern brings a path back,
+    # and docs/incidents.md is read by scripts/check_incidents.py.
+    paths:
+      - '**'
+      - '!**.md'
+      - '!CONTRIBUTORS.svg'
+      - '!assets/screenshots/**'
+      - '!assets/logo.*'
+      - '!.github/ISSUE_TEMPLATE/**'
+      - 'docs/incidents.md'
   pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'CONTRIBUTORS.svg'
-      - 'assets/screenshots/**'
-      - 'assets/logo.*'
-      - '.github/ISSUE_TEMPLATE/**'
+    # paths, not paths-ignore: a later positive pattern brings a path back,
+    # and docs/incidents.md is read by scripts/check_incidents.py.
+    paths:
+      - '**'
+      - '!**.md'
+      - '!CONTRIBUTORS.svg'
+      - '!assets/screenshots/**'
+      - '!assets/logo.*'
+      - '!.github/ISSUE_TEMPLATE/**'
+      - 'docs/incidents.md'
 
 permissions:
   contents: read
@@ -205,6 +213,11 @@ jobs:
 
       - name: Restart process selection tests
         run: python3 scripts/test_restart_kaku.py
+
+      - name: Incident ledger and risk tier tests
+        run: |
+          python3 scripts/test_review_gates.py
+          python3 scripts/check_incidents.py
 
       - name: Shell integration smoke tests
         run: |

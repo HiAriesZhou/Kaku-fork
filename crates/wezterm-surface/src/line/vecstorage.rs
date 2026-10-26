@@ -47,7 +47,20 @@ impl VecStorage {
         let mut cell_idx = 0;
         let mut has_implicit_hyperlinks = false;
         for (byte_idx, _grapheme) in line.grapheme_indices(true) {
-            let cell = &mut self.cells[cell_idx];
+            // The string can split into more graphemes than the line has
+            // cells (a cell whose text segments into two graphemes). Stop
+            // here rather than index past the end: this runs in the paint
+            // path, where a panic aborts the app (#608). Log only sizes,
+            // never the line text, which is the user's terminal content.
+            let Some(cell) = self.cells.get_mut(cell_idx) else {
+                log::warn!(
+                    "implicit hyperlink scan stopped early: {} bytes, {} cells, {} graphemes",
+                    line.len(),
+                    self.cells.len(),
+                    line.graphemes(true).count()
+                );
+                break;
+            };
             let mut matched = false;
             for m in &matches {
                 if m.range.contains(&byte_idx) {

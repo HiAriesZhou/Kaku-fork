@@ -6,6 +6,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::SEQ_ZERO;
 use alloc::sync::Arc;
 use k9::assert_equal as assert_eq;
+use unicode_segmentation::UnicodeSegmentation;
 use wezterm_cell::{Cell, CellAttributes};
 
 /// There are 4 double-wide graphemes that occupy 2 cells each.
@@ -711,4 +712,34 @@ Line {
 }
 "#
     );
+}
+
+/// A cell whose text unicode-segmentation splits into two graphemes leaves
+/// the line string with more graphemes than cells. The implicit hyperlink
+/// scan used to index past the last cell and panic inside the paint path,
+/// which aborted the whole app (#608). It must stop at the last cell instead.
+#[test]
+fn apply_hyperlink_rules_survives_more_graphemes_than_cells() {
+    let rules = vec![Rule::new(r"\b\w+://\S+[_/a-zA-Z0-9-]", "$0").unwrap()];
+
+    let mut cells = vec![Cell::new_grapheme_with_width(
+        "ab",
+        1,
+        CellAttributes::default(),
+    )];
+    for c in " http://example.com".chars() {
+        cells.push(Cell::new(c, CellAttributes::default()));
+    }
+    let mut line = Line::from_cells(cells, SEQ_ZERO);
+    let cell_count = line.len();
+    assert!(
+        line.as_str().graphemes(true).count() > cell_count,
+        "fixture must hold more graphemes than cells"
+    );
+
+    let mut lines: [&mut Line; 1] = [&mut line];
+    Line::apply_hyperlink_rules(&rules, &mut lines);
+
+    assert_eq!(line.len(), cell_count);
+    assert!(line.has_hyperlink());
 }

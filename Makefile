@@ -17,6 +17,8 @@ check:
 	cargo check --locked -p wezterm-surface
 	cargo check --locked -p wezterm-ssh
 	./scripts/check_prompts.sh
+	python3 scripts/check_incidents.py
+	@python3 scripts/risk_tier.py
 
 app:
 	PROFILE=debug ./scripts/build.sh --app-only 2>&1 | grep -v "ranlib: warning:.*has no symbols"; exit $${PIPESTATUS[0]}
