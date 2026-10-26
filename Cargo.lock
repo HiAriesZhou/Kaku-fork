@@ -7484,6 +7484,7 @@ dependencies = [
  "finl_unicode",
  "fixedbitset",
  "k9",
+ "log",
  "ordered-float 4.6.0",
  "serde",
  "siphasher",
