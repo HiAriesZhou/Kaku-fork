@@ -165,11 +165,23 @@ pub fn set_lang_from_locale() {
     }
 }
 
+/// The message a panic carries. A literal `panic!("text")` carries a
+/// `&str`, but a formatted one, an index out of bounds included, carries a
+/// `String`.
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        text
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text
+    } else {
+        "!?"
+    }
+}
+
 fn register_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let payload = info.payload();
-        let payload = payload.downcast_ref::<&str>().unwrap_or(&"!?");
+        let payload = panic_payload_text(info.payload());
         let bt = backtrace::Backtrace::new();
         if let Some(loc) = info.location() {
             log::error!(
@@ -313,5 +325,30 @@ mod claude_marker_tests {
             "settings that are not session markers survive"
         );
         std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
+    }
+}
+
+#[cfg(test)]
+mod panic_hook_tests {
+    use super::panic_payload_text;
+
+    // #608 logged `panic at ...vecstorage.rs:50:39 - !?`: an index panic
+    // carries a formatted String, which the hook used to drop.
+    #[test]
+    fn panic_payload_text_reads_str_and_string_messages() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("literal message");
+        assert_eq!(panic_payload_text(literal.as_ref()), "literal message");
+
+        let formatted: Box<dyn std::any::Any + Send> = Box::new(format!(
+            "index out of bounds: the len is {} but the index is {}",
+            3, 4
+        ));
+        assert_eq!(
+            panic_payload_text(formatted.as_ref()),
+            "index out of bounds: the len is 3 but the index is 4"
+        );
+
+        let other: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(panic_payload_text(other.as_ref()), "!?");
     }
 }
