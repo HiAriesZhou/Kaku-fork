@@ -794,6 +794,14 @@ async fn carry(
                     destination: local,
                     contents,
                 });
+                // Only datagrams from an address ICE checked, or STUN with
+                // this path's credentials. The DTLS server runs without
+                // cookies on the understanding that ICE filters first: a
+                // stranger's ClientHello sent before the page's took the
+                // handshake and the path never opened.
+                if !rtc.accepts(&input) {
+                    continue;
+                }
                 if let Err(e) = rtc.handle_input(input) {
                     return e.to_string();
                 }
@@ -1029,6 +1037,40 @@ mod tests {
     }
 
     async fn open() -> Option<Opened> {
+        open_with(|_| async {}).await
+    }
+
+    /// A DTLS ClientHello from a peer nobody negotiated with.
+    fn stranger_client_hello() -> Vec<Vec<u8>> {
+        let now = Instant::now();
+        let cert = dimpl::certificate::generate_self_signed_certificate().unwrap();
+        let config = Arc::new(dimpl::Config::builder().build().unwrap());
+        let mut dtls = dimpl::Dtls::new_auto(
+            config,
+            dimpl::DtlsCertificate {
+                certificate: cert.certificate,
+                private_key: cert.private_key,
+            },
+            now,
+        );
+        dtls.set_active(true);
+        let _ = dtls.handle_timeout(now);
+        let _ = dtls.handle_packet(&[]);
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        while let dimpl::Output::Packet(p) = dtls.poll_output(&mut buf) {
+            out.push(p.to_vec());
+        }
+        out
+    }
+
+    /// Like `open`, running `before` with Kaku's answer before the page
+    /// takes it.
+    async fn open_with<F, Fut>(before: F) -> Option<Opened>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let &(ip, _) = local_ips().first()?;
         let (page_in, inbox) = mpsc::channel::<String>(8);
         let (outbox, mut relay_out) = queue::channel::<String>(8);
@@ -1052,6 +1094,7 @@ mod tests {
         let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
         assert_eq!(answer["type"], "rtc_answer");
         let path = answer["id"].as_u64().unwrap();
+        before(answer["sdp"].as_str().unwrap().to_string()).await;
         let answer =
             str0m::change::SdpAnswer::from_sdp_string(answer["sdp"].as_str().unwrap()).unwrap();
         page.sdp_api().accept_answer(pending, answer).unwrap();
@@ -1099,6 +1142,35 @@ mod tests {
             .await
         );
         whole
+    }
+
+    /// Someone on the LAN or the tailnet who sees the path's ports must not
+    /// be able to take the handshake before the page's own arrives.
+    #[tokio::test]
+    async fn a_strangers_handshake_sent_first_does_not_stop_the_path() {
+        let opened = open_with(|sdp| async move {
+            let stranger = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let hello = stranger_client_hello();
+            assert!(!hello.is_empty());
+            for line in sdp.lines().filter(|l| l.starts_with("a=candidate")) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let Some(Ok(to)) = fields
+                    .get(4)
+                    .zip(fields.get(5))
+                    .map(|(ip, port)| format!("{ip}:{port}").parse::<SocketAddr>())
+                else {
+                    continue;
+                };
+                for packet in &hello {
+                    let _ = stranger.send_to(packet, to).await;
+                }
+            }
+            // Let Kaku read them before the page starts its own.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        })
+        .await;
+        // `open` asserts the channel opened on both sides.
+        let _ = opened;
     }
 
     #[tokio::test]

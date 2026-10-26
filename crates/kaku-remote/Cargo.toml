@@ -39,3 +39,8 @@ rustls.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-foundation.workspace = true
+
+[dev-dependencies]
+# A stranger's DTLS ClientHello for the direct path's tests; the same
+# version and features str0m already builds.
+dimpl = { version = "0.7.1", default-features = false, features = ["rust-crypto", "rcgen"] }
