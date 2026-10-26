@@ -1,6 +1,6 @@
 [package]
 name = "kaku"
-version = "0.26.1"
+version = "0.27.0"
 authors = ["Tw93 <hitw93@gmail.com>"]
 edition = "2018"
 publish = false
@@ -15,6 +15,7 @@ remote = ["dep:kaku-remote"]
 anyhow.workspace = true
 kaku-ai-utils.workspace = true
 kaku-remote = { workspace = true, optional = true }
+libc.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true

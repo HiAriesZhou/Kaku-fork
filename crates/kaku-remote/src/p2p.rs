@@ -36,8 +36,14 @@ const MAX_BUFFERED: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Public STUN servers asked for each socket's address as the internet sees
 /// it, the same ones the page asks. None in tests, which stay offline.
+/// Xiaomi's answers inside mainland China within about 40 ms, where Google's
+/// sometimes never does and Cloudflare's takes about 220 ms (2026-10-26).
 const STUN_SERVERS: &[&str] = if cfg!(test) { &[] } else { PUBLIC_STUN };
-const PUBLIC_STUN: &[&str] = &["stun.cloudflare.com:3478", "stun.l.google.com:19302"];
+const PUBLIC_STUN: &[&str] = &[
+    "stun.cloudflare.com:3478",
+    "stun.l.google.com:19302",
+    "stun.miwifi.com:3478",
+];
 /// How long the answer waits for them, DNS included; a server that has not
 /// answered by then leaves that socket with its host address only.
 const STUN_WAIT: Duration = Duration::from_millis(800);
@@ -317,6 +323,8 @@ async fn start(sdp: &str) -> anyhow::Result<(Rtc, Sockets, String)> {
     let sockets = Sockets::bind(&local_ips()).await?;
     let mut rtc = RtcConfig::new()
         .set_crypto_provider(Arc::new(str0m::crypto::from_feature_flags()))
+        // For the selected pair, which the log names once the path opens.
+        .set_stats_interval(Some(Duration::from_secs(1)))
         .build(Instant::now());
     for local in sockets.locals() {
         rtc.add_local_candidate(Candidate::host(local, "udp")?);
@@ -327,15 +335,43 @@ async fn start(sdp: &str) -> anyhow::Result<(Rtc, Sockets, String)> {
         }
     }
     let answer = rtc.sdp_api().accept_offer(offer)?;
+    log::info!(
+        "kaku-remote p2p: offering {} local and {} public addresses for the page's {}",
+        sockets.sockets.len(),
+        sockets.reflexive.len(),
+        candidate_summary(sdp)
+    );
     Ok((rtc, sockets, answer.to_sdp_string()))
+}
+
+/// What kinds of candidates the page's offer carries, for the log: counts
+/// only, so diagnostic bundles hold no addresses.
+fn candidate_summary(sdp: &str) -> String {
+    let (mut host, mut mdns, mut public, mut relayed) = (0, 0, 0, 0);
+    for line in sdp.lines().filter(|l| l.starts_with("a=candidate")) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let kind = fields
+            .iter()
+            .position(|&f| f == "typ")
+            .and_then(|i| fields.get(i + 1));
+        match kind {
+            Some(&"host") if fields.get(4).is_some_and(|a| a.ends_with(".local")) => mdns += 1,
+            Some(&"host") => host += 1,
+            Some(&"srflx") | Some(&"prflx") => public += 1,
+            Some(&"relay") => relayed += 1,
+            _ => {}
+        }
+    }
+    format!("{host} local, {mdns} mDNS, {public} public and {relayed} relayed candidates")
 }
 
 /// The Mac's IPv4 addresses a peer may reach directly. Left out: loopback,
 /// link-local, and 198.18.0.0/15, where proxy apps in TUN mode (Stash,
 /// Clash) put a fake interface that no peer can reach; the route to the
 /// internet picked that one on the maintainer's Mac. Tailscale's 100.64/10
-/// stays, as a path that works across networks.
-fn local_ips() -> Vec<IpAddr> {
+/// stays, as a path that works across networks. Each comes with the index
+/// of the interface that owns it, for `Sockets::bind`.
+fn local_ips() -> Vec<(IpAddr, u32)> {
     let mut ips = Vec::new();
     // SAFETY: getifaddrs hands back a list that stays valid until
     // freeifaddrs, and every pointer read is checked for null first.
@@ -354,9 +390,10 @@ fn local_ips() -> Vec<IpAddr> {
                 && i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET
             {
                 let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                if reachable(ip) && !ips.contains(&IpAddr::V4(ip)) {
-                    ips.push(IpAddr::V4(ip));
+                let ip = IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
+                let index = libc::if_nametoindex(ifa.ifa_name);
+                if reachable_ip(ip) && !ips.iter().any(|&(known, _)| known == ip) {
+                    ips.push((ip, index));
                 }
             }
             at = ifa.ifa_next;
@@ -367,10 +404,22 @@ fn local_ips() -> Vec<IpAddr> {
     ips
 }
 
+fn reachable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => reachable(v4),
+        IpAddr::V6(_) => false,
+    }
+}
+
 fn reachable(ip: Ipv4Addr) -> bool {
+    !(ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || proxy_fake(ip))
+}
+
+/// 198.18.0.0/15, where proxy apps in TUN mode put their fake interface and
+/// fake DNS answers.
+fn proxy_fake(ip: Ipv4Addr) -> bool {
     let [a, b, ..] = ip.octets();
-    let fake = a == 198 && b & 0xfe == 18;
-    !(ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || fake)
+    a == 198 && b & 0xfe == 18
 }
 
 /// One UDP socket per address, and the datagrams they hear.
@@ -384,13 +433,14 @@ struct Sockets {
 }
 
 impl Sockets {
-    async fn bind(ips: &[IpAddr]) -> anyhow::Result<Self> {
+    async fn bind(ips: &[(IpAddr, u32)]) -> anyhow::Result<Self> {
         let (tx, heard) = mpsc::channel(256);
         let mut sockets = Vec::new();
-        for &ip in ips {
+        for &(ip, index) in ips {
             let Ok(socket) = UdpSocket::bind(SocketAddr::new(ip, 0)).await else {
                 continue;
             };
+            pin_to_interface(&socket, index);
             sockets.push(Arc::new(socket));
         }
         anyhow::ensure!(!sockets.is_empty(), "no local address");
@@ -444,7 +494,40 @@ impl Drop for Sockets {
     }
 }
 
+/// Send this socket's datagrams out of the interface that owns its address.
+/// A proxy app in TUN mode (Stash, Clash) otherwise takes them through its
+/// tunnel: binding the address alone does not stop that, STUN then saw the
+/// proxy's exit or nothing within `STUN_WAIT`, and a path that did open ran
+/// through the proxy's UDP relay at seconds of round trip (2026-10-26). Only
+/// these sockets are affected; the relay link and other apps keep the proxy.
+fn pin_to_interface(socket: &UdpSocket, index: u32) {
+    use std::os::fd::AsRawFd;
+    if index == 0 {
+        return;
+    }
+    let value = index as libc::c_int;
+    // SAFETY: the fd belongs to `socket`, and the option takes a c_int.
+    let set = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if set != 0 {
+        log::info!(
+            "kaku-remote p2p: cannot pin a socket to its interface: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Ask the STUN servers about every socket at once, within `STUN_WAIT`.
+/// Each socket keeps what it learned by then: a socket that cannot reach
+/// the servers (a Parallels bridge, once sockets are pinned to their
+/// interface) must not cost the others their answers.
 async fn reflexive_all(
     sockets: &[Arc<UdpSocket>],
     names: &[&str],
@@ -452,34 +535,54 @@ async fn reflexive_all(
     if names.is_empty() {
         return Vec::new();
     }
-    let ask = async {
-        let mut servers = Vec::new();
-        for name in names {
-            if let Ok(found) = tokio::net::lookup_host(name).await {
-                servers.extend(found.filter(|a| a.is_ipv4()).take(1));
+    let deadline = tokio::time::Instant::now() + STUN_WAIT;
+    let mut servers = Vec::new();
+    for name in names {
+        if let Ok(Ok(found)) =
+            tokio::time::timeout_at(deadline, tokio::net::lookup_host(name)).await
+        {
+            let found: Vec<SocketAddr> = found.filter(|a| a.is_ipv4()).collect();
+            let real = |a: &&SocketAddr| !matches!(a.ip(), IpAddr::V4(v4) if proxy_fake(v4));
+            match found.iter().find(real) {
+                Some(&server) => servers.push(server),
+                // The sockets are pinned past the proxy, so a fake address
+                // from its DNS leads nowhere.
+                None if !found.is_empty() => log::info!(
+                    "kaku-remote p2p: {name} resolves only to a proxy's fake address, skipped"
+                ),
+                None => {}
             }
         }
-        let asks = sockets.iter().map(|socket| {
-            let servers = &servers;
-            async move {
-                let base = socket.local_addr().ok()?;
-                let public = reflexive(socket, servers).await?;
-                (public != base && reachable_public(public.ip())).then_some((public, base))
-            }
-        });
-        futures_util::future::join_all(asks).await
-    };
-    match tokio::time::timeout(STUN_WAIT, ask).await {
-        Ok(found) => found.into_iter().flatten().collect(),
-        Err(_) => Vec::new(),
+    }
+    let asks = sockets.iter().map(|socket| {
+        let servers = &servers;
+        async move {
+            let base = socket.local_addr().ok()?;
+            let public = tokio::time::timeout_at(deadline, reflexive(socket, servers))
+                .await
+                .ok()??;
+            (public != base && reachable_public(public.ip())).then_some((public, base))
+        }
+    });
+    futures_util::future::join_all(asks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The network a selected pair crosses, named by the page's address: the
+/// same LAN, Tailscale, or the internet.
+fn path_kind(remote: IpAddr) -> &'static str {
+    match remote {
+        IpAddr::V4(v4) if v4.is_private() => "the local network",
+        IpAddr::V4(v4) if v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64 => "Tailscale",
+        _ => "the internet",
     }
 }
 
 fn reachable_public(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => reachable(v4),
-        IpAddr::V6(_) => false,
-    }
+    reachable_ip(ip)
 }
 
 /// This socket's address as the STUN servers see it: a binding request to
@@ -610,6 +713,8 @@ async fn carry(
     let (tx, mut rx) = mpsc::channel::<Outgoing>(8);
     let mut channel: Option<ChannelId> = None;
     let mut pending: std::collections::VecDeque<Vec<u8>> = Default::default();
+    // The kind of network the selected pair runs over, once logged.
+    let mut logged_kind: Option<&str> = None;
     loop {
         // Hand the channel what it can take.
         if let Some(id) = channel {
@@ -649,6 +754,19 @@ async fn carry(
                         }
                     }
                     Event::ChannelClose(_) => return "the channel closed".into(),
+                    Event::PeerStats(stats) if channel.is_some() => {
+                        if let Some(pair) = stats.selected_candidate_pair {
+                            let kind = path_kind(pair.remote.addr.ip());
+                            if logged_kind != Some(kind) {
+                                logged_kind = Some(kind);
+                                log::info!(
+                                    "kaku-remote p2p: direct path runs over {kind}, {} ms round trip",
+                                    pair.current_round_trip_time
+                                        .map_or("unknown".into(), |rtt| rtt.as_millis().to_string())
+                                );
+                            }
+                        }
+                    }
                     // The page offers again when it can; a path that comes
                     // back on its own would need the lanes ordered again.
                     Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
@@ -676,6 +794,14 @@ async fn carry(
                     destination: local,
                     contents,
                 });
+                // Only datagrams from an address ICE checked, or STUN with
+                // this path's credentials. The DTLS server runs without
+                // cookies on the understanding that ICE filters first: a
+                // stranger's ClientHello sent before the page's took the
+                // handshake and the path never opened.
+                if !rtc.accepts(&input) {
+                    continue;
+                }
                 if let Err(e) = rtc.handle_input(input) {
                     return e.to_string();
                 }
@@ -768,6 +894,77 @@ mod tests {
         assert_eq!(found.unwrap(), Some(public));
     }
 
+    #[tokio::test]
+    async fn a_stun_server_at_a_proxys_fake_address_is_not_asked() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let began = std::time::Instant::now();
+        let found = reflexive_all(&[socket], &["198.18.0.9:3478"]).await;
+        assert!(found.is_empty());
+        assert!(began.elapsed() < STUN_WAIT / 2, "waited on a fake address");
+    }
+
+    #[test]
+    fn a_path_is_named_by_the_network_it_crosses() {
+        let kind = |ip: &str| path_kind(ip.parse().unwrap());
+        assert_eq!(kind("192.168.1.20"), "the local network");
+        assert_eq!(kind("10.0.0.3"), "the local network");
+        assert_eq!(kind("100.101.102.103"), "Tailscale");
+        assert_eq!(kind("100.128.0.1"), "the internet");
+        assert_eq!(kind("183.129.154.206"), "the internet");
+    }
+
+    #[tokio::test]
+    async fn every_socket_is_pinned_to_the_interface_of_its_address() {
+        use std::os::fd::AsRawFd;
+        let ips = local_ips();
+        if ips.is_empty() {
+            return;
+        }
+        let sockets = Sockets::bind(&ips).await.unwrap();
+        for socket in &sockets.sockets {
+            let local = socket.local_addr().unwrap().ip();
+            let &(_, index) = ips.iter().find(|(ip, _)| *ip == local).unwrap();
+            let mut value: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: reads one c_int option from a socket this test owns.
+            let got = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_BOUND_IF,
+                    (&mut value as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(got, 0);
+            assert_ne!(index, 0);
+            assert_eq!(value as u32, index, "{local} is not pinned");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_socket_the_servers_never_answer_leaves_the_others_their_address() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let public: SocketAddr = "203.0.113.7:40123".parse().unwrap();
+        let heard = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let deaf = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let answered = heard.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            // Only one socket gets answers, as when another one is pinned
+            // to an interface with no route to the servers.
+            while let Ok((_, from)) = server.recv_from(&mut buf).await {
+                if from == answered {
+                    let reply = binding_response(&buf[8..20], public);
+                    let _ = server.send_to(&reply, from).await;
+                }
+            }
+        });
+        let found = reflexive_all(&[heard, deaf], &[addr.as_str()]).await;
+        assert_eq!(found, vec![(public, answered)]);
+    }
+
     /// The public servers answer from this network: `cargo test -p
     /// kaku-remote public_stun -- --ignored --nocapture`.
     #[tokio::test]
@@ -840,7 +1037,41 @@ mod tests {
     }
 
     async fn open() -> Option<Opened> {
-        let &ip = local_ips().first()?;
+        open_with(|_| async {}).await
+    }
+
+    /// A DTLS ClientHello from a peer nobody negotiated with.
+    fn stranger_client_hello() -> Vec<Vec<u8>> {
+        let now = Instant::now();
+        let cert = dimpl::certificate::generate_self_signed_certificate().unwrap();
+        let config = Arc::new(dimpl::Config::builder().build().unwrap());
+        let mut dtls = dimpl::Dtls::new_auto(
+            config,
+            dimpl::DtlsCertificate {
+                certificate: cert.certificate,
+                private_key: cert.private_key,
+            },
+            now,
+        );
+        dtls.set_active(true);
+        let _ = dtls.handle_timeout(now);
+        let _ = dtls.handle_packet(&[]);
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        while let dimpl::Output::Packet(p) = dtls.poll_output(&mut buf) {
+            out.push(p.to_vec());
+        }
+        out
+    }
+
+    /// Like `open`, running `before` with Kaku's answer before the page
+    /// takes it.
+    async fn open_with<F, Fut>(before: F) -> Option<Opened>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let &(ip, _) = local_ips().first()?;
         let (page_in, inbox) = mpsc::channel::<String>(8);
         let (outbox, mut relay_out) = queue::channel::<String>(8);
         let (frames, relay_frames) = mpsc::channel::<Vec<u8>>(8);
@@ -863,6 +1094,7 @@ mod tests {
         let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
         assert_eq!(answer["type"], "rtc_answer");
         let path = answer["id"].as_u64().unwrap();
+        before(answer["sdp"].as_str().unwrap().to_string()).await;
         let answer =
             str0m::change::SdpAnswer::from_sdp_string(answer["sdp"].as_str().unwrap()).unwrap();
         page.sdp_api().accept_answer(pending, answer).unwrap();
@@ -910,6 +1142,35 @@ mod tests {
             .await
         );
         whole
+    }
+
+    /// Someone on the LAN or the tailnet who sees the path's ports must not
+    /// be able to take the handshake before the page's own arrives.
+    #[tokio::test]
+    async fn a_strangers_handshake_sent_first_does_not_stop_the_path() {
+        let opened = open_with(|sdp| async move {
+            let stranger = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let hello = stranger_client_hello();
+            assert!(!hello.is_empty());
+            for line in sdp.lines().filter(|l| l.starts_with("a=candidate")) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let Some(Ok(to)) = fields
+                    .get(4)
+                    .zip(fields.get(5))
+                    .map(|(ip, port)| format!("{ip}:{port}").parse::<SocketAddr>())
+                else {
+                    continue;
+                };
+                for packet in &hello {
+                    let _ = stranger.send_to(packet, to).await;
+                }
+            }
+            // Let Kaku read them before the page starts its own.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        })
+        .await;
+        // `open` asserts the channel opened on both sides.
+        let _ = opened;
     }
 
     #[tokio::test]

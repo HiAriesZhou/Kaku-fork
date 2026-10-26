@@ -613,11 +613,46 @@ done
     }
 }
 
+/// `keyAEQuitReason` ('why?') on the quit Apple event loginwindow sends.
+const K_AE_QUIT_REASON: u32 = 0x7768_793f;
+
+/// Quit reasons for log out, restart and shut down (kAEReallyLogOut,
+/// kAERestart, kAEShutDown and the dialog-confirmed variants). The user
+/// already confirmed these in the system, and cancelling the terminate here
+/// aborts the whole restart, so they skip Kaku's own close confirmation.
+fn is_system_session_end_reason(code: u32) -> bool {
+    matches!(
+        &code.to_be_bytes(),
+        b"logo" | b"rlgo" | b"rest" | b"shut" | b"rrst" | b"rsdn"
+    )
+}
+
+/// True when the quit being handled comes from log out, restart or shut down.
+/// A Dock or menu Quit carries no quit reason.
+fn quit_is_system_session_end() -> bool {
+    unsafe {
+        let manager: id = msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
+        let event: id = msg_send![manager, currentAppleEvent];
+        if event == nil {
+            return false;
+        }
+        let reason: id = msg_send![event, attributeDescriptorForKeyword: K_AE_QUIT_REASON];
+        if reason == nil {
+            return false;
+        }
+        let code: u32 = msg_send![reason, enumCodeValue];
+        is_system_session_end_reason(code)
+    }
+}
+
 extern "C" fn application_should_terminate(
     _self: &mut Object,
     _sel: Sel,
     _app: *mut Object,
 ) -> u64 {
+    if quit_is_system_session_end() {
+        return terminate_now(QuitOrigin::AppKitShouldTerminate, Some("system-session-end"));
+    }
     unsafe {
         match config::configuration().window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => terminate_now(
@@ -983,6 +1018,25 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn system_restart_and_log_out_skip_close_confirmation() {
+        for code in [b"logo", b"rlgo", b"rest", b"shut", b"rrst", b"rsdn"] {
+            assert!(is_system_session_end_reason(u32::from_be_bytes(*code)));
+        }
+        assert!(!is_system_session_end_reason(0));
+        assert!(!is_system_session_end_reason(u32::from_be_bytes(*b"quit")));
+        assert_eq!(K_AE_QUIT_REASON, u32::from_be_bytes(*b"why?"));
+
+        let source = include_str!("app.rs");
+        let handler = source
+            .split("extern \"C\" fn application_should_terminate(")
+            .nth(1)
+            .unwrap();
+        let session_end = handler.find("quit_is_system_session_end()").unwrap();
+        let prompt = handler.find("window_close_confirmation").unwrap();
+        assert!(session_end < prompt);
+    }
 
     #[test]
     fn hotkey_options_ordinary_mode_has_a_separate_route() {

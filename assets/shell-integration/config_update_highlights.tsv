@@ -112,3 +112,5 @@
 41	emoji 和 Nerd Font 选择器回到命令面板
 42	Restart to Update installs the new version instead of reopening the old one
 42	重启以更新会装好新版本，不再回到旧版本
+43	Paths and URLs a TUI wraps across two lines open in full
+43	TUI 折成两行的路径和网址可以完整打开
