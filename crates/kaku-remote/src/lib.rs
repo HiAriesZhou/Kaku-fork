@@ -22,7 +22,10 @@ mod queue;
 mod share;
 mod web;
 
-pub use pairing::{list_devices, revoke_device, Device, OFFER_LIFETIME};
+pub use pairing::{
+    answer_request, is_paired, list_devices, pending_request, revoke_device, Device, PairRequest,
+    OFFER_LIFETIME,
+};
 pub use share::{
     access_fingerprint, load_or_create_identity, reset_identity, save_access_code, ShareIdentity,
 };
@@ -271,7 +274,7 @@ fn process_alive(pid: u32) -> bool {
     signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn write_state(port: u16, token: &str, tunnel_relay: Option<&str>) {
+fn write_state_at(path: &std::path::Path, port: u16, token: &str, tunnel_relay: Option<&str>) {
     let mut val = serde_json::json!({
         "port": port,
         "token": token,
@@ -281,7 +284,7 @@ fn write_state(port: u16, token: &str, tunnel_relay: Option<&str>) {
         val["tunnel_relay"] = serde_json::Value::String(relay.to_string());
     }
     if let Ok(json) = serde_json::to_string(&val) {
-        if let Err(e) = write_private(&state_path(), json.as_bytes()) {
+        if let Err(e) = write_private(path, json.as_bytes()) {
             log::warn!("kaku-remote: failed to write state file: {e}");
         }
     }
@@ -642,6 +645,30 @@ fn launch() {
         .expect("spawn kaku-remote thread");
 }
 
+/// Bind the local page's port, then record the state `kaku remote` reads.
+/// The token and port go into the state only once the port is Kaku's: with
+/// another app (another account, a sandboxed one) holding it, the printed
+/// link would hand that app the token and a page of its own to type into.
+/// Port 0 then says the local page is not served; the relay link still is.
+async fn bind_and_record(
+    path: &std::path::Path,
+    addr: SocketAddr,
+    token: &str,
+    tunnel_relay: Option<&str>,
+) -> Option<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            write_state_at(path, addr.port(), token, tunnel_relay);
+            Some(listener)
+        }
+        Err(e) => {
+            log::error!("kaku-remote: failed to bind {addr}: {e}");
+            write_state_at(path, 0, "", tunnel_relay);
+            None
+        }
+    }
+}
+
 async fn serve_all(
     port: u16,
     token: &'static str,
@@ -663,21 +690,18 @@ async fn serve_all(
     // must not take it down with this task.
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
+    let Some(listener) =
+        bind_and_record(&state_path(), addr, token, tunnel_relay_opt.as_deref()).await
+    else {
+        return std::future::pending().await;
+    };
     log::info!("kaku-remote: listening on http://{}", addr);
-    write_state(port, token, tunnel_relay_opt.as_deref());
-
     // Keystrokes and frames are small writes; Nagle would hold one back
     // until the previous is acknowledged, as the relay already avoids on its
     // own sockets.
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l.tap_io(|tcp| {
-            let _ = tcp.set_nodelay(true);
-        }),
-        Err(e) => {
-            log::error!("kaku-remote: failed to bind {addr}: {e}");
-            return std::future::pending().await;
-        }
-    };
+    let listener = listener.tap_io(|tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     if let Err(e) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -692,6 +716,35 @@ async fn serve_all(
 #[cfg(test)]
 mod relay_status_tests {
     use super::*;
+
+    /// Another app on the port must not be handed the token in the link
+    /// `kaku remote` prints.
+    #[tokio::test]
+    async fn a_port_held_by_another_app_keeps_the_token_out_of_the_state() {
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = squatter.local_addr().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("kaku-remote-squat-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(bind_and_record(&path, addr, "secret-token", Some("wss://relay"))
+            .await
+            .is_none());
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(state["port"], 0);
+        assert_eq!(state["token"], "");
+        assert_eq!(state["tunnel_relay"], "wss://relay");
+        drop(squatter);
+        // Free, the port and token are recorded.
+        assert!(bind_and_record(&path, addr, "secret-token", None)
+            .await
+            .is_some());
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(state["port"], addr.port());
+        assert_eq!(state["token"], "secret-token");
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn only_one_kaku_per_data_dir_serves_remote_access() {

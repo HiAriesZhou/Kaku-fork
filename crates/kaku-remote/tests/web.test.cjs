@@ -351,8 +351,19 @@ test('a removed device forgets its pairing and an expired link keeps nothing', a
   t.after(() => context.close());
   const { p } = await page(t, pairingLink(mac, secret), {}, context);
   await handshake(p, mac, { secret });
+  // A bare 4403 can come from anyone on the way: the key stays and the
+  // page connects again.
+  const blip = await page(t, '', {}, context);
+  await handshake(blip.p, mac);
+  await blip.p.evaluate(() => connections.at(-1).close(4403));
+  await blip.p.waitForFunction(() => connections.length > 1);
+  assert.notEqual(await storedDevice(blip.p), null);
+  assert.doesNotMatch(await blip.p.locator('#notice').innerText(), /not paired/);
+  // The Mac's sealed note is what removes it.
   const next = await page(t, '', {}, context);
-  await handshake(next.p, mac);
+  await handshake(next.p, mac, { admit: false });
+  await next.p.evaluate(() => fromMac({ type: 'revoked' }));
+  await next.p.waitForTimeout(50);
   await next.p.evaluate(() => connections.at(-1).close(4403));
   assert.match(await next.p.locator('#notice').innerText(), /not paired/);
   await next.p.waitForTimeout(100);
@@ -365,6 +376,46 @@ test('a removed device forgets its pairing and an expired link keeps nothing', a
   assert.equal(await storedDevice(late.p), null);
   await late.p.waitForTimeout(700);
   assert.equal(await late.p.evaluate(() => connections.length), 1);
+});
+
+test('a new browser shows the code kaku remote shows and pairs once it is allowed', async t => {
+  const mac = await newMac();
+  const secret = Buffer.alloc(16, 13);
+  const { p, errors } = await page(t, pairingLink(mac, secret));
+  const { proof } = await handshake(p, mac, { secret, admit: false });
+  await p.evaluate(() => fromMac({ type: 'pair_pending' }));
+  const digits = require('node:crypto').createHmac('sha256', secret)
+    .update(Buffer.concat([Buffer.from('kaku-remote pairing code'), Buffer.from(proof.device, 'base64url')]))
+    .digest().readUInt32BE(0) % 1000000;
+  const code = String(digits).padStart(6, '0');
+  await p.waitForFunction(() => /Confirm/.test(document.querySelector('#notice').innerText));
+  assert.ok((await p.locator('#notice').innerText()).includes(code.slice(0, 3) + ' ' + code.slice(3)));
+  // Nothing is saved while it waits, and the heartbeat stays quiet.
+  assert.equal(await storedDevice(p), null);
+  const before = await p.evaluate(() => connections.at(-1).binary.length);
+  await p.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await p.waitForTimeout(100);
+  assert.equal(await p.evaluate(() => connections.at(-1).binary.length), before);
+  // Enter on the Mac: the session starts and the browser is kept.
+  await p.evaluate(() => fromMac({ type: 'pong' }));
+  await p.waitForFunction(() => !/Confirm/.test(document.querySelector('#notice').innerText));
+  await p.waitForTimeout(100);
+  assert.notEqual(await storedDevice(p), null);
+  assert.deepEqual(errors, []);
+});
+
+test('a pairing refused on the Mac or taken by another browser says so and stops', async t => {
+  const mac = await newMac();
+  for (const [code, said] of [[4409, /Not confirmed/], [4429, /Another browser/]]) {
+    const secret = Buffer.alloc(16, code % 256);
+    const { p } = await page(t, pairingLink(mac, secret));
+    await handshake(p, mac, { secret, admit: false });
+    await p.evaluate(code => connections.at(-1).close(code), code);
+    assert.match(await p.locator('#notice').innerText(), said);
+    await p.waitForTimeout(700);
+    assert.equal(await p.evaluate(() => connections.length), 1);
+    assert.equal(await storedDevice(p), null);
+  }
 });
 
 test('a paired device survives closing and relaunching the browser process', async t => {

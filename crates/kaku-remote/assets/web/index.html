@@ -354,6 +354,21 @@
     }
   }
   let paired = !pairing;
+  // Waiting for Enter in `kaku remote` on the Mac: only the handshake's
+  // messages go out meanwhile.
+  let pendingPair = false;
+  // The six digits `kaku remote` shows for this browser: an HMAC under the
+  // link's secret of this browser's key, as the Mac computes it.
+  const pairingCode = async () => {
+    const label = enc.encode("kaku-remote pairing code");
+    const key = await crypto.subtle.importKey("raw", pairing.secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const data = new Uint8Array(label.length + device.publicKey.length);
+    data.set(label);
+    data.set(device.publicKey, label.length);
+    const tag = new DataView(await crypto.subtle.sign("HMAC", key, data));
+    const n = String(tag.getUint32(0) % 1000000).padStart(6, "0");
+    return n.slice(0, 3) + " " + n.slice(3);
+  };
   const finishPairing = () => {
     if (!pairing) return;
     pairing = null;
@@ -483,6 +498,7 @@
   const send = (msg) => {
     const socket = ws;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (pendingPair) return;
     if (INPUT_TYPES.has(msg.type)) { stopScrolling(); closePast(); takeBack(); }
     // Zoom changes the pane's share of its tab. Let its next frame reclaim
     // our grid after the Mac has applied the zoom, even if our size is unchanged.
@@ -3194,7 +3210,7 @@
   let pingSentAt = 0;
   const PONG_WAIT = 15000;
   setInterval(() => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN || pendingPair) return;
     if (pingSentAt > lastHeard && Date.now() - pingSentAt > PONG_WAIT) { ws.close(); return; }
     if (pingSentAt > lastHeard) return;
     pingSentAt = Date.now();
@@ -3377,6 +3393,8 @@
 
   let reconnectTimer = 0;
   let linkRejected = false;
+  // Bare 4403 closes in a row, without the Mac's sealed `revoked`.
+  let refusals = 0;
   let handshakeTimer = 0;
   const connect = () => {
     clearTimeout(reconnectTimer);
@@ -3409,6 +3427,17 @@
     };
     const onMessage = (socket, msg) => {
       if (ws !== socket) return;
+      if (msg.type === "pair_pending" && pairing) {
+        pendingPair = true;
+        clearTimeout(handshakeTimer);
+        pairingCode().then((code) => {
+          if (ws === socket && pendingPair) setNotice("Confirm " + code + " on your Mac", "Press Enter where you ran kaku remote if it shows the same code.");
+        });
+        return;
+      }
+      // Sealed by the Mac, so unlike a bare close code nobody on the way
+      // can send it: this browser was removed, forget its key.
+      if (msg.type === "revoked") { socket.revoked = true; forgetDevice(); return; }
       if (msg.type === "rtc_answer") { answered(socket, msg); return; }
       if (msg.type === "rtc_ready") { laneReady(socket, msg); return; }
       if (msg.type === "rtc_closed") { directClosed(socket, msg); return; }
@@ -3417,6 +3446,8 @@
       if (msg.type === "config" || msg.type === "tabs" || msg.type === "frame" || msg.type === "pong") {
         clearTimeout(handshakeTimer);
         retry = 0;
+        refusals = 0;
+        pendingPair = false;
         if (everConnected && !checkedPage) {
           checkedPage = true;
           checkPageFresh();
@@ -3436,16 +3467,32 @@
       clearTimeout(handshakeTimer);
       stopScrolling();
       closePast();
-      if (ev.code === 4403 || ev.code === 1008) {
+      const wasPending = pendingPair;
+      pendingPair = false;
+      if (!relay && (ev.code === 4403 || ev.code === 1008)) {
         linkRejected = true;
-        if (!relay) {
-          setNotice("This link no longer works", "Run kaku remote on the Mac for the new one.", { stale: true });
-          return;
-        }
-        if (paired) forgetDevice();
-        setNotice("This browser is not paired", "Run kaku remote on the Mac to pair again.", { stale: true });
+        setNotice("This link no longer works", "Run kaku remote on the Mac for the new one.", { stale: true });
         return;
       }
+      // Only the Mac's sealed note removes this browser; a bare close code
+      // (a relay, or a message that did not open) is retried a few times.
+      if (socket.revoked || ((ev.code === 4403 || ev.code === 1008) && ++refusals >= 3)) {
+        linkRejected = true;
+        setNotice(socket.revoked ? "This browser is not paired" : "Kaku refused this browser", "Run kaku remote on the Mac to pair again.", { stale: true });
+        return;
+      }
+      if (ev.code === 4409) {
+        linkRejected = true;
+        setNotice("Not confirmed on the Mac", "Run kaku remote on the Mac for a new link.", { stale: true });
+        return;
+      }
+      if (ev.code === 4429) {
+        linkRejected = true;
+        setNotice("Another browser opened this link first", "Do not confirm it on the Mac. Run kaku remote there for a new link.", { stale: true });
+        return;
+      }
+      // Still waiting for Enter: reconnect at once and wait again.
+      if (wasPending) retry = 0;
       if (ev.code === 4401) {
         linkRejected = true;
         setNotice("This pairing link has expired", "Run kaku remote on the Mac for a new one.", { stale: true });
@@ -3501,7 +3548,7 @@
       connect();
       return;
     }
-    if (ws.readyState !== WebSocket.OPEN) return;
+    if (ws.readyState !== WebSocket.OPEN || pendingPair) return;
     const socket = ws;
     pingSentAt = Date.now();
     send({ type: "ping" });

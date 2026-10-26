@@ -15,6 +15,7 @@ remote = ["dep:kaku-remote"]
 anyhow.workspace = true
 kaku-ai-utils.workspace = true
 kaku-remote = { workspace = true, optional = true }
+libc.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true

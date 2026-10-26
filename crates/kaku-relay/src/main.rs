@@ -1023,7 +1023,9 @@ fn browser_close(code: u64) -> ws::Message {
         4401 => (4401, "pairing link expired or used"),
         4403 => (4403, "not a paired browser"),
         4408 => (4408, "authentication timed out"),
+        4409 => (4409, "pairing not confirmed on the Mac"),
         4426 => (4426, "page is out of date"),
+        4429 => (4429, "pairing link already in use"),
         _ => (4413, "connection is busy"),
     };
     ws::Message::Close(Some(ws::CloseFrame {
@@ -1374,7 +1376,7 @@ mod tests {
         assert_eq!(frame.reason.as_str(), "not a paired browser");
         // The page tells an expired pairing link from a removed browser by
         // its code; a code the relay does not pass reads as busy and retries.
-        for code in [4401u16, 4408, 4426] {
+        for code in [4401u16, 4403, 4408, 4409, 4426, 4429] {
             let ws::Message::Close(Some(frame)) = browser_close(code.into()) else {
                 panic!("close frame")
             };

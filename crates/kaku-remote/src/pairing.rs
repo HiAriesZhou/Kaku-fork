@@ -10,8 +10,11 @@
 //! next, so Kaku talks only to a paired device. Removing a device from the
 //! list ends its sessions within seconds.
 //!
-//! Every new pairing shows a notification on the Mac, so a pairing link that
-//! leaked within its few minutes cannot add a device unnoticed.
+//! A new browser joins only once someone at the Mac confirms it: the page
+//! and `kaku remote` show the same six-digit code, derived from the link's
+//! secret and the browser's key, and Enter in that terminal lets it in. A
+//! link that leaked, screenshots and saved scrollback included, is useless
+//! without that keypress, and one link holds one pending browser at a time.
 
 use anyhow::Context;
 use base64::Engine;
@@ -195,10 +198,15 @@ pub(crate) enum PageAuth {
 /// say what happened.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    /// Not a paired device (removed, or the Mac was reset): 4403.
+    /// Not a paired device (removed, or the Mac was reset): 4403, after a
+    /// sealed `revoked` message, the only thing that makes a page forget
+    /// its key.
     UnknownDevice,
     /// The pairing link expired, was used, or is not this Mac's: 4401.
     PairingLink,
+    /// Another browser opened the link first and waits for confirmation:
+    /// 4429.
+    LinkInUse,
     /// Malformed, or a signature that does not match: 4403.
     BadProof,
 }
@@ -207,18 +215,30 @@ impl Refusal {
     pub(crate) fn close_code(&self) -> u16 {
         match self {
             Refusal::PairingLink => 4401,
+            Refusal::LinkInUse => 4429,
             Refusal::UnknownDevice | Refusal::BadProof => 4403,
         }
     }
 }
 
+/// Closing code for a pairing the person at the Mac refused.
+pub(crate) const DECLINED: u16 = 4409;
+
+/// What a page that proved its key gets.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Admission {
+    /// A paired device signing in.
+    Known(Device),
+    /// A new browser with a valid link, waiting for Enter in `kaku remote`.
+    Pending(Device),
+}
+
 /// Check the page's proof against the paired devices and the pairing offer.
-/// Returns the device it is, and whether it joined just now.
 pub(crate) fn admit(
     auth: &PageAuth,
     transcript: &[u8; 32],
     store: &mut dyn DeviceStore,
-) -> Result<(Device, bool), Refusal> {
+) -> Result<Admission, Refusal> {
     let (device, sig) = match auth {
         PageAuth::Auth { device, sig } | PageAuth::Pair { device, sig, .. } => (device, sig),
     };
@@ -232,18 +252,16 @@ pub(crate) fn admit(
     match auth {
         PageAuth::Auth { .. } => store
             .seen(&id, &key)
-            .map(|d| (d, false))
+            .map(Admission::Known)
             .ok_or(Refusal::UnknownDevice),
         PageAuth::Pair { proof, name, .. } => {
             if let Some(known) = store.seen(&id, &key) {
-                return Ok((known, false));
+                return Ok(Admission::Known(known));
             }
             let proof = unb64(proof).ok_or(Refusal::BadProof)?;
-            let proof_matches = |secret: &[u8]| {
-                let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
-                hmac::verify(&key, transcript, &proof).is_ok()
-            };
-            if !store.take_offer(&proof_matches) {
+            let secret = store.offer_secret().ok_or(Refusal::PairingLink)?;
+            let hkey = hmac::Key::new(hmac::HMAC_SHA256, &secret);
+            if hmac::verify(&hkey, transcript, &proof).is_err() {
                 return Err(Refusal::PairingLink);
             }
             let device = Device {
@@ -253,10 +271,30 @@ pub(crate) fn admit(
                 paired_at: now(),
                 last_seen: now(),
             };
-            store.add(device.clone());
-            Ok((device, true))
+            let code = pairing_code(&secret, &public);
+            if !store.hold(&device, &code) {
+                return Err(Refusal::LinkInUse);
+            }
+            Ok(Admission::Pending(device))
         }
     }
+}
+
+const CODE_LABEL: &[u8] = b"kaku-remote pairing code";
+
+/// The six digits the page and `kaku remote` both show for a browser
+/// pairing with a link: an HMAC under the link's secret of the browser's
+/// key, so it stays the same across that browser's reconnects and differs
+/// for any other browser. The page computes it the same way.
+pub(crate) fn pairing_code(secret: &[u8], device_public: &[u8]) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
+    let mut ctx = hmac::Context::with_key(&key);
+    ctx.update(CODE_LABEL);
+    ctx.update(device_public);
+    let tag = ctx.sign();
+    let n = u32::from_be_bytes([tag.as_ref()[0], tag.as_ref()[1], tag.as_ref()[2], tag.as_ref()[3]]);
+    let n = n % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
 }
 
 /// A short id for a device: the first 8 hex digits of its key's SHA-256.
@@ -268,8 +306,21 @@ pub(crate) fn device_id(public: &[u8]) -> String {
         .collect()
 }
 
+/// Unicode format characters (category Cf) that reorder or hide text, so a
+/// name cannot pass for another in a notification or the devices list.
+pub(crate) fn is_invisible_format(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}')
+}
+
 fn clean_name(name: &str) -> String {
-    let name: String = name.chars().filter(|c| !c.is_control()).take(40).collect();
+    let name: String = name
+        .chars()
+        .filter(|&c| !c.is_control() && !is_invisible_format(c))
+        .take(40)
+        .collect();
     let name = name.trim();
     if name.is_empty() {
         "Browser".to_string()
@@ -296,6 +347,16 @@ struct Offer {
     expires_at: u64,
 }
 
+/// The browser waiting for Enter in `kaku remote`, and the answer.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PairRequest {
+    pub device: Device,
+    pub code: String,
+    /// None until `kaku remote` answers.
+    #[serde(default)]
+    pub allowed: Option<bool>,
+}
+
 /// Where `admit` reads and records devices and the offer; files in the data
 /// dir for Kaku, memory in tests.
 pub(crate) trait DeviceStore {
@@ -305,10 +366,16 @@ pub(crate) trait DeviceStore {
     /// bits can be ground offline.
     fn seen(&mut self, id: &str, public_key: &str) -> Option<Device>;
     fn add(&mut self, device: Device);
-    /// Use up the current offer if `check` accepts its secret.
-    fn take_offer(&mut self, check: &dyn Fn(&[u8]) -> bool) -> bool;
     /// The current offer's secret, left in place, if one is out and fresh.
     fn offer_secret(&mut self) -> Option<Vec<u8>>;
+    /// Make `device` the one browser waiting on the current offer, or keep
+    /// it if it already is; false when another browser holds it.
+    fn hold(&mut self, device: &Device, code: &str) -> bool;
+    /// The answer for the waiting `device`: None while nobody answered,
+    /// Some(false) when refused or no longer waiting.
+    fn answer(&mut self, device: &Device) -> Option<bool>;
+    /// Use up the offer: pair `device` when allowed, then forget the wait.
+    fn settle(&mut self, device: &Device, allowed: bool);
 }
 
 fn devices_path() -> PathBuf {
@@ -317,6 +384,39 @@ fn devices_path() -> PathBuf {
 
 fn offer_path() -> PathBuf {
     config::DATA_DIR.join("remote-pairing.json")
+}
+
+fn request_path() -> PathBuf {
+    config::DATA_DIR.join("remote-pairing-request.json")
+}
+
+fn read_request() -> Option<PairRequest> {
+    std::fs::read_to_string(request_path())
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+}
+
+/// The browser waiting for an answer on the current, fresh link, if any.
+pub fn pending_request() -> Option<PairRequest> {
+    DiskStore.offer_secret()?;
+    read_request().filter(|r| r.allowed.is_none())
+}
+
+/// Answer the browser waiting with `code`, from `kaku remote`. Returns
+/// false when it is no longer the one waiting.
+pub fn answer_request(code: &str, allowed: bool) -> anyhow::Result<bool> {
+    let Some(mut request) = pending_request().filter(|r| r.code == code) else {
+        return Ok(false);
+    };
+    request.allowed = Some(allowed);
+    crate::write_private(&request_path(), serde_json::to_string(&request)?.as_bytes())
+        .context("save pairing answer")?;
+    Ok(true)
+}
+
+/// Whether `device` ended up paired, for `kaku remote` after Enter.
+pub fn is_paired(public_key: &str) -> bool {
+    list_devices().iter().any(|d| d.public_key == public_key)
 }
 
 /// Every device paired with this Mac.
@@ -389,6 +489,7 @@ pub fn forget_all_devices() -> anyhow::Result<()> {
         (true, ())
     })?;
     let _ = std::fs::remove_file(offer_path());
+    let _ = std::fs::remove_file(request_path());
     Ok(())
 }
 
@@ -409,6 +510,8 @@ pub(crate) fn new_offer() -> anyhow::Result<String> {
     }
     crate::write_private(&path, serde_json::to_string(&offer)?.as_bytes())
         .context("save pairing link")?;
+    // A browser waiting on the old link waits on nothing now.
+    let _ = std::fs::remove_file(request_path());
     Ok(offer.secret)
 }
 
@@ -430,6 +533,16 @@ fn seen_at(path: &std::path::Path, id: &str, public_key: &str) -> Option<Device>
     .flatten()
 }
 
+fn add_at(path: &std::path::Path, device: Device) -> anyhow::Result<()> {
+    update_devices_at(path, |devices| {
+        // Replace this key's entry only: a different key that shares the
+        // 8-digit short id must not push a paired device out.
+        devices.retain(|d| d.public_key != device.public_key);
+        devices.push(device);
+        (true, ())
+    })
+}
+
 /// The devices file and offer file in Kaku's data dir.
 pub(crate) struct DiskStore;
 
@@ -439,26 +552,48 @@ impl DeviceStore for DiskStore {
     }
 
     fn add(&mut self, device: Device) {
-        let added = update_devices(|devices| {
-            devices.retain(|d| d.id != device.id);
-            devices.push(device);
-            (true, ())
-        });
-        if let Err(e) = added {
+        if let Err(e) = add_at(&devices_path(), device) {
             log::warn!("kaku-share: {e:#}");
         }
     }
 
-    fn take_offer(&mut self, check: &dyn Fn(&[u8]) -> bool) -> bool {
-        let Some(secret) = self.offer_secret() else {
-            return false;
-        };
-        if !check(&secret) {
-            return false;
+    fn hold(&mut self, device: &Device, code: &str) -> bool {
+        if let Some(waiting) = read_request() {
+            return waiting.device.public_key == device.public_key && waiting.allowed != Some(false);
         }
-        // One device per link.
+        let request = PairRequest {
+            device: device.clone(),
+            code: code.to_string(),
+            allowed: None,
+        };
+        match serde_json::to_string(&request) {
+            Ok(json) => crate::write_private(&request_path(), json.as_bytes()).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    fn answer(&mut self, device: &Device) -> Option<bool> {
+        if self.offer_secret().is_none() {
+            return Some(false);
+        }
+        match read_request() {
+            Some(r) if r.device.public_key == device.public_key => r.allowed,
+            _ => Some(false),
+        }
+    }
+
+    fn settle(&mut self, device: &Device, allowed: bool) {
+        // A newer `kaku remote` replaced the link and its wait: leave those.
+        let ours = read_request().is_some_and(|r| r.device.public_key == device.public_key);
+        if !ours {
+            return;
+        }
+        if allowed {
+            self.add(device.clone());
+        }
+        // One device per link, allowed or not.
         let _ = std::fs::remove_file(offer_path());
-        true
+        let _ = std::fs::remove_file(request_path());
     }
 
     fn offer_secret(&mut self) -> Option<Vec<u8>> {
@@ -476,19 +611,6 @@ impl DeviceStore for DiskStore {
 /// Ids of the devices paired right now, for ending removed ones' sessions.
 pub(crate) fn paired_ids() -> std::collections::HashSet<String> {
     list_devices().into_iter().map(|d| d.id).collect()
-}
-
-/// Tell the person at the Mac that a device joined.
-pub(crate) fn announce(device: &Device) {
-    let title = format!("{} can now use this Mac's terminals", device.name);
-    let message = format!(
-        "Paired through a Kaku remote link. If this was not you, run: kaku remote revoke {}",
-        device.id
-    );
-    promise::spawn::spawn_into_main_thread(async move {
-        wezterm_toast_notification::persistent_toast_notification(&title, &message);
-    })
-    .detach();
 }
 
 /// A paired device away this long says so on the Mac when it connects
@@ -551,6 +673,7 @@ pub(crate) mod tests {
     pub(crate) struct MemoryStore {
         pub(crate) devices: HashMap<String, Device>,
         pub(crate) offer: Option<(Vec<u8>, bool)>,
+        pub(crate) request: Option<PairRequest>,
     }
 
     impl DeviceStore for MemoryStore {
@@ -563,20 +686,42 @@ pub(crate) mod tests {
         fn add(&mut self, device: Device) {
             self.devices.insert(device.id.clone(), device);
         }
-        fn take_offer(&mut self, check: &dyn Fn(&[u8]) -> bool) -> bool {
-            match &mut self.offer {
-                Some((secret, used)) if !*used && check(secret) => {
-                    *used = true;
-                    true
-                }
-                _ => false,
-            }
-        }
         fn offer_secret(&mut self) -> Option<Vec<u8>> {
             match &self.offer {
                 Some((secret, false)) => Some(secret.clone()),
                 _ => None,
             }
+        }
+        fn hold(&mut self, device: &Device, code: &str) -> bool {
+            match &self.request {
+                Some(r) => r.device.public_key == device.public_key && r.allowed != Some(false),
+                None => {
+                    self.request = Some(PairRequest {
+                        device: device.clone(),
+                        code: code.to_string(),
+                        allowed: None,
+                    });
+                    true
+                }
+            }
+        }
+        fn answer(&mut self, device: &Device) -> Option<bool> {
+            if self.offer_secret().is_none() {
+                return Some(false);
+            }
+            match &self.request {
+                Some(r) if r.device.public_key == device.public_key => r.allowed,
+                _ => Some(false),
+            }
+        }
+        fn settle(&mut self, device: &Device, allowed: bool) {
+            if allowed {
+                self.add(device.clone());
+            }
+            if let Some((_, used)) = &mut self.offer {
+                *used = true;
+            }
+            self.request = None;
         }
     }
 
@@ -709,9 +854,16 @@ pub(crate) mod tests {
             last_seen: 0,
         });
         assert_eq!(
-            admit(&auth(&key, &transcript), &transcript, &mut store).map(|(d, _)| d.id),
+            admit(&auth(&key, &transcript), &transcript, &mut store).map(known_id),
             Ok(id)
         );
+    }
+
+    fn known_id(admission: Admission) -> String {
+        match admission {
+            Admission::Known(d) => d.id,
+            Admission::Pending(d) => format!("pending {}", d.id),
+        }
     }
 
     /// The short id is shown in notifications and `kaku remote devices`, and
@@ -736,7 +888,7 @@ pub(crate) mod tests {
             last_seen: 0,
         });
         assert_eq!(
-            admit(&auth(&key, &transcript), &transcript, &mut store).map(|(d, _)| d.id),
+            admit(&auth(&key, &transcript), &transcript, &mut store).map(known_id),
             Err(Refusal::UnknownDevice)
         );
         // Without a pairing link it cannot pair either, and the paired device
@@ -747,7 +899,7 @@ pub(crate) mod tests {
                 &transcript,
                 &mut store
             )
-            .map(|(d, _)| d.id),
+            .map(known_id),
             Err(Refusal::PairingLink)
         );
         assert_eq!(
@@ -797,6 +949,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_new_device_sharing_a_short_id_does_not_replace_the_paired_one() {
+        let dir = std::env::temp_dir().join(format!("kaku-collide-{}", std::process::id()));
+        let path = dir.join("remote-devices.json");
+        let device = |key: &str| Device {
+            id: "abcd1234".into(),
+            public_key: key.into(),
+            name: "Chrome".into(),
+            paired_at: 0,
+            last_seen: 0,
+        };
+        add_at(&path, device("owner")).unwrap();
+        add_at(&path, device("ground")).unwrap();
+        assert!(seen_at(&path, "abcd1234", "owner").is_some());
+        assert!(seen_at(&path, "abcd1234", "ground").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_signature_for_another_connection_does_not_sign_in() {
         // A relay that runs its own exchange with each side gets different
         // transcripts, so it cannot pass the page's signature on.
@@ -818,29 +988,83 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_pairing_link_adds_one_device_once() {
+    fn a_pairing_link_adds_one_device_once_it_is_allowed() {
         let secret = vec![7u8; OFFER_SECRET_LEN];
         let mut store = MemoryStore {
             offer: Some((secret.clone(), false)),
             ..Default::default()
         };
         let (t1, _, first) = exchange("host");
-        let (added, new) = admit(&pair(&first, &t1, &secret), &t1, &mut store).unwrap();
-        assert!(new);
-        assert_eq!(added.name, "Chrome on Windows");
-        assert!(store.devices.contains_key(&added.id));
-        // The same link a second time, from another browser.
+        let Ok(Admission::Pending(waiting)) = admit(&pair(&first, &t1, &secret), &t1, &mut store)
+        else {
+            panic!("a valid link should wait for confirmation");
+        };
+        assert_eq!(waiting.name, "Chrome on Windows");
+        // Nothing is paired before Enter.
+        assert!(store.devices.is_empty());
+        assert_eq!(store.answer(&waiting), None);
+        // Another browser with the same link while the first one waits.
         let (t2, _, second) = exchange("host");
         assert_eq!(
             admit(&pair(&second, &t2, &secret), &t2, &mut store),
-            Err(Refusal::PairingLink)
+            Err(Refusal::LinkInUse)
         );
-        // The paired browser reconnecting with its link still open is fine.
+        // The first one reconnecting keeps its place and its code.
         let (t3, _, _) = exchange("host");
         assert_eq!(
             admit(&pair(&first, &t3, &secret), &t3, &mut store),
-            Ok((added, false))
+            Ok(Admission::Pending(waiting.clone()))
         );
+        store.request.as_mut().unwrap().allowed = Some(true);
+        assert_eq!(store.answer(&waiting), Some(true));
+        store.settle(&waiting, true);
+        assert!(store.devices.contains_key(&waiting.id));
+        // The link is used up.
+        let (t4, _, third) = exchange("host");
+        assert_eq!(
+            admit(&pair(&third, &t4, &secret), &t4, &mut store),
+            Err(Refusal::PairingLink)
+        );
+        // The paired browser coming back with its link still open signs in.
+        let (t5, _, _) = exchange("host");
+        assert!(matches!(
+            admit(&pair(&first, &t5, &secret), &t5, &mut store),
+            Ok(Admission::Known(_))
+        ));
+    }
+
+    #[test]
+    fn a_refused_pairing_adds_nothing_and_uses_up_the_link() {
+        let secret = vec![7u8; OFFER_SECRET_LEN];
+        let mut store = MemoryStore {
+            offer: Some((secret.clone(), false)),
+            ..Default::default()
+        };
+        let (t, _, key) = exchange("host");
+        let Ok(Admission::Pending(waiting)) = admit(&pair(&key, &t, &secret), &t, &mut store)
+        else {
+            panic!("a valid link should wait for confirmation");
+        };
+        store.request.as_mut().unwrap().allowed = Some(false);
+        assert_eq!(store.answer(&waiting), Some(false));
+        store.settle(&waiting, false);
+        assert!(store.devices.is_empty());
+        let (t2, _, _) = exchange("host");
+        assert_eq!(
+            admit(&pair(&key, &t2, &secret), &t2, &mut store),
+            Err(Refusal::PairingLink)
+        );
+    }
+
+    #[test]
+    fn the_code_follows_the_browser_key_and_the_link() {
+        let a = pairing_code(&[7u8; 16], &[4u8; 65]);
+        assert_eq!(a, pairing_code(&[7u8; 16], &[4u8; 65]));
+        assert_ne!(a, pairing_code(&[7u8; 16], &[5u8; 65]));
+        assert_ne!(a, pairing_code(&[8u8; 16], &[4u8; 65]));
+        assert_eq!(a.len(), 7);
+        assert_eq!(&a[3..4], " ");
+        assert!(a.chars().filter(|c| *c != ' ').all(|c| c.is_ascii_digit()));
     }
 
     #[test]
@@ -856,7 +1080,10 @@ pub(crate) mod tests {
         );
         assert!(store.devices.is_empty());
         // The real link still works afterwards.
-        assert!(admit(&pair(&key, &t, &[7u8; OFFER_SECRET_LEN]), &t, &mut store).is_ok());
+        assert!(matches!(
+            admit(&pair(&key, &t, &[7u8; OFFER_SECRET_LEN]), &t, &mut store),
+            Ok(Admission::Pending(_))
+        ));
     }
 
     #[test]
@@ -873,5 +1100,9 @@ pub(crate) mod tests {
         assert_eq!(clean_name("  "), "Browser");
         assert_eq!(clean_name("Chrome\u{7}\non Windows"), "Chromeon Windows");
         assert_eq!(clean_name(&"x".repeat(100)).len(), 40);
+        // Right-to-left overrides and zero-width characters cannot disguise
+        // one name as another.
+        assert_eq!(clean_name("invoice\u{202E}gpj.app"), "invoicegpj.app");
+        assert_eq!(clean_name("Chr\u{200B}ome"), "Chrome");
     }
 }

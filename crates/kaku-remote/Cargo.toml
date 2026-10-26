@@ -35,6 +35,7 @@ wezterm-font.workspace = true
 wezterm-term.workspace = true
 wezterm-toast-notification.workspace = true
 rustls.workspace = true
+shlex.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
