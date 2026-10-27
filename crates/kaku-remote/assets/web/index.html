@@ -505,7 +505,9 @@
     if (msg.type === "zoom_pane" && msg.pane_id === paneId) claimed = "";
     const json = JSON.stringify(msg);
     const path = direct;
-    if (path && path.open && !path.paused && path.socket === socket && json.length < DIRECT_PIECE && path.dc.readyState === "open") {
+    // The heartbeat stays on the session: the relay drops a browser it has
+    // not heard from in 150 s, and on an idle path nothing else reaches it.
+    if (msg.type !== "ping" && path && path.open && !path.paused && path.socket === socket && json.length < DIRECT_PIECE && path.dc.readyState === "open") {
       path.dc.send(json);
       return;
     }

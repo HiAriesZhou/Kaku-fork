@@ -3295,6 +3295,11 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
   await p.evaluate(() => { messages.length = 0; probe.attach({ pane_id: 5, tab_id: 1 }); });
   assert.deepEqual(await p.evaluate(() => peer.sent.map(d => JSON.parse(d).type)), ['attach']);
   assert.deepEqual(await p.evaluate(() => messages.map(m => m.type)), []);
+  // The heartbeat stays on the session, which the relay times out on
+  // silence; the answer may come either way.
+  await p.evaluate(() => { messages.length = 0; peer.sent.length = 0; document.dispatchEvent(new Event('visibilitychange')); });
+  assert.deepEqual(await p.evaluate(() => [messages.map(m => m.type), peer.sent.map(d => JSON.parse(d).type).includes('ping')]), [['ping'], false]);
+  await p.evaluate(() => deliver(2, new TextEncoder().encode(JSON.stringify({ type: 'pong' }))));
 
   // A path that stops answering leaves the page's messages to the session
   // until it answers again.
