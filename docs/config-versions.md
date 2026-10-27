@@ -43,5 +43,6 @@ instruction files; read the txt file instead.
 | v41 | V0.26.0 | No schema change. Increments because the release gate requires a bump every release; the highlights cover the remote page's fonts and agent title, and the character picker's return to the command palette. |
 | v42 | V0.26.1 | No schema change. Increments because the release gate requires a bump every release; the highlight covers Restart to Update installing the new version. |
 | v43 | V0.27.0 | No schema change. Increments because the release gate requires a bump every release; the highlight covers TUI-wrapped paths and URLs opening in full. |
+| v44 | V0.27.1 | No schema change. Increments because the release gate requires a bump every release; the highlight covers Settings applying user color schemes. |
 
 When you bump the version, add a row here in the same change.

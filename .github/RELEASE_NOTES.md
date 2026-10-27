@@ -1,29 +1,29 @@
-# V0.27.0 Reach
+# V0.27.1 Guard
 
 <div align="center">
   <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/logo.png" alt="Kaku Logo" width="120" height="120" />
-  <h1 style="margin: 12px 0 6px;">Kaku V0.27.0</h1>
+  <h1 style="margin: 12px 0 6px;">Kaku V0.27.1</h1>
   <p><em>A fast, out-of-the-box terminal built for AI coding.</em></p>
 </div>
 
 ### Changelog
-1. **Wrapped Links**: A file path or URL that Claude Code and other TUIs break across two lines now opens in full with Cmd+Click, from either half.
-2. **Voice Input**: WeType and other input tools that look for the focused text field now find Kaku's cursor reliably, also after switching tabs or panes.
-3. **Remote Speed**: Remote terminals connect directly when the network allows, so typing no longer detours through the relay, which stays as the fallback.
-4. **Remote Page**: The page installs as its own app on Android, says when the Mac behind the desktop view is locked, keeps tab titles readable, and no longer flashes at the wrong size after a reload or stays shrunk after leaving the desktop view.
-5. **Remote Command**: `kaku remote` keeps working when another copy of Kaku starts with remote access off, and every `kaku` command now says why it failed instead of exiting silently.
-6. **Kaku Assistant**: Answer `a` in `k` to approve the rest of a session's requests at once, and Cmd+Shift+E no longer runs a fix that quits or kills apps, it pastes it for review instead.
-7. **macOS**: Kaku no longer blocks log out, restart or shut down, closing from the right-click menu asks only once, the hotkey drawer keeps its height across displays, and pi sessions show their agent mark and topic in the tab.
+1. **Crash Fix**: Kaku no longer quits with every tab open while drawing certain lines that contain links.
+2. **Remote Pairing**: A new browser pairs only after both it and `kaku remote` show the same six-digit code and you press Enter in the terminal, so someone who gets hold of the link cannot get in alone.
+3. **Remote Direct**: Remote terminals now connect directly even with a TUN-mode proxy such as Stash or Clash running, and a stranger can no longer cut that direct connection.
+4. **Custom Themes**: Settings lists the color schemes in `~/.config/kaku/colors` and applies them just like the built-in ones.
+5. **Yazi and Lazygit**: Cmd+Shift+Y and Cmd+Shift+G open the tool in a new tab when Codex, Claude Code or vim holds the pane, instead of typing the command into it.
+6. **Tab Bar**: With the tab bar at the bottom, clicking the last terminal row no longer switches tabs.
+7. **Kaku Assistant**: Saving its settings writes the file in one step, so an interrupted save no longer leaves it half written.
 
 ### 更新日志
-1. **折行链接**：Claude Code 等 TUI 折成两行的文件路径和网址，现在 Cmd+点击任意一半都能完整打开。
-2. **语音输入**：微信输入法等依赖焦点文本框的输入工具，现在能稳定找到 Kaku 的光标，切换标签或分屏后也一样。
-3. **远程速度**：网络允许时远程终端会直接连接，打字不再绕道中继，中继保留为备用路线。
-4. **远程网页**：网页在 Android 上可以安装成独立应用，桌面视图背后的 Mac 锁屏时会提示，标签标题保持可读，刷新后不再闪现错误尺寸，离开桌面视图后也不再缩着。
-5. **远程命令**：另一个关闭了远程访问的 Kaku 启动后，`kaku remote` 照常可用，所有 `kaku` 命令失败时都会说明原因，不再静默退出。
-6. **Kaku 助手**：在 `k` 里回答 `a` 可一次同意本次会话后续的所有请求，Cmd+Shift+E 不再直接执行会退出或结束应用的修复命令，而是粘贴出来让你确认。
-7. **macOS**：Kaku 不再阻止注销、重启和关机，右键菜单关闭只确认一次，快捷键抽屉在不同显示器间保持高度，pi 会话的标签会显示 Agent 标记和主题。
+1. **崩溃修复**：绘制某些带链接的行时，Kaku 不会再连同所有标签一起退出。
+2. **远程配对**：新浏览器要等它和 `kaku remote` 显示同一个六位码、并在终端按下回车后才会配对，别人拿到链接也进不来。
+3. **远程直连**：开着 Stash、Clash 这类 TUN 模式代理时，远程终端也能直接连接，外人也无法再掐断这条直连。
+4. **自定义主题**：Settings 会列出 `~/.config/kaku/colors` 里的配色方案，可以像内置主题一样直接应用。
+5. **Yazi 和 Lazygit**：Codex、Claude Code 或 vim 占着当前分屏时，Cmd+Shift+Y 和 Cmd+Shift+G 会在新标签页打开工具，不再把命令打进去。
+6. **标签栏**：标签栏放在底部时，点击终端最后一行不会再切换标签。
+7. **Kaku 助手**：保存设置时一次写完整个文件，中途打断也不会留下写了一半的配置。
 
-Special thanks to @sunbird89629 and @vw2x for their contributions to this release.
+Special thanks to @Konata9, @sunbird89629 and @darion-yaphet for their contributions to this release.
 
 > https://github.com/tw93/Kaku
