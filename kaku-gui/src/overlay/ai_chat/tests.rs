@@ -967,6 +967,21 @@ mod interaction_tests {
     }
 
     #[test]
+    fn streamed_reasoning_asks_for_a_redraw() {
+        let mut app = app();
+        app.messages
+            .push(Message::text(Role::Assistant, "", false, false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.token_rx = Some(rx);
+        tx.send(crate::ai_chat_engine::StreamMsg::Reasoning(
+            "thinking".into(),
+        ))
+        .unwrap();
+        assert!(app.drain_tokens());
+        assert_eq!(app.messages.last().unwrap().reasoning_content, "thinking");
+    }
+
+    #[test]
     fn poll_timeout_redraws_only_for_a_changed_visible_spinner() {
         assert!(!redraw_after_poll_timeout(false, false));
         assert!(redraw_after_poll_timeout(true, false));
