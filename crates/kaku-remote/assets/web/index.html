@@ -1232,11 +1232,32 @@
       return iconCanvas.measureText("\u{F024B}").width;
     } catch (_) { return 0; }
   };
-  let verified = { socket: null, frames: -1 };
-  const verify = (force = false) => {
+  // Kaku sends only frame fields that changed (delta), and a page in the
+  // background gets a frame a second instead of every change.
+  const sayHello = () => {
+    send({ type: "hello", frame_ack: true, delta: true });
+    if (document.hidden) send({ type: "visibility", hidden: true });
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (ws && ws.readyState === WebSocket.OPEN) send({ type: "visibility", hidden: document.hidden });
+  });
+  // Must match `rows_digest` in web.rs: FNV-1a 32 of each row's text
+  // without whitespace, trailing empty rows dropped, joined by newlines.
+  const rowsDigest = (rows) => {
+    const texts = rows.map((r) => r.replace(/\p{White_Space}/gu, ""));
+    while (texts.length && !texts[texts.length - 1]) texts.pop();
+    let h = 0x811c9dc5;
+    for (const b of new TextEncoder().encode(texts.join("\n"))) h = Math.imul(h ^ b, 0x01000193) >>> 0;
+    return h;
+  };
+  // A Kaku that checks by digest (config verify_digest) asks for the rows
+  // with verify_rows only when the digest does not match.
+  let verifyDigest = false;
+  let verified = { socket: null, frames: -1, viewSent: null };
+  const verify = (force = false, full = false) => {
     if (!ws || ws.readyState !== WebSocket.OPEN || paneId === null || !size.cols) return;
-    if (!force && verified.socket === ws && verified.frames === framesSeen) return;
-    verified = { socket: ws, frames: framesSeen };
+    if (!force && (document.hidden || (verified.socket === ws && verified.frames === framesSeen))) return;
+    verified = { socket: ws, frames: framesSeen, viewSent: verified.viewSent };
     term.write("", () => {
       const buf = term.buffer.active;
       const rows = [];
@@ -1250,6 +1271,17 @@
         font: term.options.fontSize, cell_w: cell.width, cell_h: cell.height, icon: iconWidth(),
         dpr: window.devicePixelRatio, gl: !!webgl, atlas: atlasResets, past: pastOpen,
       };
+      if (verifyDigest && !full) {
+        const msg = { type: "verify", frames: framesSeen, seq: appliedSeq || undefined, digest: rowsDigest(rows) };
+        // How the page draws goes to the Mac's log when it changes.
+        const drawing = JSON.stringify([ws.url, view.font, view.cell_w, view.cell_h, view.icon, view.dpr, view.gl, view.atlas, view.past]);
+        if (verified.viewSent !== drawing) {
+          verified.viewSent = drawing;
+          msg.view = view;
+        }
+        send(msg);
+        return;
+      }
       const region = term._core?.buffer;
       const modes = term.modes || {};
       // Rows that are one line object: writing any of them shows in all,
@@ -2443,6 +2475,7 @@
   };
 
   const onConfig = (cfg) => {
+    verifyDigest = !!cfg.verify_digest;
     if (cfg.desktop) loadDesktop();
     desktop?.sessionStarted();
     if (typeof cfg.compose_right_option === "boolean") composeOption = { left: !!cfg.compose_left_option, right: cfg.compose_right_option };
@@ -2621,7 +2654,8 @@
       if (ws !== socket) return;
       if (msg.pane_id === paneId) {
         if (msg.seq) appliedSeq = msg.seq;
-        liveWrapped = msg.wrapped || [];
+        // Kaku leaves out wrap flags that did not change (hello's delta).
+        if (msg.wrapped) liveWrapped = msg.wrapped;
         markFound();
         repairShown();
       }
@@ -2632,7 +2666,8 @@
     serverScrolled = !!msg.scrolled;
     showHistoryButton();
     // A title that already names Kaku (a cwd called kaku) is not repeated.
-    const t = (msg.title || "").trim();
+    if (msg.title === undefined) return;
+    const t = msg.title.trim();
     baseTitle = !t ? "Kaku" : /\bkaku\b/i.test(t) ? t : t + " - Kaku";
     renderTitle();
   };
@@ -3180,6 +3215,7 @@
   const handle = (msg) => {
     if (msg.type === "error") toast(msg.detail);
     else if (msg.type === "config") onConfig(msg);
+    else if (msg.type === "verify_rows") verify(true, true);
     else if (msg.type === "tabs") onTabs(msg.tabs);
     else if (msg.type === "frame") { framesSeen++; onFrame(msg); }
     else if (msg.type === "clipboard") copyToClipboard(msg.text);
@@ -3298,7 +3334,7 @@
     if (tellMac && path.id !== null) send({ type: "rtc_close", id: path.id });
     if (!path.open) return;
     // Pieces still on the path are gone: start the screen over.
-    send({ type: "hello", frame_ack: true });
+    sayHello();
     if (paneId !== null) send({ type: "attach", pane_id: paneId });
     desktop?.resync?.();
     if (performance.now() - path.openedAt > 60000) directRetries = 0;
@@ -3419,7 +3455,7 @@
       // A WebSocket upgrade is not an authenticated Kaku session. Through
       // the relay these wait for the challenge, and Kaku starts the session
       // once the first of them opens with the key.
-      send({ type: "hello", frame_ack: true });
+      sayHello();
       // Re-attach after a reconnect; the server keeps no per-browser state.
       if (paneId !== null) send({ type: "attach", pane_id: paneId });
     };

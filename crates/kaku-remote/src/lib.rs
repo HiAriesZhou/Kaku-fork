@@ -73,6 +73,9 @@ struct ConfigInfo {
     /// This Kaku answers the page's offer of a direct path beside the
     /// relay; a page talking to an older one offers nothing.
     direct: bool,
+    /// The page may check its screen with `Verify::digest` and send rows
+    /// only when asked (`verify_rows`); an older Kaku needs the rows.
+    verify_digest: bool,
     font_size: f64,
     line_height: f64,
     copy_on_select: bool,
@@ -145,6 +148,7 @@ fn config_info() -> ConfigInfo {
         font_files: page_fonts.files,
         desktop: desktop_available(),
         direct: true,
+        verify_digest: true,
         font_size: cfg.font_size,
         line_height: cfg.line_height,
         copy_on_select: cfg.copy_on_select,

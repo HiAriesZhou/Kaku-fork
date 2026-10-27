@@ -2053,6 +2053,63 @@ test('the drift check names the last frame drawn, so it runs while output stream
   assert.equal(after.view.atlas, resets);
 });
 
+test('a digest check sends a hash, and rows only when Kaku asks', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.evaluate(() => {
+    probe.handle({ type: 'config', verify_digest: true });
+    probe.handle({ type: 'frame', seq: 2, pane_id: 1, cols: 80, rows: 24, data: '\x1b[2J\x1b[1;1H✳ Hi 中文\x1b[3;1H  a b' });
+  });
+  await p.waitForTimeout(1400);
+  await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'frame', seq: 3, pane_id: 1, cols: 80, rows: 24, data: '\x1b[5;1H' }); });
+  await p.waitForFunction(() => messages.some(m => m.type === 'verify'), null, { timeout: 4000 });
+  const check = await p.evaluate(() => messages.find(m => m.type === 'verify'));
+  // The same rows hash the same in web.rs (`rows_digest_matches_the_page`).
+  assert.equal(check.digest, 0x936654e8);
+  assert.equal(check.rows, undefined);
+  assert.equal(check.view?.trace, undefined, 'no trace without a mismatch');
+  await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'verify_rows' }); });
+  await p.waitForFunction(() => messages.some(m => m.type === 'verify'));
+  const full = await p.evaluate(() => messages.find(m => m.type === 'verify'));
+  assert.equal(full.rows[0].trimEnd(), '✳ Hi 中文');
+  assert.match(full.view.trace, /^repairs /);
+});
+
+test('a frame without title or wrap flags keeps the ones the page has', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  const hello = await p.evaluate(() => messages.find(m => m.type === 'hello'));
+  assert.equal(hello.delta, true);
+  const titles = await p.evaluate(async () => {
+    probe.handle({ type: 'frame', seq: 2, pane_id: 1, cols: 10, rows: 3, title: 'claude', wrapped: [true, false, false], data: '\x1b[2J\x1b[1;1HAB  CDEF  \x1b[2;1H  K' });
+    const first = document.title;
+    probe.handle({ type: 'frame', seq: 3, pane_id: 1, cols: 10, rows: 3, data: '\x1b[3;1Hx' });
+    await new Promise(resolve => probe.term.write('', resolve));
+    probe.term.select(2, 0, 11);
+    const data = new DataTransfer();
+    document.querySelector('.xterm-helper-textarea').dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, bubbles: true, cancelable: true }));
+    return { first, after: document.title, copied: data.getData('text/plain') };
+  });
+  assert.equal(titles.first, 'claude - Kaku');
+  assert.equal(titles.after, 'claude - Kaku');
+  assert.equal(titles.copied, '  CDEF    K', 'wrap flags kept');
+});
+
+test('the page tells Kaku when it goes to the background and back', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  const sent = await p.evaluate(() => {
+    messages.length = 0;
+    for (const hidden of [true, false]) {
+      Object.defineProperty(document, 'hidden', { value: hidden, configurable: true });
+      Object.defineProperty(document, 'visibilityState', { value: hidden ? 'hidden' : 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    }
+    return messages.filter(m => m.type === 'visibility');
+  });
+  assert.deepEqual(sent, [{ type: 'visibility', hidden: true }, { type: 'visibility', hidden: false }]);
+});
+
 test('the page draws with Kaku\'s font families in their order', async t => {
   const { p } = await page(t);
   assert.equal(await p.evaluate(() => probe.term.options.fontFamily),
@@ -3341,7 +3398,7 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
   });
   assert.deepEqual(await p.evaluate(() => messages), [
     { type: 'rtc_close', id: 4 },
-    { type: 'hello', frame_ack: true },
+    { type: 'hello', frame_ack: true, delta: true },
     { type: 'attach', pane_id: 4 },
   ]);
   assert.deepEqual(errors, []);

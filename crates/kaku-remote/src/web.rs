@@ -64,6 +64,9 @@ const FRAME_WINDOW: usize = 12;
 const FRAME_BYTES_WATERMARK: usize = 512 * 1024;
 /// Re-render this often even without output, to pick up cursor moves,
 /// title changes and resizes that do not produce `PaneOutput`.
+/// How often a page in the background gets a frame.
+const HIDDEN_FRAME_INTERVAL: Duration = Duration::from_secs(1);
+
 const IDLE_REFRESH: Duration = Duration::from_secs(1);
 const MAX_INPUT_LEN: usize = 65_536;
 /// How long a click from the page holds the button, about a quick hand's.
@@ -466,6 +469,16 @@ enum WebClientMsg {
     Hello {
         #[serde(default)]
         frame_ack: bool,
+        /// The page keeps the last title and wrap flags when a frame leaves
+        /// them out, so they are sent only when they change.
+        #[serde(default)]
+        delta: bool,
+    },
+    /// The page went to the background or came back. Hidden, it gets at
+    /// most a frame a second, enough to keep its browser tab's title
+    /// current, and a full catch-up as it returns.
+    Visibility {
+        hidden: bool,
     },
     /// Heartbeat; answered with `pong` so the page can tell a dead link
     /// from a quiet terminal, and so idle-timeout proxies see traffic.
@@ -620,7 +633,13 @@ enum WebClientMsg {
     /// with a full frame.
     Verify {
         frames: u64,
+        /// Pages that check by `digest` send rows only when Kaku asks.
+        #[serde(default)]
         rows: Vec<String>,
+        /// FNV-1a of the rows' text, whitespace removed, joined by
+        /// newlines: a few bytes every few seconds instead of the screen.
+        #[serde(default)]
+        digest: Option<u32>,
         /// The last frame the page drew, so the check holds while later
         /// frames are still on the way. Older pages omit it and are checked
         /// only when nothing is in flight.
@@ -724,14 +743,18 @@ enum WebServerMsg<'a> {
         pane_id: usize,
         cols: usize,
         rows: usize,
-        title: &'a str,
+        /// Absent when unchanged, for a page that asked for deltas.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<&'a str>,
         scrolled: bool,
         /// A plain shell: scrolling moves through Kaku's history, which the
         /// page scrolls locally. Otherwise the program gets the wheel.
         local_scroll: bool,
         data: &'a str,
-        /// Whether each physical row continues into the next one.
-        wrapped: &'a [bool],
+        /// Whether each physical row continues into the next one; absent
+        /// when unchanged, for a page that asked for deltas.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wrapped: Option<&'a [bool]>,
         /// Inline images now on screen; absent when they did not change.
         #[serde(skip_serializing_if = "Option::is_none")]
         images: Option<&'a [ImagePlacement]>,
@@ -749,6 +772,8 @@ enum WebServerMsg<'a> {
         pane_id: usize,
     },
     Pong,
+    /// A `digest` check failed: the page sends its rows, for the report.
+    VerifyRows,
     /// Where a search landed, relative to the rows now shown, or no match.
     Found {
         found: bool,
@@ -1597,6 +1622,9 @@ struct Frame {
     /// One self-contained string per row: it positions itself and starts
     /// from reset attributes, so any subset of rows can be sent alone.
     lines: Vec<String>,
+    /// The same rows as cells, so a row that changed in a few places can
+    /// be sent as just those.
+    cells: Vec<Vec<RowCell>>,
     wrapped: Vec<bool>,
     /// Cursor position, shape and visibility, applied after the rows.
     cursor: String,
@@ -1605,6 +1633,10 @@ struct Frame {
     image_data: HashMap<String, Arc<ImageData>>,
     /// Set by `Shown::update` when `images` differ from what the page has.
     images_changed: bool,
+    /// Set by `Shown::update` when the page does not have this title or
+    /// these wrap flags yet; a page that asked for deltas gets them only then.
+    title_changed: bool,
+    wrapped_changed: bool,
 }
 
 /// Where an image sits, in cells from the top left of the rows sent. It can
@@ -1719,18 +1751,7 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
 
     let (_, lines) = pane.get_lines(top..top + rows as isize);
 
-    let palette = pane.palette();
-    let mut rendered = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let mut out = String::with_capacity(dims.cols + 16);
-        let _ = write!(out, "\x1b[{};1H", row + 1);
-        if let Some(line) = lines.get(row) {
-            render_cells(line, dims.cols, &palette, &mut out);
-        }
-        // Clear the rest of the row with the default background.
-        out.push_str("\x1b[0m\x1b[K");
-        rendered.push(out);
-    }
+    let (rendered, cells) = screen_rows(&lines, rows, dims.cols, &pane.palette());
 
     let mut cursor_out = String::new();
     let cursor = pane.get_cursor_position();
@@ -1756,6 +1777,7 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
         scrolled: view.pinned_top.is_some(),
         local_scroll: pane_scrolls_locally(pane),
         lines: rendered,
+        cells,
         wrapped: (0..rows)
             .map(|row| lines.get(row).is_some_and(Line::last_cell_was_wrapped))
             .collect(),
@@ -1763,7 +1785,35 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
         images,
         image_data,
         images_changed: false,
+        title_changed: false,
+        wrapped_changed: false,
     }
+}
+
+/// Each screen row as a self-contained string that places itself, and as
+/// cells.
+fn screen_rows(
+    lines: &[Line],
+    rows: usize,
+    cols: usize,
+    palette: &ColorPalette,
+) -> (Vec<String>, Vec<Vec<RowCell>>) {
+    let mut rendered = Vec::with_capacity(rows);
+    let mut cells = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let mut out = String::with_capacity(cols + 16);
+        let _ = write!(out, "\x1b[{};1H", row + 1);
+        let row_cells = lines
+            .get(row)
+            .map(|line| row_cells(line, cols, palette))
+            .unwrap_or_default();
+        write_cells(&row_cells, cols, &mut out);
+        // Clear the rest of the row with the default background.
+        out.push_str("\x1b[0m\x1b[K");
+        rendered.push(out);
+        cells.push(row_cells);
+    }
+    (rendered, cells)
 }
 
 fn local_scroll_allowed(alt_screen: bool, mouse_grabbed: bool, foreground: Option<&str>) -> bool {
@@ -1785,33 +1835,98 @@ fn pane_scrolls_locally(pane: &Arc<dyn Pane>) -> bool {
 
 /// One row's cells as SGR runs, at most `cols` wide.
 fn render_cells(line: &Line, cols: usize, palette: &ColorPalette, out: &mut String) {
-    let mut current: Option<Sgr> = None;
+    write_cells(&row_cells(line, cols, palette), cols, out);
+}
+
+/// One cell as the page gets it: where it starts, how wide Kaku draws it,
+/// its attributes and its text (a space for an empty cell).
+#[derive(Clone, PartialEq, Debug)]
+struct RowCell {
+    col: usize,
+    width: usize,
+    sgr: Sgr,
+    text: String,
+}
+
+fn row_cells(line: &Line, cols: usize, palette: &ColorPalette) -> Vec<RowCell> {
+    let mut cells = Vec::new();
     let mut col = 0;
     for cell in line.visible_cells() {
         if col >= cols {
             break;
         }
-        let sgr = Sgr::from_attrs(cell.attrs(), palette);
-        if current.as_ref() != Some(&sgr) {
-            sgr.write(out);
-            current = Some(sgr);
-        }
         let text = cell.str();
         let width = cell.width().max(1);
-        if text.is_empty() {
-            out.push(' ');
-        } else {
-            out.push_str(text);
-        }
+        cells.push(RowCell {
+            col,
+            width,
+            sgr: Sgr::from_attrs(cell.attrs(), palette),
+            text: if text.is_empty() {
+                " ".into()
+            } else {
+                text.into()
+            },
+        });
         col += width;
+    }
+    cells
+}
+
+/// Cells as SGR runs. The first cell always states its attributes, since
+/// every SGR here starts from a reset, so a run of cells can be written
+/// anywhere on its own.
+fn write_cells(cells: &[RowCell], cols: usize, out: &mut String) {
+    let mut current: Option<&Sgr> = None;
+    for cell in cells {
+        if current != Some(&cell.sgr) {
+            cell.sgr.write(out);
+            current = Some(&cell.sgr);
+        }
+        out.push_str(&cell.text);
+        let next = cell.col + cell.width;
         // xterm.js has its own width table (Unicode 6 by default), so for
         // symbols and emoji it can disagree with Kaku about how many columns
         // a glyph takes and shift the rest of the row. Pin the next column
         // to Kaku's answer.
-        if !text.is_ascii() && col < cols {
-            let _ = write!(out, "\x1b[{}G", col + 1);
+        if !cell.text.is_ascii() && next < cols {
+            let _ = write!(out, "\x1b[{}G", next + 1);
         }
     }
+}
+
+/// The bytes that turn `old`, already on the page in `row`, into `new`:
+/// only the cells from the first difference to the last one, so Claude
+/// Code's spinner, which changes one glyph and a few colors ten times a
+/// second, sends those instead of the whole row. Cells compare with their
+/// columns, so a common head or tail lines up on both rows.
+fn row_delta(row: usize, old: &[RowCell], new: &[RowCell], cols: usize) -> Option<String> {
+    let head = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let tail = old[head..]
+        .iter()
+        .rev()
+        .zip(new[head..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let changed = &new[head..new.len() - tail];
+    let start = match (
+        changed.first(),
+        head.checked_sub(1).and_then(|i| new.get(i)),
+    ) {
+        (Some(cell), _) => cell.col,
+        // Only removed cells between an equal head and tail: their columns
+        // cannot line up, so this is not a row Kaku draws. Send it whole.
+        (None, _) if tail > 0 => return None,
+        (None, Some(last)) => last.col + last.width,
+        (None, None) => 0,
+    };
+    let mut out = String::new();
+    let _ = write!(out, "\x1b[{};{}H", row + 1, start + 1);
+    write_cells(changed, cols, &mut out);
+    if tail == 0 {
+        // The row's end changed: clear past it, as a whole row does.
+        out.push_str("\x1b[0m\x1b[K");
+    }
+    Some(out)
 }
 
 /// Up to `HISTORY_PAGE` rows of the pane ending before `end` (the bottom of
@@ -1847,9 +1962,13 @@ struct Shown {
     scrolled: bool,
     local_scroll: bool,
     lines: Vec<String>,
+    cells: Vec<Vec<RowCell>>,
     wrapped: Vec<bool>,
     cursor: String,
     images: Vec<ImagePlacement>,
+    /// A frame went out since the page was last reset, so it has this
+    /// title and these wrap flags.
+    primed: bool,
     /// For drift reports: the last row move sent, and frames since a full one.
     last_move: isize,
     since_full: usize,
@@ -1931,21 +2050,36 @@ impl Shown {
                     .and_then(|i| self.lines.get(i))
             };
             if before.map(|old| row_body(old)) != Some(row_body(line)) {
-                data.push_str(line);
+                let old_cells = if full {
+                    None
+                } else {
+                    idx.checked_add_signed(moved)
+                        .and_then(|i| self.cells.get(i))
+                };
+                let delta = old_cells
+                    .zip(frame.cells.get(idx))
+                    .and_then(|(old, new)| row_delta(idx, old, new, frame.cols))
+                    .filter(|delta| delta.len() < line.len());
+                data.push_str(delta.as_deref().unwrap_or(line));
                 changed = true;
                 resent += 1;
             }
         }
         let images_changed = self.images != frame.images;
+        let title_changed = !self.primed || self.title != frame.title;
+        let wrapped_changed = !self.primed || self.wrapped != frame.wrapped;
         if !changed
-            && self.wrapped == frame.wrapped
+            && !wrapped_changed
             && !images_changed
             && self.cursor == frame.cursor
-            && self.title == frame.title
+            && !title_changed
             && self.local_scroll == frame.local_scroll
         {
             return None;
         }
+        self.primed = true;
+        frame.title_changed = title_changed;
+        frame.wrapped_changed = wrapped_changed;
         if images_changed {
             self.images.clone_from(&frame.images);
         }
@@ -1967,6 +2101,7 @@ impl Shown {
         self.local_scroll = frame.local_scroll;
         self.cursor.clone_from(&frame.cursor);
         self.lines.clone_from(&frame.lines);
+        self.cells = std::mem::take(&mut frame.cells);
         self.wrapped.clone_from(&frame.wrapped);
         Some((frame, data))
     }
@@ -2041,6 +2176,23 @@ fn row_text(line: &str) -> String {
         }
     }
     out
+}
+
+/// What a page that checks by digest sends for the rows Kaku believes it
+/// shows: FNV-1a 32 over each row's text without whitespace, trailing empty
+/// rows dropped (`drifted_rows` reads a missing row as empty), rows joined
+/// by newlines, as UTF-8.
+fn rows_digest(shown: &[String]) -> u32 {
+    let mut texts: Vec<String> = shown.iter().map(|l| row_text(l)).collect();
+    while texts.last().is_some_and(String::is_empty) {
+        texts.pop();
+    }
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in texts.join("\n").bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 /// Rows where the page's text differs from what Kaku believes it shows.
@@ -2136,7 +2288,7 @@ fn cursor_shape_param(shape: CursorShape) -> u8 {
 }
 
 /// The subset of cell attributes that xterm.js can draw.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 struct Sgr {
     fg: ColorAttribute,
     bg: ColorAttribute,
@@ -2508,6 +2660,7 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
             Ok(())
         }
         WebClientMsg::Hello { .. }
+        | WebClientMsg::Visibility { .. }
         | WebClientMsg::Redraw
         | WebClientMsg::History { .. }
         | WebClientMsg::Ping
@@ -2638,6 +2791,10 @@ pub(crate) async fn run_session(
     let mut updates: Option<broadcast::Receiver<()>> = None;
     let mut view = View::default();
     let mut shown = Shown::default();
+    // The page keeps unchanged frame fields (`Hello::delta`).
+    let mut page_delta = false;
+    // The page is in the background (`WebClientMsg::Visibility`).
+    let mut page_hidden = false;
     // How the page last said it draws, logged when that changes.
     let mut page_drawing = String::new();
     // A page reporting drift every few seconds would otherwise fill the
@@ -2693,8 +2850,17 @@ pub(crate) async fn run_session(
                     }
                     continue;
                 }
-                if let WebClientMsg::Hello { frame_ack } = msg {
+                if let WebClientMsg::Hello { frame_ack, delta } = msg {
                     frame_window.hello(frame_ack);
+                    page_delta = delta;
+                    continue;
+                }
+                if let WebClientMsg::Visibility { hidden } = msg {
+                    if page_hidden && !hidden {
+                        next_render = tokio::time::Instant::now();
+                        dirty_frame = true;
+                    }
+                    page_hidden = hidden;
                     continue;
                 }
                 if let WebClientMsg::FrameAck { seq } = msg {
@@ -2803,7 +2969,7 @@ pub(crate) async fn run_session(
                     }
                     continue;
                 }
-                if let WebClientMsg::Verify { frames, rows, seq, view } = &msg {
+                if let WebClientMsg::Verify { frames, rows, digest, seq, view } = &msg {
                     let drawing = view.as_ref().map(PageView::drawing).unwrap_or_default();
                     if !drawing.is_empty() && drawing != page_drawing {
                         log::info!("kaku-remote web: page draws with {drawing}");
@@ -2814,8 +2980,26 @@ pub(crate) async fn run_session(
                         None => (*frames == frame_window.sent).then_some(shown.lines.as_slice()),
                     };
                     if let (Some(expected), true) = (expected, attached.is_some()) {
-                        let drift = drifted_rows(expected, rows);
                         let report = drift_logged.is_none_or(|at| at.elapsed() >= DRIFT_LOG_EVERY);
+                        if let Some(digest) = digest {
+                            if *digest == rows_digest(expected) {
+                                continue;
+                            }
+                            // Ask for the rows for the report, which redraws
+                            // when it finds the drift; between reports,
+                            // redraw now.
+                            if report {
+                                let Some(json) = encode(&WebServerMsg::VerifyRows) else { continue };
+                                if outbox.send(json).await.is_err() {
+                                    break;
+                                }
+                            } else {
+                                shown = Shown::default();
+                                dirty_frame = true;
+                            }
+                            continue;
+                        }
+                        let drift = drifted_rows(expected, rows);
                         if !drift.is_empty() && report {
                             drift_logged = Some(std::time::Instant::now());
                             let pane = attached.and_then(lookup_pane);
@@ -3019,11 +3203,11 @@ pub(crate) async fn run_session(
                     pane_id,
                     cols: frame.cols,
                     rows: frame.rows,
-                    title: &frame.title,
+                    title: (!page_delta || frame.title_changed).then_some(frame.title.as_str()),
                     scrolled: frame.scrolled,
                     local_scroll: frame.local_scroll,
                     data: &data,
-                    wrapped: &frame.wrapped,
+                    wrapped: (!page_delta || frame.wrapped_changed).then_some(frame.wrapped.as_slice()),
                     images: images_changed.then_some(placed.as_slice()),
                 };
                 let Some(json) = encode(&msg) else { continue };
@@ -3037,7 +3221,8 @@ pub(crate) async fn run_session(
                 // Only a frame sent starts the interval: input marks the view
                 // dirty before its echo arrives, and that render, which finds
                 // nothing new, must not hold the echo back for a tick.
-                next_render = tokio::time::Instant::now() + FRAME_INTERVAL;
+                next_render = tokio::time::Instant::now()
+                    + if page_hidden { HIDDEN_FRAME_INTERVAL } else { FRAME_INTERVAL };
             }
         }
     }
@@ -3426,6 +3611,9 @@ mod tests {
             images: Vec::new(),
             image_data: HashMap::new(),
             images_changed: false,
+            cells: Vec::new(),
+            title_changed: false,
+            wrapped_changed: false,
         }
     }
 
@@ -4251,5 +4439,179 @@ mod tests {
         assert_eq!(key_code("c"), Some(KeyCode::Char('c')));
         assert_eq!(key_code("F99"), None);
         assert_eq!(key_code("Unidentified"), None);
+    }
+
+    #[derive(Debug)]
+    struct ReplayConfig;
+    impl wezterm_term::TerminalConfiguration for ReplayConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn replay_term(cols: usize, rows: usize) -> wezterm_term::Terminal {
+        wezterm_term::Terminal::new(
+            TerminalSize {
+                rows,
+                cols,
+                ..Default::default()
+            },
+            Arc::new(ReplayConfig),
+            "test",
+            "0",
+            Box::new(Vec::new()),
+        )
+    }
+
+    /// The frame a pane showing `output` would produce.
+    fn term_frame(cols: usize, rows: usize, output: &str) -> Frame {
+        let mut source = replay_term(cols, rows);
+        source.advance_bytes(output);
+        let screen = source.screen();
+        let lines = screen.lines_in_phys_range(screen.phys_range(&(0..rows as i64)));
+        let (lines, cells) = screen_rows(&lines, rows, cols, &ColorPalette::default());
+        Frame {
+            cells,
+            ..frame(
+                cols,
+                &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+                "",
+            )
+        }
+    }
+
+    fn page_cells(page: &wezterm_term::Terminal, cols: usize) -> Vec<Vec<RowCell>> {
+        let palette = ColorPalette::default();
+        let screen = page.screen();
+        screen
+            .lines_in_phys_range(screen.phys_range(&(0..screen.physical_rows as i64)))
+            .iter()
+            .map(|line| row_cells(line, cols, &palette))
+            .collect()
+    }
+
+    /// Claude Code's spinner, a shorter and a longer status, wide glyphs:
+    /// a page that applies only the changed cells ends up with the same
+    /// screen as the pane, in fewer bytes than whole rows.
+    #[test]
+    fn partial_rows_draw_the_same_screen_as_whole_rows() {
+        let (cols, rows) = (40, 5);
+        let screens = [
+            "\x1b[31m✢\x1b[0m Recombobulating… \x1b[2m(2m 23s · 4.6k tokens)\x1b[0m\r\n> \r\n中文 abc 🙂 end",
+            "\x1b[31m✳\x1b[0m Recombobulating… \x1b[2m(2m 24s · 4.7k tokens)\x1b[0m\r\n> \r\n中文 abc 🙂 end",
+            "\x1b[31m✳\x1b[0m Done\r\n> \r\n中文 abd 🙂 end",
+            "\x1b[34m✳\x1b[0m Done, and a much longer line\r\n> hi\r\n汉字 abd 🙂 end",
+            "\x1b[34m✳\x1b[0m Done, and a much longer line\r\n> \r\n汉字 abd 🙂",
+        ];
+        let mut shown = Shown::default();
+        let mut page = replay_term(cols, rows);
+        // The same page fed every row whole, as before rows went in parts.
+        let mut whole_page = replay_term(cols, rows);
+        let mut whole_shown = Shown::default();
+        let mut partial_bytes = 0;
+        let mut whole_bytes = 0;
+        for (i, screen) in screens.iter().enumerate() {
+            let frame = term_frame(cols, rows, screen);
+            whole_page.advance_bytes(frame.lines.concat());
+            // Without cells, `Shown` sends changed rows whole.
+            let (_, whole) = whole_shown
+                .update(Frame {
+                    cells: Vec::new(),
+                    ..term_frame(cols, rows, screen)
+                })
+                .unwrap();
+            let (_, data) = shown.update(frame).unwrap();
+            page.advance_bytes(&data);
+            assert_eq!(
+                page_cells(&page, cols),
+                page_cells(&whole_page, cols),
+                "screen {i}"
+            );
+            if i > 0 {
+                partial_bytes += data.len();
+                whole_bytes += whole.len();
+            }
+        }
+        assert!(
+            partial_bytes < whole_bytes,
+            "{partial_bytes} bytes for changed cells, {whole_bytes} for changed rows"
+        );
+    }
+
+    #[test]
+    fn a_spinner_tick_sends_only_the_glyph_that_changed() {
+        let mut shown = Shown::default();
+        shown
+            .update(term_frame(40, 2, "\x1b[31m✢\x1b[0m Working (1s)"))
+            .unwrap();
+        let (_, data) = shown
+            .update(term_frame(40, 2, "\x1b[31m✳\x1b[0m Working (1s)"))
+            .unwrap();
+        assert_eq!(data, "\x1b[?25l\x1b[1;1H\x1b[0;38;5;1m✳\x1b[2G");
+    }
+
+    /// A page that asked for deltas gets the title and wrap flags only when
+    /// they change, and always in the first frame after a reset.
+    #[test]
+    fn unchanged_title_and_wrap_flags_are_marked() {
+        let mut shown = Shown::default();
+        let (first, _) = shown.update(frame(10, &["A"], "")).unwrap();
+        assert!(first.title_changed && first.wrapped_changed);
+        let (second, _) = shown.update(frame(10, &["B"], "")).unwrap();
+        assert!(!second.title_changed && !second.wrapped_changed);
+        let (third, _) = shown
+            .update(Frame {
+                title: "u".into(),
+                ..frame(10, &["C"], "")
+            })
+            .unwrap();
+        assert!(third.title_changed && !third.wrapped_changed);
+        let mut shown = Shown::default();
+        let (reset, _) = shown.update(frame(10, &["C"], "")).unwrap();
+        assert!(reset.title_changed && reset.wrapped_changed);
+    }
+
+    #[test]
+    fn frames_leave_out_what_a_delta_page_already_has() {
+        let msg = WebServerMsg::Frame {
+            seq: 1,
+            pane_id: 2,
+            cols: 3,
+            rows: 4,
+            title: None,
+            scrolled: false,
+            local_scroll: true,
+            data: "x",
+            wrapped: None,
+            images: None,
+        };
+        let json = encode(&msg).unwrap();
+        assert!(
+            !json.contains("title") && !json.contains("wrapped"),
+            "{json}"
+        );
+        let hello: WebClientMsg =
+            serde_json::from_str(r#"{"type":"hello","frame_ack":true}"#).unwrap();
+        assert!(matches!(hello, WebClientMsg::Hello { delta: false, .. }));
+    }
+
+    /// Must match `rowsDigest` in the page, which hashes what xterm.js shows.
+    #[test]
+    fn rows_digest_matches_the_page() {
+        let rows = vec![
+            "\x1b[1;1H\x1b[0;31m✳\x1b[0m Hi 中文\x1b[0m\x1b[K".to_string(),
+            "\x1b[2;1H\x1b[0m\x1b[K".to_string(),
+            "\x1b[3;1H\x1b[0m a b\x1b[0m\x1b[K".to_string(),
+            "\x1b[4;1H\x1b[0m\x1b[K".to_string(),
+        ];
+        // FNV-1a 32 of "✳Hi中文\n\nab", computed by the page's function.
+        assert_eq!(rows_digest(&rows), 0x9366_54e8);
+        assert_eq!(rows_digest(&rows[..3]), rows_digest(&rows));
+        let verify: WebClientMsg =
+            serde_json::from_str(r#"{"type":"verify","frames":3,"digest":7,"seq":3}"#).unwrap();
+        assert!(matches!(
+            verify,
+            WebClientMsg::Verify { digest: Some(7), ref rows, .. } if rows.is_empty()
+        ));
     }
 }
