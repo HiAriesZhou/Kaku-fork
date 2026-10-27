@@ -95,6 +95,10 @@ const MAX_TRUSTED_ADDRS: usize = 64;
 /// Time to read a request's headers; a client that trickles them in holds a
 /// connection for at most this long.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// How often the relay logs how many Macs and browsers it carries, so how
+/// many people use it can be read from `fly logs`, which keeps about an
+/// hour, without keeping any id.
+const USAGE_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// A token bucket. `take` may go into debt and returns how long the caller
 /// should wait for it to clear, which paces a stream without refusing a
@@ -410,6 +414,19 @@ struct AppState {
 }
 
 impl AppState {
+    /// Macs online (ids, not registrations), browsers connected to them,
+    /// and of those the ones their Mac admitted.
+    fn usage(&self) -> (usize, usize, usize) {
+        let hosts = self.hosts.lock();
+        let (mut browsers, mut admitted) = (0, 0);
+        for host in hosts.values().filter_map(|all| all.last()) {
+            let links = host.browsers.lock();
+            browsers += links.len();
+            admitted += links.values().filter(|b| b.admitted).count();
+        }
+        (hosts.len(), browsers, admitted)
+    }
+
     fn host(&self, id: &str) -> Option<Arc<Host>> {
         self.hosts
             .lock()
@@ -1307,6 +1324,15 @@ async fn main() {
         page_origin,
         ..AppState::default()
     };
+    let counted = state.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(USAGE_EVERY);
+        loop {
+            every.tick().await;
+            let (macs, browsers, admitted) = counted.usage();
+            info!("in use: {macs} Macs, {browsers} browsers ({admitted} paired)");
+        }
+    });
     serve(listener, app(state), HEADER_READ_TIMEOUT).await;
 }
 
@@ -1526,6 +1552,24 @@ mod tests {
             admit: Default::default(),
             sent: 0,
         }
+    }
+
+    #[test]
+    fn usage_counts_macs_once_and_paired_browsers_apart() {
+        let state = AppState::default();
+        // A second Kaku under the same identity is still one Mac.
+        for _ in 0..2 {
+            state.register("a", test_host(&state)).unwrap();
+        }
+        state.register("b", test_host(&state)).unwrap();
+        let a = state.host("a").unwrap();
+        let mut paired = test_browser(&state.queued_bytes);
+        paired.admitted = true;
+        a.browsers.lock().insert(1, paired);
+        a.browsers
+            .lock()
+            .insert(2, test_browser(&state.queued_bytes));
+        assert_eq!(state.usage(), (2, 2, 1));
     }
 
     #[test]
