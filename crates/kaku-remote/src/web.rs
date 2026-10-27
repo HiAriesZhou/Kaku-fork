@@ -2170,11 +2170,11 @@ impl Sgr {
                     Intensity::Normal,
                 )
             }
-            other => (attrs.foreground(), other),
+            other => (overridden_fg(attrs.foreground(), palette), other),
         };
         Self {
             fg,
-            bg: attrs.background(),
+            bg: overridden_bg(attrs.background(), palette),
             intensity,
             underline: attrs.underline(),
             blink: attrs.blink(),
@@ -2215,6 +2215,43 @@ impl Sgr {
         write_color(out, self.fg, 38);
         write_color(out, self.bg, 48);
         out.push('m');
+    }
+}
+
+/// The page only has the scheme's sixteen colors, not its `color_overrides`,
+/// so a background the Mac window replaces goes out as the replacement. Kaku
+/// Dark's ANSI black is light grey for text and maps back to the window
+/// background behind it; sent as index 0, Claude Code's scrolled transcript
+/// (ANSI black behind every row) came out light grey with white text.
+fn overridden_bg(bg: ColorAttribute, palette: &ColorPalette) -> ColorAttribute {
+    let raw = match bg {
+        ColorAttribute::Default => return bg,
+        ColorAttribute::PaletteIndex(idx) => palette.colors.0[idx as usize],
+        ColorAttribute::TrueColorWithPaletteFallback(c, _)
+        | ColorAttribute::TrueColorWithDefaultFallback(c) => c,
+    };
+    let resolved = palette.resolve_bg(bg);
+    if resolved == raw {
+        bg
+    } else {
+        ColorAttribute::TrueColorWithDefaultFallback(resolved)
+    }
+}
+
+/// The same for `foreground_color_overrides`, which the Mac applies to the
+/// default and true color foregrounds (black text from Rich and Hermes).
+fn overridden_fg(fg: ColorAttribute, palette: &ColorPalette) -> ColorAttribute {
+    let raw = match fg {
+        ColorAttribute::Default => palette.foreground,
+        ColorAttribute::PaletteIndex(_) => return fg,
+        ColorAttribute::TrueColorWithPaletteFallback(c, _)
+        | ColorAttribute::TrueColorWithDefaultFallback(c) => c,
+    };
+    let resolved = palette.resolve_fg(fg);
+    if resolved == raw {
+        fg
+    } else {
+        ColorAttribute::TrueColorWithDefaultFallback(resolved)
     }
 }
 
@@ -3253,6 +3290,44 @@ mod tests {
         let mut out = String::new();
         Sgr::from_attrs(&plain, &ColorPalette::default()).write(&mut out);
         assert!(out.starts_with("\x1b[0;38;2;"), "{out}");
+    }
+
+    /// Backgrounds and foregrounds the Mac window remaps through the scheme's
+    /// overrides go to the page as the remapped color; the rest keep their
+    /// index so the page's own palette still draws them.
+    #[test]
+    fn colors_the_mac_overrides_are_sent_overridden() {
+        let mut palette = ColorPalette::default();
+        let light_black = SrgbaTuple(0.78, 0.78, 0.8, 1.0);
+        let window_bg = SrgbaTuple(0.08, 0.08, 0.1, 1.0);
+        palette.colors.0[0] = light_black;
+        palette.color_overrides.insert(light_black, window_bg);
+        let black_text = SrgbaTuple(0.0, 0.0, 0.0, 1.0);
+        let readable = SrgbaTuple(0.8, 0.8, 0.8, 1.0);
+        palette
+            .foreground_color_overrides
+            .insert(black_text, readable);
+
+        // Claude Code's scrolled transcript: default text on ANSI black.
+        let mut attrs = CellAttributes::default();
+        attrs.set_background(ColorAttribute::PaletteIndex(0));
+        let mut out = String::new();
+        Sgr::from_attrs(&attrs, &palette).write(&mut out);
+        assert_eq!(out, "\x1b[0;48;2;20;20;25m");
+
+        // ANSI black text keeps its index: overrides only remap backgrounds.
+        let mut attrs = CellAttributes::default();
+        attrs.set_foreground(ColorAttribute::PaletteIndex(0));
+        attrs.set_background(ColorAttribute::PaletteIndex(4));
+        let mut out = String::new();
+        Sgr::from_attrs(&attrs, &palette).write(&mut out);
+        assert_eq!(out, "\x1b[0;38;5;0;48;5;4m");
+
+        let mut attrs = CellAttributes::default();
+        attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(black_text));
+        let mut out = String::new();
+        Sgr::from_attrs(&attrs, &palette).write(&mut out);
+        assert_eq!(out, "\x1b[0;38;2;204;204;204m");
     }
 
     #[test]
