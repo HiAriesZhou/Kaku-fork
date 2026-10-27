@@ -478,6 +478,11 @@
     if (!genuine) throw new Error("not this Mac");
     const signed = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, device.keys.privateKey, conn.transcript);
     const proof = { type: "auth", device: toBase64Url(device.publicKey), sig: toBase64Url(signed) };
+    // Kaku deflates this session's text for a page that can inflate it.
+    if (await inflateWorks) {
+      proof.deflate = true;
+      conn.inflate = inflater();
+    }
     if (pairing) {
       const secret = await crypto.subtle.importKey("raw", pairing.secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
       proof.type = "pair";
@@ -529,6 +534,41 @@
     msg.bytes = bytes.subarray(5 + len);
     return msg;
   };
+  // Kaku's deflated messages: one raw deflate stream per session, each
+  // message flushed and ended by a newline (`share::deflate`).
+  const inflater = () => {
+    const stream = new DecompressionStream("deflate-raw");
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+    const text = new TextDecoder();
+    let out = "";
+    return async (bytes) => {
+      writer.write(bytes).catch(() => {});
+      for (;;) {
+        const end = out.indexOf("\n");
+        if (end >= 0) {
+          const msg = out.slice(0, end);
+          out = out.slice(end + 1);
+          return msg;
+        }
+        const { value, done } = await reader.read();
+        if (done) throw new Error("sealed message did not open");
+        out += text.decode(value, { stream: true });
+      }
+    };
+  };
+  // A browser whose DecompressionStream holds output back until the stream
+  // ends could never read a message; it gets plain text instead.
+  const inflateWorks = (async () => {
+    try {
+      const inflate = inflater();
+      const first = new Uint8Array([170, 86, 42, 81, 178, 50, 172, 229, 2, 0, 0, 0, 255, 255]);
+      const second = new Uint8Array([170, 134, 210, 0, 0, 0, 0, 255, 255]);
+      const timeout = new Promise((resolve) => setTimeout(() => resolve(""), 500));
+      const read = async () => (await inflate(first)) + (await inflate(second));
+      return (await Promise.race([read(), timeout])) === '{"t":1}{"t":1}';
+    } catch (_) { return false; }
+  })();
   const receive = (socket, data, handle) => {
     if (!relay) { handle(typeof data === "string" ? JSON.parse(data) : unpackFrame(new Uint8Array(data))); return; }
     const conn = link;
@@ -547,7 +587,8 @@
         if (conn.verified) handle(unpackFrame(view));
         return;
       }
-      const msg = JSON.parse(dec.decode(plain));
+      if (view[0] === 1 && !conn.inflate) throw new Error("sealed message did not open");
+      const msg = JSON.parse(view[0] === 1 ? await conn.inflate(view.subarray(1)) : dec.decode(plain));
       if (!conn.verified) {
         if (msg.type !== "mac_auth") throw new Error("not this Mac");
         await prove(socket, conn, msg);
@@ -1232,9 +1273,47 @@
       return iconCanvas.measureText("\u{F024B}").width;
     } catch (_) { return 0; }
   };
+  // A delta frame leaves out the pane, grid and scroll fields when they did
+  // not change: they carry over from the last frame on this session.
+  const FRAME_FIELDS = ["pane_id", "cols", "rows", "scrolled", "local_scroll"];
+  let frameBase = {};
+  const fillFrame = (msg) => {
+    for (const key of FRAME_FIELDS) {
+      if (msg[key] === undefined) msg[key] = frameBase[key];
+      else frameBase[key] = msg[key];
+    }
+    return msg;
+  };
+  // Acks are cumulative, and Kaku keeps 12 frames in flight: one ack for
+  // every 4 frames, or 300 ms after the first unacked one, keeps it sending
+  // while the spinner's ten frames a second no longer cost ten acks.
+  let ackSeq = 0;
+  let ackCount = 0;
+  let ackTimer = null;
+  const flushAck = () => {
+    clearTimeout(ackTimer);
+    ackTimer = null;
+    if (ackSeq) send({ type: "frame_ack", seq: ackSeq });
+    ackSeq = 0;
+    ackCount = 0;
+  };
+  const ackFrame = (seq) => {
+    ackSeq = Math.max(ackSeq, seq);
+    if (++ackCount >= 4) flushAck();
+    else if (!ackTimer) ackTimer = setTimeout(flushAck, 300);
+  };
+  // A new session numbers its frames from 1 again.
+  const resetFrames = () => {
+    frameBase = {};
+    clearTimeout(ackTimer);
+    ackTimer = null;
+    ackSeq = 0;
+    ackCount = 0;
+  };
   // Kaku sends only frame fields that changed (delta), and a page in the
   // background gets a frame a second instead of every change.
   const sayHello = () => {
+    resetFrames();
     send({ type: "hello", frame_ack: true, delta: true });
     if (document.hidden) send({ type: "visibility", hidden: true });
   };
@@ -2627,7 +2706,7 @@
   const onFrame = (msg) => {
     const socket = ws;
     if (msg.pane_id !== paneId) {
-      if (msg.seq) send({ type: "frame_ack", seq: msg.seq });
+      if (msg.seq) ackFrame(msg.seq);
       return;
     }
     document.body.classList.add("drawn");
@@ -2659,7 +2738,7 @@
         markFound();
         repairShown();
       }
-      if (msg.seq) send({ type: "frame_ack", seq: msg.seq });
+      if (msg.seq) ackFrame(msg.seq);
     });
     if (msg.images) imagePlacements = msg.images;
     if (msg.images || imagePlacements.length) renderImages();
@@ -3217,7 +3296,7 @@
     else if (msg.type === "config") onConfig(msg);
     else if (msg.type === "verify_rows") verify(true, true);
     else if (msg.type === "tabs") onTabs(msg.tabs);
-    else if (msg.type === "frame") { framesSeen++; onFrame(msg); }
+    else if (msg.type === "frame") { framesSeen++; onFrame(fillFrame(msg)); }
     else if (msg.type === "clipboard") copyToClipboard(msg.text);
     else if (msg.type === "notify") onNotify(msg);
     else if (msg.type === "image") onImage(msg);
@@ -3448,6 +3527,7 @@
     pingSentAt = 0;
     framesSeen = 0;
     appliedSeq = 0;
+    resetFrames();
     link = newLink();
     sendChain = relay ? link.promise : Promise.resolve();
     recvChain = Promise.resolve();

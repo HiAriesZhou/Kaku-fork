@@ -23,6 +23,8 @@ log.workspace = true
 ring = "0.17"
 mux.workspace = true
 parking_lot.workspace = true
+# Raw deflate for the relay session, as the page's DecompressionStream reads it.
+flate2 = "1.1"
 promise.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

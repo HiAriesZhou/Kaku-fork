@@ -736,20 +736,27 @@ enum WebServerMsg<'a> {
     Tabs {
         tabs: &'a [TabInfo],
     },
+    /// The fields after `seq` other than `data` are absent when unchanged,
+    /// for a page that asked for deltas; it keeps the last frame's.
     Frame {
         seq: u64,
         /// The pane this frame draws; the page drops frames still in flight
         /// from the tab it just left.
-        pane_id: usize,
-        cols: usize,
-        rows: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pane_id: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cols: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rows: Option<usize>,
         /// Absent when unchanged, for a page that asked for deltas.
         #[serde(skip_serializing_if = "Option::is_none")]
         title: Option<&'a str>,
-        scrolled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scrolled: Option<bool>,
         /// A plain shell: scrolling moves through Kaku's history, which the
         /// page scrolls locally. Otherwise the program gets the wheel.
-        local_scroll: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_scroll: Option<bool>,
         data: &'a str,
         /// Whether each physical row continues into the next one; absent
         /// when unchanged, for a page that asked for deltas.
@@ -1637,6 +1644,8 @@ struct Frame {
     /// these wrap flags yet; a page that asked for deltas gets them only then.
     title_changed: bool,
     wrapped_changed: bool,
+    /// Likewise for the pane, grid size and scroll state.
+    layout_changed: bool,
 }
 
 /// Where an image sits, in cells from the top left of the rows sent. It can
@@ -1787,6 +1796,7 @@ fn render_frame(pane: &Arc<dyn Pane>, view: &mut View) -> Frame {
         images_changed: false,
         title_changed: false,
         wrapped_changed: false,
+        layout_changed: false,
     }
 }
 
@@ -1958,6 +1968,7 @@ fn history_rows(
 #[derive(Default)]
 struct Shown {
     cols: usize,
+    rows: usize,
     title: String,
     scrolled: bool,
     local_scroll: bool,
@@ -2068,18 +2079,24 @@ impl Shown {
         let images_changed = self.images != frame.images;
         let title_changed = !self.primed || self.title != frame.title;
         let wrapped_changed = !self.primed || self.wrapped != frame.wrapped;
+        let layout_changed = !self.primed
+            || self.cols != frame.cols
+            || self.rows != frame.rows
+            || self.scrolled != frame.scrolled
+            || self.local_scroll != frame.local_scroll;
         if !changed
             && !wrapped_changed
             && !images_changed
             && self.cursor == frame.cursor
             && !title_changed
-            && self.local_scroll == frame.local_scroll
+            && !layout_changed
         {
             return None;
         }
         self.primed = true;
         frame.title_changed = title_changed;
         frame.wrapped_changed = wrapped_changed;
+        frame.layout_changed = layout_changed;
         if images_changed {
             self.images.clone_from(&frame.images);
         }
@@ -2096,6 +2113,7 @@ impl Shown {
         });
         data.push_str(&frame.cursor);
         self.cols = frame.cols;
+        self.rows = frame.rows;
         self.title.clone_from(&frame.title);
         self.scrolled = frame.scrolled;
         self.local_scroll = frame.local_scroll;
@@ -3198,14 +3216,15 @@ pub(crate) async fn run_session(
                         placed.push(placement.clone());
                     }
                 }
+                let layout = !page_delta || frame.layout_changed;
                 let msg = WebServerMsg::Frame {
                     seq: frame_window.sent + 1,
-                    pane_id,
-                    cols: frame.cols,
-                    rows: frame.rows,
+                    pane_id: layout.then_some(pane_id),
+                    cols: layout.then_some(frame.cols),
+                    rows: layout.then_some(frame.rows),
                     title: (!page_delta || frame.title_changed).then_some(frame.title.as_str()),
-                    scrolled: frame.scrolled,
-                    local_scroll: frame.local_scroll,
+                    scrolled: layout.then_some(frame.scrolled),
+                    local_scroll: layout.then_some(frame.local_scroll),
                     data: &data,
                     wrapped: (!page_delta || frame.wrapped_changed).then_some(frame.wrapped.as_slice()),
                     images: images_changed.then_some(placed.as_slice()),
@@ -3614,6 +3633,7 @@ mod tests {
             cells: Vec::new(),
             title_changed: false,
             wrapped_changed: false,
+            layout_changed: false,
         }
     }
 
@@ -4557,8 +4577,11 @@ mod tests {
         let mut shown = Shown::default();
         let (first, _) = shown.update(frame(10, &["A"], "")).unwrap();
         assert!(first.title_changed && first.wrapped_changed);
+        assert!(first.layout_changed);
         let (second, _) = shown.update(frame(10, &["B"], "")).unwrap();
-        assert!(!second.title_changed && !second.wrapped_changed);
+        assert!(!second.title_changed && !second.wrapped_changed && !second.layout_changed);
+        let (wider, _) = shown.update(frame(12, &["B"], "")).unwrap();
+        assert!(wider.layout_changed && !wider.title_changed);
         let (third, _) = shown
             .update(Frame {
                 title: "u".into(),
@@ -4575,21 +4598,18 @@ mod tests {
     fn frames_leave_out_what_a_delta_page_already_has() {
         let msg = WebServerMsg::Frame {
             seq: 1,
-            pane_id: 2,
-            cols: 3,
-            rows: 4,
+            pane_id: None,
+            cols: None,
+            rows: None,
             title: None,
-            scrolled: false,
-            local_scroll: true,
+            scrolled: None,
+            local_scroll: None,
             data: "x",
             wrapped: None,
             images: None,
         };
         let json = encode(&msg).unwrap();
-        assert!(
-            !json.contains("title") && !json.contains("wrapped"),
-            "{json}"
-        );
+        assert_eq!(json, r#"{"type":"frame","seq":1,"data":"x"}"#);
         let hello: WebClientMsg =
             serde_json::from_str(r#"{"type":"hello","frame_ack":true}"#).unwrap();
         assert!(matches!(hello, WebClientMsg::Hello { delta: false, .. }));

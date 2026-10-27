@@ -412,6 +412,12 @@ fn advance(
             let Ok(auth) = serde_json::from_str::<PageAuth>(&text) else {
                 return Step::Close(4403);
             };
+            if serde_json::from_str::<PageCaps>(&text).is_ok_and(|caps| caps.deflate) {
+                let _ = keys.deflate.set(parking_lot::Mutex::new(flate2::Compress::new(
+                    flate2::Compression::default(),
+                    false,
+                )));
+            }
             match pairing::admit(&auth, &transcript, store) {
                 Ok(pairing::Admission::Known(device)) => {
                     browser.stage = Stage::Session {
@@ -511,6 +517,41 @@ fn refusal_text(body: &[u8]) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// What else the page's proof says it can do. Older pages say nothing.
+#[derive(Deserialize)]
+struct PageCaps {
+    #[serde(default)]
+    deflate: bool,
+}
+
+/// First byte of a deflated message; JSON starts with `{` and a desktop
+/// picture with 0, which stays as it is, being video already.
+const DEFLATED: u8 = 1;
+
+/// A text message for a page that inflates: `DEFLATED`, then the message
+/// and a newline through the session's one raw deflate stream, flushed at
+/// the end. The stream's window spans messages, so a frame that repeats
+/// the last one's escapes and text costs a few bytes; the newline, which
+/// JSON never contains, ends each message in the page's output.
+fn deflate(stream: &parking_lot::Mutex<flate2::Compress>, plain: &[u8]) -> Option<Vec<u8>> {
+    let mut stream = stream.lock();
+    let input = [plain, b"\n"].concat();
+    let mut out = Vec::with_capacity(input.len() / 2 + 64);
+    out.push(DEFLATED);
+    let start = stream.total_in();
+    // The flush is complete once a call leaves room in the buffer.
+    loop {
+        out.reserve(out.capacity().max(64));
+        let done = (stream.total_in() - start) as usize;
+        stream
+            .compress_vec(&input[done..], &mut out, flate2::FlushCompress::Sync)
+            .ok()?;
+        if (stream.total_in() - start) as usize == input.len() && out.len() < out.capacity() {
+            return Some(out);
+        }
+    }
 }
 
 // ── Relay framing ─────────────────────────────────────────────────────────────
@@ -737,6 +778,11 @@ impl Outbound {
                     return None;
                 }
                 let seq = seq.fetch_add(1, Ordering::Relaxed);
+                // Compressed here, in the order the page opens them.
+                let plain = match keys.deflate.get() {
+                    Some(stream) if plain.first() != Some(&0) => deflate(stream, &plain)?,
+                    _ => plain,
+                };
                 let sealed = seal(&keys.from_host, rng, &aad(FROM_HOST, seq), &plain)?;
                 Some(Message::Binary(frame(KIND_DATA, c, &sealed).into()))
             }
@@ -1602,6 +1648,51 @@ mod tests {
             fx.send(&mut conn, r#"{"type":"ping"}"#),
             Step::Close(4403)
         ));
+    }
+
+    /// A page that says `deflate` in its proof gets its session's text
+    /// through one stream; each message inflates whole on its own, in
+    /// order, as the page's DecompressionStream reads them.
+    #[test]
+    fn a_page_that_inflates_gets_each_message_deflated_whole() {
+        for capable in [false, true] {
+            let mut fx = Fixture::new();
+            let mut conn = fx.connect();
+            fx.pair(&conn);
+            let mut auth: serde_json::Value = serde_json::from_str(&sign_in(&conn)).unwrap();
+            if capable {
+                auth["deflate"] = true.into();
+            }
+            assert!(matches!(
+                fx.send(&mut conn, &auth.to_string()),
+                Step::Admitted { .. }
+            ));
+            let Stage::Session { keys, .. } = &conn.browser.stage else {
+                panic!("in session");
+            };
+            assert_eq!(keys.deflate.get().is_some(), capable);
+        }
+
+        let stream = parking_lot::Mutex::new(flate2::Compress::new(
+            flate2::Compression::default(),
+            false,
+        ));
+        let frame = r#"{"type":"frame","seq":7,"data":"\u001b[28;1H\u001b[0;38;5;9m✳ Recombobulating… (2m 3s)"}"#;
+        let big = format!(r#"{{"type":"tabs","pad":"{}"}}"#, "x".repeat(200_000));
+        let mut inflate = flate2::Decompress::new(false);
+        let mut sizes = Vec::new();
+        for msg in [frame, frame, big.as_str(), frame] {
+            let out = deflate(&stream, msg.as_bytes()).unwrap();
+            assert_eq!(out[0], DEFLATED);
+            sizes.push(out.len());
+            let mut text = Vec::with_capacity(msg.len() + 64);
+            inflate
+                .decompress_vec(&out[1..], &mut text, flate2::FlushDecompress::Sync)
+                .unwrap();
+            assert_eq!(text, [msg.as_bytes(), b"\n"].concat());
+        }
+        // The second copy of a frame costs a fraction of the first.
+        assert!(sizes[1] * 4 < sizes[0], "{sizes:?}");
     }
 
     /// What Kaku sent the page as message `seq`, opened the way the page

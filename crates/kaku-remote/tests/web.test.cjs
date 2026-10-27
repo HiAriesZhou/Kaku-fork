@@ -256,6 +256,44 @@ test('a pairing link proves itself once and the device signs in afterwards', asy
   assert.deepEqual([...errors, ...next.errors], []);
 });
 
+// Kaku's `share::deflate`: one raw deflate stream, each message ended by a
+// newline and flushed, behind a 1 byte.
+function deflater() {
+  const zlib = require('node:zlib');
+  const stream = zlib.createDeflateRaw();
+  const out = [];
+  stream.on('data', chunk => out.push(chunk));
+  return msg => new Promise(resolve => {
+    stream.write(JSON.stringify(msg) + '\n');
+    stream.flush(zlib.constants.Z_SYNC_FLUSH, () => {
+      const bytes = Buffer.concat([Buffer.from([1]), ...out.splice(0)]);
+      resolve([...bytes]);
+    });
+  });
+}
+
+test('through the relay, a page that inflates reads deflated messages among plain ones', async t => {
+  const mac = await newMac();
+  const secret = Buffer.alloc(16, 4);
+  const { p, errors } = await page(t, pairingLink(mac, secret));
+  const { proof } = await handshake(p, mac, { secret });
+  assert.equal(proof.deflate, true, 'the page says it inflates');
+  const deflate = deflater();
+  const msgs = [
+    await deflate({ type: 'config' }),
+    await deflate({ type: 'tabs', tabs: [{ tab_id: 1, pane_id: 1, panes: [], title: 'one', active: true }] }),
+    await deflate({ type: 'frame', seq: 1, pane_id: 1, cols: 80, rows: 24, title: 'claude', data: '\x1b[2J\x1b[1;1H✳ Working' }),
+    { type: 'pong' },
+    await deflate({ type: 'frame', seq: 2, data: '\x1b[1;1H✶' }),
+  ];
+  await p.evaluate(async (msgs) => {
+    for (const msg of msgs) await fromMac(Array.isArray(msg) ? new Uint8Array(msg) : msg);
+  }, msgs);
+  await p.waitForFunction(() => document.querySelector('.xterm-rows')?.textContent.includes('✶ Working'));
+  assert.equal(await p.evaluate(() => document.title), 'claude - Kaku');
+  assert.deepEqual(errors, []);
+});
+
 test('a link from earlier Kaku with the key in it still pairs', async t => {
   const mac = await newMac();
   const secret = Buffer.alloc(16, 5);
@@ -1105,12 +1143,31 @@ test('a multi-file drop stays on its original pane and retains the upload window
 test('frame acknowledgments include discarded panes and follow xterm parsing', async t => {
   const { p } = await page(t);
   await screen(p);
-  assert.ok(await p.evaluate(() => messages.some(m => m.type === 'frame_ack' && m.seq === 1)));
+  await p.waitForFunction(() => messages.some(m => m.type === 'frame_ack' && m.seq === 1), null, { timeout: 1000 });
   await p.evaluate(() => {
     probe.handle({ type: 'frame', seq: 2, pane_id: 99, cols: 80, rows: 24, data: 'MUST NOT DRAW' });
   });
-  assert.ok(await p.evaluate(() => messages.some(m => m.type === 'frame_ack' && m.seq === 2)));
+  await p.waitForFunction(() => messages.some(m => m.type === 'frame_ack' && m.seq === 2), null, { timeout: 1000 });
   assert.doesNotMatch(await text(p), /MUST NOT DRAW/);
+});
+
+test('acks go one for every four frames, and the last within 300 ms', async t => {
+  const { p } = await page(t);
+  await screen(p);
+  await p.waitForTimeout(400);
+  const acks = await p.evaluate(async () => {
+    messages.length = 0;
+    // Delta frames from the same pane leave out its id and grid.
+    probe.handle({ type: 'frame', seq: 2, pane_id: 1, cols: 80, rows: 24, data: '\x1b[2;1Hstart' });
+    for (let seq = 3; seq <= 10; seq++) probe.handle({ type: 'frame', seq, data: '\x1b[3;1Htick ' + seq });
+    await new Promise(resolve => probe.term.write('', resolve));
+    const soon = messages.filter(m => m.type === 'frame_ack').map(m => m.seq);
+    await new Promise(resolve => setTimeout(resolve, 400));
+    return { soon, later: messages.filter(m => m.type === 'frame_ack').map(m => m.seq) };
+  });
+  assert.deepEqual(acks.soon, [5, 9]);
+  assert.deepEqual(acks.later, [5, 9, 10]);
+  assert.match(await text(p), /tick 10/, 'frames without pane_id draw on the pane of the last one');
 });
 
 test('phone, tablet and desktop grids stay within their viewports, the desktop bar one row tall', async t => {

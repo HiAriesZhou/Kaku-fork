@@ -117,6 +117,9 @@ pub(crate) fn transcript(host_id: &str, mac_eph: &[u8], page_eph: &[u8]) -> [u8;
 pub(crate) struct SessionKeys {
     pub(crate) to_host: LessSafeKey,
     pub(crate) from_host: LessSafeKey,
+    /// Set once the page says in its proof that it inflates: Kaku's text
+    /// messages then go through this one stream (`share::deflate`).
+    pub(crate) deflate: std::sync::OnceLock<parking_lot::Mutex<flate2::Compress>>,
 }
 
 /// HKDF-SHA256 over the ECDH secret, salted with the transcript; the same
@@ -131,6 +134,7 @@ pub(crate) fn derive_keys(shared: &[u8], transcript: &[u8; 32]) -> Option<Sessio
     Some(SessionKeys {
         to_host: key(b"kaku c2h")?,
         from_host: key(b"kaku h2c")?,
+        deflate: std::sync::OnceLock::new(),
     })
 }
 
