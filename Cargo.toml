@@ -292,7 +292,7 @@ whoami = "1.5"
 window = {path="window"}
 window-funcs = { path = "lua-api-crates/window-funcs" }
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
-zstd = "0.11"
+zstd = "0.14"
 
 [patch.crates-io]
 # We use our own vendored cairo, which has minimal deps and should just
