@@ -1849,6 +1849,9 @@ impl App {
                         {
                             last.reasoning_content.push_str(&t);
                         }
+                        // The reasoning block shows its length while it streams,
+                        // and an idle poll timeout no longer repaints on its own.
+                        changed = true;
                     }
                     Ok(StreamMsg::ResponsesState(items)) => {
                         self.pending_responses_items = items;
