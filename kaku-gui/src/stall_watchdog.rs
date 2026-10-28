@@ -47,20 +47,35 @@ fn run() {
         .detach();
 
         let mut stall_start: Option<Instant> = None;
-        let mut throttled = false;
+        // Time the wait from the last late tick, not from the post: a stall
+        // that begins right after a system sleep or App Nap must still count.
+        let mut since = posted;
+        let mut rescued = false;
         while answered.get().is_none() {
             let before = Instant::now();
             std::thread::sleep(TICK);
             if before.elapsed() > TICK + THROTTLE_SLACK {
-                throttled = true;
+                since = Instant::now();
             }
-            if stall_start.is_none() && !throttled && posted.elapsed() >= STALL_THRESHOLD {
-                stall_start = Some(posted);
+            if stall_due(
+                stall_start.is_some(),
+                answered.get().is_some(),
+                since.elapsed(),
+            ) {
+                stall_start = Some(since);
                 log::warn!("GUI thread blocked for over {STALL_THRESHOLD:?}");
                 if capture_due(last_capture, Instant::now()) {
                     last_capture = Some(Instant::now());
                     capture_sample();
                 }
+            }
+            if stall_start.is_some() && !rescued && answered.get().is_none() {
+                rescued = true;
+                log::warn!(
+                    "GUI thread still blocked: {}",
+                    window::main_thread_queue_state()
+                );
+                window::rescue_main_thread_queue();
             }
         }
         if let (Some(start), Some(ran)) = (stall_start, answered.get()) {
@@ -68,6 +83,12 @@ fn run() {
         }
         std::thread::sleep(TICK);
     }
+}
+
+/// Re-check `answered` after the sleep: a ping run just before the threshold
+/// is not a stall, and counting it logged sub-second waits as over 1s.
+fn stall_due(already_stalled: bool, answered: bool, waited: Duration) -> bool {
+    !already_stalled && !answered && waited >= STALL_THRESHOLD
 }
 
 fn capture_due(last: Option<Instant>, now: Instant) -> bool {
@@ -116,6 +137,15 @@ fn prune_captures(dir: &Path, keep: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ping_answered_by_the_threshold_is_not_a_stall() {
+        let past = STALL_THRESHOLD + TICK;
+        assert!(stall_due(false, false, past));
+        assert!(!stall_due(false, true, past));
+        assert!(!stall_due(true, false, past));
+        assert!(!stall_due(false, false, STALL_THRESHOLD - TICK));
+    }
 
     #[test]
     fn captures_are_rate_limited() {

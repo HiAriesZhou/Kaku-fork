@@ -55,6 +55,9 @@ pub fn drain_spawn_queue_burst(max_funcs: usize) -> bool {
     spawn::run_spawn_queue_burst(max_funcs)
 }
 
+#[cfg(target_os = "macos")]
+pub use spawn::{main_thread_queue_state, rescue_main_thread_queue};
+
 mod egl;
 
 pub use bitmaps::{BitmapImage, Image};

@@ -2,6 +2,8 @@
 use core_foundation::runloop::*;
 use promise::spawn::{Runnable, SpawnFunc};
 use std::collections::VecDeque;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -142,6 +144,7 @@ impl SpawnQueue {
         _: CFRunLoopActivity,
         _: *mut std::ffi::c_void,
     ) {
+        OBSERVER_LAST_FIRED.store(monotonic_ms(), Ordering::Relaxed);
         if SPAWN_QUEUE.run() {
             Self::queue_wakeup();
         }
@@ -151,11 +154,21 @@ impl SpawnQueue {
         unsafe {
             CFRunLoopWakeUp(CFRunLoopGetMain());
         }
+        if DISPATCH_FALLBACK.load(Ordering::Relaxed) {
+            dispatch_drain();
+        }
     }
 
     fn spawn_impl(&self, f: SpawnFunc, high_pri: bool) {
         self.queue_func(f, high_pri);
         Self::queue_wakeup();
+    }
+
+    fn queued_counts(&self) -> (usize, usize) {
+        (
+            Self::lock_recover(&self.spawned_funcs, "spawned_funcs").len(),
+            Self::lock_recover(&self.spawned_funcs_low_pri, "spawned_funcs_low_pri").len(),
+        )
     }
 
     fn run_impl(&self) -> bool {
@@ -191,5 +204,161 @@ impl SpawnQueue {
             func();
         }
         self.has_any_queued()
+    }
+}
+
+// In the field (V0.25.0 and V0.27.0) the GUI froze after an update
+// notification click: the main thread sat idle in AppKit's event loop while
+// tasks queued here were never run, so keys, scrolling and tab switches did
+// nothing until a force quit, though menus still opened. Why the observer
+// stopped draining is not known yet. The stall watchdog asks for a drain
+// through the main dispatch queue, which wakes the run loop through its own
+// port; if the observer then stays silent while the main thread is free,
+// every later wakeup also goes through the dispatch queue.
+#[cfg(target_os = "macos")]
+static OBSERVER_LAST_FIRED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static DISPATCH_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+fn monotonic_ms() -> u64 {
+    lazy_static::lazy_static! {
+        static ref EPOCH: Instant = Instant::now();
+    }
+    // Start at 1 so that 0 keeps meaning "never fired".
+    EPOCH.elapsed().as_millis() as u64 + 1
+}
+
+/// The check runs on the main thread `SILENCE_CHECK_DELAY_NS` after a rescue
+/// drain. A free main thread goes to sleep, and fires the observer, many
+/// times in that window, so no fire since the request means it is dead. The
+/// drain itself cannot decide: CFRunLoop serves a pending dispatch message
+/// without the waiting observers, so it can run ahead of a healthy observer.
+#[cfg(target_os = "macos")]
+fn observer_went_silent(last_fired: u64, requested: u64) -> bool {
+    last_fired < requested
+}
+
+#[cfg(target_os = "macos")]
+const SILENCE_CHECK_DELAY_NS: i64 = 500_000_000;
+
+#[cfg(target_os = "macos")]
+mod dispatch {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    pub struct DispatchQueue {
+        _private: [u8; 0],
+    }
+
+    pub const DISPATCH_TIME_NOW: u64 = 0;
+
+    extern "C" {
+        #[link_name = "_dispatch_main_q"]
+        pub static MAIN_QUEUE: DispatchQueue;
+        pub fn dispatch_async_f(
+            queue: *const DispatchQueue,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+        pub fn dispatch_after_f(
+            when: u64,
+            queue: *const DispatchQueue,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+        pub fn dispatch_time(when: u64, delta: i64) -> u64;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_drain() {
+    unsafe {
+        dispatch::dispatch_async_f(
+            &dispatch::MAIN_QUEUE,
+            std::ptr::null_mut(),
+            drain_on_main_queue,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn drain_on_main_queue(_: *mut std::ffi::c_void) {
+    if SPAWN_QUEUE.run() {
+        dispatch_drain();
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn rescue_on_main_queue(context: *mut std::ffi::c_void) {
+    drain_on_main_queue(std::ptr::null_mut());
+    unsafe {
+        dispatch::dispatch_after_f(
+            dispatch::dispatch_time(dispatch::DISPATCH_TIME_NOW, SILENCE_CHECK_DELAY_NS),
+            &dispatch::MAIN_QUEUE,
+            context,
+            check_observer_silence,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn check_observer_silence(context: *mut std::ffi::c_void) {
+    let requested = context as usize as u64;
+    let last_fired = OBSERVER_LAST_FIRED.load(Ordering::Relaxed);
+    if observer_went_silent(last_fired, requested)
+        && !DISPATCH_FALLBACK.swap(true, Ordering::Relaxed)
+    {
+        log::error!(
+            "main thread queue: run loop observer silent for {}ms, \
+             draining through the main dispatch queue from now on",
+            monotonic_ms().saturating_sub(last_fired)
+        );
+        drain_on_main_queue(std::ptr::null_mut());
+    }
+}
+
+/// Called by the stall watchdog while a task it posted is still waiting:
+/// drain once through the main dispatch queue, then check whether the
+/// observer is still firing.
+#[cfg(target_os = "macos")]
+pub fn rescue_main_thread_queue() {
+    unsafe {
+        dispatch::dispatch_async_f(
+            &dispatch::MAIN_QUEUE,
+            monotonic_ms() as usize as *mut std::ffi::c_void,
+            rescue_on_main_queue,
+        );
+    }
+}
+
+/// One line for the stall log: how long since the observer drained, and how
+/// much is waiting.
+#[cfg(target_os = "macos")]
+pub fn main_thread_queue_state() -> String {
+    let last_fired = OBSERVER_LAST_FIRED.load(Ordering::Relaxed);
+    let (high, low) = SPAWN_QUEUE.queued_counts();
+    format!(
+        "observer last fired {}ms ago, {high}+{low} tasks queued, dispatch fallback {}",
+        monotonic_ms().saturating_sub(last_fired),
+        if DISPATCH_FALLBACK.load(Ordering::Relaxed) {
+            "on"
+        } else {
+            "off"
+        }
+    )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_drain_with_no_observer_fire_since_the_request_means_silence() {
+        assert!(observer_went_silent(100, 5000));
+        assert!(!observer_went_silent(5000, 5000));
+        assert!(!observer_went_silent(5001, 5000));
+        // Never fired at all.
+        assert!(observer_went_silent(0, 1));
     }
 }
