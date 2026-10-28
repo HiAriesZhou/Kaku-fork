@@ -234,6 +234,9 @@ impl<'a> Performer<'a> {
 
             let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
             if print_width == 0 {
+                if self.append_kitty_placeholder_diacritics(g) {
+                    continue;
+                }
                 // We got a zero-width grapheme.
 
                 // Relevant reading:
@@ -832,6 +835,7 @@ impl<'a> Performer<'a> {
                 self.progress = Progress::default();
                 self.program_status = None;
 
+                self.kitty_img = Default::default();
                 self.screen.full_reset();
                 self.screen.activate_alt_screen(seqno);
                 self.erase_in_display(EraseInDisplay::EraseDisplay);

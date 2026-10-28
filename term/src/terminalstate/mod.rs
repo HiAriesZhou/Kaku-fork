@@ -1508,6 +1508,7 @@ impl TerminalState {
                 self.screen.activate_primary_screen(self.seqno);
                 self.screen.saved_cursor().take();
                 self.kitty_remove_all_placements(true);
+                self.kitty_img = KittyImageState::default();
 
                 self.reverse_wraparound_mode = false;
                 self.reverse_video_mode = false;

@@ -110,6 +110,11 @@ pub fn terminal_with_lines<F>(term: &mut Terminal, lines: Range<StableRowIndex>,
 where
     F: FnMut(StableRowIndex, &[&Line]),
 {
+    if let Some((first, rendered)) = term.kitty_placeholder_lines(lines.clone()) {
+        let refs: Vec<_> = rendered.iter().collect();
+        func(first, &refs);
+        return;
+    }
     let peek = term.is_primary_peek();
     let screen = if peek {
         term.primary_screen_mut()
@@ -128,6 +133,11 @@ pub fn terminal_with_lines_mut(
     lines: Range<StableRowIndex>,
     with_lines: &mut dyn WithPaneLines,
 ) {
+    if let Some((first, mut rendered)) = term.kitty_placeholder_lines(lines.clone()) {
+        let mut refs: Vec<_> = rendered.iter_mut().collect();
+        with_lines.with_lines_mut(first, &mut refs);
+        return;
+    }
     let peek = term.is_primary_peek();
     let screen = if peek {
         term.primary_screen_mut()
@@ -145,6 +155,9 @@ pub fn terminal_get_lines(
     term: &mut Terminal,
     lines: Range<StableRowIndex>,
 ) -> (StableRowIndex, Vec<Line>) {
+    if let Some((first, rendered)) = term.kitty_placeholder_lines(lines.clone()) {
+        return (first, rendered);
+    }
     let peek = term.is_primary_peek();
     let screen = if peek {
         term.primary_screen_mut()

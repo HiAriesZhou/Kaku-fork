@@ -317,8 +317,6 @@ fn read_shared_memory_data(
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
-
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum KittyImageVerbosity {
     Verbose,
@@ -466,6 +464,8 @@ impl KittyImageTransmit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KittyImagePlacement {
+    /// U=1: define a prototype for Unicode placeholder cells.
+    pub virtual_placement: bool,
     /// source rectangle bounds.
     /// Default is whole image.
     /// x=...
@@ -500,6 +500,11 @@ pub struct KittyImagePlacement {
 impl KittyImagePlacement {
     fn from_keys(keys: &BTreeMap<&str, &str>) -> Option<Self> {
         Some(Self {
+            virtual_placement: match get(keys, "U") {
+                None | Some("0") => false,
+                Some("1") => true,
+                _ => return None,
+            },
             x: geti(keys, "x"),
             y: geti(keys, "y"),
             w: geti(keys, "w"),
@@ -519,6 +524,9 @@ impl KittyImagePlacement {
     }
 
     fn to_keys(&self, keys: &mut BTreeMap<&'static str, String>) {
+        if self.virtual_placement {
+            keys.insert("U", "1".to_string());
+        }
         set(keys, "x", &self.x);
         set(keys, "y", &self.y);
         set(keys, "w", &self.w);
@@ -1095,6 +1103,31 @@ impl Display for KittyImage {
 mod test {
     use super::*;
     use k9::assert_equal as assert_eq;
+
+    #[test]
+    fn kitty_virtual_placement_round_trip() {
+        for action in ["p", "T"] {
+            let image =
+                KittyImage::parse_apc(format!("Ga={action},U=1,i=42,c=3,r=2").as_bytes()).unwrap();
+            let mut keys = BTreeMap::new();
+            match image {
+                KittyImage::Display { placement, .. }
+                | KittyImage::TransmitDataAndDisplay { placement, .. } => {
+                    assert!(placement.virtual_placement);
+                    placement.to_keys(&mut keys);
+                    assert_eq!(keys.get("U").map(String::as_str), Some("1"));
+                    assert_eq!(
+                        KittyImagePlacement::from_keys(
+                            &keys.iter().map(|(k, v)| (*k, v.as_str())).collect()
+                        ),
+                        Some(placement)
+                    );
+                }
+                _ => panic!("expected placement"),
+            }
+        }
+        assert!(KittyImage::parse_apc(b"Ga=p,U=2,i=42").is_none());
+    }
 
     #[test]
     fn kitty_payload() {
