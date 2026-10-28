@@ -57,8 +57,9 @@ const MANIFEST: &str = include_str!("../assets/web/manifest.webmanifest");
 /// once, so a keystroke's echo never waits for a tick; a burst is coalesced
 /// and its trailing edge always flushes, so its last output is never dropped.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-/// Twelve small frames cover 150 ms RTT at 60 Hz without waiting for ACKs.
-const FRAME_WINDOW: usize = 12;
+/// Sixteen small frames cover 190 ms RTT at 60 Hz with the page acking
+/// every fourth frame, without waiting for ACKs.
+const FRAME_WINDOW: usize = 16;
 /// A complete frame and its new images may cross this watermark once, then
 /// rendering waits for ACKs. Large redraws must not deadlock behind a byte cap.
 const FRAME_BYTES_WATERMARK: usize = 512 * 1024;
@@ -3659,28 +3660,52 @@ mod tests {
     }
 
     #[test]
-    fn frame_window_allows_twelve_small_frames_and_rejects_future_acks() {
+    fn frame_window_allows_sixteen_small_frames_and_rejects_future_acks() {
         let mut window = FrameWindow::default();
         window.hello(true);
-        for _ in 0..12 {
+        for _ in 0..16 {
             assert!(window.ready());
             window.record(100);
         }
         assert!(!window.ready());
-        window.acknowledge(13);
+        window.acknowledge(17);
         assert!(!window.ready(), "a future ACK cannot release backpressure");
         window.acknowledge(5);
         assert!(window.ready());
-        assert_eq!(window.pending.len(), 7);
+        assert_eq!(window.pending.len(), 11);
         window.acknowledge(5);
         window.acknowledge(3);
         assert_eq!(
             window.pending.len(),
-            7,
+            11,
             "duplicate and older ACKs do nothing"
         );
-        window.acknowledge(12);
+        window.acknowledge(16);
         assert!(window.pending.is_empty());
+    }
+
+    #[test]
+    fn frame_window_keeps_60hz_flowing_over_180ms_with_acks_every_four_frames() {
+        // The page acks every fourth frame on arrival, so up to RTT/16 + 4
+        // frames are in flight; twelve stalled the stream past 128 ms.
+        let rtt = 180;
+        let mut window = FrameWindow::default();
+        window.hello(true);
+        let mut acks = VecDeque::new();
+        for now in (0..3000).step_by(16) {
+            while acks.front().is_some_and(|&(at, _)| at <= now) {
+                window.acknowledge(acks.pop_front().unwrap().1);
+            }
+            assert!(
+                window.ready(),
+                "frame {} waited for an ack at {now} ms",
+                window.sent + 1
+            );
+            window.record(100);
+            if window.sent % 4 == 0 {
+                acks.push_back((now + rtt, window.sent));
+            }
+        }
     }
 
     #[test]

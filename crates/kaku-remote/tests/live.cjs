@@ -129,13 +129,13 @@ async function until(fn, ms = 15000) {
     send({ type: 'text', data: 'for i in {1..30}; do echo FLOW-$i; sleep 0.03; done\n' });
     await sleep(1500);
     const frames = received.filter(m => m.type === 'frame').slice(flowStart);
-    assert.equal(frames.length, 12, 'slow consumers receive at most twelve unacknowledged frames');
+    assert.equal(frames.length, 16, 'slow consumers receive at most sixteen unacknowledged frames');
     send({ type: 'frame_ack', seq: 1000000 }); await sleep(100);
-    assert.equal(received.filter(m => m.type === 'frame').length - flowStart, 12, 'future ACK cannot release the window');
+    assert.equal(received.filter(m => m.type === 'frame').length - flowStart, 16, 'future ACK cannot release the window');
     send({ type: 'frame_ack', seq: frames.at(-1).seq });
     const latest = await until(() => received.filter(m => m.type === 'frame').at(-1).seq > frames.at(-1).seq);
     assert.ok(latest);
-    assert.ok(received.filter(m => m.type === 'frame').slice(flowStart + 12).some(m => m.data.includes('FLOW-30')), 'ACK releases the latest coalesced screen');
+    assert.ok(received.filter(m => m.type === 'frame').slice(flowStart + 16).some(m => m.data.includes('FLOW-30')), 'ACK releases the latest coalesced screen');
     // Pages already open before the upgrade still use the old hello.
     send({ type: 'hello' });
     const beforeLegacy = received.filter(m => m.type === 'frame').length;

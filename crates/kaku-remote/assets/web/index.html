@@ -1284,7 +1284,7 @@
     }
     return msg;
   };
-  // Acks are cumulative, and Kaku keeps 12 frames in flight: one ack for
+  // Acks are cumulative, and Kaku keeps 16 frames in flight: one ack for
   // every 4 frames, or 300 ms after the first unacked one, keeps it sending
   // while the spinner's ten frames a second no longer cost ten acks.
   let ackSeq = 0;
