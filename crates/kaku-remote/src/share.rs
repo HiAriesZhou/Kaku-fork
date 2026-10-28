@@ -697,6 +697,30 @@ fn retry_delay(previous: Duration, connected_for: Option<Duration>) -> Duration 
     }
 }
 
+/// How long a refused page gets to read its sealed note before it is closed.
+/// The relay ends a browser's socket ahead of whatever is still queued for
+/// it, so a close sent right behind the note dropped the note.
+const REFUSE_GRACE: Duration = Duration::from_secs(1);
+
+/// Send a refused page its sealed note now and its close code after
+/// `REFUSE_GRACE`. False when the relay output queue is full.
+fn refuse(to_relay: &crate::queue::Sender<Outbound>, c: u32, note: &[u8], code: u16) -> bool {
+    let note = Outbound::Protocol(Message::Binary(frame(KIND_DATA, c, note).into()));
+    if to_relay.interactive.try_send(note).is_err() {
+        return false;
+    }
+    let to_relay = to_relay.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(REFUSE_GRACE).await;
+        // Fails only when the relay link ended meanwhile, taking the page.
+        let _ = to_relay
+            .interactive
+            .send(Outbound::Protocol(close_browser(c, code)))
+            .await;
+    });
+    true
+}
+
 fn close_browser(c: u32, code: u16) -> Message {
     Message::Text(
         serde_json::json!({ "t": "close", "c": c, "code": code })
@@ -945,8 +969,7 @@ async fn serve(
                             }
                             Step::Refuse(bytes, code) => {
                                 browsers.remove(&c);
-                                let sent = to_relay.interactive.try_send(Outbound::Protocol(Message::Binary(frame(KIND_DATA, c, &bytes).into())));
-                                if sent.is_err() || to_relay.interactive.try_send(Outbound::Protocol(close_browser(c, code))).is_err() {
+                                if !refuse(&to_relay, c, &bytes, code) {
                                     break Err(anyhow::anyhow!("relay output queue is full"));
                                 }
                                 continue;
@@ -1653,6 +1676,25 @@ mod tests {
     /// A page that says `deflate` in its proof gets its session's text
     /// through one stream; each message inflates whole on its own, in
     /// order, as the page's DecompressionStream reads them.
+    #[tokio::test]
+    async fn a_refused_page_gets_its_note_before_the_close() {
+        let (to_relay, mut out) = crate::queue::channel::<Outbound>(8);
+        assert!(refuse(&to_relay, 7, b"note", 4403));
+        let Some(Outbound::Protocol(Message::Binary(note))) = out.interactive.recv().await else {
+            panic!("the sealed note goes out first");
+        };
+        assert_eq!(&note[5..], b"note");
+        assert!(
+            out.interactive.try_recv().is_err(),
+            "the relay drops a note with a close right behind it"
+        );
+        let close = tokio::time::timeout(REFUSE_GRACE * 3, out.interactive.recv()).await;
+        let Ok(Some(Outbound::Protocol(Message::Text(close)))) = close else {
+            panic!("the close follows the grace period");
+        };
+        assert!(close.contains(r#""code":4403"#), "{close}");
+    }
+
     #[test]
     fn a_page_that_inflates_gets_each_message_deflated_whole() {
         for capable in [false, true] {

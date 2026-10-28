@@ -258,6 +258,18 @@ async function until(fn, ms = 15000) {
       child.once('error', reject);
       child.once('exit', code => code === 0 ? resolve(out) : reject(new Error(`kaku ${args.join(' ')} exited ${code}: ${out}`)));
     });
+    // A new pairing waits for Enter in `kaku remote`, which reads it only
+    // from a terminal: run it on a pty and press Enter once the code shows.
+    const confirmPairing = () => new Promise((resolve, reject) => {
+      const pty = 'import os, pty, sys\npid, fd = pty.fork()\nif pid == 0: os.execv(sys.argv[1], sys.argv[1:])\nout, sent = b"", False\nwhile True:\n    try: data = os.read(fd, 4096)\n    except OSError: break\n    if not data: break\n    out += data\n    if not sent and b"press Enter" in out: os.write(fd, b"\\r"); sent = True\nsys.stdout.buffer.write(out)\nsys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))\n';
+      const child = spawn('python3', ['-I', '-c', pty, path.join(app, 'Contents/MacOS/kaku'), 'remote'], {
+        env: { ...inheritedEnv, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), TMPDIR: path.join(home, 'tmp/') },
+      });
+      let out = '';
+      child.stdout.on('data', d => { out += d; });
+      child.once('error', reject);
+      child.once('exit', code => code === 0 ? resolve(out) : reject(new Error(`kaku remote on a pty exited ${code}: ${out}`)));
+    });
     const pairingLink = async () => (await cli('remote')).split('\n').find(line => /#[A-Za-z0-9_-]{22}$/.test(line));
     // Without pairing, the page says how to pair and opens no socket.
     const unpaired = await browser.newPage();
@@ -275,6 +287,8 @@ async function until(fn, ms = 15000) {
     const link = await pairingLink();
     assert.ok(link.startsWith(relayBase + '#'), link);
     await encrypted.goto(link);
+    await encrypted.waitForFunction(() => /Confirm \d{3} \d{3} on your Mac/.test(document.getElementById('stage')?.innerText || ''));
+    assert.match(await confirmPairing(), /Paired\./);
     await encrypted.waitForSelector('body.drawn');
     assert.equal(new URL(encrypted.url()).hash, '');
     await until(async () => (await cli('remote', 'devices')).includes(' on '));
