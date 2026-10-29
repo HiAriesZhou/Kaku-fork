@@ -173,12 +173,23 @@
      hover or focus. */
   /* Close confirmation: one bar at the bottom, the terminal stays in view.
      The layer covers the stage, so a click anywhere else cancels. */
-  #dialog { position: absolute; inset: 0; display: none; align-items: flex-end; justify-content: center; padding-bottom: 16px; box-sizing: border-box; z-index: 10; outline: none; }
-  #dialog.show { display: flex; }
-  #dialog .card { display: flex; align-items: center; gap: 16px; max-width: calc(100% - 32px); padding: 8px 8px 8px 14px; border: 1px solid var(--line); border-radius: 10px; background: linear-gradient(var(--tab-active-bg), var(--tab-active-bg)), var(--bg); box-shadow: 0 4px 16px rgba(0,0,0,0.25); color: var(--fg); font-size: 13px; }
+  /* The close confirmation sits by the tab or pane it asks about, its tip
+     pointing there: one hairline, a fill a step above the page, no scrim. */
+  :root { --hair: 1px; --pop-bg: #26252c; --pop-bg: color-mix(in srgb, var(--bg) 90%, white); --pop-line: rgba(255,255,255,0.14); --pop-line: color-mix(in srgb, var(--fg) 16%, transparent); }
+  @media (min-resolution: 2dppx) { :root { --hair: 0.5px; } }
+  #dialog { position: fixed; inset: 0; display: none; box-sizing: border-box; z-index: 25; outline: none; }
+  #dialog.show { display: block; }
+  #dialog .card { position: absolute; left: 0; top: 0; display: flex; align-items: center; gap: 14px; box-sizing: border-box; max-width: calc(100vw - 16px); padding: 8px 8px 8px 14px; border: var(--hair) solid var(--pop-line); border-radius: 10px; background: var(--pop-bg); box-shadow: 0 8px 16px rgba(0,0,0,0.18); color: var(--fg); font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; opacity: 0; transition: opacity 0.25s ease-out; }
+  #dialog.in .card { opacity: 1; }
+  #dialog .tip { position: absolute; left: 0; width: 16px; height: 8px; overflow: visible; pointer-events: none; }
+  #dialog .tip .cover { fill: var(--pop-bg); }
+  #dialog .tip .edge { fill: none; stroke: var(--pop-line); stroke-width: var(--hair); }
+  #dialog .card.below .tip { top: -7px; margin-top: calc(-1 * var(--hair)); }
+  #dialog .card.above .tip { bottom: -7px; margin-bottom: calc(-1 * var(--hair)); transform: rotate(180deg); }
+  #dialog .card:not(.below):not(.above) .tip { display: none; }
   #dialog .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #dialog .actions { display: flex; gap: 8px; flex: none; }
-  #dialog button { height: 28px; padding: 0 12px; border: 0; border-radius: 6px; background: var(--line); color: var(--fg); font: inherit; cursor: pointer; }
+  #dialog button { height: 28px; padding: 0 12px; border: 0; border-radius: 6px; background: rgba(255,255,255,0.08); background: color-mix(in srgb, var(--fg) 10%, transparent); color: var(--fg); font: inherit; cursor: pointer; }
   #dialog button[data-act="ok"] { background: var(--fg); color: var(--bg); }
   #dialog button:hover, #dialog button:focus-visible { opacity: 0.85; outline: none; }
   body.touch #dialog button { height: 34px; padding: 0 16px; }
@@ -222,8 +233,8 @@
 </head>
 <body>
 <div id="bar"><div id="tabs"></div><div id="tools"></div></div>
+<div id="dialog" role="dialog" aria-modal="true" tabindex="-1"><div class="card"><svg class="tip" viewBox="0 0 16 8" aria-hidden="true"><path class="cover" d="M0 8L6.6 1.4Q8 0 9.4 1.4L16 8Z"/><path class="edge" d="M1 7L6.6 1.4Q8 0 9.4 1.4L15 7"/></svg><div class="title"></div><div class="actions"><button type="button" data-act="cancel" tabindex="-1">Cancel</button><button type="button" data-act="ok" tabindex="-1">Close</button></div></div></div>
 <div id="stage">
-  <div id="dialog" role="dialog" aria-modal="true" tabindex="-1"><div class="card"><div class="title"></div><div class="actions"><button type="button" data-act="cancel" tabindex="-1">Cancel</button><button type="button" data-act="ok" tabindex="-1">Close</button></div></div></div>
   <div id="term"></div>
   <div id="past"></div>
   <button id="history" type="button">Back to live</button>
@@ -2017,22 +2028,73 @@
   };
 
   // Close confirmation in the page's own style: Enter closes, Esc cancels.
+  // It sits by what it asks about (the tab, its close mark, the spot the pane
+  // menu opened at) with its tip pointing there, below it when there is room
+  // and above it otherwise; with nothing to point at it sits low and centered.
   const dialogEl = document.getElementById("dialog");
-  let dialogDone = null;
+  const dialogCard = dialogEl.querySelector(".card");
+  const dialogTip = dialogEl.querySelector(".tip");
+  let dialogDone = null, dialogAnchor = null;
   // Kaku's own wording (overlay/confirm_close_pane.rs).
   const CLOSE_TEXT = { tab: "Close this tab?", pane: "Close this pane?" };
-  const askClose = (_title, kind = "tab") => new Promise((resolve) => {
+  // The card's body keeps 16px from what it points at, 8px from the window.
+  const POP_GAP = 16, POP_EDGE = 8, TIP_W = 16, POP_RADIUS = 10;
+  const anchorRect = (anchor) => {
+    // A tab is looked up again each time: the bar redraws its tabs.
+    if (typeof anchor === "function") anchor = anchor();
+    if (!anchor) return null;
+    if (anchor instanceof Element) {
+      const r = anchor.getBoundingClientRect();
+      return r.width || r.height ? r : null;
+    }
+    return { left: anchor.x, right: anchor.x, top: anchor.y, bottom: anchor.y };
+  };
+  const placeDialog = () => {
+    const at = anchorRect(dialogAnchor);
+    const w = dialogCard.offsetWidth, h = dialogCard.offsetHeight;
+    const vw = innerWidth, vh = innerHeight;
+    let x, y, side = "";
+    if (at) {
+      const cx = (at.left + at.right) / 2;
+      x = Math.min(Math.max(cx - w / 2, POP_EDGE), vw - w - POP_EDGE);
+      if (at.bottom + POP_GAP + h + POP_EDGE <= vh) { side = "below"; y = at.bottom + POP_GAP; }
+      else if (at.top - POP_GAP - h >= POP_EDGE) { side = "above"; y = at.top - POP_GAP - h; }
+      if (side) {
+        // The tip follows the anchor and stays clear of the rounded corners.
+        const tip = Math.min(Math.max(cx - x - TIP_W / 2, POP_RADIUS), w - POP_RADIUS - TIP_W);
+        dialogTip.style.left = tip + "px";
+      }
+    }
+    if (!side) {
+      const r = stage.getBoundingClientRect();
+      x = Math.max(r.left + (r.width - w) / 2, POP_EDGE);
+      y = r.bottom - 16 - h;
+    }
+    dialogCard.classList.toggle("below", side === "below");
+    dialogCard.classList.toggle("above", side === "above");
+    dialogCard.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+  };
+  const askClose = (_title, kind = "tab", anchor = null) => new Promise((resolve) => {
     if (dialogDone) dialogDone(false);
     dialogEl.querySelector(".title").textContent = CLOSE_TEXT[kind] || CLOSE_TEXT.tab;
+    dialogAnchor = anchor;
     dialogEl.classList.add("show");
+    placeDialog();
+    requestAnimationFrame(() => { if (dialogDone) dialogEl.classList.add("in"); });
     dialogDone = (ok) => {
       dialogDone = null;
-      dialogEl.classList.remove("show");
+      dialogAnchor = null;
+      dialogEl.classList.remove("show", "in");
       refocus();
       resolve(ok);
     };
     dialogEl.focus();
   });
+  window.addEventListener("resize", () => { if (dialogDone) placeDialog(); });
+  // Scrolling outside it cancels, as a click outside does.
+  dialogEl.addEventListener("wheel", (ev) => {
+    if (dialogDone && !dialogCard.contains(ev.target)) dialogDone(false);
+  }, { passive: true });
   dialogEl.addEventListener("click", (ev) => {
     if (!dialogDone) return;
     const act = ev.target.closest("[data-act]");
@@ -2157,7 +2219,14 @@
   const closing = new Map();
   let authoritativeTabs = [];
   const CLOSE_GRACE_MS = 3000;
-  const closeTab = (t) => {
+  const closeTab = (t, anchor) => {
+    // The confirmation points at the close mark that was clicked, else the
+    // tab itself, or at the given spot.
+    const mark = anchor === "mark";
+    if (!anchor || mark) anchor = () => {
+      const b = tabsEl.querySelector(`.tab[data-tab="${t.tab_id}"]`);
+      return mark ? b?.querySelector(".close") : b;
+    };
     const go = () => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       send({ type: "close_tab", tab_id: t.tab_id });
@@ -2177,7 +2246,7 @@
       if (t.tab_id === tabId) attach(rest[Math.min(at, rest.length - 1)], true);
       else renderTabs();
     };
-    if (t.confirm_close) askClose(t.title || "Tab").then((ok) => { if (ok) go(); });
+    if (t.confirm_close) askClose(t.title || "Tab", "tab", anchor).then((ok) => { if (ok) go(); });
     else go();
   };
   const newTab = () => {
@@ -2213,7 +2282,7 @@
       close.title = "Close Tab";
       close.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        closeTab(t);
+        closeTab(t, "mark");
       });
       const slot = document.createElement("span");
       slot.className = "slot";
@@ -2287,6 +2356,8 @@
       if (active) active.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
     tabsEdge();
+    // A title that changes width moves the tab the confirmation points at.
+    if (dialogDone) placeDialog();
   };
   const clearDropMarks = () => tabsEl.querySelectorAll(".drop-before, .drop-after").forEach((e) => e.classList.remove("drop-before", "drop-after"));
   // Kaku's own order is per window; the page lists every window's tabs in a
@@ -2455,13 +2526,13 @@
   window.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && menuEl.classList.contains("show")) { ev.preventDefault(); ev.stopPropagation(); closeMenu(); } }, true);
   window.addEventListener("blur", closeMenu);
 
-  const closePane = target => {
+  const closePane = (target, at) => {
     const tab = tabs.find(t => t.pane_id === target || (t.panes || []).some(p => p.pane_id === target));
     if (!tab) return;
-    if (!tab.panes || tab.panes.length < 2) { closeTab(tab); return; }
+    if (!tab.panes || tab.panes.length < 2) { closeTab(tab, at); return; }
     const pane = tab.panes.find(p => p.pane_id === target);
     const go = () => send({ type: "close_pane", pane_id: target });
-    if (pane?.confirm_close !== false) askClose(tab.title || "Pane", "pane").then(ok => { if (ok) go(); });
+    if (pane?.confirm_close !== false) askClose(tab.title || "Pane", "pane", at).then(ok => { if (ok) go(); });
     else go();
   };
   stage.addEventListener("contextmenu", ev => {
@@ -2492,7 +2563,7 @@
     if (here && (here.panes || []).length > 1) {
       items.push(null, [here.zoomed ? "Unzoom Pane" : "Zoom Pane", () => send({ type: "zoom_pane", pane_id: target })]);
     }
-    items.push(null, ["Close Pane", () => closePane(target)]);
+    items.push(null, ["Close Pane", () => closePane(target, { x: ev.clientX, y: ev.clientY })]);
     openMenu(ev.clientX, ev.clientY, items);
   });
 

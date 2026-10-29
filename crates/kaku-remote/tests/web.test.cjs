@@ -1693,6 +1693,56 @@ test('the close confirmation answers to N, Y and clicks outside it', async t => 
   assert.equal(await closes(), 1);
 });
 
+// The confirmation sits by what it asks about with its tip on it: 16px under
+// the close mark that was clicked, above the tab when the bar is at the
+// bottom, by the spot the pane menu opened at; scrolling outside cancels.
+test('the close confirmation points at the tab or spot it asks about', async t => {
+  const { p } = await page(t); await screen(p);
+  const tabs = bottom => p.evaluate(bottom => {
+    connections.at(-1).onmessage({ data: JSON.stringify({ type: 'config', tab_bar_at_bottom: bottom }) });
+    probe.handle({ type: 'tabs', tabs: [
+      { tab_id: 1, pane_id: 1, title: 'one', active: true },
+      { tab_id: 2, pane_id: 2, title: 'two', confirm_close: true, panes: [
+        { pane_id: 2, left: 0, top: 0, width: 40, height: 24, confirm_close: true },
+        { pane_id: 4, left: 40, top: 0, width: 40, height: 24 },
+      ] },
+    ] });
+  }, bottom);
+  const geometry = () => p.evaluate(() => {
+    const card = document.querySelector('#dialog .card').getBoundingClientRect();
+    const tip = document.querySelector('#dialog .tip').getBoundingClientRect();
+    const mark = document.querySelectorAll('#bar .tab')[1].querySelector('.close').getBoundingClientRect();
+    const tab = document.querySelectorAll('#bar .tab')[1].getBoundingClientRect();
+    return { card, tip: { x: tip.left + tip.width / 2, top: tip.top, bottom: tip.bottom }, mark, tab };
+  });
+  await tabs(false);
+  await p.locator('#bar .tab').nth(1).hover();
+  await p.locator('#bar .tab').nth(1).locator('.close').click();
+  let g = await geometry();
+  assert.ok(Math.abs(g.card.top - g.mark.bottom - 16) <= 1, `card ${g.card.top} under the mark at ${g.mark.bottom}`);
+  assert.ok(Math.abs(g.tip.x - (g.mark.left + g.mark.right) / 2) <= 1, `tip ${g.tip.x} on the mark`);
+  assert.ok(g.tip.top < g.card.top && g.tip.top > g.mark.bottom, 'the tip rises from the card toward the mark');
+  await p.mouse.move(500, 400);
+  await p.mouse.wheel(0, 100);
+  await p.waitForFunction(() => !document.querySelector('#dialog.show'), null, { timeout: 2000 });
+  await tabs(true);
+  await p.locator('#bar .tab').nth(1).click({ button: 'middle' });
+  g = await geometry();
+  assert.ok(Math.abs(g.tab.top - g.card.bottom - 16) <= 1, `card ${g.card.bottom} above the bottom tab at ${g.tab.top}`);
+  assert.ok(Math.abs(g.tip.x - (g.tab.left + g.tab.right) / 2) <= 1, 'tip on the tab');
+  assert.ok(g.tip.bottom > g.card.bottom, 'the tip points down at the tab');
+  await p.keyboard.press('Escape');
+  await tabs(false);
+  await p.evaluate(() => probe.attach({ tab_id: 2, pane_id: 2 }, true));
+  await p.locator('.xterm-screen').click({ button: 'right', position: { x: 300, y: 200 } });
+  const spot = await p.locator('.xterm-screen').boundingBox();
+  await p.locator('#menu button').getByText('Close Pane', { exact: true }).click();
+  assert.equal(await p.locator('#dialog .title').innerText(), 'Close this pane?');
+  g = await geometry();
+  assert.ok(Math.abs(g.card.top - (spot.y + 200) - 16) <= 1, 'card under the menu spot');
+  assert.ok(Math.abs(g.tip.x - (spot.x + 300)) <= 1, 'tip on the menu spot');
+});
+
 test('terminal menu copies its selection and shares paste limits and pane guards', async t => {
   const { p } = await page(t); await screen(p, 'hello world'); await captureClipboard(p);
   await p.evaluate(() => { probe.term.select(0, 0, 5); navigator.clipboard.readText = async () => 'pasted'; });
