@@ -288,9 +288,16 @@ echo "[3/7] Downloading vendor plugins..."
 ./scripts/download_vendor.sh
 
 echo "[4/7] Copying resources and binaries..."
-cp -R assets/shell-integration/* "$APP_BUNDLE_OUT/Contents/Resources/"
+# The shell smoke tests run from the checkout and CI, never from the bundle.
+for item in assets/shell-integration/*; do
+	[[ "$(basename "$item")" == "tests" ]] && continue
+	cp -R "$item" "$APP_BUNDLE_OUT/Contents/Resources/"
+done
 cp -R assets/shell-completion "$APP_BUNDLE_OUT/Contents/Resources/"
-cp -R assets/fonts "$APP_BUNDLE_OUT/Contents/Resources/"
+# The fonts themselves are compiled into kaku-gui (wezterm-font's vendored
+# fonts), and nothing reads a copy from Resources; only their licenses ship.
+mkdir -p "$APP_BUNDLE_OUT/Contents/Resources/fonts"
+cp assets/fonts/*.txt "$APP_BUNDLE_OUT/Contents/Resources/fonts/"
 cp -R assets/prompts "$APP_BUNDLE_OUT/Contents/Resources/"
 mkdir -p "$APP_BUNDLE_OUT/Contents/Resources/vendor"
 for vendor_item in starship.toml fast-syntax-highlighting zsh-autosuggestions zsh-completions zsh-z; do
@@ -300,6 +307,11 @@ for vendor_item in starship.toml fast-syntax-highlighting zsh-autosuggestions zs
 	else
 		echo "Warning: missing vendor item: $src_path"
 	fi
+done
+# Upstream demo images, test suites and CI config are never sourced, and
+# setup_zsh.sh copies these plugin directories into every user's config.
+for vendor_extra in .github .gitignore images img test tests spec; do
+	rm -rf "$APP_BUNDLE_OUT/Contents/Resources/vendor/"*/"$vendor_extra"
 done
 cp assets/shell-integration/first_run.sh "$APP_BUNDLE_OUT/Contents/Resources/"
 chmod +x "$APP_BUNDLE_OUT/Contents/Resources/first_run.sh"
