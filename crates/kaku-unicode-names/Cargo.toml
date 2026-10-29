@@ -3,7 +3,7 @@ name = "kaku-unicode-names"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Generated Unicode name table (~140k lines) lifted out of kaku-gui/src to keep IDE indexing and rg searches fast. Regenerate with: ucd-generate names ."
+description = "Unicode name table for the character selector, stored zstd-compressed. Regenerate with regenerate.sh."
 
-# No `[lints]` opt-in: this is generated code; running lints on it produces
-# noise without value. The lib.rs header carries the generator command.
+[dependencies]
+zstd.workspace = true

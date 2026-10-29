@@ -203,7 +203,7 @@ fn build_aliases() -> Vec<Alias> {
         }
     }
 
-    for (name, value) in kaku_unicode_names::NAMES {
+    for (name, value) in kaku_unicode_names::names() {
         push(
             &mut aliases,
             Alias {
