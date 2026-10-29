@@ -943,6 +943,14 @@ fn set_window_style_mask_preserving_responder(window: &StrongPtr, mask: NSWindow
     }
 }
 
+/// `WindowInner::show` rebuilds the style mask through borderless as a WebGpu
+/// scale workaround. AppKit throws when that clears `NSFullScreenWindowMask`
+/// outside a full screen transition, so a native fullscreen window keeps its
+/// mask; it has no titlebar decorations to restore anyway.
+fn show_rebuilds_style_mask(style_mask: NSWindowStyleMask) -> bool {
+    !style_mask.contains(NSWindowStyleMask::NSFullScreenWindowMask)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct PersistedWindowSize {
     width: usize,
@@ -3048,21 +3056,23 @@ impl WindowInner {
             let current_app = NSRunningApplication::currentApplication(nil);
             current_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps);
 
-            // Stupid hack: adjust the window style mask and set it back
-            // to what it was.
-            // Without this, the CAMetalLayer used by webgpu seems to get
-            // stuck with a scale factor of 2 despite us having configured 1.
-            set_window_style_mask_preserving_responder(
-                &self.window,
-                NSWindowStyleMask::NSBorderlessWindowMask,
-            );
+            if show_rebuilds_style_mask(NSWindow::styleMask(*self.window)) {
+                // Stupid hack: adjust the window style mask and set it back
+                // to what it was.
+                // Without this, the CAMetalLayer used by webgpu seems to get
+                // stuck with a scale factor of 2 despite us having configured 1.
+                set_window_style_mask_preserving_responder(
+                    &self.window,
+                    NSWindowStyleMask::NSBorderlessWindowMask,
+                );
 
-            apply_decorations_to_window(
-                &self.window,
-                self.config.window_decorations,
-                self.config.integrated_title_button_style,
-                self.config.native_macos_fullscreen_mode,
-            );
+                apply_decorations_to_window(
+                    &self.window,
+                    self.config.window_decorations,
+                    self.config.integrated_title_button_style,
+                    self.config.native_macos_fullscreen_mode,
+                );
+            }
 
             self.update_titlebar_background();
             apply_window_appearance(&self.window, &self.config);
@@ -5468,6 +5478,29 @@ mod tests {
             unsafe { *(**second).get_ivar::<NSUInteger>("focusStep") },
             2
         );
+    }
+
+    #[test]
+    fn show_leaves_the_style_mask_of_a_native_fullscreen_window_alone() {
+        // AppKit throws when the mask loses NSFullScreenWindowMask outside a
+        // transition. The exception skips the WindowInner borrow's drop, so the
+        // next with_window_inner on that window aborts.
+        assert!(!show_rebuilds_style_mask(
+            NSWindowStyleMask::NSTitledWindowMask | NSWindowStyleMask::NSFullScreenWindowMask
+        ));
+        assert!(show_rebuilds_style_mask(
+            NSWindowStyleMask::NSTitledWindowMask | NSWindowStyleMask::NSResizableWindowMask
+        ));
+        let source = include_str!("window.rs");
+        let ordinary = &source[source.find("impl WindowInner {").unwrap()..];
+        let show = production_method(ordinary, "fn show(&mut self)");
+        let guard = show
+            .find("show_rebuilds_style_mask(")
+            .expect("show() must check for native fullscreen");
+        let guarded = &show[guard..show.find("self.update_titlebar_background()").unwrap()];
+        assert!(guarded.contains("set_window_style_mask_preserving_responder"));
+        assert!(guarded.contains("apply_decorations_to_window"));
+        assert_eq!(show.matches("apply_decorations_to_window").count(), 1);
     }
 
     #[test]
