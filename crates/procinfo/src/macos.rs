@@ -62,7 +62,8 @@ impl LocalProcessInfo {
         }
 
         unsafe { buffer.set_len(x as usize) };
-        Some(OsString::from_vec(buffer).into())
+        let path: PathBuf = OsString::from_vec(buffer).into();
+        Some(kaku_multicall_path(pid, path))
     }
 
     pub fn with_root_pid(pid: u32) -> Option<Self> {
@@ -129,34 +130,6 @@ impl LocalProcessInfo {
             LocalProcessInfo::current_working_dir(pid as _).unwrap_or_else(PathBuf::new)
         }
 
-        fn exe_and_args_for_pid_sysctl(pid: libc::pid_t) -> Option<(PathBuf, Vec<String>)> {
-            use libc::c_int;
-            let mut size = 64 * 1024;
-            let mut buf: Vec<u8> = Vec::with_capacity(size);
-            let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as c_int];
-
-            let res = unsafe {
-                libc::sysctl(
-                    mib.as_mut_ptr(),
-                    mib.len() as _,
-                    buf.as_mut_ptr() as *mut _,
-                    &mut size,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            if res == -1 {
-                return None;
-            }
-            if size < (std::mem::size_of::<c_int>() * 2) {
-                // Not big enough
-                return None;
-            }
-            unsafe { buf.set_len(size) };
-
-            parse_exe_and_argv_sysctl(buf)
-        }
-
         fn exe_for_pid(pid: libc::pid_t) -> PathBuf {
             LocalProcessInfo::executable_path(pid as _).unwrap_or_else(PathBuf::new)
         }
@@ -204,6 +177,73 @@ impl LocalProcessInfo {
         } else {
             None
         }
+    }
+}
+
+fn exe_and_args_for_pid_sysctl(pid: libc::pid_t) -> Option<(PathBuf, Vec<String>)> {
+    use libc::c_int;
+    let mut size = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(size);
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as c_int];
+
+    let res = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as _,
+            buf.as_mut_ptr() as *mut _,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if res == -1 {
+        return None;
+    }
+    if size < (std::mem::size_of::<c_int>() * 2) {
+        // Not big enough
+        return None;
+    }
+    unsafe { buf.set_len(size) };
+
+    parse_exe_and_argv_sysctl(buf)
+}
+
+/// Kaku's bundle ships one binary: `Contents/MacOS/kaku` and
+/// `Contents/MacOS/k` are symlinks to `kaku-gui`, which runs the CLI or the
+/// chat CLI by the name it was started under (`multicall_entry` in
+/// `kaku-gui/src/main.rs`, whose rule this mirrors). proc_pidpath reports the
+/// resolved file, so without this a running `kaku config` would show up as
+/// `kaku-gui` to every foreground-process consumer (#583's opaque TUI
+/// background, title fallbacks, Lua). Only that one binary is mapped; other
+/// programs keep their resolved paths.
+fn kaku_multicall_path(pid: u32, resolved: PathBuf) -> PathBuf {
+    if resolved.file_name() != Some(OsStr::new("kaku-gui")) {
+        return resolved;
+    }
+    // Unreadable arguments (another user's process, a zombie) keep the
+    // resolved path rather than guessing the CLI.
+    let Some((_, argv)) = exe_and_args_for_pid_sysctl(pid as _) else {
+        return resolved;
+    };
+    match multicall_name(argv.first().map(String::as_str).unwrap_or_default()) {
+        Some(name) => resolved.with_file_name(name),
+        None => resolved,
+    }
+}
+
+/// The bundle entry a `kaku-gui` process started as `argv0` runs: `None` for
+/// the GUI itself.
+fn multicall_name(argv0: &str) -> Option<&'static str> {
+    let name = std::path::Path::new(argv0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if name.eq_ignore_ascii_case("kaku-gui") {
+        None
+    } else if name.eq_ignore_ascii_case("k") {
+        Some("k")
+    } else {
+        Some("kaku")
     }
 }
 
@@ -256,7 +296,51 @@ fn parse_exe_and_argv_sysctl(buf: Vec<u8>) -> Option<(PathBuf, Vec<String>)> {
 mod tests {
     use std::path::Path;
 
-    use super::parse_exe_and_argv_sysctl;
+    use super::{multicall_name, parse_exe_and_argv_sysctl};
+
+    #[test]
+    fn multicall_name_matches_the_bundle_dispatch() {
+        assert_eq!(
+            multicall_name("/Applications/Kaku.app/Contents/MacOS/kaku-gui"),
+            None
+        );
+        assert_eq!(multicall_name("/opt/homebrew/bin/kaku"), Some("kaku"));
+        assert_eq!(multicall_name("Kaku"), Some("kaku"));
+        assert_eq!(
+            multicall_name("/Applications/Kaku.app/Contents/MacOS/k"),
+            Some("k")
+        );
+        assert_eq!(multicall_name("/usr/local/bin/wezterm"), Some("kaku"));
+        assert_eq!(multicall_name(""), Some("kaku"));
+    }
+
+    #[test]
+    fn executable_path_reports_the_bundle_name_a_kaku_gui_process_started_as() {
+        // A stand-in bundle: any binary named kaku-gui, linked as kaku and k
+        // the way build.sh links them.
+        let dir = tempfile::tempdir().unwrap();
+        let gui = dir.path().join("kaku-gui");
+        std::fs::copy("/bin/sleep", &gui).unwrap();
+        for name in ["kaku", "k"] {
+            std::os::unix::fs::symlink("kaku-gui", dir.path().join(name)).unwrap();
+        }
+        let resolved = std::fs::canonicalize(&gui).unwrap();
+        for (started_as, expected) in [("kaku", "kaku"), ("k", "k"), ("kaku-gui", "kaku-gui")] {
+            let mut child = std::process::Command::new(dir.path().join(started_as))
+                .arg("5")
+                .spawn()
+                .unwrap();
+            // Command::spawn uses posix_spawn here, which returns after exec.
+            let path = super::LocalProcessInfo::executable_path(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            assert_eq!(
+                path,
+                Some(resolved.with_file_name(expected)),
+                "{started_as}"
+            );
+        }
+    }
 
     #[test]
     fn test_trailing_zeros() {

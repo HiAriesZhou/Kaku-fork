@@ -14,3 +14,6 @@ libc.workspace = true
 log.workspace = true
 luahelper = { workspace=true, optional = true }
 wezterm-dynamic = { workspace=true, optional = true, features=["std"]}
+
+[dev-dependencies]
+tempfile.workspace = true

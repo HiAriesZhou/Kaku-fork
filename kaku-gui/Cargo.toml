@@ -36,7 +36,7 @@ vendored-fonts = [
 ]
 dhat-heap = ["dhat"]    # if you are doing heap profiling
 dhat-ad-hoc = ["dhat"]  # if you are doing ad hoc profiling
-remote = ["dep:kaku-remote"]
+remote = ["dep:kaku-remote", "kaku/remote"]
 desktop = ["remote", "kaku-remote/desktop"]
 
 [build-dependencies]
@@ -44,6 +44,7 @@ anyhow.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+kaku.workspace = true
 kaku-ai-utils.workspace = true
 kaku-unicode-names.workspace = true
 base64.workspace = true

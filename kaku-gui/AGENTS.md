@@ -10,7 +10,7 @@
 - tab/pane UI behavior
 - startup lifecycle and app event flow
 - AI chat overlays, approval UI, inline status, syntax highlighting, and assistant transport
-- the `k` helper binary under `src/bin/k.rs`
+- the `k` chat CLI (`cli_chat::k_main`; `src/bin/k.rs` is the dev bin target)
 
 ## Where to Look
 

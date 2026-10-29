@@ -3324,6 +3324,7 @@ dependencies = [
  "ignore",
  "image",
  "k9",
+ "kaku",
  "kaku-ai-utils",
  "kaku-remote",
  "kaku-unicode-names",
@@ -4931,6 +4932,7 @@ dependencies = [
  "libc",
  "log",
  "luahelper",
+ "tempfile",
  "wezterm-dynamic",
 ]
 

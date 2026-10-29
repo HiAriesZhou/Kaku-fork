@@ -244,26 +244,22 @@ for target in "${BUILD_TARGETS[@]}"; do
 done
 echo "Building targets: ${BUILD_TARGETS[*]}"
 ./scripts/prune_target.sh "$TARGET_DIR"
-CARGO_TERM_PROGRESS_WHEN=auto cargo build --locked ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} ${CARGO_FEATURE_ARGS[@]+"${CARGO_FEATURE_ARGS[@]}"} "${CARGO_TARGET_ARGS[@]}" --target-dir "$TARGET_DIR" -p kaku-gui -p kaku
+CARGO_TERM_PROGRESS_WHEN=auto cargo build --locked ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} ${CARGO_FEATURE_ARGS[@]+"${CARGO_FEATURE_ARGS[@]}"} "${CARGO_TARGET_ARGS[@]}" --target-dir "$TARGET_DIR" -p kaku-gui --bin kaku-gui
 
 if [[ "$BUILD_ARCH" == "universal" ]]; then
 	BIN_DIR="$TARGET_DIR/universal/$PROFILE_DIR"
 	mkdir -p "$BIN_DIR"
-	for bin in kaku kaku-gui k; do
-		lipo -create \
-			-output "$BIN_DIR/$bin" \
-			"$TARGET_DIR/aarch64-apple-darwin/$PROFILE_DIR/$bin" \
-			"$TARGET_DIR/x86_64-apple-darwin/$PROFILE_DIR/$bin"
-		chmod +x "$BIN_DIR/$bin"
-	done
+	lipo -create \
+		-output "$BIN_DIR/kaku-gui" \
+		"$TARGET_DIR/aarch64-apple-darwin/$PROFILE_DIR/kaku-gui" \
+		"$TARGET_DIR/x86_64-apple-darwin/$PROFILE_DIR/kaku-gui"
+	chmod +x "$BIN_DIR/kaku-gui"
 else
 	BIN_DIR="$TARGET_DIR/${BUILD_TARGETS[0]}/$PROFILE_DIR"
 fi
 
-for bin in kaku kaku-gui k; do
-	echo -n "Built $bin: "
-	lipo -info "$BIN_DIR/$bin"
-done
+echo -n "Built kaku-gui: "
+lipo -info "$BIN_DIR/kaku-gui"
 
 echo "[2/7] Preparing app bundle..."
 rm -rf "$APP_BUNDLE_OUT"
@@ -326,9 +322,14 @@ if ! tic -xe kaku -o "$APP_BUNDLE_OUT/Contents/Resources/terminfo" termwiz/data/
 	tic -x -o "$APP_BUNDLE_OUT/Contents/Resources/terminfo" termwiz/data/kaku.terminfo
 fi
 
-for bin in kaku kaku-gui k; do
-	cp "$BIN_DIR/$bin" "$APP_BUNDLE_OUT/Contents/MacOS/$bin"
-	chmod +x "$APP_BUNDLE_OUT/Contents/MacOS/$bin"
+cp "$BIN_DIR/kaku-gui" "$APP_BUNDLE_OUT/Contents/MacOS/kaku-gui"
+chmod +x "$APP_BUNDLE_OUT/Contents/MacOS/kaku-gui"
+# One binary serves all three names: kaku-gui starts the CLI or `k` when run
+# under those names (multicall_entry in kaku-gui/src/main.rs). Separate CLI
+# binaries were 93% and 87% the same code as kaku-gui. The links are relative
+# so they stay inside the bundle, which `codesign --strict` requires.
+for bin in kaku k; do
+	ln -s kaku-gui "$APP_BUNDLE_OUT/Contents/MacOS/$bin"
 done
 
 if [[ -n "${KAKU_DESKTOP_HELPER:-}" ]]; then
@@ -396,8 +397,9 @@ touch "$APP_BUNDLE_OUT"
 # kaku-gui is CFBundleExecutable. When codesign signs the main executable it
 # validates the other executables in Contents/MacOS as nested code and refuses
 # while any of them is still unsigned ("code object is not signed at all,
-# In subcomponent: .../k"), so the helpers must be signed before it.
-SIGN_BINARIES=(kaku k)
+# In subcomponent: .../kaku-desktop"), so the helper must be signed before
+# it. `kaku` and `k` are symlinks to kaku-gui, sealed as links, not signed.
+SIGN_BINARIES=()
 if [[ -n "${KAKU_DESKTOP_HELPER:-}" ]]; then
 	SIGN_BINARIES+=(kaku-desktop)
 fi
