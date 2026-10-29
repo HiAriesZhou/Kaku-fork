@@ -550,7 +550,7 @@ test('local token stays tab-only', async t => {
   assert.ok(await p.evaluate(() => sessionStorage.getItem('kaku.link:/')));
 });
 
-test('image paths preview after 150ms, scaled by the Mac, again from memory, and cancel on leave', async t => {
+test('image paths preview after 80ms, scaled by the Mac, again from memory, and cancel on leave', async t => {
   const { p, errors } = await page(t);
   await screen(p, '~/Desktop/shot.png');
   await p.evaluate(() => new Promise(resolve => testLinkProvider.provideLinks(1, links => {
@@ -558,14 +558,14 @@ test('image paths preview after 150ms, scaled by the Mac, again from memory, and
     previewLink.hover({ clientX: 980, clientY: 580, buttons: 0 });
     resolve();
   })));
-  await p.waitForTimeout(80);
+  await p.waitForTimeout(40);
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
   await p.waitForFunction(() => messages.some(m => m.type === 'download'));
   const request = await p.evaluate(() => messages.find(m => m.type === 'download'));
   assert.equal(request.path, '~/Desktop/shot.png');
   assert.equal(request.pane_id, 1);
   // The preview's longest side in device pixels, for the Mac to scale to.
-  assert.equal(request.preview, await p.evaluate(() => Math.round(420 * devicePixelRatio)));
+  assert.equal(request.preview, await p.evaluate(() => Math.round(640 * devicePixelRatio)));
   let saves = 0;
   p.on('download', () => saves++);
   await p.evaluate(id => {
@@ -595,6 +595,92 @@ test('image paths preview after 150ms, scaled by the Mac, again from memory, and
   await p.waitForFunction(() => !document.querySelector('#image-preview').hidden);
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
   await p.evaluate(() => previewLink.leave());
+  assert.deepEqual(errors, []);
+});
+
+test('a selection left on screen does not hold an image preview back', async t => {
+  const { p, errors } = await page(t);
+  await screen(p, 'see ~/Desktop/shot.png now');
+  await p.evaluate(() => probe.term.selectAll());
+  assert.equal(await p.evaluate(() => probe.term.hasSelection()), true);
+  await p.evaluate(() => new Promise(resolve => testLinkProvider.provideLinks(1, links => {
+    links[0].hover({ clientX: 100, clientY: 100, buttons: 0 });
+    resolve();
+  })));
+  await p.waitForFunction(() => messages.some(m => m.type === 'download' && m.preview));
+  assert.deepEqual(errors, []);
+});
+
+test('Option+clicking an image path shows it over the page to zoom, sending the Mac no click', async t => {
+  const { p, errors } = await page(t);
+  await p.setViewportSize({ width: 1000, height: 600 });
+  await screen(p, 'see ~/Desktop/shot.png now');
+  const box = await p.locator('.xterm-screen').boundingBox();
+  const cell = await p.evaluate(() => probe.term._core._renderService.dimensions.css.cell);
+  const at = [box.x + cell.width * 8.5, box.y + cell.height / 2];
+  await p.mouse.move(at[0] - cell.width, at[1]);
+  await p.mouse.move(at[0], at[1]);
+  await p.waitForTimeout(30);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.down('Alt');
+  await p.mouse.click(at[0], at[1]);
+  await p.keyboard.up('Alt');
+  await p.waitForFunction(() => document.querySelector('#viewer.show'));
+  const request = await p.evaluate(() => messages.find(m => m.type === 'download'));
+  assert.equal(request.path, '~/Desktop/shot.png');
+  assert.equal(request.preview, await p.evaluate(() => Math.min(2048, Math.round(Math.max(screen.width, screen.height) * devicePixelRatio))));
+  // xterm's Alt click would have moved the shell's cursor with arrow keys.
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => ['click', 'text', 'key'].includes(m.type))), []);
+  // A 400 by 200 picture fits inside the page, centred.
+  const png = await p.evaluate(async () => {
+    const c = document.createElement('canvas'); c.width = 400; c.height = 200;
+    const g = c.getContext('2d'); g.fillStyle = '#4a8'; g.fillRect(0, 0, 400, 200);
+    return c.toDataURL('image/png').split(',')[1];
+  });
+  await p.evaluate(({ id, png }) => {
+    probe.handle({ type: 'file_start', id, name: 'preview', size: atob(png).length });
+    probe.handle({ type: 'file_chunk', id, data: png });
+    probe.handle({ type: 'file_end', id });
+  }, { id: request.id, png });
+  await p.waitForFunction(() => document.querySelector('#viewer.ready img')?.getBoundingClientRect().width > 2);
+  const fit = await p.locator('#viewer img').boundingBox();
+  assert.ok(Math.abs(fit.width - 400) < 1 && Math.abs(fit.x + fit.width / 2 - 500) < 1 && Math.abs(fit.y + fit.height / 2 - 300) < 1, JSON.stringify(fit));
+  // The wheel zooms; while the picture is smaller than the page it stays
+  // centred, and once larger the pixel under the pointer stays put.
+  await p.mouse.move(400, 280);
+  await p.mouse.wheel(0, -300);
+  const larger = await p.locator('#viewer img').boundingBox();
+  assert.ok(larger.width > fit.width * 1.5 && Math.abs(larger.x + larger.width / 2 - 500) < 1, JSON.stringify(larger));
+  await p.mouse.wheel(0, -300);
+  const zoomed = await p.locator('#viewer img').boundingBox();
+  assert.ok(zoomed.width > 1000 && zoomed.height > 600, JSON.stringify(zoomed));
+  const u = (400 - larger.x) / larger.width, v = (280 - larger.y) / larger.height;
+  assert.ok(Math.abs(zoomed.x + u * zoomed.width - 400) < 2 && Math.abs(zoomed.y + v * zoomed.height - 280) < 2, JSON.stringify(zoomed));
+  // A drag pans it.
+  await p.mouse.move(500, 300);
+  await p.mouse.down();
+  await p.mouse.move(540, 290, { steps: 4 });
+  await p.mouse.up();
+  const panned = await p.locator('#viewer img').boundingBox();
+  assert.ok(Math.abs(panned.x - zoomed.x - 40) < 2 && Math.abs(panned.y - zoomed.y + 10) < 2, JSON.stringify(panned));
+  assert.equal(await p.locator('#viewer').isVisible(), true, 'a drag is not a click beside it');
+  // Escape closes it and reaches nothing else.
+  await p.keyboard.press('Escape');
+  assert.equal(await p.locator('#viewer').isVisible(), false);
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => ['click', 'text', 'key'].includes(m.type))), []);
+  // Opening it again needs no transfer, the copy is kept.
+  await p.evaluate(() => { messages.length = 0; });
+  await p.mouse.move(at[0] - cell.width, at[1]);
+  await p.mouse.move(at[0], at[1]);
+  await p.waitForTimeout(30);
+  await p.keyboard.down('Alt');
+  await p.mouse.click(at[0], at[1]);
+  await p.keyboard.up('Alt');
+  await p.waitForFunction(() => document.querySelector('#viewer.ready img')?.getBoundingClientRect().width > 2);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
+  // A click beside the picture closes it.
+  await p.mouse.click(20, 20);
+  assert.equal(await p.locator('#viewer').isVisible(), false);
   assert.deepEqual(errors, []);
 });
 
