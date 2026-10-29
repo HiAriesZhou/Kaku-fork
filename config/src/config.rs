@@ -3842,9 +3842,11 @@ fn default_update_interval() -> u64 {
 }
 
 fn default_prefer_egl() -> bool {
-    // MetalANGLE via EGL is the preferred path on macOS in general, but
-    // older Intel Macs can abort during startup inside the bundled ANGLE
-    // stack. Keep EGL opt-in there and preserve the safer CGL fallback.
+    // Kaku no longer bundles ANGLE: the copy inherited from WezTerm was
+    // x86_64-only, so Apple Silicon could never load it, and Intel Macs kept
+    // EGL opt-in because they aborted inside it. EGL is used only when a
+    // libEGL.dylib is found next to the executable, in Frameworks or on
+    // DYLD_LIBRARY_PATH; otherwise window creation falls back to CGL.
     if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
         return false;
     }

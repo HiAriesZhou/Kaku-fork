@@ -270,12 +270,6 @@ rm -rf "$APP_BUNDLE_OUT"
 mkdir -p "$OUT_DIR"
 cp -R "$APP_BUNDLE_SRC" "$APP_BUNDLE_OUT"
 
-# Move libraries from root to Frameworks (macOS requirement)
-if ls "$APP_BUNDLE_OUT"/*.dylib 1>/dev/null 2>&1; then
-	mkdir -p "$APP_BUNDLE_OUT/Contents/Frameworks"
-	mv "$APP_BUNDLE_OUT"/*.dylib "$APP_BUNDLE_OUT/Contents/Frameworks/"
-fi
-
 mkdir -p "$APP_BUNDLE_OUT/Contents/MacOS"
 mkdir -p "$APP_BUNDLE_OUT/Contents/Resources"
 
@@ -386,10 +380,6 @@ fi
 touch "$APP_BUNDLE_OUT/Contents/Resources/terminal.icns"
 touch "$APP_BUNDLE_OUT/Contents/Info.plist"
 touch "$APP_BUNDLE_OUT"
-
-while IFS= read -r -d '' dylib; do
-	codesign_with_retry "${BASE_SIGN_ARGS[@]}" "$dylib"
-done < <(find "$APP_BUNDLE_OUT/Contents/Frameworks" -type f -name '*.dylib' -print0 | sort -z)
 
 # kaku-gui is CFBundleExecutable. When codesign signs the main executable it
 # validates the other executables in Contents/MacOS as nested code and refuses
