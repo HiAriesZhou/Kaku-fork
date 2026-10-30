@@ -2764,7 +2764,12 @@
     term.options.theme = theme;
     const families = cfg.font_families || (cfg.font_family ? [cfg.font_family] : []);
     term.options.fontFamily = fontStack(families);
-    if (cfg.line_height) term.options.lineHeight = cfg.line_height;
+    // Kaku supports compact rows, but xterm.js rejects lineHeight < 1.
+    // Keep config initialization running so the page can claim its grid.
+    const lineHeight = cfg.line_height;
+    if (Number.isFinite(lineHeight) && lineHeight > 0) {
+      term.options.lineHeight = Math.max(1, lineHeight);
+    }
     document.body.classList.toggle("tabs-bottom", !!cfg.tab_bar_at_bottom);
     const root = document.documentElement.style;
     root.setProperty("--mono", term.options.fontFamily);
