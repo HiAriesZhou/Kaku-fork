@@ -989,7 +989,10 @@ const PREVIEW_AS_IS: u64 = 256 << 10;
 const PREVIEW_MAX_SIDE: u32 = 2048;
 
 /// A picture for a hover preview: the image scaled to fit `side` pixels,
-/// as JPEG, or PNG when it has transparency. A small file, one the image
+/// as JPEG, or PNG when it has transparency. macOS saves screenshots with
+/// an alpha channel that is opaque throughout; as PNG a 3456x2234 one
+/// scaled to 2048 was 2.6 MB, ten round trips over the relay, and 250 KB
+/// as JPEG. A small file, one the image
 /// decoder does not know, or one that scaling would not shrink goes as it
 /// is. A screenshot is several megabytes, seconds over the relay, and the
 /// preview shows it a few hundred pixels wide.
@@ -1012,10 +1015,12 @@ fn preview_bytes(path: &std::path::Path, side: u32) -> Result<Vec<u8>, String> {
         picture
     };
     let mut out = std::io::Cursor::new(Vec::new());
-    let encoded = if picture.color().has_alpha() {
+    let transparent = picture.color().has_alpha() && picture.to_rgba8().pixels().any(|p| p.0[3] < 255);
+    let encoded = if transparent {
         picture.write_to(&mut out, image::ImageFormat::Png)
     } else {
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+        // For the text in screenshots, at about a fifth more bytes than 85.
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
             .encode_image(&picture.to_rgb8())
     };
     let out = out.into_inner();
@@ -4095,6 +4100,19 @@ mod tests {
             image::ImageFormat::Png
         );
         assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 600);
+
+        // A macOS screenshot carries an alpha channel that is opaque
+        // throughout; it is not transparent, so JPEG.
+        let opaque = image::RgbaImage::from_fn(3000, 2000, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, ((x ^ y) % 256) as u8, 255])
+        });
+        let path = dir.join("opaque.png");
+        opaque.save(&path).unwrap();
+        let bytes = preview_bytes(&path, 600).unwrap();
+        assert_eq!(
+            image::guess_format(&bytes).unwrap(),
+            image::ImageFormat::Jpeg
+        );
 
         // Small files and files the decoder does not know go as they are.
         let small = dir.join("small.png");

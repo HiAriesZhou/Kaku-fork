@@ -98,6 +98,7 @@
   #viewer.zoomed img { cursor: grab; }
   #viewer:not(.ready) img { visibility: hidden; }
   #viewer .wait { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 13px; }
+  #viewer .wait[hidden] { display: none; }
   #menu { position: fixed; display: none; min-width: 150px; padding: 4px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); box-shadow: 0 6px 24px rgba(0,0,0,0.25); z-index: 20; }
   #menu.show { display: block; }
   #menu { max-height: calc(100% - 16px); overflow-y: auto; }

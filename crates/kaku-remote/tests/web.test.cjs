@@ -637,12 +637,15 @@ test('Option+clicking an image path shows it over the page to zoom, sending the 
     const g = c.getContext('2d'); g.fillStyle = '#4a8'; g.fillRect(0, 0, 400, 200);
     return c.toDataURL('image/png').split(',')[1];
   });
+  // A slow answer says it is loading, and the note goes once it lands.
+  await p.waitForFunction(() => getComputedStyle(document.querySelector('#viewer .wait')).display !== 'none', null, { timeout: 2000 });
   await p.evaluate(({ id, png }) => {
     probe.handle({ type: 'file_start', id, name: 'preview', size: atob(png).length });
     probe.handle({ type: 'file_chunk', id, data: png });
     probe.handle({ type: 'file_end', id });
   }, { id: request.id, png });
   await p.waitForFunction(() => document.querySelector('#viewer.ready img')?.getBoundingClientRect().width > 2);
+  assert.equal(await p.evaluate(() => getComputedStyle(document.querySelector('#viewer .wait')).display), 'none');
   const fit = await p.locator('#viewer img').boundingBox();
   assert.ok(Math.abs(fit.width - 400) < 1 && Math.abs(fit.x + fit.width / 2 - 500) < 1 && Math.abs(fit.y + fit.height / 2 - 300) < 1, JSON.stringify(fit));
   // The wheel zooms; while the picture is smaller than the page it stays
