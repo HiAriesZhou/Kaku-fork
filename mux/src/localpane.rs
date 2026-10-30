@@ -1318,7 +1318,8 @@ mod tests {
                 if ui {
                     assert!(
                         !line.chars().any(is_emoji),
-                        "emoji in interface text: {line}"
+                        "emoji in interface text: {}",
+                        line
                     );
                 }
             }
