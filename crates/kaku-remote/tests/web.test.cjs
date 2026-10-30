@@ -3639,6 +3639,30 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
   assert.deepEqual(errors, []);
 });
 
+// Control-Up and F11 belong to the computer in front of the page, so the
+// switch key's modifiers with Up and Down open Mission Control and the
+// desktop on the Mac, letting go of the modifiers already sent there.
+test('Ctrl+Option+Cmd+Up and Down open Mission Control and the desktop on the Mac', async t => {
+  const { p, errors } = await page(t, '#t=fixture', { platform: 'MacIntel' });
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+  const sent = () => p.evaluate(() => messages.filter(m => m.type.startsWith('desktop_key') || m.type === 'desktop_mission_control')
+    .map(m => m.type === 'desktop_key' ? `${m.code} ${m.down ? 'down' : 'up'}` : `mission ${m.show || 'windows'}`));
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.press('Control+Alt+Meta+ArrowUp');
+  assert.deepEqual(await sent(), ['ControlLeft down', 'AltLeft down', 'MetaLeft down', 'ControlLeft up', 'AltLeft up', 'MetaLeft up', 'mission windows']);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.press('Control+Alt+Meta+ArrowDown');
+  assert.equal((await sent()).at(-1), 'mission desktop');
+  // Control-Up alone still goes to the Mac as keys.
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.press('Control+ArrowUp');
+  assert.deepEqual(await sent(), ['ControlLeft down', 'ArrowUp down', 'ArrowUp up', 'ControlLeft up']);
+  assert.deepEqual(errors, []);
+});
+
 test('one key switches between the terminal and the desktop view, and the system keys fill the screen', async t => {
   const { p, errors } = await page(t, '#t=fixture', { platform: 'MacIntel' });
   await screen(p);

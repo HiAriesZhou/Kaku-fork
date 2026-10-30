@@ -1195,6 +1195,10 @@
     };
 
     const pressed = new Set();
+    const releaseKeys = () => {
+      for (const code of pressed) send({ type: "desktop_key", code: isMac ? code : SWAP[code] || code, down: false });
+      pressed.clear();
+    };
     // Keys and buttons still held when the view goes away would stay down
     // on the Mac.
     const releaseAll = () => {
@@ -1205,8 +1209,7 @@
       if (wheelFrame) cancelAnimationFrame(wheelFrame);
       wheelFrame = 0;
       wheel = null;
-      for (const code of pressed) send({ type: "desktop_key", code: isMac ? code : SWAP[code] || code, down: false });
-      pressed.clear();
+      releaseKeys();
       releaseButtons();
     };
     const onKey = (down) => (ev) => {
@@ -1229,7 +1232,21 @@
     // Ahead of the keys sent to the Mac: the D goes nowhere, the modifiers
     // held while switching are let go of on the Mac by the view leaving.
     let switchHeld = false;
+    // With the same three modifiers, Up opens Mission Control on the Mac and
+    // Down shows its desktop (maintainer, 2026-10-30): Control-Up and F11
+    // would go to the computer in front of the page. The modifiers already
+    // sent are let go of first, so the Mac is not left holding them.
+    const isMissionControl = (ev) => (ev.code === "ArrowUp" || ev.code === "ArrowDown") && ev.ctrlKey && ev.altKey
+      && (isMac ? ev.metaKey && !ev.shiftKey : ev.shiftKey && !ev.metaKey);
     window.addEventListener("keydown", (ev) => {
+      if (active && isMissionControl(ev) && ownsKeys(ev)) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        if (ev.repeat || !live()) return;
+        releaseKeys();
+        send({ type: "desktop_mission_control", ...(ev.code === "ArrowDown" ? { show: "desktop" } : {}) });
+        return;
+      }
       if (!isSwitch(ev)) return;
       ev.preventDefault();
       ev.stopImmediatePropagation();
