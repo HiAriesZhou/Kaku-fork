@@ -16,6 +16,14 @@ pub struct Menu {
     menu: StrongPtr,
 }
 
+/// A fixed paragraph line height puts the extra space above the text, so
+/// the baseline moves up by half of it to center the title in its row.
+/// Measured on macOS 26 at 36pt and 44pt rows: the gaps above and below
+/// the text then differ by under 1pt.
+fn row_baseline_offset(row: f64, ascender: f64, descender: f64) -> f64 {
+    ((row - (ascender - descender)) / 2.).max(0.)
+}
+
 impl Menu {
     pub fn new_with_title(title: &str) -> Self {
         unsafe {
@@ -29,11 +37,13 @@ impl Menu {
         self.menu.autorelease()
     }
 
-    /// Draws the items at `points` instead of the system menu font size.
-    pub fn set_font_size(&self, points: f64) {
-        unsafe {
-            let font: id = msg_send![class!(NSFont), menuFontOfSize: points];
-            let _: () = msg_send![*self.menu, setFont: font];
+    /// Makes every titled item `points` tall while keeping the system menu
+    /// font. NSMenu sizes a row from its title's line height, not from an
+    /// item image, and a larger font mostly grows the text, so a fixed
+    /// paragraph line height is the native way to a larger tap target.
+    pub fn set_row_height(&self, points: f64) {
+        for item in self.items() {
+            item.set_row_height(points);
         }
     }
 
@@ -351,6 +361,50 @@ impl MenuItem {
         }
     }
 
+    /// See `Menu::set_row_height`. Separators keep their own height.
+    pub fn set_row_height(&self, points: f64) {
+        unsafe {
+            let is_separator: BOOL = msg_send![*self.item, isSeparatorItem];
+            if is_separator == YES {
+                return;
+            }
+            let font: id = msg_send![class!(NSFont), menuFontOfSize: 0.0f64];
+            let style: id = msg_send![class!(NSMutableParagraphStyle), new];
+            let style = StrongPtr::new(style);
+            let () = msg_send![*style, setMinimumLineHeight: points];
+            let () = msg_send![*style, setMaximumLineHeight: points];
+            let ascender: f64 = msg_send![font, ascender];
+            let descender: f64 = msg_send![font, descender];
+            let offset: id = msg_send![class!(NSNumber), alloc];
+            let offset = StrongPtr::new(msg_send![
+                offset,
+                initWithDouble: row_baseline_offset(points, ascender, descender)
+            ]);
+            let keys = [
+                nsstring("NSFont"),
+                nsstring("NSParagraphStyle"),
+                nsstring("NSBaselineOffset"),
+            ];
+            let keys = [*keys[0], *keys[1], *keys[2]];
+            let values = [font, *style, *offset];
+            let attributes: id = msg_send![class!(NSDictionary), alloc];
+            let attributes = StrongPtr::new(msg_send![
+                attributes,
+                initWithObjects: values.as_ptr()
+                forKeys: keys.as_ptr()
+                count: values.len()
+            ]);
+            let title: id = msg_send![*self.item, title];
+            let attributed: id = msg_send![class!(NSAttributedString), alloc];
+            let attributed = StrongPtr::new(msg_send![
+                attributed,
+                initWithString: title
+                attributes: *attributes
+            ]);
+            let () = msg_send![*self.item, setAttributedTitle: *attributed];
+        }
+    }
+
     pub fn set_key_equivalent(&self, equiv: &str) {
         unsafe {
             let () = msg_send![*self.item, setKeyEquivalent:*nsstring(equiv)];
@@ -456,6 +510,44 @@ mod test {
             pool.drain();
             let retain_count: usize = msg_send![*separator.item, retainCount];
             assert_eq!(retain_count, 1);
+        }
+    }
+
+    #[test]
+    fn row_baseline_offset_centers_the_title() {
+        // 13pt menu font on macOS 26: ascender 12.57, descender -2.74.
+        assert!((row_baseline_offset(36., 12.57, -2.74) - 10.345).abs() < 0.01);
+        assert_eq!(row_baseline_offset(10., 12.57, -2.74), 0.);
+    }
+
+    #[test]
+    fn row_height_grows_titled_rows_and_keeps_titles() {
+        unsafe {
+            let size = |menu: &Menu| -> f64 {
+                let size: cocoa::foundation::NSSize = msg_send![*menu.menu, size];
+                size.height
+            };
+            let build = || {
+                let menu = Menu::new_with_title("");
+                menu.add_item(&MenuItem::new_with("New Tab", None, ""));
+                menu.add_item(&MenuItem::new_separator());
+                menu.add_item(&MenuItem::new_with("Close Tab", None, ""));
+                menu
+            };
+            let plain = build();
+            let tall = build();
+            let pool = NSAutoreleasePool::new(nil);
+            tall.set_row_height(36.);
+            pool.drain();
+            // Two titled rows grow; the separator keeps its height.
+            assert!(size(&tall) - size(&plain) > 2. * 10.);
+            let titles: Vec<String> = tall.items().iter().map(MenuItem::get_title).collect();
+            assert_eq!(titles, ["New Tab", "", "Close Tab"]);
+            for item in tall.items() {
+                let attributed: id = msg_send![*item.item, attributedTitle];
+                let is_separator: BOOL = msg_send![*item.item, isSeparatorItem];
+                assert_eq!(attributed.is_null(), is_separator == YES);
+            }
         }
     }
 }
