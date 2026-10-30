@@ -45,7 +45,7 @@ impl LineEditorHost for PasswordPromptHost {
         } else {
             // Rewrite the input so that we can obscure the password
             // characters when output to the terminal widget
-            let placeholder = "🔑";
+            let placeholder = "•";
             let grapheme_count = unicode_column_width(line, None);
             let mut output = vec![];
             for _ in 0..grapheme_count {
