@@ -590,6 +590,15 @@ enum WebClientMsg {
     DownloadCancel {
         id: u32,
     },
+    /// Which of these paths exist on the Mac, resolved as `Download` does:
+    /// a path a TUI wrapped onto the next row is a link only if the joined
+    /// text names a real file, as in Kaku's own hover (#547).
+    PathsExist {
+        id: u32,
+        paths: Vec<String>,
+        #[serde(default)]
+        pane_id: Option<usize>,
+    },
     SplitPane {
         pane_id: usize,
         direction: config::keyassignment::PaneDirection,
@@ -817,6 +826,11 @@ enum WebServerMsg<'a> {
     FileError {
         id: u32,
         detail: &'a str,
+    },
+    /// The answer to `PathsExist`, one entry per path asked about in order.
+    PathsExist {
+        id: u32,
+        exists: Vec<bool>,
     },
     /// Text a program in the attached pane copied, for the browser clipboard.
     Clipboard {
@@ -1061,6 +1075,9 @@ const MAX_DOWNLOADS: usize = 16;
 /// Previews being made at once; each reads and decodes an image on a
 /// blocking thread.
 const MAX_PREVIEWS: usize = 4;
+/// Paths one `PathsExist` may ask about, and the longest one checked.
+const MAX_PATH_CHECKS: usize = 8;
+const MAX_CHECKED_PATH: usize = 4096;
 /// How often one session may write a screen drift report to the log.
 const DRIFT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -2698,7 +2715,8 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
         | WebClientMsg::UploadEnd { .. }
         | WebClientMsg::Download { .. }
         | WebClientMsg::DownloadAck { .. }
-        | WebClientMsg::DownloadCancel { .. } => Ok(()),
+        | WebClientMsg::DownloadCancel { .. }
+        | WebClientMsg::PathsExist { .. } => Ok(()),
         WebClientMsg::Resize { cols, rows } => {
             let cols = cols.clamp(MIN_COLS, MAX_COLS);
             let rows = rows.clamp(MIN_ROWS, MAX_ROWS);
@@ -2923,6 +2941,24 @@ pub(crate) async fn run_session(
                         let made = resolved.and_then(|path| preview_bytes(&path, side));
                         let _ = ready.blocking_send((id, made));
                     });
+                    continue;
+                }
+                if let WebClientMsg::PathsExist { id, paths, pane_id } = msg {
+                    let resolved: Vec<_> = paths
+                        .iter()
+                        .take(MAX_PATH_CHECKS)
+                        .map(|path| (path.len() <= MAX_CHECKED_PATH).then(|| download_path(path, cwd(pane_id))).flatten())
+                        .collect();
+                    // A stat can hang on a network volume; keep it off the session.
+                    let exists = tokio::task::spawn_blocking(move || {
+                        resolved.into_iter().map(|path| path.is_some_and(|path| path.exists())).collect::<Vec<_>>()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let Some(json) = encode(&WebServerMsg::PathsExist { id, exists }) else { continue };
+                    if outbox.send(json).await.is_err() {
+                        break;
+                    }
                     continue;
                 }
                 if let WebClientMsg::DownloadCancel { id } = &msg {
@@ -4054,6 +4090,17 @@ mod tests {
         );
         // A relative path with no known working directory is not guessed.
         assert_eq!(download_path("a.png", None), None);
+    }
+
+    #[test]
+    fn a_path_check_parses_and_answers_in_order() {
+        let msg: WebClientMsg =
+            serde_json::from_str(r#"{"type":"paths_exist","id":3,"paths":["~/a","b"],"pane_id":2}"#).unwrap();
+        assert!(matches!(msg, WebClientMsg::PathsExist { id: 3, ref paths, pane_id: Some(2) } if paths.len() == 2));
+        assert_eq!(
+            encode(&WebServerMsg::PathsExist { id: 3, exists: vec![true, false] }).unwrap(),
+            r#"{"type":"paths_exist","id":3,"exists":[true,false]}"#
+        );
     }
 
     #[test]

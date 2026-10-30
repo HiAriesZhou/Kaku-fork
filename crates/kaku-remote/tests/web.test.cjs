@@ -1581,6 +1581,45 @@ test('Mac paths stop at Chinese sentence punctuation but keep Chinese file names
   }
 });
 
+// Claude Code breaks a long path with a newline and an indent; the joined
+// path is a link on both rows once the Mac says it exists (#547), and the
+// fragments stay as they were when it does not or Kaku never answers.
+test('a path a TUI wrapped onto the next row links whole once the Mac finds it', async t => {
+  const { p } = await page(t); await screen(p);
+  const links = row => p.evaluate(async row => {
+    const found = await new Promise(resolve => testLinkProvider.provideLinks(row, resolve));
+    return (found || []).map(l => ({ text: l.text, from: [l.range.start.x, l.range.start.y], to: [l.range.end.x, l.range.end.y] }));
+  }, row);
+  const show = text => p.evaluate(text => new Promise(resolve => {
+    probe.term.resize(60, 24);
+    probe.term.write('\x1b[2J\x1b[H' + text, resolve);
+  }), text);
+  const answer = exists => p.waitForFunction(() => messages.some(m => m.type === 'paths_exist')).then(() => p.evaluate(exists => {
+    const ask = messages.filter(m => m.type === 'paths_exist').at(-1);
+    messages.length = 0;
+    probe.handle({ type: 'paths_exist', id: ask.id, exists: ask.paths.map(() => exists) });
+    return ask.paths;
+  }, exists));
+  await p.evaluate(() => { messages.length = 0; });
+  await show('对比图在 /private/tmp/a/47ca47e\r\n  d-ea27/shot.png：左边改前\r\n');
+  const first = links(1);
+  assert.deepEqual(await answer(true), ['/private/tmp/a/47ca47ed-ea27/shot.png']);
+  const whole = { text: '/private/tmp/a/47ca47ed-ea27/shot.png', from: [10, 1], to: [17, 2] };
+  assert.deepEqual(await first, [whole]);
+  assert.deepEqual(await links(2), [whole]);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'paths_exist').length), 0, 'asked once');
+
+  await show('see /tmp/b/one\r\n  two/x.png here\r\n');
+  const missing = links(1);
+  await answer(false);
+  assert.deepEqual((await missing).map(l => l.text), ['/tmp/b/one']);
+  assert.deepEqual(await links(2), []);
+
+  // A Kaku that does not know the question: the fragment, after a moment.
+  await show('see /tmp/c/one\r\n  two/x.png here\r\n');
+  assert.deepEqual((await links(1)).map(l => l.text), ['/tmp/c/one']);
+});
+
 test('middle click closes the clicked tab through the same confirmation path', async t => {
   const { p } = await page(t); await screen(p);
   await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'tabs', tabs: [

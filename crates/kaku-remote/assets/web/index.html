@@ -820,23 +820,112 @@
   // Chinese sentence punctuation ends a path as it ends a URL; Chinese
   // file names (~/桌面/截图.png) stay inside it.
   const PATH_RE = /(?<![\w:/.~-])(?:~|\.{1,2})?\/[^\s"'`<>|;()\[\]{}，。；：！？、（）【】「」『』“”‘’]+/g;
+  // A row's text read cell by cell, with the column each UTF-16 unit sits
+  // in, the column after its last visible character, and whether the next
+  // row continues it (the wrap attribute).
+  const readRow = (index) => {
+    const buffer = term.buffer.active;
+    const line = buffer.getLine(index);
+    if (!line) return null;
+    let text = "", end = 0, cell;
+    const cols = [];
+    for (let x = 0; x < line.length; x++) {
+      cell = line.getCell(x, cell);
+      if (!cell || cell.getWidth() === 0) continue;
+      const chars = cell.getChars() || " ";
+      if (chars.trim()) end = x + cell.getWidth();
+      for (const ch of chars) {
+        text += ch;
+        for (let i = 0; i < ch.length; i++) cols.push(x);
+      }
+    }
+    return { line, text, cols, end, soft: !!buffer.getLine(index + 1)?.isWrapped };
+  };
+  const pathOf = (match) => match.replace(/[.,:;!?]+$/, "");
+  // A path a TUI wrapped itself: Claude Code and Codex break a long token
+  // with a real newline and an indent, so no row carries the wrap attribute
+  // and neither fragment is the path (#547). As in Kaku's own hover, rows
+  // are joined up to four either side, a hard break dropping the trailing
+  // blanks above and the indent below, and a joined path counts only once
+  // the Mac says it exists: joining by shape alone was reverted twice in
+  // Kaku because unrelated output can make up a target.
+  const WRAP_SPAN = 4;
+  const rejoinedPaths = (index) => {
+    const rows = new Map();
+    const row = (i) => { if (!rows.has(i)) rows.set(i, readRow(i)); return rows.get(i); };
+    if (!row(index)?.text.trim()) return [];
+    const joins = (upper) => {
+      const above = row(upper), below = row(upper + 1);
+      return !!above && !!below && (above.soft || (!!above.text.trim() && !!below.text.trim()));
+    };
+    let first = index, last = index;
+    while (first > 0 && index - first < WRAP_SPAN && joins(first - 1)) first--;
+    while (last - index < WRAP_SPAN && joins(last)) last++;
+    const spans = [];
+    for (let top = first; top <= index; top++) for (let bottom = index; bottom <= last; bottom++) if (top !== bottom) spans.push([top, bottom]);
+    spans.sort((x, y) => (y[1] - y[0]) - (x[1] - x[0]));
+    const found = [];
+    for (const [top, bottom] of spans) {
+      let joined = "", hovered = null;
+      const pieces = [];
+      for (let i = top; i <= bottom; i++) {
+        const r = row(i);
+        let piece = r.text, lead = 0;
+        if (i > top && !row(i - 1).soft) { const t = piece.trimStart(); lead = piece.length - t.length; piece = t; }
+        if (i < bottom && !r.soft) piece = piece.trimEnd();
+        if (i === index) hovered = [joined.length, joined.length + piece.length];
+        pieces.push({ i, start: joined.length, lead, len: piece.length });
+        joined += piece;
+      }
+      for (const m of joined.matchAll(PATH_RE)) {
+        const path = pathOf(m[0]);
+        const from = m.index, to = m.index + path.length;
+        // Only a path that runs across the hovered row's edge.
+        if (to <= hovered[0] || from >= hovered[1] || (from >= hovered[0] && to <= hovered[1])) continue;
+        if (found.some((f) => f.path === path)) continue;
+        const segments = pieces.flatMap(({ i, start, lead, len }) => {
+          const a = Math.max(from, start), b = Math.min(to, start + len);
+          return a < b ? [{ i, from: lead + a - start, to: lead + b - start }] : [];
+        });
+        found.push({ path, segments });
+      }
+    }
+    return found;
+  };
+  // What the Mac said about each joined path, by pane, and the questions
+  // still out. A Kaku that predates the question never answers; after a
+  // moment the path counts as missing. Missing is asked again after a few
+  // seconds, for a file written after its path was printed.
+  const pathExists = new Map();
+  const knownPath = (key) => {
+    const known = pathExists.get(key);
+    if (known && !known.exists && Date.now() - known.at > 5000) pathExists.delete(key);
+    return pathExists.get(key);
+  };
+  const pathQuestions = new Map();
+  let pathSeq = 0;
+  const askPathsExist = (paths) => {
+    const pane = paneId;
+    const key = (path) => `${pane}\n${path}`;
+    const unknown = paths.filter((path) => !knownPath(key(path))).slice(0, 8);
+    if (!unknown.length || !ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve();
+    const id = ++pathSeq;
+    return new Promise((resolve) => {
+      const done = (exists = []) => {
+        if (!pathQuestions.delete(id)) return;
+        unknown.forEach((path, i) => pathExists.set(key(path), { exists: exists[i] === true, at: Date.now() }));
+        resolve();
+      };
+      pathQuestions.set(id, done);
+      setTimeout(done, 600);
+      send({ type: "paths_exist", id, paths: unknown, pane_id: pane });
+    });
+  };
   term.registerLinkProvider({
     provideLinks(y, callback) {
-      const line = term.buffer.active.getLine(y - 1);
-      if (!line) return callback(undefined);
-      let text = "";
-      const cols = [];
-      let cell;
-      for (let x = 0; x < line.length; x++) {
-        cell = line.getCell(x, cell);
-        if (!cell || cell.getWidth() === 0) continue;
-        const chars = cell.getChars() || " ";
-        for (const ch of chars) {
-          text += ch;
-          // RegExp indices count UTF-16 code units, including surrogate pairs.
-          for (let i = 0; i < ch.length; i++) cols.push(x);
-        }
-      }
+      const row = readRow(y - 1);
+      if (!row) return callback(undefined);
+      const { line, text, cols } = row;
       const links = [];
       const range = (index, length) => {
         const start = cols[index];
@@ -856,20 +945,43 @@
         });
       }
       // Paths on the Mac (~/..., /..., ./...): Cmd+click downloads the file.
+      const pathLink = (rangeOf, path) => ({
+        range: rangeOf,
+        text: path,
+        hover: (ev) => { hoveredPath = path; previewImage(ev, path); },
+        leave: () => { hoveredPath = null; hideImagePreview(); },
+        activate: (ev) => {
+          if (ev.metaKey || ev.ctrlKey) download(path);
+        },
+      });
+      const own = [];
       for (const m of text.matchAll(PATH_RE)) {
-        const path = m[0].replace(/[.,:;!?]+$/, "");
+        const path = pathOf(m[0]);
         if (path.length < 2 || urls.some(([a, b]) => m.index < b && m.index + path.length > a)) continue;
-        links.push({
-          range: range(m.index, path.length),
-          text: path,
-          hover: (ev) => { hoveredPath = path; previewImage(ev, path); },
-          leave: () => { hoveredPath = null; hideImagePreview(); },
-          activate: (ev, path) => {
-            if (ev.metaKey || ev.ctrlKey) download(path);
-          },
-        });
+        own.push({ from: m.index, to: m.index + path.length, link: pathLink(range(m.index, path.length), path) });
       }
-      callback(links.length ? links : undefined);
+      const joined = rejoinedPaths(y - 1).filter(({ segments }) => !segments.some(({ i, from, to }) =>
+        i === y - 1 && urls.some(([a, b]) => from < b && to > a)));
+      const finish = () => {
+        const pane = paneId;
+        const kept = joined.filter(({ path }) => knownPath(`${pane}\n${path}`)?.exists);
+        for (const { path, segments } of kept) {
+          const head = segments[0], tail = segments.at(-1);
+          const headRow = readRow(head.i), tailRow = readRow(tail.i);
+          const endCol = tailRow.cols[tail.to - 1];
+          links.push(pathLink({
+            start: { x: headRow.cols[head.from] + 1, y: head.i + 1 },
+            end: { x: endCol + Math.max(1, tailRow.line.getCell(endCol)?.getWidth() || 1), y: tail.i + 1 },
+          }, path));
+        }
+        // A fragment of a joined path is not a link of its own.
+        for (const o of own) {
+          if (!kept.some(({ segments }) => segments.some(({ i, from, to }) => i === y - 1 && o.from < to && o.to > from))) links.push(o.link);
+        }
+        callback(links.length ? links : undefined);
+      };
+      if (!joined.length) return finish();
+      askPathsExist(joined.map(({ path }) => path)).then(finish);
     },
   });
 
@@ -3580,6 +3692,7 @@
     else if (msg.type === "found") onFound(msg);
     else if (msg.type === "history") onHistory(msg);
     else if (msg.type.startsWith("file_")) onFile(msg);
+    else if (msg.type === "paths_exist") pathQuestions.get(msg.id)?.(msg.exists);
     else if (msg.type.startsWith("desktop_")) desktop?.handle(msg);
     else if (msg.type === "upload_ack") { const a = uploadAcks.get(msg.id); if (a) a(msg.received); }
     else if (msg.type === "uploaded") { const w = uploadWaiters.get(msg.id); if (w) { uploadWaiters.delete(msg.id); w(msg); } }
