@@ -2491,20 +2491,27 @@ configure_touchid() {
 		return 0
 	fi
 	echo "" # Move to next line for result display
+	# Writing under /etc/pam.d is a protected change, so macOS asks once to let
+	# Kaku administer the computer; say so before its dialog appears.
+	echo -e "  macOS may ask to let Kaku administer this Mac. Allow it to add Touch ID to sudo."
 
+	local pam_target pam_tmp
+	pam_tmp=$(mktemp)
 	# Try the modern sudo_local method (macOS Sonoma+)
 	if grep -q "sudo_local" "$PAM_SUDO_FILE" 2>/dev/null; then
-		echo "# sudo_local: local customizations for sudo" | sudo tee "$PAM_SUDO_LOCAL_FILE" >/dev/null
-		echo "$PAM_TID_LINE" | sudo tee -a "$PAM_SUDO_LOCAL_FILE" >/dev/null
-		sudo chmod 444 "$PAM_SUDO_LOCAL_FILE"
-		sudo chown root:wheel "$PAM_SUDO_LOCAL_FILE"
-		echo -e "  ${GREEN}✓${NC} ${BOLD}Sudo${NC}        Enabled via sudo_local"
+		pam_target="$PAM_SUDO_LOCAL_FILE"
+		printf '%s\n' "# sudo_local: local customizations for sudo" "$PAM_TID_LINE" >"$pam_tmp"
 	else
 		# Fallback to editing /etc/pam.d/sudo
-		sudo awk -v line="$PAM_TID_LINE" 'NR==2{print line} 1' "$PAM_SUDO_FILE" >"${PAM_SUDO_FILE}.tmp" &&
-			sudo mv "${PAM_SUDO_FILE}.tmp" "$PAM_SUDO_FILE"
-		echo -e "  ${GREEN}✓${NC} ${BOLD}Sudo${NC}        Enabled via /etc/pam.d/sudo"
+		pam_target="$PAM_SUDO_FILE"
+		awk -v line="$PAM_TID_LINE" 'NR==2{print line} 1' "$PAM_SUDO_FILE" >"$pam_tmp"
 	fi
+	if sudo install -m 444 -o root -g wheel "$pam_tmp" "$pam_target"; then
+		echo -e "  ${GREEN}✓${NC} ${BOLD}Sudo${NC}        Enabled via ${pam_target}"
+	else
+		echo -e "  ${YELLOW}!${NC} ${BOLD}Sudo${NC}        Touch ID not enabled, ${pam_target} was not changed"
+	fi
+	rm -f "$pam_tmp"
 }
 
 if [[ "$UPDATE_ONLY" != "true" ]]; then

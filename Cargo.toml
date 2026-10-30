@@ -67,6 +67,7 @@ todo = "warn"
 [workspace.dependencies]
 ahash = "0.8"
 axum = { version = "0.8", features = ["ws"] }
+kaku = { path = "kaku", default-features = false }
 kaku-remote = { path = "crates/kaku-remote" }
 rustls = { version = "0.23", features = ["ring"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }

@@ -953,7 +953,44 @@ fn start_termination_listener(on_terminate: impl FnOnce() + Send + 'static) -> a
     Ok(())
 }
 
+/// The release bundle ships one binary: `Contents/MacOS/kaku` and
+/// `Contents/MacOS/k` are symlinks to `kaku-gui`, told apart by the name they
+/// were started under. Only `kaku-gui` starts the GUI, the name every GUI
+/// launch uses (LaunchServices, `kaku start`, restart_kaku.sh); every other
+/// name runs the CLI, as the standalone CLI binary did under any name a user
+/// linked or copied it to. `crates/procinfo/src/macos.rs` mirrors this rule.
+#[derive(Debug, PartialEq)]
+enum MulticallEntry {
+    Cli,
+    Chat,
+}
+
+fn multicall_entry(argv0: &std::ffi::OsStr) -> Option<MulticallEntry> {
+    // APFS is case-insensitive by default, so a typed `Kaku` reaches the
+    // `kaku` symlink under that spelling.
+    let name = std::path::Path::new(argv0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if name.eq_ignore_ascii_case("kaku-gui") {
+        None
+    } else if name.eq_ignore_ascii_case("k") {
+        Some(MulticallEntry::Chat)
+    } else {
+        Some(MulticallEntry::Cli)
+    }
+}
+
 fn main() {
+    match std::env::args_os()
+        .next()
+        .and_then(|argv0| multicall_entry(&argv0))
+    {
+        Some(MulticallEntry::Cli) => return kaku::cli_main(),
+        Some(MulticallEntry::Chat) => return kaku_gui_lib::cli_chat::k_main(),
+        None => {}
+    }
+
     startup_trace::init();
     startup_trace::mark("main() entry");
 
@@ -1062,7 +1099,34 @@ fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_spawn_in_current_window, should_try_existing_gui};
+    use super::{
+        multicall_entry, should_spawn_in_current_window, should_try_existing_gui, MulticallEntry,
+    };
+
+    #[test]
+    fn multicall_entry_follows_the_invoked_name() {
+        let entry = |argv0: &str| multicall_entry(std::ffi::OsStr::new(argv0));
+        assert_eq!(entry("kaku"), Some(MulticallEntry::Cli));
+        assert_eq!(
+            entry("/Applications/Kaku.app/Contents/MacOS/kaku"),
+            Some(MulticallEntry::Cli)
+        );
+        assert_eq!(entry("/opt/homebrew/bin/Kaku"), Some(MulticallEntry::Cli));
+        assert_eq!(entry("k"), Some(MulticallEntry::Chat));
+        assert_eq!(
+            entry("/Applications/Kaku.app/Contents/MacOS/k"),
+            Some(MulticallEntry::Chat)
+        );
+        assert_eq!(
+            entry("/Applications/Kaku.app/Contents/MacOS/kaku-gui"),
+            None
+        );
+        assert_eq!(entry("kaku-gui"), None);
+        assert_eq!(entry("/tmp/Kaku-GUI"), None);
+        // A user's own link or copy of the CLI keeps working under its name.
+        assert_eq!(entry("/usr/local/bin/wezterm"), Some(MulticallEntry::Cli));
+        assert_eq!(entry(""), Some(MulticallEntry::Cli));
+    }
 
     #[test]
     fn gui_termination_reaches_the_owning_checkpoint_on_the_main_thread() {

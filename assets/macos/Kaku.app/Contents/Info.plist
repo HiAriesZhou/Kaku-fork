@@ -72,7 +72,7 @@
 	<key>NSDownloadsFolderUsageDescription</key>
 	<string>An application launched via Kaku would like to access your Downloads folder.</string>
 	<key>NSSystemAdministrationUsageDescription</key>
-	<string>An application launched via Kaku requires elevated permission.</string>
+	<string>A command in Kaku wants to change a protected system file. Touch ID for sudo only adds one line to sudo_local.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>An application launched via Kaku would like to access the local network.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>

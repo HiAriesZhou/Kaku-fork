@@ -15,6 +15,9 @@ use termwiz::input::{InputEvent, KeyCode, KeyEvent, Modifiers};
 use termwiz::surface::{Change, CursorVisibility, Position};
 use termwiz::terminal::Terminal;
 
+mod entry;
+pub use entry::k_main;
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub struct CliArgs {

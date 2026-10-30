@@ -29,7 +29,7 @@
   /* The tab bar follows Kaku's own: monospace titles, the active tab as a
      filled block in Kaku's tab colors, no rule between it and the terminal. */
   :root { --mono: "Kaku Mono", monospace; --bar-bg: var(--bg); --tab-fg: var(--muted); --tab-active-bg: rgba(255,255,255,0.08); --tab-active-fg: var(--fg); --tab-hover-bg: rgba(255,255,255,0.05); --tab-hover-fg: var(--fg); }
-  #image-preview { box-sizing: border-box; position: fixed; z-index: 30; pointer-events: none; max-width: min(420px, calc(100vw - 24px)); max-height: min(320px, calc(100vh - 24px)); object-fit: contain; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 8px 24px #0004; }
+  #image-preview { box-sizing: border-box; position: fixed; z-index: 30; pointer-events: none; max-width: min(640px, calc(100vw - 24px)); max-height: min(480px, calc(100vh - 24px)); object-fit: contain; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 8px 24px #0004; }
   body.tabs-bottom #bar { order: 2; }
   #bar { display: flex; align-items: stretch; height: var(--bar-h, 32px); padding: 0; background: var(--bar-bg); flex: none; font: var(--bar-font, 15px) var(--mono); }
   /* Tabs scroll sideways when they do not fit; a fade at either end says
@@ -91,6 +91,14 @@
   .map button:hover { opacity: 1; background: transparent !important; }
   .map button[aria-current="true"] { background: var(--tab-fg) !important; opacity: 1; }
   /* Menus and panels share the find bar's look. */
+  #viewer { position: fixed; inset: 0; z-index: 40; display: none; overflow: hidden; background: rgba(0,0,0,0.85); background: color-mix(in srgb, var(--bg) 92%, transparent); touch-action: none; opacity: 0; transition: opacity 0.25s ease-out; }
+  #viewer.show { display: block; }
+  #viewer.in { opacity: 1; }
+  #viewer img { position: absolute; left: 0; top: 0; box-sizing: border-box; border: 1px solid var(--line); border-radius: 6px; cursor: zoom-in; user-select: none; -webkit-user-select: none; -webkit-user-drag: none; }
+  #viewer.zoomed img { cursor: grab; }
+  #viewer:not(.ready) img { visibility: hidden; }
+  #viewer .wait { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 13px; }
+  #viewer .wait[hidden] { display: none; }
   #menu { position: fixed; display: none; min-width: 150px; padding: 4px; border-radius: 8px; background: var(--bar-bg); border: 1px solid var(--line); box-shadow: 0 6px 24px rgba(0,0,0,0.25); z-index: 20; }
   #menu.show { display: block; }
   #menu { max-height: calc(100% - 16px); overflow-y: auto; }
@@ -166,12 +174,23 @@
      hover or focus. */
   /* Close confirmation: one bar at the bottom, the terminal stays in view.
      The layer covers the stage, so a click anywhere else cancels. */
-  #dialog { position: absolute; inset: 0; display: none; align-items: flex-end; justify-content: center; padding-bottom: 16px; box-sizing: border-box; z-index: 10; outline: none; }
-  #dialog.show { display: flex; }
-  #dialog .card { display: flex; align-items: center; gap: 16px; max-width: calc(100% - 32px); padding: 8px 8px 8px 14px; border: 1px solid var(--line); border-radius: 10px; background: linear-gradient(var(--tab-active-bg), var(--tab-active-bg)), var(--bg); box-shadow: 0 4px 16px rgba(0,0,0,0.25); color: var(--fg); font-size: 13px; }
+  /* The close confirmation sits by the tab or pane it asks about, its tip
+     pointing there: one hairline, a fill a step above the page, no scrim. */
+  :root { --hair: 1px; --pop-bg: #26252c; --pop-bg: color-mix(in srgb, var(--bg) 90%, white); --pop-line: rgba(255,255,255,0.14); --pop-line: color-mix(in srgb, var(--fg) 16%, transparent); }
+  @media (min-resolution: 2dppx) { :root { --hair: 0.5px; } }
+  #dialog { position: fixed; inset: 0; display: none; box-sizing: border-box; z-index: 25; outline: none; }
+  #dialog.show { display: block; }
+  #dialog .card { position: absolute; left: 0; top: 0; display: flex; align-items: center; gap: 14px; box-sizing: border-box; max-width: calc(100vw - 16px); padding: 8px 8px 8px 14px; border: var(--hair) solid var(--pop-line); border-radius: 10px; background: var(--pop-bg); box-shadow: 0 8px 16px rgba(0,0,0,0.18); color: var(--fg); font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; opacity: 0; transition: opacity 0.25s ease-out; }
+  #dialog.in .card { opacity: 1; }
+  #dialog .tip { position: absolute; left: 0; width: 16px; height: 8px; overflow: visible; pointer-events: none; }
+  #dialog .tip .cover { fill: var(--pop-bg); }
+  #dialog .tip .edge { fill: none; stroke: var(--pop-line); stroke-width: var(--hair); }
+  #dialog .card.below .tip { top: -7px; margin-top: calc(-1 * var(--hair)); }
+  #dialog .card.above .tip { bottom: -7px; margin-bottom: calc(-1 * var(--hair)); transform: rotate(180deg); }
+  #dialog .card:not(.below):not(.above) .tip { display: none; }
   #dialog .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #dialog .actions { display: flex; gap: 8px; flex: none; }
-  #dialog button { height: 28px; padding: 0 12px; border: 0; border-radius: 6px; background: var(--line); color: var(--fg); font: inherit; cursor: pointer; }
+  #dialog button { height: 28px; padding: 0 12px; border: 0; border-radius: 6px; background: rgba(255,255,255,0.08); background: color-mix(in srgb, var(--fg) 10%, transparent); color: var(--fg); font: inherit; cursor: pointer; }
   #dialog button[data-act="ok"] { background: var(--fg); color: var(--bg); }
   #dialog button:hover, #dialog button:focus-visible { opacity: 0.85; outline: none; }
   body.touch #dialog button { height: 34px; padding: 0 16px; }
@@ -215,8 +234,8 @@
 </head>
 <body>
 <div id="bar"><div id="tabs"></div><div id="tools"></div></div>
+<div id="dialog" role="dialog" aria-modal="true" tabindex="-1"><div class="card"><svg class="tip" viewBox="0 0 16 8" aria-hidden="true"><path class="cover" d="M0 8L6.6 1.4Q8 0 9.4 1.4L16 8Z"/><path class="edge" d="M1 7L6.6 1.4Q8 0 9.4 1.4L15 7"/></svg><div class="title"></div><div class="actions"><button type="button" data-act="cancel" tabindex="-1">Cancel</button><button type="button" data-act="ok" tabindex="-1">Close</button></div></div></div>
 <div id="stage">
-  <div id="dialog" role="dialog" aria-modal="true" tabindex="-1"><div class="card"><div class="title"></div><div class="actions"><button type="button" data-act="cancel" tabindex="-1">Cancel</button><button type="button" data-act="ok" tabindex="-1">Close</button></div></div></div>
   <div id="term"></div>
   <div id="past"></div>
   <button id="history" type="button">Back to live</button>
@@ -801,23 +820,112 @@
   // Chinese sentence punctuation ends a path as it ends a URL; Chinese
   // file names (~/桌面/截图.png) stay inside it.
   const PATH_RE = /(?<![\w:/.~-])(?:~|\.{1,2})?\/[^\s"'`<>|;()\[\]{}，。；：！？、（）【】「」『』“”‘’]+/g;
+  // A row's text read cell by cell, with the column each UTF-16 unit sits
+  // in, the column after its last visible character, and whether the next
+  // row continues it (the wrap attribute).
+  const readRow = (index) => {
+    const buffer = term.buffer.active;
+    const line = buffer.getLine(index);
+    if (!line) return null;
+    let text = "", end = 0, cell;
+    const cols = [];
+    for (let x = 0; x < line.length; x++) {
+      cell = line.getCell(x, cell);
+      if (!cell || cell.getWidth() === 0) continue;
+      const chars = cell.getChars() || " ";
+      if (chars.trim()) end = x + cell.getWidth();
+      for (const ch of chars) {
+        text += ch;
+        for (let i = 0; i < ch.length; i++) cols.push(x);
+      }
+    }
+    return { line, text, cols, end, soft: !!buffer.getLine(index + 1)?.isWrapped };
+  };
+  const pathOf = (match) => match.replace(/[.,:;!?]+$/, "");
+  // A path a TUI wrapped itself: Claude Code and Codex break a long token
+  // with a real newline and an indent, so no row carries the wrap attribute
+  // and neither fragment is the path (#547). As in Kaku's own hover, rows
+  // are joined up to four either side, a hard break dropping the trailing
+  // blanks above and the indent below, and a joined path counts only once
+  // the Mac says it exists: joining by shape alone was reverted twice in
+  // Kaku because unrelated output can make up a target.
+  const WRAP_SPAN = 4;
+  const rejoinedPaths = (index) => {
+    const rows = new Map();
+    const row = (i) => { if (!rows.has(i)) rows.set(i, readRow(i)); return rows.get(i); };
+    if (!row(index)?.text.trim()) return [];
+    const joins = (upper) => {
+      const above = row(upper), below = row(upper + 1);
+      return !!above && !!below && (above.soft || (!!above.text.trim() && !!below.text.trim()));
+    };
+    let first = index, last = index;
+    while (first > 0 && index - first < WRAP_SPAN && joins(first - 1)) first--;
+    while (last - index < WRAP_SPAN && joins(last)) last++;
+    const spans = [];
+    for (let top = first; top <= index; top++) for (let bottom = index; bottom <= last; bottom++) if (top !== bottom) spans.push([top, bottom]);
+    spans.sort((x, y) => (y[1] - y[0]) - (x[1] - x[0]));
+    const found = [];
+    for (const [top, bottom] of spans) {
+      let joined = "", hovered = null;
+      const pieces = [];
+      for (let i = top; i <= bottom; i++) {
+        const r = row(i);
+        let piece = r.text, lead = 0;
+        if (i > top && !row(i - 1).soft) { const t = piece.trimStart(); lead = piece.length - t.length; piece = t; }
+        if (i < bottom && !r.soft) piece = piece.trimEnd();
+        if (i === index) hovered = [joined.length, joined.length + piece.length];
+        pieces.push({ i, start: joined.length, lead, len: piece.length });
+        joined += piece;
+      }
+      for (const m of joined.matchAll(PATH_RE)) {
+        const path = pathOf(m[0]);
+        const from = m.index, to = m.index + path.length;
+        // Only a path that runs across the hovered row's edge.
+        if (to <= hovered[0] || from >= hovered[1] || (from >= hovered[0] && to <= hovered[1])) continue;
+        if (found.some((f) => f.path === path)) continue;
+        const segments = pieces.flatMap(({ i, start, lead, len }) => {
+          const a = Math.max(from, start), b = Math.min(to, start + len);
+          return a < b ? [{ i, from: lead + a - start, to: lead + b - start }] : [];
+        });
+        found.push({ path, segments });
+      }
+    }
+    return found;
+  };
+  // What the Mac said about each joined path, by pane, and the questions
+  // still out. A Kaku that predates the question never answers; after a
+  // moment the path counts as missing. Missing is asked again after a few
+  // seconds, for a file written after its path was printed.
+  const pathExists = new Map();
+  const knownPath = (key) => {
+    const known = pathExists.get(key);
+    if (known && !known.exists && Date.now() - known.at > 5000) pathExists.delete(key);
+    return pathExists.get(key);
+  };
+  const pathQuestions = new Map();
+  let pathSeq = 0;
+  const askPathsExist = (paths) => {
+    const pane = paneId;
+    const key = (path) => `${pane}\n${path}`;
+    const unknown = paths.filter((path) => !knownPath(key(path))).slice(0, 8);
+    if (!unknown.length || !ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve();
+    const id = ++pathSeq;
+    return new Promise((resolve) => {
+      const done = (exists = []) => {
+        if (!pathQuestions.delete(id)) return;
+        unknown.forEach((path, i) => pathExists.set(key(path), { exists: exists[i] === true, at: Date.now() }));
+        resolve();
+      };
+      pathQuestions.set(id, done);
+      setTimeout(done, 600);
+      send({ type: "paths_exist", id, paths: unknown, pane_id: pane });
+    });
+  };
   term.registerLinkProvider({
     provideLinks(y, callback) {
-      const line = term.buffer.active.getLine(y - 1);
-      if (!line) return callback(undefined);
-      let text = "";
-      const cols = [];
-      let cell;
-      for (let x = 0; x < line.length; x++) {
-        cell = line.getCell(x, cell);
-        if (!cell || cell.getWidth() === 0) continue;
-        const chars = cell.getChars() || " ";
-        for (const ch of chars) {
-          text += ch;
-          // RegExp indices count UTF-16 code units, including surrogate pairs.
-          for (let i = 0; i < ch.length; i++) cols.push(x);
-        }
-      }
+      const row = readRow(y - 1);
+      if (!row) return callback(undefined);
+      const { line, text, cols } = row;
       const links = [];
       const range = (index, length) => {
         const start = cols[index];
@@ -837,20 +945,43 @@
         });
       }
       // Paths on the Mac (~/..., /..., ./...): Cmd+click downloads the file.
+      const pathLink = (rangeOf, path) => ({
+        range: rangeOf,
+        text: path,
+        hover: (ev) => { hoveredPath = path; previewImage(ev, path); },
+        leave: () => { hoveredPath = null; hideImagePreview(); },
+        activate: (ev) => {
+          if (ev.metaKey || ev.ctrlKey) download(path);
+        },
+      });
+      const own = [];
       for (const m of text.matchAll(PATH_RE)) {
-        const path = m[0].replace(/[.,:;!?]+$/, "");
+        const path = pathOf(m[0]);
         if (path.length < 2 || urls.some(([a, b]) => m.index < b && m.index + path.length > a)) continue;
-        links.push({
-          range: range(m.index, path.length),
-          text: path,
-          hover: (ev) => previewImage(ev, path),
-          leave: () => hideImagePreview(),
-          activate: (ev, path) => {
-            if (ev.metaKey || ev.ctrlKey) download(path);
-          },
-        });
+        own.push({ from: m.index, to: m.index + path.length, link: pathLink(range(m.index, path.length), path) });
       }
-      callback(links.length ? links : undefined);
+      const joined = rejoinedPaths(y - 1).filter(({ segments }) => !segments.some(({ i, from, to }) =>
+        i === y - 1 && urls.some(([a, b]) => from < b && to > a)));
+      const finish = () => {
+        const pane = paneId;
+        const kept = joined.filter(({ path }) => knownPath(`${pane}\n${path}`)?.exists);
+        for (const { path, segments } of kept) {
+          const head = segments[0], tail = segments.at(-1);
+          const headRow = readRow(head.i), tailRow = readRow(tail.i);
+          const endCol = tailRow.cols[tail.to - 1];
+          links.push(pathLink({
+            start: { x: headRow.cols[head.from] + 1, y: head.i + 1 },
+            end: { x: endCol + Math.max(1, tailRow.line.getCell(endCol)?.getWidth() || 1), y: tail.i + 1 },
+          }, path));
+        }
+        // A fragment of a joined path is not a link of its own.
+        for (const o of own) {
+          if (!kept.some(({ segments }) => segments.some(({ i, from, to }) => i === y - 1 && o.from < to && o.to > from))) links.push(o.link);
+        }
+        callback(links.length ? links : undefined);
+      };
+      if (!joined.length) return finish();
+      askPathsExist(joined.map(({ path }) => path)).then(finish);
     },
   });
 
@@ -2010,22 +2141,73 @@
   };
 
   // Close confirmation in the page's own style: Enter closes, Esc cancels.
+  // It sits by what it asks about (the tab, its close mark, the spot the pane
+  // menu opened at) with its tip pointing there, below it when there is room
+  // and above it otherwise; with nothing to point at it sits low and centered.
   const dialogEl = document.getElementById("dialog");
-  let dialogDone = null;
+  const dialogCard = dialogEl.querySelector(".card");
+  const dialogTip = dialogEl.querySelector(".tip");
+  let dialogDone = null, dialogAnchor = null;
   // Kaku's own wording (overlay/confirm_close_pane.rs).
   const CLOSE_TEXT = { tab: "Close this tab?", pane: "Close this pane?" };
-  const askClose = (_title, kind = "tab") => new Promise((resolve) => {
+  // The card's body keeps 16px from what it points at, 8px from the window.
+  const POP_GAP = 16, POP_EDGE = 8, TIP_W = 16, POP_RADIUS = 10;
+  const anchorRect = (anchor) => {
+    // A tab is looked up again each time: the bar redraws its tabs.
+    if (typeof anchor === "function") anchor = anchor();
+    if (!anchor) return null;
+    if (anchor instanceof Element) {
+      const r = anchor.getBoundingClientRect();
+      return r.width || r.height ? r : null;
+    }
+    return { left: anchor.x, right: anchor.x, top: anchor.y, bottom: anchor.y };
+  };
+  const placeDialog = () => {
+    const at = anchorRect(dialogAnchor);
+    const w = dialogCard.offsetWidth, h = dialogCard.offsetHeight;
+    const vw = innerWidth, vh = innerHeight;
+    let x, y, side = "";
+    if (at) {
+      const cx = (at.left + at.right) / 2;
+      x = Math.min(Math.max(cx - w / 2, POP_EDGE), vw - w - POP_EDGE);
+      if (at.bottom + POP_GAP + h + POP_EDGE <= vh) { side = "below"; y = at.bottom + POP_GAP; }
+      else if (at.top - POP_GAP - h >= POP_EDGE) { side = "above"; y = at.top - POP_GAP - h; }
+      if (side) {
+        // The tip follows the anchor and stays clear of the rounded corners.
+        const tip = Math.min(Math.max(cx - x - TIP_W / 2, POP_RADIUS), w - POP_RADIUS - TIP_W);
+        dialogTip.style.left = tip + "px";
+      }
+    }
+    if (!side) {
+      const r = stage.getBoundingClientRect();
+      x = Math.max(r.left + (r.width - w) / 2, POP_EDGE);
+      y = r.bottom - 16 - h;
+    }
+    dialogCard.classList.toggle("below", side === "below");
+    dialogCard.classList.toggle("above", side === "above");
+    dialogCard.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+  };
+  const askClose = (_title, kind = "tab", anchor = null) => new Promise((resolve) => {
     if (dialogDone) dialogDone(false);
     dialogEl.querySelector(".title").textContent = CLOSE_TEXT[kind] || CLOSE_TEXT.tab;
+    dialogAnchor = anchor;
     dialogEl.classList.add("show");
+    placeDialog();
+    requestAnimationFrame(() => { if (dialogDone) dialogEl.classList.add("in"); });
     dialogDone = (ok) => {
       dialogDone = null;
-      dialogEl.classList.remove("show");
+      dialogAnchor = null;
+      dialogEl.classList.remove("show", "in");
       refocus();
       resolve(ok);
     };
     dialogEl.focus();
   });
+  window.addEventListener("resize", () => { if (dialogDone) placeDialog(); });
+  // Scrolling outside it cancels, as a click outside does.
+  dialogEl.addEventListener("wheel", (ev) => {
+    if (dialogDone && !dialogCard.contains(ev.target)) dialogDone(false);
+  }, { passive: true });
   dialogEl.addEventListener("click", (ev) => {
     if (!dialogDone) return;
     const act = ev.target.closest("[data-act]");
@@ -2101,11 +2283,11 @@
   const HELP = IS_MAC ? [
     ["⌘1–9", "Go to a tab"], ["⌘⇧[  ⌘⇧]", "Previous or next tab"], ["⌘T  ⌘W", "New or close tab"],
     ["⌘F", "Find in history"], ["⌘K", "Clear"], ["⇧↩", "New line without running"], ["⌘⇧↩", "Zoom the pane"],
-    ["⌘ click", "Open a link"], ["Drop or paste", "Send files to ~/Downloads/Kaku"],
+    ["⌘ click", "Open a link"], ["⌥ click", "View an image"], ["Drop or paste", "Send files to ~/Downloads/Kaku"],
     ["Double click", "Rename a tab"], ["⌘/", "These shortcuts"],
   ] : [
     ["Ctrl+Shift+F", "Find in history"], ["Ctrl+Shift+C  V", "Copy or paste"], ["Shift+Enter", "New line without running"],
-    ["Ctrl click", "Open a link"], ["Drop or paste", "Send files to ~/Downloads/Kaku"],
+    ["Ctrl click", "Open a link"], ["Alt click", "View an image"], ["Drop or paste", "Send files to ~/Downloads/Kaku"],
     ["Double click", "Rename a tab"], ["Ctrl+Shift+/", "These shortcuts"],
   ];
   const helpList = helpEl.querySelector("dl");
@@ -2150,7 +2332,14 @@
   const closing = new Map();
   let authoritativeTabs = [];
   const CLOSE_GRACE_MS = 3000;
-  const closeTab = (t) => {
+  const closeTab = (t, anchor) => {
+    // The confirmation points at the close mark that was clicked, else the
+    // tab itself, or at the given spot.
+    const mark = anchor === "mark";
+    if (!anchor || mark) anchor = () => {
+      const b = tabsEl.querySelector(`.tab[data-tab="${t.tab_id}"]`);
+      return mark ? b?.querySelector(".close") : b;
+    };
     const go = () => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       send({ type: "close_tab", tab_id: t.tab_id });
@@ -2170,7 +2359,7 @@
       if (t.tab_id === tabId) attach(rest[Math.min(at, rest.length - 1)], true);
       else renderTabs();
     };
-    if (t.confirm_close) askClose(t.title || "Tab").then((ok) => { if (ok) go(); });
+    if (t.confirm_close) askClose(t.title || "Tab", "tab", anchor).then((ok) => { if (ok) go(); });
     else go();
   };
   const newTab = () => {
@@ -2206,7 +2395,7 @@
       close.title = "Close Tab";
       close.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        closeTab(t);
+        closeTab(t, "mark");
       });
       const slot = document.createElement("span");
       slot.className = "slot";
@@ -2280,6 +2469,8 @@
       if (active) active.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
     tabsEdge();
+    // A title that changes width moves the tab the confirmation points at.
+    if (dialogDone) placeDialog();
   };
   const clearDropMarks = () => tabsEl.querySelectorAll(".drop-before, .drop-after").forEach((e) => e.classList.remove("drop-before", "drop-after"));
   // Kaku's own order is per window; the page lists every window's tabs in a
@@ -2448,13 +2639,13 @@
   window.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && menuEl.classList.contains("show")) { ev.preventDefault(); ev.stopPropagation(); closeMenu(); } }, true);
   window.addEventListener("blur", closeMenu);
 
-  const closePane = target => {
+  const closePane = (target, at) => {
     const tab = tabs.find(t => t.pane_id === target || (t.panes || []).some(p => p.pane_id === target));
     if (!tab) return;
-    if (!tab.panes || tab.panes.length < 2) { closeTab(tab); return; }
+    if (!tab.panes || tab.panes.length < 2) { closeTab(tab, at); return; }
     const pane = tab.panes.find(p => p.pane_id === target);
     const go = () => send({ type: "close_pane", pane_id: target });
-    if (pane?.confirm_close !== false) askClose(tab.title || "Pane", "pane").then(ok => { if (ok) go(); });
+    if (pane?.confirm_close !== false) askClose(tab.title || "Pane", "pane", at).then(ok => { if (ok) go(); });
     else go();
   };
   stage.addEventListener("contextmenu", ev => {
@@ -2485,7 +2676,7 @@
     if (here && (here.panes || []).length > 1) {
       items.push(null, [here.zoomed ? "Unzoom Pane" : "Zoom Pane", () => send({ type: "zoom_pane", pane_id: target })]);
     }
-    items.push(null, ["Close Pane", () => closePane(target)]);
+    items.push(null, ["Close Pane", () => closePane(target, { x: ev.clientX, y: ev.clientY })]);
     openMenu(ev.clientX, ev.clientY, items);
   });
 
@@ -3007,7 +3198,7 @@
   // the page saves the whole file through the browser's downloads.
   let downloadSeq = 0;
   const incoming = new Map();
-  // Image paths preview after 150ms; use the authenticated file channel,
+  // Image paths preview after 80ms; use the authenticated file channel,
   // and cancel the transfer as soon as the pointer leaves the path. Kaku
   // sends the picture scaled to the preview's size (a screenshot of several
   // megabytes took seconds over the relay), and the last few stay for a
@@ -3017,12 +3208,13 @@
   previewEl.alt = "";
   previewEl.hidden = true;
   document.body.append(previewEl);
-  let previewTimer = 0, previewId = null;
+  let previewTimer = 0, previewId = null, hoveredPath = null;
+  const IMAGE_RE = /\.(png|jpe?g|gif|webp|avif|bmp|ico)$/i;
   const PREVIEW_LIMIT = 8 * 1024 * 1024;
   const PREVIEW_KEPT = 8;
   const PREVIEW_FRESH = 30000;
   // The preview's longest side on screen (CSS max-width), in device pixels.
-  const previewSide = () => Math.round(420 * (window.devicePixelRatio || 1));
+  const previewSide = () => Math.round(640 * (window.devicePixelRatio || 1));
   const previewCache = new Map();
   const cachedPreview = (path) => {
     const hit = previewCache.get(path);
@@ -3030,13 +3222,15 @@
     previewCache.delete(path);
     if (Date.now() - hit.at > PREVIEW_FRESH) { URL.revokeObjectURL(hit.url); return null; }
     previewCache.set(path, hit);
-    return hit.url;
+    return hit;
   };
-  const keepPreview = (path, url) => {
+  // `side` is what the Mac was asked to scale to; the viewer's larger copy
+  // replaces the hover's, which then shows it within its own bounds.
+  const keepPreview = (path, url, side) => {
     const old = previewCache.get(path);
     if (old && old.url !== url) URL.revokeObjectURL(old.url);
     previewCache.delete(path);
-    previewCache.set(path, { url, at: Date.now() });
+    previewCache.set(path, { url, at: Date.now(), side });
     while (previewCache.size > PREVIEW_KEPT) {
       const [first, entry] = previewCache.entries().next().value;
       URL.revokeObjectURL(entry.url);
@@ -3068,18 +3262,21 @@
   };
   const previewImage = (ev, path) => {
     hideImagePreview();
-    if (ev.buttons || !/\.(png|jpe?g|gif|webp|avif|bmp|ico)$/i.test(path) || term.hasSelection()) return;
+    // A selection left on screen no longer holds previews back: once it
+    // was there, pointing at a path showed nothing until a click cleared it.
+    if (ev.buttons || !IMAGE_RE.test(path) || viewer) return;
     const x = ev.clientX, y = ev.clientY, target = paneId;
     previewTimer = setTimeout(() => {
-      if (target !== paneId || term.hasSelection()) return;
+      if (target !== paneId) return;
       const cached = cachedPreview(path);
-      if (cached) { showPreview(cached, { x, y, target }); return; }
+      if (cached) { showPreview(cached.url, { x, y, target }); return; }
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const id = ++downloadSeq;
       previewId = id;
-      incoming.set(id, { preview: { x, y, target, path }, parts: [], received: 0 });
-      send({ type: "download", id, path, pane_id: target, preview: previewSide() });
-    }, 150);
+      const side = previewSide();
+      incoming.set(id, { preview: { x, y, target, path, side }, parts: [], received: 0 });
+      send({ type: "download", id, path, pane_id: target, preview: side });
+    }, 80);
   };
   document.addEventListener("pointerdown", hideImagePreview, true);
   document.addEventListener("keydown", hideImagePreview, true);
@@ -3089,6 +3286,181 @@
   window.addEventListener("resize", hideImagePreview);
   document.addEventListener("visibilitychange", hideImagePreview);
   term.onSelectionChange(hideImagePreview);
+
+  // ⌥ click (Alt click off the Mac) on an image path shows it over the
+  // page, scaled on the Mac to at most 2048 pixels a side, the hover's copy
+  // standing in until it arrives. The wheel or a pinch zooms around the
+  // pointer, a drag pans, a double click switches between fit and 2.5x, and
+  // Escape, a click beside it or any other key closes it.
+  const viewerEl = document.createElement("div");
+  viewerEl.id = "viewer";
+  viewerEl.setAttribute("role", "dialog");
+  viewerEl.setAttribute("aria-modal", "true");
+  const viewerImg = document.createElement("img");
+  viewerImg.alt = "";
+  viewerImg.draggable = false;
+  const viewerWait = document.createElement("div");
+  viewerWait.className = "wait";
+  viewerWait.textContent = "Loading";
+  viewerWait.hidden = true;
+  viewerEl.append(viewerImg, viewerWait);
+  document.body.append(viewerEl);
+  let viewer = null, viewerWaitTimer = 0;
+  const TOO_LARGE = `Too large to show here. ${IS_MAC ? "⌘" : "Ctrl"} click downloads it.`;
+  const viewSide = () => Math.min(2048, Math.round(Math.max(screen.width, screen.height) * (window.devicePixelRatio || 1)));
+  const layoutViewer = () => {
+    const v = viewer;
+    if (!v || !v.w) return;
+    const w = v.w * v.scale, h = v.h * v.scale;
+    v.x = w <= innerWidth ? (innerWidth - w) / 2 : Math.min(0, Math.max(innerWidth - w, v.x));
+    v.y = h <= innerHeight ? (innerHeight - h) / 2 : Math.min(0, Math.max(innerHeight - h, v.y));
+    viewerImg.style.width = w + "px";
+    viewerImg.style.height = h + "px";
+    viewerImg.style.transform = `translate(${v.x}px, ${v.y}px)`;
+    viewerEl.classList.toggle("zoomed", v.scale > v.fit * 1.01);
+    viewerEl.classList.add("ready");
+  };
+  const fitViewer = () => {
+    const v = viewer;
+    if (!v || !v.w) return;
+    v.fit = v.scale = Math.min((innerWidth - 48) / v.w, (innerHeight - 48) / v.h, 1);
+    layoutViewer();
+  };
+  const zoomViewer = (factor, cx = innerWidth / 2, cy = innerHeight / 2) => {
+    const v = viewer;
+    if (!v || !v.w) return;
+    const scale = Math.min(Math.max(v.scale * factor, v.fit), Math.max(v.fit * 8, 4));
+    v.x = cx - (cx - v.x) * scale / v.scale;
+    v.y = cy - (cy - v.y) * scale / v.scale;
+    v.scale = scale;
+    layoutViewer();
+  };
+  const showInViewer = (url) => {
+    viewerImg.onload = () => {
+      const v = viewer;
+      if (!v) return;
+      const w = viewerImg.naturalWidth, h = viewerImg.naturalHeight;
+      clearTimeout(viewerWaitTimer);
+      viewerWait.hidden = true;
+      // The sharper copy takes the stand-in's place at the same size.
+      if (v.w) { v.scale *= v.w / w; v.fit *= v.w / w; v.w = w; v.h = h; layoutViewer(); }
+      else { v.w = w; v.h = h; fitViewer(); }
+    };
+    viewerImg.src = url;
+  };
+  const stopViewerFetch = () => {
+    if (!viewer || viewer.id === null) return;
+    incoming.delete(viewer.id);
+    send({ type: "download_cancel", id: viewer.id });
+    viewer.id = null;
+  };
+  const closeViewer = () => {
+    if (!viewer) return;
+    stopViewerFetch();
+    clearTimeout(viewerWaitTimer);
+    viewer = null;
+    viewerEl.classList.remove("show", "in", "zoomed", "ready");
+    viewerImg.onload = null;
+    viewerImg.removeAttribute("src");
+    viewerImg.removeAttribute("style");
+    viewerWait.hidden = true;
+  };
+  // A file that could not be shown: keep the stand-in if there is one.
+  const viewerFailed = (why) => {
+    if (!viewer) return;
+    stopViewerFetch();
+    if (viewer.w) return;
+    closeViewer();
+    toast(why);
+  };
+  const openViewer = (path) => {
+    hideImagePreview();
+    closeViewer();
+    viewer = { path, id: null, w: 0, h: 0, scale: 1, fit: 1, x: 0, y: 0 };
+    viewerEl.classList.add("show");
+    requestAnimationFrame(() => { if (viewer) viewerEl.classList.add("in"); });
+    const side = viewSide();
+    const cached = cachedPreview(path);
+    if (cached) showInViewer(cached.url);
+    if (cached && cached.side >= side) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) { if (!cached) closeViewer(); return; }
+    if (!cached) viewerWaitTimer = setTimeout(() => { if (viewer && !viewer.w) viewerWait.hidden = false; }, 450);
+    const id = ++downloadSeq;
+    viewer.id = id;
+    incoming.set(id, { view: { path, side }, parts: [], received: 0 });
+    send({ type: "download", id, path, pane_id: paneId, preview: side });
+  };
+  // Taken before xterm and the click forwarding see the press, which would
+  // otherwise move the shell's cursor there (xterm's Alt click) or click.
+  window.addEventListener("pointerdown", (ev) => {
+    if (ev.pointerType !== "mouse" || ev.button !== 0 || !ev.altKey || ev.metaKey || ev.ctrlKey) return;
+    if (!hoveredPath || !IMAGE_RE.test(hoveredPath) || !termEl.contains(ev.target)) return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    openViewer(hoveredPath);
+  }, true);
+  const viewerPointers = new Map();
+  let viewerMoved = false, viewerPressOnImage = false;
+  viewerEl.addEventListener("pointerdown", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    viewerEl.setPointerCapture(ev.pointerId);
+    if (!viewerPointers.size) { viewerMoved = false; viewerPressOnImage = ev.target === viewerImg; }
+    viewerPointers.set(ev.pointerId, [ev.clientX, ev.clientY]);
+  });
+  viewerEl.addEventListener("pointermove", (ev) => {
+    const from = viewerPointers.get(ev.pointerId);
+    if (!from || !viewer) return;
+    const before = [...viewerPointers.values()];
+    viewerPointers.set(ev.pointerId, [ev.clientX, ev.clientY]);
+    const after = [...viewerPointers.values()];
+    if (after.length === 1) {
+      const dx = ev.clientX - from[0], dy = ev.clientY - from[1];
+      if (Math.abs(dx) + Math.abs(dy) > 0) viewerMoved = true;
+      viewer.x += dx;
+      viewer.y += dy;
+      layoutViewer();
+    } else if (after.length === 2) {
+      const mid = (pts) => [(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2];
+      const gap = (pts) => Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]) || 1;
+      const [ax, ay] = mid(before), [bx, by] = mid(after);
+      viewerMoved = true;
+      viewer.x += bx - ax;
+      viewer.y += by - ay;
+      zoomViewer(gap(after) / gap(before), bx, by);
+    }
+  });
+  const viewerRelease = (ev) => {
+    if (!viewerPointers.delete(ev.pointerId)) return;
+    if (!viewerPointers.size && ev.type === "pointerup" && !viewerMoved && !viewerPressOnImage) closeViewer();
+  };
+  viewerEl.addEventListener("pointerup", viewerRelease);
+  viewerEl.addEventListener("pointercancel", viewerRelease);
+  viewerEl.addEventListener("dblclick", (ev) => {
+    if (!viewer || ev.target !== viewerImg) return;
+    if (viewer.scale > viewer.fit * 1.01) fitViewer();
+    else zoomViewer(2.5, ev.clientX, ev.clientY);
+  });
+  // A trackpad pinch arrives as a wheel with ctrlKey and small steps.
+  viewerEl.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const step = ev.deltaY * (ev.deltaMode === 1 ? 16 : 1) * (ev.ctrlKey ? 0.01 : 0.002);
+    zoomViewer(Math.exp(-step), ev.clientX, ev.clientY);
+  }, { passive: false });
+  window.addEventListener("keydown", (ev) => {
+    if (!viewer || ["Shift", "Alt", "Control", "Meta", "CapsLock"].includes(ev.key)) return;
+    const plain = !ev.metaKey && !ev.ctrlKey && !ev.altKey;
+    const act = ev.key === "Escape" ? closeViewer
+      : plain && (ev.key === "+" || ev.key === "=") ? () => zoomViewer(1.25)
+      : plain && ev.key === "-" ? () => zoomViewer(0.8)
+      : plain && ev.key === "0" ? fitViewer : null;
+    if (!act) { closeViewer(); return; }
+    ev.preventDefault();
+    ev.stopPropagation();
+    act();
+  }, true);
+  window.addEventListener("resize", () => { if (viewer && viewer.w && viewer.scale <= viewer.fit * 1.01) fitViewer(); else layoutViewer(); });
   const download = (path) => {
     const id = ++downloadSeq;
     incoming.set(id, { path, name: path.split("/").pop(), size: 0, received: 0, parts: [] });
@@ -3104,6 +3476,23 @@
   const onFile = (msg) => {
     const file = incoming.get(msg.id);
     if (!file) return;
+    if (file.view) {
+      if (msg.type === "file_start" && msg.size > PREVIEW_LIMIT) viewerFailed(TOO_LARGE);
+      else if (msg.type === "file_chunk") {
+        const bytes = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
+        file.received += bytes.length;
+        if (file.received > PREVIEW_LIMIT) { viewerFailed(TOO_LARGE); return; }
+        file.parts.push(bytes);
+        send({ type: "download_ack", id: msg.id, received: file.received });
+      } else if (msg.type === "file_end") {
+        incoming.delete(msg.id);
+        if (viewer && viewer.id === msg.id) viewer.id = null;
+        const url = URL.createObjectURL(new Blob(file.parts));
+        keepPreview(file.view.path, url, file.view.side);
+        if (viewer && viewer.path === file.view.path) showInViewer(url);
+      } else if (msg.type === "file_error") viewerFailed(`Not shown: ${msg.detail}`);
+      return;
+    }
     if (file.preview) {
       if (file.preview.target !== paneId || (msg.type === "file_start" && msg.size > PREVIEW_LIMIT)) {
         hideImagePreview();
@@ -3117,7 +3506,7 @@
         incoming.delete(msg.id);
         if (previewId === msg.id) previewId = null;
         const url = URL.createObjectURL(new Blob(file.parts));
-        keepPreview(file.preview.path, url);
+        keepPreview(file.preview.path, url, file.preview.side);
         showPreview(url, file.preview);
       } else if (msg.type === "file_error") hideImagePreview();
       return;
@@ -3308,6 +3697,7 @@
     else if (msg.type === "found") onFound(msg);
     else if (msg.type === "history") onHistory(msg);
     else if (msg.type.startsWith("file_")) onFile(msg);
+    else if (msg.type === "paths_exist") pathQuestions.get(msg.id)?.(msg.exists);
     else if (msg.type.startsWith("desktop_")) desktop?.handle(msg);
     else if (msg.type === "upload_ack") { const a = uploadAcks.get(msg.id); if (a) a(msg.received); }
     else if (msg.type === "uploaded") { const w = uploadWaiters.get(msg.id); if (w) { uploadWaiters.delete(msg.id); w(msg); } }

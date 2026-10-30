@@ -2,16 +2,14 @@
 //!
 //! Why this exists when `k` is already on PATH after `kaku init`:
 //!
-//! - **Discoverability** — `kaku --help` should show the full AI story
+//! - **Discoverability**: `kaku --help` should show the full AI story
 //!   (`ai` to configure, `chat` to talk). New users find `chat` here without
 //!   knowing about the 1-letter `k` shortcut.
-//! - **PATH-independent** — works even when the user has not run
+//! - **PATH-independent**: works even when the user has not run
 //!   `kaku init` or is on a shell without managed integration.
-//! - **No dependency bloat** — instead of pulling the GUI/chat engine into
-//!   the `kaku` binary (which would link in WGPU + Cairo + the entire
-//!   GUI runtime), we `execvp` the `k` binary that already ships in
-//!   `Kaku.app/Contents/MacOS/k`. Same chat engine, same args, zero
-//!   process-overhead (exec replaces this process in-place on Unix).
+//! - **One chat entry point**: we `execvp` `Kaku.app/Contents/MacOS/k`, a
+//!   symlink to `kaku-gui` that starts the chat CLI under that name. Same
+//!   chat engine, same args, and exec replaces this process in place.
 
 use anyhow::anyhow;
 use clap::Parser;

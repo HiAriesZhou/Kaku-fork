@@ -590,6 +590,15 @@ enum WebClientMsg {
     DownloadCancel {
         id: u32,
     },
+    /// Which of these paths exist on the Mac, resolved as `Download` does:
+    /// a path a TUI wrapped onto the next row is a link only if the joined
+    /// text names a real file, as in Kaku's own hover (#547).
+    PathsExist {
+        id: u32,
+        paths: Vec<String>,
+        #[serde(default)]
+        pane_id: Option<usize>,
+    },
     SplitPane {
         pane_id: usize,
         direction: config::keyassignment::PaneDirection,
@@ -818,6 +827,11 @@ enum WebServerMsg<'a> {
         id: u32,
         detail: &'a str,
     },
+    /// The answer to `PathsExist`, one entry per path asked about in order.
+    PathsExist {
+        id: u32,
+        exists: Vec<bool>,
+    },
     /// Text a program in the attached pane copied, for the browser clipboard.
     Clipboard {
         text: &'a str,
@@ -989,7 +1003,10 @@ const PREVIEW_AS_IS: u64 = 256 << 10;
 const PREVIEW_MAX_SIDE: u32 = 2048;
 
 /// A picture for a hover preview: the image scaled to fit `side` pixels,
-/// as JPEG, or PNG when it has transparency. A small file, one the image
+/// as JPEG, or PNG when it has transparency. macOS saves screenshots with
+/// an alpha channel that is opaque throughout; as PNG a 3456x2234 one
+/// scaled to 2048 was 2.6 MB, ten round trips over the relay, and 250 KB
+/// as JPEG. A small file, one the image
 /// decoder does not know, or one that scaling would not shrink goes as it
 /// is. A screenshot is several megabytes, seconds over the relay, and the
 /// preview shows it a few hundred pixels wide.
@@ -1012,10 +1029,12 @@ fn preview_bytes(path: &std::path::Path, side: u32) -> Result<Vec<u8>, String> {
         picture
     };
     let mut out = std::io::Cursor::new(Vec::new());
-    let encoded = if picture.color().has_alpha() {
+    let transparent = picture.color().has_alpha() && picture.to_rgba8().pixels().any(|p| p.0[3] < 255);
+    let encoded = if transparent {
         picture.write_to(&mut out, image::ImageFormat::Png)
     } else {
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+        // For the text in screenshots, at about a fifth more bytes than 85.
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
             .encode_image(&picture.to_rgb8())
     };
     let out = out.into_inner();
@@ -1056,6 +1075,9 @@ const MAX_DOWNLOADS: usize = 16;
 /// Previews being made at once; each reads and decodes an image on a
 /// blocking thread.
 const MAX_PREVIEWS: usize = 4;
+/// Paths one `PathsExist` may ask about, and the longest one checked.
+const MAX_PATH_CHECKS: usize = 8;
+const MAX_CHECKED_PATH: usize = 4096;
 /// How often one session may write a screen drift report to the log.
 const DRIFT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -2693,7 +2715,8 @@ fn handle_input(pane: &Arc<dyn Pane>, msg: WebClientMsg, view: &mut View) {
         | WebClientMsg::UploadEnd { .. }
         | WebClientMsg::Download { .. }
         | WebClientMsg::DownloadAck { .. }
-        | WebClientMsg::DownloadCancel { .. } => Ok(()),
+        | WebClientMsg::DownloadCancel { .. }
+        | WebClientMsg::PathsExist { .. } => Ok(()),
         WebClientMsg::Resize { cols, rows } => {
             let cols = cols.clamp(MIN_COLS, MAX_COLS);
             let rows = rows.clamp(MIN_ROWS, MAX_ROWS);
@@ -2918,6 +2941,24 @@ pub(crate) async fn run_session(
                         let made = resolved.and_then(|path| preview_bytes(&path, side));
                         let _ = ready.blocking_send((id, made));
                     });
+                    continue;
+                }
+                if let WebClientMsg::PathsExist { id, paths, pane_id } = msg {
+                    let resolved: Vec<_> = paths
+                        .iter()
+                        .take(MAX_PATH_CHECKS)
+                        .map(|path| (path.len() <= MAX_CHECKED_PATH).then(|| download_path(path, cwd(pane_id))).flatten())
+                        .collect();
+                    // A stat can hang on a network volume; keep it off the session.
+                    let exists = tokio::task::spawn_blocking(move || {
+                        resolved.into_iter().map(|path| path.is_some_and(|path| path.exists())).collect::<Vec<_>>()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let Some(json) = encode(&WebServerMsg::PathsExist { id, exists }) else { continue };
+                    if outbox.send(json).await.is_err() {
+                        break;
+                    }
                     continue;
                 }
                 if let WebClientMsg::DownloadCancel { id } = &msg {
@@ -4052,6 +4093,17 @@ mod tests {
     }
 
     #[test]
+    fn a_path_check_parses_and_answers_in_order() {
+        let msg: WebClientMsg =
+            serde_json::from_str(r#"{"type":"paths_exist","id":3,"paths":["~/a","b"],"pane_id":2}"#).unwrap();
+        assert!(matches!(msg, WebClientMsg::PathsExist { id: 3, ref paths, pane_id: Some(2) } if paths.len() == 2));
+        assert_eq!(
+            encode(&WebServerMsg::PathsExist { id: 3, exists: vec![true, false] }).unwrap(),
+            r#"{"type":"paths_exist","id":3,"exists":[true,false]}"#
+        );
+    }
+
+    #[test]
     fn a_hover_preview_is_scaled_to_the_side_the_page_shows() {
         let dir = std::env::temp_dir().join(format!("kaku-preview-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4095,6 +4147,19 @@ mod tests {
             image::ImageFormat::Png
         );
         assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 600);
+
+        // A macOS screenshot carries an alpha channel that is opaque
+        // throughout; it is not transparent, so JPEG.
+        let opaque = image::RgbaImage::from_fn(3000, 2000, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, ((x ^ y) % 256) as u8, 255])
+        });
+        let path = dir.join("opaque.png");
+        opaque.save(&path).unwrap();
+        let bytes = preview_bytes(&path, 600).unwrap();
+        assert_eq!(
+            image::guess_format(&bytes).unwrap(),
+            image::ImageFormat::Jpeg
+        );
 
         // Small files and files the decoder does not know go as they are.
         let small = dir.join("small.png");

@@ -648,7 +648,7 @@ pub struct Confirmation {
 }
 
 fn default_message() -> String {
-    "🛑 Really continue?".to_string()
+    "Really continue?".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]

@@ -2020,10 +2020,8 @@ impl App {
             let was_transient = self.stream_is_transient;
             self.stream_is_transient = false;
             if !was_transient && !had_error {
-                send_unfocused_notification(
-                    &strings::task_complete_notification_title(),
-                    &strings::task_complete_notification_body(),
-                );
+                // Title only: a body saying the response is ready repeated it.
+                send_unfocused_notification(&strings::task_complete_notification_title(), "");
             }
             if !was_transient {
                 self.save_history();

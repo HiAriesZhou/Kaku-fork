@@ -550,7 +550,7 @@ test('local token stays tab-only', async t => {
   assert.ok(await p.evaluate(() => sessionStorage.getItem('kaku.link:/')));
 });
 
-test('image paths preview after 150ms, scaled by the Mac, again from memory, and cancel on leave', async t => {
+test('image paths preview after 80ms, scaled by the Mac, again from memory, and cancel on leave', async t => {
   const { p, errors } = await page(t);
   await screen(p, '~/Desktop/shot.png');
   await p.evaluate(() => new Promise(resolve => testLinkProvider.provideLinks(1, links => {
@@ -558,14 +558,14 @@ test('image paths preview after 150ms, scaled by the Mac, again from memory, and
     previewLink.hover({ clientX: 980, clientY: 580, buttons: 0 });
     resolve();
   })));
-  await p.waitForTimeout(80);
+  await p.waitForTimeout(40);
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
   await p.waitForFunction(() => messages.some(m => m.type === 'download'));
   const request = await p.evaluate(() => messages.find(m => m.type === 'download'));
   assert.equal(request.path, '~/Desktop/shot.png');
   assert.equal(request.pane_id, 1);
   // The preview's longest side in device pixels, for the Mac to scale to.
-  assert.equal(request.preview, await p.evaluate(() => Math.round(420 * devicePixelRatio)));
+  assert.equal(request.preview, await p.evaluate(() => Math.round(640 * devicePixelRatio)));
   let saves = 0;
   p.on('download', () => saves++);
   await p.evaluate(id => {
@@ -595,6 +595,95 @@ test('image paths preview after 150ms, scaled by the Mac, again from memory, and
   await p.waitForFunction(() => !document.querySelector('#image-preview').hidden);
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
   await p.evaluate(() => previewLink.leave());
+  assert.deepEqual(errors, []);
+});
+
+test('a selection left on screen does not hold an image preview back', async t => {
+  const { p, errors } = await page(t);
+  await screen(p, 'see ~/Desktop/shot.png now');
+  await p.evaluate(() => probe.term.selectAll());
+  assert.equal(await p.evaluate(() => probe.term.hasSelection()), true);
+  await p.evaluate(() => new Promise(resolve => testLinkProvider.provideLinks(1, links => {
+    links[0].hover({ clientX: 100, clientY: 100, buttons: 0 });
+    resolve();
+  })));
+  await p.waitForFunction(() => messages.some(m => m.type === 'download' && m.preview));
+  assert.deepEqual(errors, []);
+});
+
+test('Option+clicking an image path shows it over the page to zoom, sending the Mac no click', async t => {
+  const { p, errors } = await page(t);
+  await p.setViewportSize({ width: 1000, height: 600 });
+  await screen(p, 'see ~/Desktop/shot.png now');
+  const box = await p.locator('.xterm-screen').boundingBox();
+  const cell = await p.evaluate(() => probe.term._core._renderService.dimensions.css.cell);
+  const at = [box.x + cell.width * 8.5, box.y + cell.height / 2];
+  await p.mouse.move(at[0] - cell.width, at[1]);
+  await p.mouse.move(at[0], at[1]);
+  await p.waitForTimeout(30);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.down('Alt');
+  await p.mouse.click(at[0], at[1]);
+  await p.keyboard.up('Alt');
+  await p.waitForFunction(() => document.querySelector('#viewer.show'));
+  const request = await p.evaluate(() => messages.find(m => m.type === 'download'));
+  assert.equal(request.path, '~/Desktop/shot.png');
+  assert.equal(request.preview, await p.evaluate(() => Math.min(2048, Math.round(Math.max(screen.width, screen.height) * devicePixelRatio))));
+  // xterm's Alt click would have moved the shell's cursor with arrow keys.
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => ['click', 'text', 'key'].includes(m.type))), []);
+  // A 400 by 200 picture fits inside the page, centred.
+  const png = await p.evaluate(async () => {
+    const c = document.createElement('canvas'); c.width = 400; c.height = 200;
+    const g = c.getContext('2d'); g.fillStyle = '#4a8'; g.fillRect(0, 0, 400, 200);
+    return c.toDataURL('image/png').split(',')[1];
+  });
+  // A slow answer says it is loading, and the note goes once it lands.
+  await p.waitForFunction(() => getComputedStyle(document.querySelector('#viewer .wait')).display !== 'none', null, { timeout: 2000 });
+  await p.evaluate(({ id, png }) => {
+    probe.handle({ type: 'file_start', id, name: 'preview', size: atob(png).length });
+    probe.handle({ type: 'file_chunk', id, data: png });
+    probe.handle({ type: 'file_end', id });
+  }, { id: request.id, png });
+  await p.waitForFunction(() => document.querySelector('#viewer.ready img')?.getBoundingClientRect().width > 2);
+  assert.equal(await p.evaluate(() => getComputedStyle(document.querySelector('#viewer .wait')).display), 'none');
+  const fit = await p.locator('#viewer img').boundingBox();
+  assert.ok(Math.abs(fit.width - 400) < 1 && Math.abs(fit.x + fit.width / 2 - 500) < 1 && Math.abs(fit.y + fit.height / 2 - 300) < 1, JSON.stringify(fit));
+  // The wheel zooms; while the picture is smaller than the page it stays
+  // centred, and once larger the pixel under the pointer stays put.
+  await p.mouse.move(400, 280);
+  await p.mouse.wheel(0, -300);
+  const larger = await p.locator('#viewer img').boundingBox();
+  assert.ok(larger.width > fit.width * 1.5 && Math.abs(larger.x + larger.width / 2 - 500) < 1, JSON.stringify(larger));
+  await p.mouse.wheel(0, -300);
+  const zoomed = await p.locator('#viewer img').boundingBox();
+  assert.ok(zoomed.width > 1000 && zoomed.height > 600, JSON.stringify(zoomed));
+  const u = (400 - larger.x) / larger.width, v = (280 - larger.y) / larger.height;
+  assert.ok(Math.abs(zoomed.x + u * zoomed.width - 400) < 2 && Math.abs(zoomed.y + v * zoomed.height - 280) < 2, JSON.stringify(zoomed));
+  // A drag pans it.
+  await p.mouse.move(500, 300);
+  await p.mouse.down();
+  await p.mouse.move(540, 290, { steps: 4 });
+  await p.mouse.up();
+  const panned = await p.locator('#viewer img').boundingBox();
+  assert.ok(Math.abs(panned.x - zoomed.x - 40) < 2 && Math.abs(panned.y - zoomed.y + 10) < 2, JSON.stringify(panned));
+  assert.equal(await p.locator('#viewer').isVisible(), true, 'a drag is not a click beside it');
+  // Escape closes it and reaches nothing else.
+  await p.keyboard.press('Escape');
+  assert.equal(await p.locator('#viewer').isVisible(), false);
+  assert.deepEqual(await p.evaluate(() => messages.filter(m => ['click', 'text', 'key'].includes(m.type))), []);
+  // Opening it again needs no transfer, the copy is kept.
+  await p.evaluate(() => { messages.length = 0; });
+  await p.mouse.move(at[0] - cell.width, at[1]);
+  await p.mouse.move(at[0], at[1]);
+  await p.waitForTimeout(30);
+  await p.keyboard.down('Alt');
+  await p.mouse.click(at[0], at[1]);
+  await p.keyboard.up('Alt');
+  await p.waitForFunction(() => document.querySelector('#viewer.ready img')?.getBoundingClientRect().width > 2);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'download').length), 0);
+  // A click beside the picture closes it.
+  await p.mouse.click(20, 20);
+  assert.equal(await p.locator('#viewer').isVisible(), false);
   assert.deepEqual(errors, []);
 });
 
@@ -1492,6 +1581,45 @@ test('Mac paths stop at Chinese sentence punctuation but keep Chinese file names
   }
 });
 
+// Claude Code breaks a long path with a newline and an indent; the joined
+// path is a link on both rows once the Mac says it exists (#547), and the
+// fragments stay as they were when it does not or Kaku never answers.
+test('a path a TUI wrapped onto the next row links whole once the Mac finds it', async t => {
+  const { p } = await page(t); await screen(p);
+  const links = row => p.evaluate(async row => {
+    const found = await new Promise(resolve => testLinkProvider.provideLinks(row, resolve));
+    return (found || []).map(l => ({ text: l.text, from: [l.range.start.x, l.range.start.y], to: [l.range.end.x, l.range.end.y] }));
+  }, row);
+  const show = text => p.evaluate(text => new Promise(resolve => {
+    probe.term.resize(60, 24);
+    probe.term.write('\x1b[2J\x1b[H' + text, resolve);
+  }), text);
+  const answer = exists => p.waitForFunction(() => messages.some(m => m.type === 'paths_exist')).then(() => p.evaluate(exists => {
+    const ask = messages.filter(m => m.type === 'paths_exist').at(-1);
+    messages.length = 0;
+    probe.handle({ type: 'paths_exist', id: ask.id, exists: ask.paths.map(() => exists) });
+    return ask.paths;
+  }, exists));
+  await p.evaluate(() => { messages.length = 0; });
+  await show('对比图在 /private/tmp/a/47ca47e\r\n  d-ea27/shot.png：左边改前\r\n');
+  const first = links(1);
+  assert.deepEqual(await answer(true), ['/private/tmp/a/47ca47ed-ea27/shot.png']);
+  const whole = { text: '/private/tmp/a/47ca47ed-ea27/shot.png', from: [10, 1], to: [17, 2] };
+  assert.deepEqual(await first, [whole]);
+  assert.deepEqual(await links(2), [whole]);
+  assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'paths_exist').length), 0, 'asked once');
+
+  await show('see /tmp/b/one\r\n  two/x.png here\r\n');
+  const missing = links(1);
+  await answer(false);
+  assert.deepEqual((await missing).map(l => l.text), ['/tmp/b/one']);
+  assert.deepEqual(await links(2), []);
+
+  // A Kaku that does not know the question: the fragment, after a moment.
+  await show('see /tmp/c/one\r\n  two/x.png here\r\n');
+  assert.deepEqual((await links(1)).map(l => l.text), ['/tmp/c/one']);
+});
+
 test('middle click closes the clicked tab through the same confirmation path', async t => {
   const { p } = await page(t); await screen(p);
   await p.evaluate(() => { messages.length = 0; probe.handle({ type: 'tabs', tabs: [
@@ -1605,6 +1733,56 @@ test('the close confirmation answers to N, Y and clicks outside it', async t => 
   await ask();
   await p.keyboard.press('y');
   assert.equal(await closes(), 1);
+});
+
+// The confirmation sits by what it asks about with its tip on it: 16px under
+// the close mark that was clicked, above the tab when the bar is at the
+// bottom, by the spot the pane menu opened at; scrolling outside cancels.
+test('the close confirmation points at the tab or spot it asks about', async t => {
+  const { p } = await page(t); await screen(p);
+  const tabs = bottom => p.evaluate(bottom => {
+    connections.at(-1).onmessage({ data: JSON.stringify({ type: 'config', tab_bar_at_bottom: bottom }) });
+    probe.handle({ type: 'tabs', tabs: [
+      { tab_id: 1, pane_id: 1, title: 'one', active: true },
+      { tab_id: 2, pane_id: 2, title: 'two', confirm_close: true, panes: [
+        { pane_id: 2, left: 0, top: 0, width: 40, height: 24, confirm_close: true },
+        { pane_id: 4, left: 40, top: 0, width: 40, height: 24 },
+      ] },
+    ] });
+  }, bottom);
+  const geometry = () => p.evaluate(() => {
+    const card = document.querySelector('#dialog .card').getBoundingClientRect();
+    const tip = document.querySelector('#dialog .tip').getBoundingClientRect();
+    const mark = document.querySelectorAll('#bar .tab')[1].querySelector('.close').getBoundingClientRect();
+    const tab = document.querySelectorAll('#bar .tab')[1].getBoundingClientRect();
+    return { card, tip: { x: tip.left + tip.width / 2, top: tip.top, bottom: tip.bottom }, mark, tab };
+  });
+  await tabs(false);
+  await p.locator('#bar .tab').nth(1).hover();
+  await p.locator('#bar .tab').nth(1).locator('.close').click();
+  let g = await geometry();
+  assert.ok(Math.abs(g.card.top - g.mark.bottom - 16) <= 1, `card ${g.card.top} under the mark at ${g.mark.bottom}`);
+  assert.ok(Math.abs(g.tip.x - (g.mark.left + g.mark.right) / 2) <= 1, `tip ${g.tip.x} on the mark`);
+  assert.ok(g.tip.top < g.card.top && g.tip.top > g.mark.bottom, 'the tip rises from the card toward the mark');
+  await p.mouse.move(500, 400);
+  await p.mouse.wheel(0, 100);
+  await p.waitForFunction(() => !document.querySelector('#dialog.show'), null, { timeout: 2000 });
+  await tabs(true);
+  await p.locator('#bar .tab').nth(1).click({ button: 'middle' });
+  g = await geometry();
+  assert.ok(Math.abs(g.tab.top - g.card.bottom - 16) <= 1, `card ${g.card.bottom} above the bottom tab at ${g.tab.top}`);
+  assert.ok(Math.abs(g.tip.x - (g.tab.left + g.tab.right) / 2) <= 1, 'tip on the tab');
+  assert.ok(g.tip.bottom > g.card.bottom, 'the tip points down at the tab');
+  await p.keyboard.press('Escape');
+  await tabs(false);
+  await p.evaluate(() => probe.attach({ tab_id: 2, pane_id: 2 }, true));
+  await p.locator('.xterm-screen').click({ button: 'right', position: { x: 300, y: 200 } });
+  const spot = await p.locator('.xterm-screen').boundingBox();
+  await p.locator('#menu button').getByText('Close Pane', { exact: true }).click();
+  assert.equal(await p.locator('#dialog .title').innerText(), 'Close this pane?');
+  g = await geometry();
+  assert.ok(Math.abs(g.card.top - (spot.y + 200) - 16) <= 1, 'card under the menu spot');
+  assert.ok(Math.abs(g.tip.x - (spot.x + 300)) <= 1, 'tip on the menu spot');
 });
 
 test('terminal menu copies its selection and shares paste limits and pane guards', async t => {
@@ -3497,6 +3675,30 @@ test('a direct path takes Kaku\'s pieces and the page\'s messages once it opens'
     { type: 'hello', frame_ack: true, delta: true },
     { type: 'attach', pane_id: 4 },
   ]);
+  assert.deepEqual(errors, []);
+});
+
+// Control-Up and F11 belong to the computer in front of the page, so the
+// switch key's modifiers with Up and Down open Mission Control and the
+// desktop on the Mac, letting go of the modifiers already sent there.
+test('Ctrl+Option+Cmd+Up and Down open Mission Control and the desktop on the Mac', async t => {
+  const { p, errors } = await page(t, '#t=fixture', { platform: 'MacIntel' });
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', desktop: true }));
+  await p.locator('#bar .tool.desktop').click();
+  await showPicture(p);
+  const sent = () => p.evaluate(() => messages.filter(m => m.type.startsWith('desktop_key') || m.type === 'desktop_mission_control')
+    .map(m => m.type === 'desktop_key' ? `${m.code} ${m.down ? 'down' : 'up'}` : `mission ${m.show || 'windows'}`));
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.press('Control+Alt+Meta+ArrowUp');
+  assert.deepEqual(await sent(), ['ControlLeft down', 'AltLeft down', 'MetaLeft down', 'ControlLeft up', 'AltLeft up', 'MetaLeft up', 'mission windows']);
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.press('Control+Alt+Meta+ArrowDown');
+  assert.equal((await sent()).at(-1), 'mission desktop');
+  // Control-Up alone still goes to the Mac as keys.
+  await p.evaluate(() => { messages.length = 0; });
+  await p.keyboard.press('Control+ArrowUp');
+  assert.deepEqual(await sent(), ['ControlLeft down', 'ArrowUp down', 'ArrowUp up', 'ControlLeft up']);
   assert.deepEqual(errors, []);
 });
 

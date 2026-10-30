@@ -997,6 +997,7 @@ impl Screen {
         F: FnMut(&[&Line]),
     {
         let (first, second) = self.lines.as_slices();
+        let first_len = first.len();
         let first_range = 0..first.len();
         let second_range = first.len()..first.len() + second.len();
         let first_range = phys_intersection(&first_range, &phys_range);
@@ -1006,7 +1007,10 @@ impl Screen {
         for line in &first[first_range] {
             lines.push(line);
         }
-        for line in &second[second_range] {
+        // second_range is in ring order; the second slice starts at 0.
+        for line in &second[second_range.start.saturating_sub(first_len)
+            ..second_range.end.saturating_sub(first_len)]
+        {
             lines.push(line);
         }
         func(&lines)
@@ -1271,5 +1275,51 @@ mod tests {
         screen.stable_row_index_offset = 10;
 
         assert_eq!(screen.stable_range(&(8..11)), 5..8);
+    }
+
+    #[test]
+    fn phys_lines_read_both_halves_of_a_wrapped_ring() {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestConfig);
+        let mut screen = Screen::new(
+            TerminalSize {
+                cols: 80,
+                rows: 3,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            },
+            &config,
+            true,
+            0,
+            BidiMode {
+                enabled: false,
+                hint: ParagraphDirectionHint::LeftToRight,
+            },
+        );
+
+        // Fill the ring to capacity, then evict from the front and append, as
+        // scrollback does once it is full: the newest rows wrap to the start
+        // of the buffer and as_slices() returns two halves.
+        let mut lines = VecDeque::with_capacity(8);
+        let capacity = lines.capacity();
+        for seqno in 0..capacity {
+            lines.push_back(Line::new(seqno as SequenceNo));
+        }
+        for seqno in capacity..capacity + 3 {
+            lines.pop_front();
+            lines.push_back(Line::new(seqno as SequenceNo));
+        }
+        assert!(!lines.as_slices().1.is_empty());
+        screen.lines = lines;
+
+        let len = screen.lines.len();
+        let mut seen = vec![];
+        screen.with_phys_lines(len - 5..len, |lines| {
+            seen = lines.iter().map(|line| line.current_seqno()).collect();
+        });
+        let expected: Vec<SequenceNo> = (capacity - 2..capacity + 3)
+            .map(|seqno| seqno as SequenceNo)
+            .collect();
+        assert_eq!(seen, expected);
     }
 }

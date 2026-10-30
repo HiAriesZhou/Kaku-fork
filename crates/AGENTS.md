@@ -14,7 +14,7 @@ Key groups:
 | Platform and process | `pty`, `filedescriptor`, `procinfo`, `env-bootstrap`, `umask`, `async_ossl` |
 | Lua and config support | `luahelper`, `wezterm-dynamic` |
 | Shared utilities | `promise`, `base91`, `bidi`, `bintree`, `frecency`, `lfucache`, `rangeset`, `ratelim`, `tabout`, `wezterm-blob-leases`, `wezterm-char-props`, `wezterm-version` |
-| Kaku-specific utilities | `kaku-ai-utils`, `kaku-unicode-names` (generated Unicode name table lifted out of `kaku-gui/src`; regenerate with `ucd-generate`, do not hand-edit) |
+| Kaku-specific utilities | `kaku-ai-utils`, `kaku-unicode-names` (Unicode name table for the character selector, a zstd-compressed `src/names.tsv.zst` decoded on first use; regenerate with `regenerate.sh`, do not hand-edit) |
 
 ## Practical Rules
 

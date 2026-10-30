@@ -3324,6 +3324,7 @@ dependencies = [
  "ignore",
  "image",
  "k9",
+ "kaku",
  "kaku-ai-utils",
  "kaku-remote",
  "kaku-unicode-names",
@@ -3417,6 +3418,9 @@ dependencies = [
 [[package]]
 name = "kaku-unicode-names"
 version = "0.1.0"
+dependencies = [
+ "zstd",
+]
 
 [[package]]
 name = "kasuari"
@@ -4928,6 +4932,7 @@ dependencies = [
  "libc",
  "log",
  "luahelper",
+ "tempfile",
  "wezterm-dynamic",
 ]
 
