@@ -2260,6 +2260,45 @@ test('no size is claimed before Kaku\'s config and font are in, then one', async
   assert.equal(await p.evaluate(() => messages.filter(m => m.type === 'resize').length), 1);
 });
 
+for (const [lineHeight, expected] of [[0.95, 1], [1, 1], [1.28, 1.28]]) {
+  test(`remote line height ${lineHeight} keeps initial sizing and resize working`, async t => {
+    const { p, errors } = await page(t, '#t=fixture', { noConfig: true });
+    await screen(p);
+    assert.deepEqual(await p.evaluate(() => messages.filter(m => m.type === 'resize')), []);
+    // Start with the first config: a prior config would already have made
+    // fontReady true and hidden the failure reported in #612.
+    await p.evaluate(line_height => probe.handle({ type: 'config', line_height, font_size: 14 }), lineHeight);
+    await p.waitForFunction(() => messages.some(m => m.type === 'resize'));
+    assert.equal(await p.evaluate(() => probe.term.options.lineHeight), expected);
+    const initial = await p.evaluate(() => messages.filter(m => m.type === 'resize').at(-1));
+    // Apply the claimed grid, as Kaku would, then change the browser size.
+    await p.evaluate(grid => {
+      probe.handle({ type: 'frame', seq: 2, pane_id: 1, cols: grid.cols, rows: grid.rows, data: '' });
+      messages.length = 0;
+    }, initial);
+    await p.setViewportSize({ width: 600, height: 700 });
+    await p.waitForFunction(() => messages.some(m => m.type === 'resize'));
+    const resized = await p.evaluate(() => messages.filter(m => m.type === 'resize').at(-1));
+    assert.ok(resized.cols < initial.cols, 'the narrower window claims fewer columns');
+    assert.notEqual(resized.rows, initial.rows, 'the taller window claims a new row count');
+    assert.deepEqual(errors, []);
+  });
+}
+
+test('invalid remote line heights keep the last valid setting', async t => {
+  const { p, errors } = await page(t, '#t=fixture', { noConfig: true });
+  await screen(p);
+  await p.evaluate(() => probe.handle({ type: 'config', line_height: 1.28 }));
+  await p.waitForFunction(() => messages.some(m => m.type === 'resize'));
+  for (const value of [null, 0, -0.5, '0.95', NaN, Infinity]) {
+    await p.evaluate(line_height => probe.handle({ type: 'config', line_height }), value);
+    assert.equal(await p.evaluate(() => probe.term.options.lineHeight), 1.28);
+  }
+  await p.evaluate(() => probe.handle({ type: 'config' }));
+  assert.equal(await p.evaluate(() => probe.term.options.lineHeight), 1.28);
+  assert.deepEqual(errors, []);
+});
+
 test('the drift check names the last frame drawn, so it runs while output streams', async t => {
   const { p } = await page(t);
   await screen(p);
