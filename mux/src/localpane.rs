@@ -1309,16 +1309,17 @@ mod tests {
             include_str!("ssh.rs"),
             include_str!("../../config/src/keyassignment.rs"),
         ];
-        let is_emoji = |c: char| {
-            matches!(c as u32, 0x1F300..=0x1FAFF | 0x2600..=0x27BF | 0xFE0F)
-        };
+        let is_emoji = |c: char| matches!(c as u32, 0x1F300..=0x1FAFF | 0x2600..=0x27BF | 0xFE0F);
         for source in sources {
             for line in source.lines() {
                 let ui = line.contains("brief = format!(")
                     || line.contains("let placeholder =")
                     || line.contains("Really continue");
                 if ui {
-                    assert!(!line.chars().any(is_emoji), "emoji in interface text: {line}");
+                    assert!(
+                        !line.chars().any(is_emoji),
+                        "emoji in interface text: {line}"
+                    );
                 }
             }
         }
