@@ -98,7 +98,7 @@ jobs:
       - name: Build binaries
         run: |
           set -o pipefail
-          cargo build --locked --profile "$PROFILE" --target ${{ matrix.target }} -p kaku -p kaku-gui 2>&1 | sed '/has no symbols/d'
+          cargo build --locked --profile "$PROFILE" --target ${{ matrix.target }} -p kaku-gui --bin kaku-gui 2>&1 | sed '/has no symbols/d'
 
       - name: Assemble app bundle
         if: matrix.bundle
@@ -114,14 +114,25 @@ jobs:
           test "$(cat dist/Kaku.app/Contents/Resources/vendor/fast-syntax-highlighting/.kaku-vendor-ref)" = "3d574ccf48804b10dca52625df13da5edae7f553"
           test "$(cat dist/Kaku.app/Contents/Resources/vendor/zsh-completions/.kaku-vendor-ref)" = "84615f3d0b0e943d5b1de862c9552e572c8e70bb"
 
+      - name: Verify the CLI names run the bundled binary
+        if: matrix.bundle
+        run: |
+          set -euo pipefail
+          for bin in kaku k; do
+            test "$(readlink "dist/Kaku.app/Contents/MacOS/$bin")" = kaku-gui
+          done
+          test ! -e dist/Kaku.app/Contents/Frameworks
+          version="$(dist/Kaku.app/Contents/MacOS/kaku --version)"
+          [[ "$version" == "kaku "* ]]
+          chat_help="$(dist/Kaku.app/Contents/MacOS/k --help)"
+          [[ "$chat_help" == *"Usage: k "* ]]
+
       - name: Upload binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bin-${{ matrix.arch }}
           path: |
-            target/${{ matrix.target }}/release-opt/kaku
             target/${{ matrix.target }}/release-opt/kaku-gui
-            target/${{ matrix.target }}/release-opt/k
           if-no-files-found: error
           retention-days: 1
 
@@ -139,8 +150,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p universal
-          for bin in kaku kaku-gui k; do
-            lipo -create -output "universal/$bin" "bin-arm64/$bin" "bin-x86_64/$bin"
-            lipo "universal/$bin" -verify_arch arm64 x86_64
-            lipo -info "universal/$bin"
-          done
+          lipo -create -output universal/kaku-gui bin-arm64/kaku-gui bin-x86_64/kaku-gui
+          lipo universal/kaku-gui -verify_arch arm64 x86_64
+          lipo -info universal/kaku-gui

@@ -396,11 +396,7 @@ fn render_selector(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .title(Line::from(vec![
             Span::styled(" Select: ", Style::default().fg(primary())),
             Span::styled(field.key, Style::default().fg(text_fg())),
-            Span::styled("  ", Style::default()),
-            Span::styled("Enter", Style::default().fg(primary())),
-            Span::styled(": Apply  ", Style::default().fg(muted())),
-            Span::styled("Esc", Style::default().fg(primary())),
-            Span::styled(": Save & Exit ", Style::default().fg(muted())),
+            Span::styled(" ", Style::default()),
         ]))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(primary()))

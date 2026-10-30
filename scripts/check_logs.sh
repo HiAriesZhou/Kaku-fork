@@ -33,6 +33,7 @@ cd "$REPO_ROOT"
 #     macro expansion.
 ALLOW_FILES=(
   'kaku/src/main\.rs'
+  'kaku/src/lib\.rs'
   'kaku/src/cli/'
   'kaku/src/config_cmd\.rs'
   'kaku/src/doctor\.rs'

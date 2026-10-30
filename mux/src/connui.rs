@@ -24,7 +24,7 @@ impl LineEditorHost for PasswordPromptHost {
     // Rewrite the input so that we can obscure the password
     // characters when output to the terminal widget
     fn highlight_line(&self, line: &str, cursor_position: usize) -> (Vec<OutputElement>, usize) {
-        let placeholder = "🔑";
+        let placeholder = "•";
         let grapheme_count = unicode_column_width(line, None);
         let mut output = vec![];
         for _ in 0..grapheme_count {

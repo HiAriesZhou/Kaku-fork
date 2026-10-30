@@ -326,7 +326,7 @@ impl Pane for LocalPane {
                     ) {
                         (ExitBehavior::Close, _, _) => *proc = ProcessState::Dead,
                         (ExitBehavior::CloseOnCleanExit, false, _) => {
-                            brief = format!("⚠️  Process {cmd} didn't exit cleanly");
+                            brief = format!("Process {cmd} didn't exit cleanly");
                             terse = format!("{status}.");
                             trailer = format!("{EXIT_BEHAVIOR}=\"CloseOnCleanExit\"");
 
@@ -337,10 +337,10 @@ impl Pane for LocalPane {
                             trailer = format!("{EXIT_BEHAVIOR}=\"Hold\"");
 
                             if success {
-                                brief = format!("👍 Process {cmd} completed.");
+                                brief = format!("Process {cmd} completed.");
                                 terse = "done".to_string();
                             } else {
-                                brief = format!("⚠️  Process {cmd} didn't exit cleanly");
+                                brief = format!("Process {cmd} didn't exit cleanly");
                                 terse = format!("{status}");
                             }
                             *proc = ProcessState::DeadPendingClose { killed: false }
@@ -1298,6 +1298,33 @@ impl Drop for LocalPane {
 mod tests {
     use super::*;
     use procinfo::LocalProcessStatus;
+
+    /// The exit notice, the password mask and the default confirmation are
+    /// interface text: no emoji in them (the WezTerm-era 👍, ⚠️, 🔑 and 🛑).
+    #[test]
+    fn interface_text_carries_no_emoji() {
+        let sources = [
+            include_str!("localpane.rs"),
+            include_str!("connui.rs"),
+            include_str!("ssh.rs"),
+            include_str!("../../config/src/keyassignment.rs"),
+        ];
+        let is_emoji = |c: char| matches!(c as u32, 0x1F300..=0x1FAFF | 0x2600..=0x27BF | 0xFE0F);
+        for source in sources {
+            for line in source.lines() {
+                let ui = line.contains("brief = format!(")
+                    || line.contains("let placeholder =")
+                    || line.contains("Really continue");
+                if ui {
+                    assert!(
+                        !line.chars().any(is_emoji),
+                        "emoji in interface text: {}",
+                        line
+                    );
+                }
+            }
+        }
+    }
 
     fn process(pid: u32, pgid: u32, executable: &str) -> LocalProcessInfo {
         LocalProcessInfo {

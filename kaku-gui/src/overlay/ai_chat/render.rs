@@ -763,7 +763,7 @@ fn render_picker(
     changes.push(Change::ClearScreen(pal.bg_attr()));
 
     // Top border
-    let title = format!(" Resume Conversation · {} saved · ESC cancel ", items.len());
+    let title = format!(" Resume Conversation · {} saved ", items.len());
     let title_width = unicode_column_width(&title, None);
     let border_fill = inner_w.saturating_sub(title_width);
     changes.push(Change::CursorPosition {

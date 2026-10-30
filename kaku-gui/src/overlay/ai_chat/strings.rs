@@ -29,8 +29,3 @@ pub(crate) fn approval_notification_title() -> String {
 pub(crate) fn task_complete_notification_title() -> String {
     "Kaku AI Task Complete".to_string()
 }
-
-/// Body shown by the task-complete system notification.
-pub(crate) fn task_complete_notification_body() -> String {
-    "Response ready.".to_string()
-}
